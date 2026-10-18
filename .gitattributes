@@ -1,0 +1,18 @@
+* text=auto
+
+# Windows-side sources: CRLF in the working tree
+*.lua  text eol=crlf
+*.cs   text eol=crlf
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+
+# run by bash / python
+*.sh   text eol=lf
+*.py   text eol=lf
+
+*.md   text
+*.ico  binary
+*.png  binary
+*.exe  binary
+*.dll  binary
+*.pak  binary

@@ -1,0 +1,17 @@
+# build output
+dist/
+mod/SurrounSync/bridge/
+
+# logs
+*.log
+__pycache__/
+*.pyc
+
+# local tool installs
+tools/lint/luapkg/
+
+# game dumps and decompiled Blueprints
+research/
+
+# bug report webhook (secret)
+tools/report-webhook.txt
