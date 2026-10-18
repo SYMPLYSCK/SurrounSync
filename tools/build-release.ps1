@@ -19,15 +19,6 @@ Write-Host "SurrounSync $Version"
 python -I (Join-Path $Repo 'tools\lint\lualint.py') (Get-ChildItem (Join-Path $Repo 'mod\SurrounSync\Scripts') -Recurse -Filter *.lua | ForEach-Object FullName)
 if ($LASTEXITCODE -ne 0) { throw "lint failed" }
 
-$BridgeExe = Join-Path $Repo 'mod\SurrounSync\bridge\SurrounSyncBridge.exe'
-$BridgeSrc = @(Get-ChildItem (Join-Path $Repo 'bridge') -Filter *.cs) + @(Get-ChildItem (Join-Path $Repo 'tools') -Filter 'report-webhook.txt' -ErrorAction SilentlyContinue) |
-    Sort-Object LastWriteTime | Select-Object -Last 1
-if ((Test-Path $BridgeExe) -and (Get-Item $BridgeExe).LastWriteTime -gt $BridgeSrc.LastWriteTime) {
-    Write-Host "Connector up to date"
-} else {
-    & (Join-Path $PSScriptRoot 'build-bridge.ps1')
-}
-
 if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
 $P = Join-Path $Stage 'payload'
 $Ue = Join-Path $P 'game\ue4ss'
@@ -39,6 +30,8 @@ $ini = Join-Path $Ue 'UE4SS-settings.ini'
 (Get-Content $ini) -replace '^(ConsoleEnabled|GuiConsoleEnabled|GuiConsoleVisible)\s*=.*', '$1 = 0' | Set-Content $ini -Encoding ascii
 Copy-Item (Join-Path $Repo 'mod\SurrounSync') (Join-Path $Ue 'Mods') -Recurse
 Get-ChildItem (Join-Path $Ue 'Mods\SurrounSync') -Recurse -Include '*.bak*', '*.log', 'dlls' | Remove-Item -Recurse -Force
+# always a fresh bridge, built straight into the package (a running game locks the one in mod\SurrounSync\bridge)
+& (Join-Path $PSScriptRoot 'build-bridge.ps1') -Out (Join-Path $Ue 'Mods\SurrounSync\bridge')
 if (-not $NoPds -and (Test-Path $Pds)) {
     Copy-Item $Pds (Join-Path $Ue 'Mods') -Recurse
     Get-ChildItem (Join-Path $Ue 'Mods\PDS') -Recurse -Include '*.bak*', '*.log' | Remove-Item -Force

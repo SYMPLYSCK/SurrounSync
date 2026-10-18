@@ -1,8 +1,9 @@
 # Builds bridge/SurrounSyncBridge.cs into mod/SurrounSync/bridge (uses the csc.exe that ships with Windows).
+param([string]$Out = '')
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path $PSScriptRoot -Parent
 $Csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-$Out = Join-Path $Repo 'mod\SurrounSync\bridge'
+if (-not $Out) { $Out = Join-Path $Repo 'mod\SurrounSync\bridge' }
 $Game = 'C:\Program Files (x86)\Steam\steamapps\common\SurrounDead'
 New-Item -ItemType Directory -Force $Out | Out-Null
 $ReportTarget = & (Join-Path $PSScriptRoot 'report-target.ps1') | Select-Object -Last 1

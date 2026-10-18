@@ -12,8 +12,8 @@ if (git status --porcelain) { throw "Commit or stash your changes first - a rele
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw "GitHub CLI (gh) not found: https://cli.github.com, then gh auth login" }
 
 $log = Get-Content 'CHANGELOG.md' -Raw
-$m = [regex]::Match($log, "(?ms)^## \[$([regex]::Escape($Version))\][^\n]*\n(.*?)(?=^## \[|\z)")
-if (-not $m.Success) { throw "CHANGELOG.md has no section '## [$Version]'" }
+$m = [regex]::Match(($log -replace "`r`n", "`n"), "(?ms)^## \[?$([regex]::Escape($Version))\]?[^\n]*\n(.*?)(?=^## |\z)")
+if (-not $m.Success) { throw "CHANGELOG.md has no section '## $Version'" }
 $notes = Join-Path $env:TEMP "surrounsync-notes-$Version.md"
 Set-Content $notes ($m.Groups[1].Value.Trim() + "`n`n**Install:** download SurrounSyncSetup.exe below and run it. Already installed? Update from the game: handbook (J) -> CO-OP -> UPDATE.") -Encoding utf8
 
