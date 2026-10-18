@@ -21,6 +21,9 @@ First public release.
   grenades and projectiles, time and weather, sounds.
 - Smoother movement over long distances: updates are timed by when they were sent and the smoothing adjusts to
   the connection.
+- Less lag: bigger messages are compressed (about half the data), and zombie snapshots no longer hold up hits,
+  loot and other events when a packet is lost. On a simulated long-distance link with 5% loss, events arrive in
+  about 140 ms instead of 250 ms.
 
 **Saves**
 - Your own save is backed up before you join and never written while you're in a friend's world.

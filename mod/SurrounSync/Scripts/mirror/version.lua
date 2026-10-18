@@ -2,5 +2,5 @@
 
 return {
     VERSION = "0.10.0",
-    PROTOCOL = 43,
+    PROTOCOL = 44,
 }

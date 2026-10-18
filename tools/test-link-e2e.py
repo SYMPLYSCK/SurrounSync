@@ -13,7 +13,7 @@ except ImportError:
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "mod", "SurrounSync", "Scripts")
-EXE = os.path.join(ROOT, "mod", "SurrounSync", "bridge", "SurrounSyncBridge.exe")
+EXE = os.environ.get("SURROUNSYNC_BRIDGE") or os.path.join(ROOT, "mod", "SurrounSync", "bridge", "SurrounSyncBridge.exe")
 PORT = 46000 + random.randint(0, 999)
 fails = []
 

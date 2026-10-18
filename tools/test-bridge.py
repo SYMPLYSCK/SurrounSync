@@ -6,7 +6,7 @@
 import os, random, re, shutil, string, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(ROOT, "mod", "SurrounSync", "bridge", "SurrounSyncBridge.exe")
+EXE = os.environ.get("SURROUNSYNC_BRIDGE") or os.path.join(ROOT, "mod", "SurrounSync", "bridge", "SurrounSyncBridge.exe")
 PORT = 47000 + random.randint(0, 999)
 fails = []
 

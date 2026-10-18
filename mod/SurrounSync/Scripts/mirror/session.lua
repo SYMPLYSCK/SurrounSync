@@ -1019,8 +1019,17 @@ local function install_firewall()
     if firewall_on then return end
     firewall_on = true
     game.on_new_player(function() util.safe(on_world_ready, "session.world_ready") end)
-    util.hook("/Game/Blueprints/SD_GameInstance.SD_GameInstance_C:Event_LoadLevel", function() on_any_load() end)
-    game.on_tick(function() util.safe(firewall_tick, "session.firewall_tick") end)
+    -- (the game instance class isn't loaded yet when the mod starts: hooked once it is, and again after loads)
+    local hook_in = 0.0
+    local on_load = function() on_any_load() end
+    game.on_tick(function(dt)
+        hook_in = hook_in - (dt or 0)
+        if hook_in <= 0 then
+            hook_in = 2.0
+            util.ensure_hook("/Game/Blueprints/SD_GameInstance.SD_GameInstance_C:Event_LoadLevel", on_load)
+        end
+        util.safe(firewall_tick, "session.firewall_tick")
+    end)
     if game.player() then on_world_ready() end
 end
 

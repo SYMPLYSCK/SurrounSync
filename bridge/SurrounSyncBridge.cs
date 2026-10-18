@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -37,6 +38,16 @@ static class Steam
     public static extern bool SteamAPI_ISteamNetworking_AllowP2PPacketRelay(IntPtr self, [MarshalAs(UnmanagedType.I1)] bool allow);
     [DllImport(DLL)] [return: MarshalAs(UnmanagedType.I1)]
     public static extern bool SteamAPI_ISteamNetworking_CloseP2PSessionWithUser(IntPtr self, ulong id);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct P2PSessionState
+    {
+        public byte Active, Connecting, Error, UsingRelay;
+        public int BytesQueued, PacketsQueued;
+        public uint RemoteIP;
+        public ushort RemotePort;
+    }
+    [DllImport(DLL)] [return: MarshalAs(UnmanagedType.I1)]
+    public static extern bool SteamAPI_ISteamNetworking_GetP2PSessionState(IntPtr self, ulong id, out P2PSessionState state);
 
     [DllImport(DLL)] public static extern IntPtr SteamAPI_SteamUser_v021();
     [DllImport(DLL)] public static extern void SteamAPI_ISteamUser_StartVoiceRecording(IntPtr self);
@@ -98,6 +109,7 @@ interface INet
     void Accept(ulong id);
     void Close(ulong id);
     string NameOf(ulong id);
+    string Route(ulong id);
     void SetPresence(string role);
     List<KeyValuePair<ulong, string>> FriendsWithPresence(string role);
     int FriendCount();
@@ -185,6 +197,14 @@ class SteamNet : INet
     public void Accept(ulong id) { Steam.SteamAPI_ISteamNetworking_AcceptP2PSessionWithUser(net, id); }
     public void Close(ulong id) { Steam.SteamAPI_ISteamNetworking_CloseP2PSessionWithUser(net, id); }
     public string NameOf(ulong id) { return Steam.S(Steam.SteamAPI_ISteamFriends_GetFriendPersonaName(friends, id)); }
+
+    // how the session runs: through a Steam relay or direct, and how much is still waiting to go out
+    public string Route(ulong id)
+    {
+        Steam.P2PSessionState s;
+        if (id == 0 || !Steam.SteamAPI_ISteamNetworking_GetP2PSessionState(net, id, out s)) return "route ?";
+        return string.Format("route {0} queued {1} B", s.UsingRelay != 0 ? "relay" : "direct", s.BytesQueued);
+    }
 
     const int CB_CALL_COMPLETED = 703, CB_LOBBY_CREATED = 513, CB_LOBBY_MATCH_LIST = 510;
     static readonly string[] LOBBY_KEYS = { "surrounsync", "name", "proto", "locked", "players", "host" };
@@ -459,6 +479,7 @@ class TestNet : INet
     public void Accept(ulong id) { }
     public void Close(ulong id) { DropClient(); }
     public string NameOf(ulong id) { return id == 1001UL ? "Test-host" : "Test-guest"; }
+    public string Route(ulong id) { return "route test queued 0 B"; }
     public int FriendCount() { return 0; }
     public List<KeyValuePair<ulong, string>> FriendsWithPresence(string r)
     {
@@ -833,6 +854,7 @@ class Bridge
                 if (t - lastPoseRead >= 10) { lastPoseRead = t; PumpPose(); }
                 if (t - lastBlobScan > 15) { lastBlobScan = t; PumpBlobs(); }
             }
+            Ping(t);
             Receive(0); Receive(1);
             if (voice.Available) Receive(2);
             if (peer != 0) voice.Tick(pkt => { bool ok = net.Send(peer, pkt, false, 2); if (ok) { txPkts++; txBytes += pkt.Length; } return ok; });
@@ -1256,6 +1278,86 @@ class Bridge
         if (found.Count > 0) SetPeer(found[0].Key, "Steam friend running SurrounSync as " + other);
     }
 
+    bool SendBytes(char type, byte[] payload, bool reliable)
+    {
+        if (peer == 0) return false;
+        var data = new byte[payload.Length + 1];
+        data[0] = (byte)type;
+        Buffer.BlockCopy(payload, 0, data, 1, payload.Length);
+        bool ok = net.Send(peer, data, reliable, reliable ? 1 : 0);
+        if (ok) { txPkts++; txBytes += data.Length; }
+        return ok;
+    }
+
+    // 'F' <id:4> <index:1> <count:1> <part>
+    bool SendFragments(byte[] z, int parts)
+    {
+        int id = ++fragId;
+        for (int i = 0; i < parts; i++)
+        {
+            int off = i * FRAG, len = Math.Min(FRAG, z.Length - off);
+            var p = new byte[6 + len];
+            BitConverter.GetBytes(id).CopyTo(p, 0);
+            p[4] = (byte)i; p[5] = (byte)parts;
+            Buffer.BlockCopy(z, off, p, 6, len);
+            if (!SendBytes('F', p, false)) return false;
+        }
+        return true;
+    }
+
+    static byte[] Deflate(byte[] raw)
+    {
+        using (var m = new MemoryStream())
+        {
+            using (var d = new DeflateStream(m, CompressionLevel.Fastest, true)) d.Write(raw, 0, raw.Length);
+            return m.ToArray();
+        }
+    }
+
+    // capped, so a bad packet can't unpack into something huge
+    static string Inflate(byte[] z, int offset, int cap)
+    {
+        using (var src = new MemoryStream(z, offset, z.Length - offset))
+        using (var d = new DeflateStream(src, CompressionMode.Decompress))
+        using (var m = new MemoryStream())
+        {
+            var buf = new byte[16384];
+            int n;
+            while ((n = d.Read(buf, 0, buf.Length)) > 0)
+            {
+                m.Write(buf, 0, n);
+                if (m.Length > cap) throw new InvalidDataException("too big");
+            }
+            return Encoding.UTF8.GetString(m.ToArray());
+        }
+    }
+
+    // fragments of the newest latest-wins blob; an older or incomplete one is simply dropped
+    int rxFragId = -1, rxFragHave;
+    byte[][] rxFrags;
+    void TakeFragment(byte[] data)
+    {
+        if (data.Length < 8) return;
+        int id = BitConverter.ToInt32(data, 1), idx = data[5], count = data[6];
+        if (count == 0 || count > MAX_FRAGS || idx >= count) { Dropped("size F"); return; }
+        if (id != rxFragId)
+        {
+            if (rxFragId >= 0 && id < rxFragId && rxFragId - id < 100000) return;     // late part of an older one
+            rxFragId = id; rxFrags = new byte[count][]; rxFragHave = 0;
+        }
+        if (rxFrags == null || rxFrags.Length != count || rxFrags[idx] != null) return;   // (already complete / mismatched)
+        rxFrags[idx] = new byte[data.Length - 7];
+        Buffer.BlockCopy(data, 7, rxFrags[idx], 0, data.Length - 7);
+        if (++rxFragHave < count) return;
+        int total = 0;
+        foreach (var f in rxFrags) total += f.Length;
+        var z = new byte[total];
+        int at = 0;
+        foreach (var f in rxFrags) { Buffer.BlockCopy(f, 0, z, at, f.Length); at += f.Length; }
+        rxFrags = null;
+        Handle('B', Inflate(z, 0, MAX_PART));
+    }
+
     bool SendRaw(char type, string body, bool reliable)
     {
         if (peer == 0) return false;
@@ -1343,9 +1445,28 @@ class Bridge
         }
     }
 
+    // Blobs over COMPRESS_FROM go deflated ('Z'). Blobs that are replaced many times a second (zombie snapshots,
+    // the car being driven) go unreliable in fragments ('F'): a lost one is replaced by the next a moment later,
+    // and they no longer hold up everything else on the reliable channel while Steam resends them.
+    static readonly HashSet<string> LatestWins = new HashSet<string> { "zombies", "drive" };
+    const int COMPRESS_FROM = 512, FRAG = 1100, MAX_FRAGS = 64;
+    int fragId;
+
     bool SendBlob(string name, string body)
     {
         bool ok;
+        if (body.Length > COMPRESS_FROM && body.Length <= CHUNK)
+        {
+            byte[] z = Deflate(Encoding.UTF8.GetBytes(epoch + "\n" + name + "\n" + body));
+            int parts = (z.Length + FRAG - 1) / FRAG;
+            ok = LatestWins.Contains(name) && parts <= MAX_FRAGS ? SendFragments(z, parts) : SendBytes('Z', z, true);
+            if (ok)
+            {
+                txBlobs++;
+                if (loggedTx.Add(name)) Log("sent " + name + " (" + body.Length + " chars, " + z.Length + " B compressed)");
+            }
+            return ok;
+        }
         if (body.Length <= CHUNK) ok = SendRaw('B', epoch + "\n" + name + "\n" + body, true);
         else
         {
@@ -1384,8 +1505,8 @@ class Bridge
         if (pktTokens < 1 || byteTokens < data.Length) { Dropped("rate"); return false; }
         pktTokens -= 1; byteTokens -= data.Length;
         char type = data.Length > 0 ? (char)data[0] : '?';
-        int max = type == 'P' ? MAX_POSE : type == 'H' ? MAX_HELLO : (type == 'B' || type == 'K') ? MAX_PART
-                : (type == 'C' || type == 'A' || type == 'R') ? 256 : type == 'V' ? 8192 : 0;
+        int max = type == 'P' ? MAX_POSE : type == 'H' ? MAX_HELLO : (type == 'B' || type == 'K' || type == 'Z') ? MAX_PART
+                : (type == 'C' || type == 'A' || type == 'R' || type == 'T') ? 256 : type == 'V' ? 8192 : type == 'F' ? FRAG + 16 : 0;
         if (data.Length > max) { Dropped("size " + type + " " + data.Length + " B"); return false; }
         return true;
     }
@@ -1433,6 +1554,12 @@ class Bridge
             if (!WithinLimits(data)) continue;
             lastRx = Now(); lastHeard = lastRx;
             if (data[0] == (byte)'V') { voice.Play(data, 1); continue; }
+            if (data[0] == (byte)'Z' || data[0] == (byte)'F')
+            {
+                try { if (data[0] == (byte)'Z') Handle('B', Inflate(data, 1, MAX_PART)); else TakeFragment(data); }
+                catch (Exception e) { Dropped("bad " + (char)data[0] + " " + e.Message); }
+                continue;
+            }
             string msg = Encoding.UTF8.GetString(data);
             if (msg.Length == 0) continue;
             try { Handle(msg[0], msg.Substring(1)); } catch (Exception e) { Log("handle " + msg[0] + ": " + e.Message); }
@@ -1460,8 +1587,29 @@ class Bridge
         if (loggedRx.Add(name)) Log("got " + name + " (" + body.Length + " chars)");
     }
 
+    // bridge-to-bridge round trip, without the games in between (what the network itself costs)
+    long pingAt;
+    double rttMs = -1;
+    void Ping(long t)
+    {
+        if (peer == 0 || t - pingAt < 2000) return;
+        pingAt = t;
+        SendRaw('T', "q" + t, false);
+    }
+
     void Handle(char type, string body)
     {
+        if (type == 'T')
+        {
+            long sent;
+            if (body.StartsWith("q")) SendRaw('T', "a" + body.Substring(1), false);
+            else if (body.StartsWith("a") && long.TryParse(body.Substring(1), out sent))
+            {
+                double r = Now() - sent;
+                if (r >= 0 && r < 30000) rttMs = rttMs < 0 ? r : rttMs * 0.7 + r * 0.3;
+            }
+            return;
+        }
         if (type == 'P')
         {
             int a = body.IndexOf(' '), b2 = a < 0 ? -1 : body.IndexOf(' ', a + 1);
@@ -1532,7 +1680,8 @@ class Bridge
         double hb = peer == 0 || lastHeard == 0 ? -1 : (Now() - lastHeard) / 1000.0;
         string s = string.Format("bridge {0}: me {1}, peer {2} ({3}), last rx {4:0.0} s, pkts tx {5} rx {6}, KB tx {7:0} rx {8:0}, blobs tx {9} rx {10} peer_hb {4:0.0} peer_game {12} at {11}",
             role, me, peer == 0 ? "searching" : peerName, peer, hb,
-            txPkts, rxPkts, txBytes / 1024.0, rxBytes / 1024.0, txBlobs, rxBlobs, Unix(), peer == 0 ? "?" : peerGame);
+            txPkts, rxPkts, txBytes / 1024.0, rxBytes / 1024.0, txBlobs, rxBlobs, Unix(), peer == 0 ? "?" : peerGame)
+            + (rttMs >= 0 ? string.Format(" rtt {0:0} ms", rttMs) : " rtt ?") + (peer != 0 ? " " + net.Route(peer) : "");
         try { WriteAtomic(Path.Combine(dir, "mirror_bridge_status_" + role + ".txt"), s); } catch { }
     }
 }
