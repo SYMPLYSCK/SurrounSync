@@ -49,6 +49,9 @@ folder, so it's safe to run on a dev install.
 
 ## Testing on one PC
 
+Two games on one PC need a lot of memory: plan on 32 GB of RAM. With 16 GB, close browsers and Discord first or one
+of the games can freeze or crash.
+
 Two games on one PC need two installs with separate save folders. `tools\setup-guest.ps1` makes a second install
 (`SurrounDead_Guest`, linked to the real game files, saves in `Saved_Guest`). Then:
 

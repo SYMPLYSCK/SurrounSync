@@ -24,10 +24,19 @@ zombies and AI, loot, doors, cars, weather and so on.
 - **Your saves are safe.** Your own world is saved and backed up before you join, and it's never touched while
   you're away. See [Save safety](#save-safety).
 
+## Requirements
+
+- SurrounDead on Steam (each player their own copy), Windows 10 or 11, Steam running and logged in.
+- A PC that runs SurrounDead smoothly on its own. The mod itself adds about 1 ms per frame and a few MB of memory.
+- 16 GB of RAM recommended, and at least 2 GB free on the drive your saves are on (for backups).
+- Internet: under 0.5 Mbit/s each way. Ping matters more than speed: players in the same region get the
+  smoothest game, and across continents it still works with a little delay. Wired or good Wi-Fi helps. No ports
+  to open.
+- The host's PC runs all the AI for both players, so let the faster PC host.
+
 ## Install
 
-You need SurrounDead on Steam (each player their own copy), Windows 10 or 11, and Steam running. Both players need
-the same SurrounSync version.
+Both players need the same SurrounSync version.
 
 1. Close SurrounDead.
 2. Download **SurrounSyncSetup.exe** from the [latest release](https://github.com/munroejayden20-star/SurrounSync/releases/latest) and run it.
