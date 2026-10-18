@@ -74,7 +74,7 @@ Write-Host "Mode set:"
 Show 'host' $HostWin64
 if ($HasGuest) { Show 'guest' $GuestWin64 }
 if ($Mode -eq 'steam') {
-    Write-Host "Other player: send them dist\SurrounSyncSetup.exe (build: toolsuild-release.ps1); they run it, then use the CO-OP tab of the handbook (J) in-game"
+    Write-Host "Other player: send them dist\SurrounSyncSetup.exe (build: tools\build-release.ps1); they run it, then use the CO-OP tab of the handbook (J) in-game"
 }
 
 $running = Get-Process SurrounDead-Win64-Shipping -ErrorAction SilentlyContinue
