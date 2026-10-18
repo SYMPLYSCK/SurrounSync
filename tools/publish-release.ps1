@@ -33,7 +33,9 @@ if ($LASTEXITCODE -ne 0) {
 if (-not (git remote 2>$null | Select-String -SimpleMatch 'origin')) { git remote add origin "https://github.com/$Slug.git" }
 
 if (-not (git tag --list $Tag)) { git tag -a $Tag -m "SurrounSync $Version" }
-git push origin HEAD:master --follow-tags
+$ErrorActionPreference = 'Continue'                 # git reports progress on stderr
+git push origin HEAD:master --follow-tags 2>&1 | Out-Host
+$ErrorActionPreference = 'Stop'
 if ($LASTEXITCODE -ne 0) { throw "git push failed" }
 
 $ghArgs = @('release', 'create', $Tag, $Exe, "$Exe.sha256", '--repo', $Slug, '--title', "SurrounSync $Version", '--notes-file', $notes)
