@@ -259,7 +259,7 @@ function link.lobby()
             if id then l.hosts[#l.hosts + 1] = { id = id, name = name ~= "" and name or id } end
         elseif k == "request" then
             local id, name = rest:match("^(%d+) ?(.*)$")
-            if id then l.requests[#l.requests + 1] = { id = id, name = name ~= "" and name or id } end
+            if id then l.requests[#l.requests + 1] = { id = id, name = (name ~= "" and name ~= "[unknown]") and name or "Someone" } end
         elseif k == "kicked" then
             local id, name = rest:match("^(%d+) ?(.*)$")
             if id then l.kicked = { id = id, name = name ~= "" and name or id } end
@@ -318,7 +318,7 @@ function link.peer_name()
         if f then
             local s = (f:read("*a") or ""):gsub("^%s+", ""):gsub("%s+$", "")
             f:close()
-            peer_name = s ~= "" and s or nil
+            peer_name = (s ~= "" and s ~= "[unknown]") and s or nil
         end
     end
     return peer_name or (bridge_role == "host" and "the guest" or (bridge_role and "the host" or "the other player"))

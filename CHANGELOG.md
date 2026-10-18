@@ -2,6 +2,11 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 0.10.1 (2026-10-18)
+
+- The other player's name shows above their head and in join requests even when you aren't Steam friends
+  (it said "Unknown" before).
+
 ## 0.10.0 (2026-10-18)
 
 First public release.

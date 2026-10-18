@@ -19,6 +19,7 @@ local want_host, want_join = false, nil
 local pending_join = false
 local wait_since, wait_told, wait_who = nil, nil, nil
 local request_nag = {}
+local request_seen_at = {}
 
 local phase1
 local function p1() phase1 = phase1 or require("mirror.phase1"); return phase1 end
@@ -307,21 +308,27 @@ local function watch_requests()
     local now_ids = {}
     for _, q in ipairs(l.requests or {}) do
         now_ids[q.id] = true
+        -- Steam only names your friends; the joining player sends their name a moment after asking
+        local name = (q.name and q.name ~= "Someone" and q.name ~= tostring(q.id)) and q.name or nil
         if not seen_requests[q.id] and accepted_ids()[tostring(q.id)] then
             link.bridge_cmd("accept " .. q.id)
-            log.info("menu: " .. q.name .. " (" .. q.id .. ") rejoined - accepted earlier this session")
-        elseif not seen_requests[q.id] then
-            log.info("menu: join request from " .. q.name .. " (" .. q.id .. ")")
-            notify.show(q.name .. " wants to join your world - open the handbook (J), CO-OP tab, to ACCEPT or DECLINE.", "good",
-                "join_req_" .. q.id)
-            notify.ping(2)
+            log.info("menu: " .. (name or q.id) .. " rejoined - accepted earlier this session")
+        elseif not request_nag[q.id] then
+            request_seen_at[q.id] = request_seen_at[q.id] or os.clock()
+            if name or os.clock() - request_seen_at[q.id] > 2 then
+                log.info("menu: join request from " .. (name or "?") .. " (" .. q.id .. ")")
+                notify.show((name or "Someone") .. " wants to join your world - open the handbook (J), CO-OP tab, to ACCEPT or DECLINE.",
+                    "good", "join_req_" .. q.id)
+                notify.ping(2)
+                request_nag[q.id] = os.clock()
+            end
+        elseif os.clock() - request_nag[q.id] > 30 then
             request_nag[q.id] = os.clock()
-        elseif os.clock() - (request_nag[q.id] or 0) > 30 then
-            request_nag[q.id] = os.clock()
-            notify.show(q.name .. " is still waiting to join - handbook (J), CO-OP tab.", "info", "join_req_" .. q.id)
+            notify.show((name or "Someone") .. " is still waiting to join - handbook (J), CO-OP tab.", "info", "join_req_" .. q.id)
         end
     end
     for id in pairs(request_nag) do if not now_ids[id] then request_nag[id] = nil end end
+    for id in pairs(request_seen_at) do if not now_ids[id] then request_seen_at[id] = nil end end
     seen_requests = now_ids
     local k = l.kicked and l.kicked.id
     if k and k ~= last_kick then

@@ -48,9 +48,9 @@ def wait_for(fn, secs=10.0):
     return fn()
 
 
-def start(role, d, extra=()):
+def start(role, d, extra=(), env=None):
     args = [EXE, "--role", role, "--dir", d, "--test-net", str(PORT), "--no-game-check"] + list(extra)
-    return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
 
 
 def log_of(d, name):
@@ -272,6 +272,23 @@ def main():
         time.sleep(0.8)
         lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "browse")
         check(wait_for(lambda: "server 1001" not in log_of(B, "mirror_lobby.txt"), 10), "public off: gone from the search")
+
+        print("8. players who aren't Steam friends: each side sends its own name")
+        for p in procs:
+            p.kill(); p.wait()
+        procs.clear()
+        for d in (A, B):
+            for f in os.listdir(d):
+                if f.endswith(".name"):
+                    os.remove(os.path.join(d, f))
+        env = dict(os.environ, SURROUNSYNC_TEST_STRANGERS="1")
+        procs.append(start("host", A, env=env))
+        time.sleep(1.0)
+        procs.append(start("guest", B, env=env))
+        check(wait_for(lambda: log_of(B, "mirror_peer_guest.name").strip() == "Test-host", 15),
+              "the guest shows the host's name, not [unknown] (got %r)" % log_of(B, "mirror_peer_guest.name").strip())
+        check(wait_for(lambda: log_of(A, "mirror_peer_host.name").strip() == "Test-guest", 15),
+              "the host shows the guest's name (got %r)" % log_of(A, "mirror_peer_host.name").strip())
     finally:
         for p in procs:
             try:

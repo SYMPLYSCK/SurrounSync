@@ -478,7 +478,12 @@ class TestNet : INet
 
     public void Accept(ulong id) { }
     public void Close(ulong id) { DropClient(); }
-    public string NameOf(ulong id) { return id == 1001UL ? "Test-host" : "Test-guest"; }
+    // (SURROUNSYNC_TEST_STRANGERS=1: answer like Steam does for someone who isn't your friend)
+    public string NameOf(ulong id)
+    {
+        if (Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_STRANGERS") == "1") return "[unknown]";
+        return id == 1001UL ? "Test-host" : "Test-guest";
+    }
     public string Route(ulong id) { return "route test queued 0 B"; }
     public int FriendCount() { return 0; }
     public List<KeyValuePair<ulong, string>> FriendsWithPresence(string r)
@@ -842,6 +847,8 @@ class Bridge
             {
                 lastHello = t;
                 SendRaw('H', epoch + " " + Unix() + " " + role + " " + (!gameCheck || gameMissing == 0 ? "1" : "0"), false);
+                // Steam only knows the names of your friends ("[unknown]" for anyone else): we say ours
+                if (t - lastNameSent > 5000) { lastNameSent = t; SendRaw('N', net.MyName ?? "", false); }
             }
             if (peer != 0 && lastRx != 0 && t - lastRx > 20000)
             {
@@ -1268,6 +1275,27 @@ class Bridge
         UpdatePublic();
         try { WriteAtomic(PeerNameFile(), peerName); } catch { }
         SendRaw('H', epoch + " " + Unix() + " " + role, false);
+        SendRaw('N', net.MyName ?? "", true);
+        lastNameSent = Now();
+    }
+
+    long lastNameSent;
+    static bool NameKnown(string n, ulong id)
+    {
+        return !string.IsNullOrEmpty(n) && n != "[unknown]" && n != id.ToString();
+    }
+
+    // the other player told us their Steam name: use it when Steam doesn't know them
+    void TakePeerName(string body)
+    {
+        string n = Clean(body).Trim();
+        if (n.Length > 32) n = n.Substring(0, 32);
+        if (n == "" || n == "[unknown]" || n == peerName || NameKnown(peerName, peer)) return;
+        peerName = n;
+        Log("the other player is " + n);
+        try { WriteAtomic(PeerNameFile(), peerName); } catch { }
+        UpdatePublic();
+        WriteLobby();
     }
 
     void Discover()
@@ -1506,7 +1534,7 @@ class Bridge
         pktTokens -= 1; byteTokens -= data.Length;
         char type = data.Length > 0 ? (char)data[0] : '?';
         int max = type == 'P' ? MAX_POSE : type == 'H' ? MAX_HELLO : (type == 'B' || type == 'K' || type == 'Z') ? MAX_PART
-                : (type == 'C' || type == 'A' || type == 'R' || type == 'T') ? 256 : type == 'V' ? 8192 : type == 'F' ? FRAG + 16 : 0;
+                : (type == 'C' || type == 'A' || type == 'R' || type == 'T' || type == 'N') ? 256 : type == 'V' ? 8192 : type == 'F' ? FRAG + 16 : 0;
         if (data.Length > max) { Dropped("size " + type + " " + data.Length + " B"); return false; }
         return true;
     }
@@ -1546,6 +1574,19 @@ class Bridge
             if (role == "host" && from != peer && data.Length > 1 && data[0] == (byte)'A' && data.Length < 200)
             {
                 CheckAnswer(from, Encoding.UTF8.GetString(data, 1, data.Length - 1));
+                continue;
+            }
+            if (role == "host" && from != peer && data.Length > 1 && data[0] == (byte)'N' && data.Length < 100)
+            {
+                // someone asking to join says who they are (Steam only names your friends)
+                KeyValuePair<string, long> r;
+                string n = Clean(Encoding.UTF8.GetString(data, 1, data.Length - 1)).Trim();
+                if (n.Length > 32) n = n.Substring(0, 32);
+                if (n != "" && requests.TryGetValue(from, out r) && !NameKnown(r.Key, from))
+                {
+                    requests[from] = new KeyValuePair<string, long>(n, r.Value);
+                    WriteLobby();
+                }
                 continue;
             }
             if (peer == 0 && role == "host") TakeOrRequest(from, "it sent us data");
@@ -1659,6 +1700,7 @@ class Bridge
             Log("the host refused: " + joinError);
             WriteLobby();
         }
+        else if (type == 'N') TakePeerName(body);
         else if (type == 'H')
         {
             var f = body.Split(' ');
