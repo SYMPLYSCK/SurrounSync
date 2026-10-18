@@ -157,6 +157,12 @@ docs/              how it works, development notes
 
 Building and testing: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
+## License
+
+© 2026 Jayden Munroe. All rights reserved. The code is public so you can see how it works, but it isn't free to
+reuse: please don't copy, modify or redistribute it without asking. Playing it and reporting bugs is always
+welcome. See [LICENSE](LICENSE).
+
 ## Credits
 
 - [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS), the scripting runtime this is built on (MIT licence, included in

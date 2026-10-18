@@ -1,0 +1,16 @@
+Copyright (c) 2026 Jayden Munroe. All rights reserved.
+
+The source code is public so anyone can see how SurrounSync works. That doesn't make it free to reuse.
+
+You may:
+- download and play SurrounSync from the official releases,
+- read the code and learn from it,
+- report bugs and suggest changes.
+
+You may not, without written permission:
+- copy, modify or reuse any part of the code in other projects,
+- redistribute SurrounSync or modified versions of it,
+- publish it, or anything built from it, under another name.
+
+Third-party parts keep their own licences: UE4SS (MIT, included with the setup) and SurrounDead itself, which
+belongs to its developers.
