@@ -3,7 +3,7 @@
 param([switch]$NoBuild, [switch]$Draft)
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path $PSScriptRoot -Parent
-$Slug = 'munroejayden20-star/SurrounSync'
+$Slug = 'SYMPLYSCK/SurrounSync'
 Set-Location $Repo
 
 $Version = ([regex]::Match((Get-Content 'mod\SurrounSync\Scripts\mirror\version.lua' -Raw), 'VERSION\s*=\s*"([^"]+)"')).Groups[1].Value

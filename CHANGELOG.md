@@ -2,6 +2,10 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 0.10.2 (2026-10-18)
+
+- Updates now come from the project's new home, github.com/SYMPLYSCK/SurrounSync.
+
 ## 0.10.1 (2026-10-18)
 
 - The other player's name shows above their head and in join requests even when you aren't Steam friends

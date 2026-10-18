@@ -14,7 +14,7 @@ namespace SurrounSyncShared
 {
     public static class Release
     {
-        public const string Repo = "munroejayden20-star/SurrounSync";
+        public const string Repo = "SYMPLYSCK/SurrounSync";
         public const string SetupName = "SurrounSyncSetup.exe";
 
         public static string AppDir

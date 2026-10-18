@@ -6,7 +6,7 @@
 
 <p align="center">
   Co-op for SurrounDead. Play together over Steam, no server or port forwarding needed.<br>
-  <a href="https://github.com/munroejayden20-star/SurrounSync/releases/latest">Download</a> ·
+  <a href="https://github.com/SYMPLYSCK/SurrounSync/releases/latest">Download</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
   <a href="#troubleshooting">Help</a>
 </p>
@@ -39,7 +39,7 @@ zombies and AI, loot, doors, cars, weather and so on.
 Both players need the same SurrounSync version.
 
 1. Close SurrounDead.
-2. Download **SurrounSyncSetup.exe** from the [latest release](https://github.com/munroejayden20-star/SurrounSync/releases/latest) and run it.
+2. Download **SurrounSyncSetup.exe** from the [latest release](https://github.com/SYMPLYSCK/SurrounSync/releases/latest) and run it.
 3. Click **INSTALL**. It finds the game on its own (or use *Browse*), installs UE4SS if you don't have it yet, the
    mod, and optionally the PDS blood and gore mod.
 
