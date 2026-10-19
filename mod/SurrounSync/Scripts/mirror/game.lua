@@ -181,15 +181,20 @@ local function on_tick(self, DeltaSeconds)
     for i = 1, #tick_handlers do util.safe(tick_handlers[i], "game.on_tick", dt) end
 end
 
+-- The player class can exist before its functions are ready: hooking then fails ("UFunction::Func: 0x0").
+-- Only a hook that took counts as installed; until then every new player character tries again.
+-- (Not from LoopAsync: that runs in a separate Lua state, a second copy of the mod.)
+local tick_fn = function(self, DeltaSeconds) util.safe(on_tick, "game.tick", self, DeltaSeconds) end
 local function install()
-    if installed then return end
+    if installed then return true end
+    if not util.hook(P .. ":ReceiveTick", tick_fn, nil, true) then return false end
     installed = true
-    util.hook(P .. ":ReceiveTick", function(self, DeltaSeconds) util.safe(on_tick, "game.tick", self, DeltaSeconds) end)
     for _, h in ipairs(pending_hooks) do util.hook(P .. ":" .. h.fn, h.cb, nil, true) end
+    return true
 end
 
 function game.init()
-    if util.valid(StaticFindObject(P)) then install() end
+    if util.valid(StaticFindObject(P)) then util.safe(install, "game.install") end
     NotifyOnNewObject(P, function() util.safe(install, "game.install") end)
 end
 

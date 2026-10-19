@@ -620,6 +620,22 @@ namespace SurrounSyncSetup
                     if (Regex.IsMatch(txt, "^\\s*" + c + "\\s*:\\s*1\\s*$", RegexOptions.Multiline))
                         add("problem", c + " is switched on - it's an older multiplayer mod and fights with SurrounSync.",
                             "Click REPAIR (it switches it off), or open " + list + " in Notepad and change \"" + c + " : 1\" to \"" + c + " : 0\".");
+                // mods that switch themselves on with an enabled.txt (they never show in mods.txt)
+                var self = new List<string>();
+                try
+                {
+                    foreach (var d in Directory.GetDirectories(mods))
+                    {
+                        string n = Path.GetFileName(d);
+                        if (n == "SurrounSync" || n == "PDS" || n == "shared" || !File.Exists(Path.Combine(d, "enabled.txt"))) continue;
+                        if (Regex.IsMatch(txt, "^\\s*" + Regex.Escape(n) + "\\s*:", RegexOptions.Multiline)) continue;
+                        self.Add(n);
+                    }
+                }
+                catch { }
+                if (self.Count > 0)
+                    add("info", "Other mods running: " + string.Join(", ", self.ToArray()) + " (switched on by their own enabled.txt).",
+                        "If co-op crashes or behaves oddly, try once without them: rename their enabled.txt to enabled.txt.off.");
                 if (Directory.Exists(modDir) && !File.Exists(Path.Combine(modDir, "bridge", "SurrounSyncBridge.exe")))
                     add("problem", "The Steam connector (SurrounSyncBridge.exe) is missing - your antivirus probably removed it.",
                         "Restore it from your antivirus' quarantine and add an exception for " + Path.Combine(modDir, "bridge") + ", then REPAIR.");

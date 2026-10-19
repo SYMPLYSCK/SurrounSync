@@ -2,6 +2,12 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 0.10.3 (2026-10-18)
+
+- Fixed SurrounSync sometimes staying switched off for a whole session (no CO-OP tab, nothing synced) when
+  the game was slow to finish loading at startup. It now keeps trying until it's hooked in.
+- The setup's Check also lists mods that switch themselves on outside UE4SS's mod list.
+
 ## 0.10.2 (2026-10-18)
 
 - Updates now come from the project's new home, github.com/SYMPLYSCK/SurrounSync.
