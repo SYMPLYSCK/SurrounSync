@@ -33,6 +33,7 @@ zombies and AI, loot, doors, cars, weather and so on.
   smoothest game, and across continents it still works with a little delay. Wired or good Wi-Fi helps. No ports
   to open.
 - The host's PC runs all the AI for both players, so let the faster PC host.
+- BOTH PLAYERS MUST BE ON 0.8 EXPERIMENTAL!
 
 ## Install
 
