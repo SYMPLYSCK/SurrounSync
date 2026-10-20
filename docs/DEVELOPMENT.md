@@ -20,11 +20,12 @@ Main modules:
 | Module | |
 |---|---|
 | `phase1.lua` | main loop: sends our pose, shows the other player, ticks every system |
-| `link.lua`, `link_file.lua`, `events.lua` | transport: poses, state blobs, ordered events, files |
+| `link.lua`, `link_file.lua`, `events.lua`, `posepack.lua` | transport: poses, state blobs, ordered events, files |
 | `session.lua` | joining and leaving, crash recovery, checkpoint saves, the save firewall |
 | `savefs.lua`, `backups.lua`, `slotguard.lua` | save safety: atomic writes, backups, the only code that touches save folders |
 | `ghost.lua`, `look.lua`, `anim.lua` | the other player's character, gear and animations |
 | `zombies.lua`, `corpses.lua` | zombie and AI snapshots, copies, hits, damage, corpse loot |
+| `infest.lua` | infestation nests: host-run waves, guest hits forwarded, destruction on both screens |
 | `loot.lua`, `drops.lua`, `builds.lua`, `doors.lua`, `vehicles.lua`, `power.lua`, `world.lua` | the rest of the world |
 | `menu.lua`, `journal_tab.lua` | the CO-OP tab |
 | `config.lua`, `settings.lua`, `version.lua` | defaults, per-PC overrides, version and protocol |
@@ -85,6 +86,7 @@ python -I tools\test-bridge.py          # the bridge: framing, chunking, join re
 pip install --target <dir> lupa ; $env:PYTHONPATH = "<dir>"
 python tools\test-link-e2e.py           # the mod's link code through two bridges
 python tools\test-saves.py              # save safety, with simulated crashes (a name prefix runs a subset)
+python tools\test-sync.py               # pose packets, clock placement, null-object guards
 ```
 
 Lint runs as a git pre-commit hook too (`.git/hooks/pre-commit`, not versioned).

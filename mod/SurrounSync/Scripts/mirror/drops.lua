@@ -121,15 +121,11 @@ end
 
 local function shared() return role == "host" or (session and session.in_world()) end
 local function traded() if session and session.checkpoint and shared() then session.checkpoint("drops") end end
-channel.send = function(self, p) if p:find("^[DWT] ") then traded() end return events.send(self, p) end
+channel.send = function(self, p) if p:find("^[DT] ") then traded() end return events.send(self, p) end
 
-local function on_dropped(self, ItemUID, FromContainerUID, ActorRef)
-    local p = self:get()
-    if not util.same(p, game.player()) then return end
-    if not shared() then return end
-    local pickup
-    pcall(function() pickup = ActorRef:get() end)
-    if not util.valid(pickup) then return end
+local function send_drop(pickup)
+    if not shared() or not util.valid(pickup) then return end
+    if tracked_uid(pickup) then return end
     local comp = jig_of(pickup)
     if not comp then log.warn("drops: dropped pickup has no Jig component"); return end
     local da, count, dur, uid
@@ -149,6 +145,7 @@ local function on_dropped(self, ItemUID, FromContainerUID, ActorRef)
         weight, price = info[WEIGHT] or 0, info[PRICE] or 0
     end)
     if not (da and uid) then log.warn("drops: couldn't read the dropped item's info"); return end
+    if tracked[uid] and alive(tracked[uid]) then return end
     local l, r
     pcall(function() l = pickup:K2_GetActorLocation(); r = pickup:K2_GetActorRotation() end)
     if not l then return end
@@ -168,6 +165,30 @@ local function on_dropped(self, ItemUID, FromContainerUID, ActorRef)
     stats.sent = stats.sent + 1
     log.info(string.format("drops: dropped %s x%d%s - sent", da:match("[^%.]+$") or da, count or 1,
         #inside > 0 and (" (holding " .. describe(inside) .. ")") or ""))
+end
+
+local function on_dropped(self, ItemUID, FromContainerUID, ActorRef)
+    if not util.same(self:get(), game.player()) then return end
+    send_drop(util.obj(ActorRef))
+end
+
+-- Drops from a container or of part of a stack never reach the player's OnItemDropped: the game tells the
+-- container instead, or nobody. Every drop path fills the spawned pickup with SetPickupContainerData and then
+-- returns from the drop request, so pickups filled during a drop request are this player's drops.
+local filled = {}
+local function on_filled(self)
+    local comp = util.obj(self)
+    if not comp then return end
+    local owner
+    pcall(function() owner = comp:GetOwner() end)
+    if util.valid(owner) then filled[#filled + 1] = { actor = owner, at = now } end
+end
+local function on_drop_request()
+    local list = filled
+    filled = {}
+    for _, f in ipairs(list) do
+        if f.at == now then send_drop(f.actor) end
+    end
 end
 
 local function make(payload)
@@ -224,6 +245,9 @@ local function make(payload)
             info[ROTATED] = false
         end)
         if not okw then log.warn("drops: couldn't write the item info: " .. tostring(errw)) end
+        local ns, errs = nil, nil
+        pcall(function() ns, errs = jig.write_stats(comp.PickupInfo[INFO], asset) end)
+        if ns == nil then log.warn("drops: couldn't give the copy its stats (it may do nothing when used): " .. tostring(errs)) end
         pcall(function()
             local i = comp.PickupInfo[INFO]
             local v = i[ITEM_VEC]
@@ -390,6 +414,8 @@ local hook_fn = function(self, ItemUID, FromContainerUID, ActorRef)
     util.safe(on_dropped, "drops.capture", self, ItemUID, FromContainerUID, ActorRef)
 end
 local picked_fn = function(self, Info, ItemUID) util.safe(on_picked, "drops.picked", self, Info, ItemUID) end
+local filled_fn = function(self) util.safe(on_filled, "drops.filled", self) end
+local request_fn = function() util.safe(on_drop_request, "drops.request") end
 local add_pre_fn = function(self, ActorRef) util.safe(on_add_actor_pre, "drops.add_pre", ActorRef) end
 local add_post_fn = function() util.safe(on_add_actor_post, "drops.add_post") end
 local end_play_fn = function(self)
@@ -430,6 +456,10 @@ function drops.tick(dt)
     if check_in <= 0 then
         check_in = 0.5
         util.ensure_hook(PLAYER .. ":JigMP_OnItemDropped", hook_fn)
+        util.ensure_hook(JIG .. ":SetPickupContainerData", filled_fn)
+        util.ensure_hook(JIG .. ":HandleServerDropRequest", request_fn)
+        util.ensure_hook(JIG .. ":HandleServerFuncRequestCraftDrop", request_fn)
+        if #filled > 0 and filled[#filled].at < now - 1 then filled = {} end
         util.ensure_hook(PLAYER .. ":JigMP_OnPickupAdded", picked_fn)
         util.ensure_hook(PLAYER .. ":JigMP_OnPickupEquipped", equipped_fn)
         util.ensure_hook(JIG .. ":ServerFunc_HandleRequestAddActorToContainer", add_pre_fn, add_post_fn)
@@ -447,7 +477,7 @@ function drops.tick(dt)
     end
     channel:pump(function(payload)
         local k = payload:sub(1, 1)
-        if k == "D" or k == "W" or k == "T" then traded() end
+        if k == "D" or k == "T" then traded() end
         if k == "D" then util.safe(make, "drops.make", payload)
         elseif k == "W" then util.safe(remove_world, "drops.world", payload)
         elseif k == "I" then util.safe(take_content, "drops.content", payload)

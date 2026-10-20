@@ -28,7 +28,10 @@ local COUNT = "Count_8_DD79AF2A46126A338C8DCCB4616D91CD"
 local UID = "UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"
 
 local cfg, role, session
-local channel = events.new("loot", 64, 10)
+-- Taken/put-in events must not expire: replaying a full contents list over a lost one dupes or loses items.
+local channel = events.new("loot", 64, 120)
+-- Host -> guest full contents ("C <id> <ack> <items>"), kept apart so the event blob stays small.
+local cchan = events.new("lootc", 16, 120)
 local applying = false
 local hook_in = 0.0
 local stats = { sent = 0, applied = 0, missing = 0, put = 0, added = 0 }
@@ -37,7 +40,8 @@ local alias = {}
 local rev = {}
 local added_once = {}
 local put_sent = {}
-local GENERATE = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:InitializeJigComponent"
+local JIG_COMP = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
+local GENERATE = JIG_COMP .. ":InitializeJigComponent"
 local REQUEST = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:SERVER_RequestData"
 local diag_left = 20
 local PREFETCH = {
@@ -58,6 +62,26 @@ local opened = {}
 local asked = {}
 local synced = {}
 local apply_q = {}
+-- Guest: last event number sent per container, and items the host had no room for (kept here only).
+local seq, pending, held = 0, {}, {}
+-- Host: last guest event number applied per container.
+local ack = {}
+local function next_seq(id)
+    seq = seq + 1
+    if role ~= "host" then pending[id] = seq end
+    return seq
+end
+local function mark_dirty(id, comp)
+    if role ~= "host" or not util.valid(comp) or not ghost.get() then return end
+    local q = push_q[id]
+    if q then q.comp = comp else push_q[id] = { comp = comp, at = now + 0.5 } end
+end
+local function release(id, uid)
+    local h = held[id]
+    if not h or not h[uid] then return end
+    h[uid] = nil
+    if next(h) == nil then held[id] = nil end
+end
 
 local function list_add(id, uid, da, count, dx, dy, inside)
     local list = host_list[id]
@@ -93,7 +117,13 @@ end
 
 local function shared() return role == "host" or (session and session.in_world()) end
 local function traded() if session and session.checkpoint and shared() then session.checkpoint("loot") end end
-channel.send = function(self, p) if not p:find("^[CQ] ") then traded() end return events.send(self, p) end
+-- Only items moving between players need a save soon: put-ins, and takes from player-built storage.
+-- World loot doesn't (a crash just puts it back).
+local function is_trade(p)
+    if p:find("^A ") then return true end
+    return p:find("^Buildable") ~= nil or p:find("^Vehicle") ~= nil
+end
+channel.send = function(self, p) if is_trade(p) then traded() end return events.send(self, p) end
 
 local uid_str, guid, full_path = jig.uid_str, jig.guid, jig.full_path
 
@@ -138,22 +168,32 @@ local function on_removed(self, ItemUID)
     local ok, id = pcall(id_of, actor)
     if not ok then return end
     local left = count_of(comp, uid)
-    channel:send(string.format("%s %s %d", id, rev[uid] or uid, left))
+    channel:send(string.format("%s %s %d %d", id, rev[uid] or uid, left, next_seq(id)))
     stats.sent = stats.sent + 1
+    if left == 0 then release(id, uid) end
+    mark_dirty(id, comp)
     if left == 0 then forget(uid, rev[uid]) end
     log.debug(string.format("loot: took %s from %s (%d left there)", uid, id, left))
 end
 
 local function find(id) return util.find_by_id(id, 100) end
 
+local function acked(id, s, comp)
+    s = tonumber(s)
+    if role ~= "host" or not s then return end
+    if s > (ack[id] or 0) then ack[id] = s end
+    mark_dirty(id, comp)
+end
+
 local function apply(payload)
     if not shared() then return end
-    local id, uid, left = payload:match("^(%S+) (%S+) (%d+)$")
+    local id, uid, left, s = payload:match("^(%S+) (%S+) (%d+) ?(%d*)$")
     if not id then return end
     list_take(id, uid, tonumber(left) or 0)
     local actor = find(id)
     local comp = actor and comp_of(actor)
     if not comp then stats.missing = stats.missing + 1; return end
+    acked(id, s, comp)
     local theirs = uid
     local have = count_of(comp, uid)
     if have == 0 and alias[uid] then uid = alias[uid]; have = count_of(comp, uid) end
@@ -194,27 +234,31 @@ local function on_added(self, ItemUID, ItemInfo)
     local ok, id = pcall(id_of, actor)
     if not ok then return end
     local inside = jig.subtree(comp, uid)
-    channel:send(string.format("A %s %s %s %d %.3f %.3f", id, uid, da, count or 1, dur and dur.X or 0, dur and dur.Y or 0)
+    channel:send(string.format("A %s %s %s %d %.3f %.3f %d", id, uid, da, count or 1, dur and dur.X or 0, dur and dur.Y or 0, next_seq(id))
         .. ((inside and #inside > 1) and (" " .. jig.encode(inside)) or ""))
+    mark_dirty(id, comp)
     stats.put = stats.put + 1
     log.info(string.format("loot: put %s x%d into %s - telling the other game", da:match("[^%.]+$") or da, count or 1, id))
 end
 
 local function apply_add(payload)
     if not shared() then return end
-    local id, uid, da, count, dx, dy, inside = payload:match("^A (%S+) (%S+) (%S+) (%-?%d+) (%S+) (%S+) ?(%S*)$")
-    if not id or added_once[uid] then return end
+    local id, uid, da, count, dx, dy, s, inside = payload:match("^A (%S+) (%S+) (%S+) (%-?%d+) (%S+) (%S+) (%d+) ?(%S*)$")
+    if not id then return end
     local actor = find(id)
     local comp = actor and comp_of(actor)
+    if added_once[uid] then if comp then acked(id, s, comp) end return end
     if not comp then
         stats.missing = stats.missing + 1
         log.info("loot: the other player put something into " .. id .. " - not here")
+        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
         return
     end
-    if count_of(comp, uid) > 0 then added_once[uid] = true; return end
+    if count_of(comp, uid) > 0 or (alias[uid] and count_of(comp, alias[uid]) > 0) then added_once[uid] = true; acked(id, s, comp); return end
     local asset = StaticFindObject(da)
     if not util.valid(asset) then
         log.info("loot: the other player put " .. (da:match("[^%.]+$") or da) .. " into " .. id .. " - not loaded here")
+        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
         return
     end
     local slots = 0
@@ -229,7 +273,12 @@ local function apply_add(payload)
     applying = true
     local mine, err = jig.add_item(comp, da, tonumber(count) or 1, tonumber(dx) or 0, tonumber(dy) or 0)
     applying = false
-    if not mine then log.warn("loot: couldn't add the other player's " .. (da:match("[^%.]+$") or da) .. " to " .. id .. ": " .. tostring(err)); return end
+    if not mine then
+        log.warn("loot: couldn't add the other player's " .. (da:match("[^%.]+$") or da) .. " to " .. id .. ": " .. tostring(err))
+        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
+        return
+    end
+    acked(id, s, comp)
     added_once[uid] = true
     alias[uid], rev[mine] = mine, uid
     stats.added = stats.added + 1
@@ -245,7 +294,9 @@ local function apply_add(payload)
 end
 
 local main_cls, main_miss = {}, {}
-local function is_main(actor)
+-- Answer per class (by class address): saves up to 12 IsA calls per actor.
+local main_by_class = {}
+local function is_main_uncached(actor)
     for _, p in ipairs(MAIN) do
         local c = main_cls[p]
         if not util.valid(c) and os.clock() >= (main_miss[p] or 0) then
@@ -258,10 +309,26 @@ local function is_main(actor)
     end
     return false
 end
+local function is_main(actor)
+    local cls
+    pcall(function() cls = actor:GetClass() end)
+    local a = util.addr(cls)
+    if not a then return is_main_uncached(actor) end
+    local r = main_by_class[a]
+    if r == nil then
+        r = is_main_uncached(actor)
+        local all_found = true
+        for _, p in ipairs(MAIN) do if not util.valid(main_cls[p]) then all_found = false; break end end
+        if r or all_found then main_by_class[a] = r end
+    end
+    return r
+end
 
 local function sync_from_host(id)
     local comp, list = opened[id], host_list[id]
-    if synced[id] or not (comp and list) or not util.valid(comp) then return end
+    if not (comp and list) or not util.valid(comp) then return end
+    if held[id] then return end
+    local first = not synced[id]
     synced[id] = true
     applying = true
     local ok, set, added, removed, missing, pairs_ = pcall(jig.apply_contents, comp, list)
@@ -271,6 +338,14 @@ local function sync_from_host(id)
         if p.want.uid then alias[p.want.uid], rev[p.uid] = p.uid, p.want.uid end
     end
     stats.synced = (stats.synced or 0) + 1
+    if not first then
+        if added + removed > 0 then
+            stats.fixed = (stats.fixed or 0) + 1
+            log.info(string.format("loot: %s corrected to the host's contents (%d added, %d removed%s)", id, added, removed,
+                missing > 0 and (", " .. missing .. " not loaded here") or ""))
+        end
+        return
+    end
     if added + removed > 0 and now - (opened_at[id] or -100) < 5.0 then
         local owner
         pcall(function() owner = comp:GetOwner() end)
@@ -294,7 +369,9 @@ local function on_generated(comp, via)
     local ok, id = pcall(id_of, owner)
     if not ok then return end
     if role == "host" then
-        if not pushed[id] then pushed[id] = true; push_q[id] = { comp = comp, at = now + 0.3 } end
+        -- Every generation, not just the first: some containers (shops) roll new stock after a while.
+        pushed[id] = true
+        push_q[id] = { comp = comp, at = now + 0.3 }
     elseif not opened[id] then
         opened[id], opened_at[id] = comp, now
         if host_list[id] and jig.is_empty(comp) then
@@ -312,18 +389,18 @@ local function flush_pushes()
         if now >= q.at then
             push_q[id] = nil
             if util.valid(q.comp) then
-                channel:send("C " .. id .. " " .. jig.encode(jig.contents_of(q.comp), true))
+                cchan:send("C " .. id .. " " .. (ack[id] or 0) .. " " .. jig.encode(jig.contents_of(q.comp), true))
                 stats.pushed = (stats.pushed or 0) + 1
             end
         end
     end
 end
 
-local LIST_EVERY, SCAN_EVERY, AHEAD_M, AHEAD_STEP = 30.0, 2.0, 35, 0.15
+local LIST_EVERY, SCAN_EVERY, AHEAD_M, AHEAD_STEP = 120.0, 2.0, 35, 0.15
 local ahead, ahead_scan_in, ahead_step_in = {}, 0.0, 0.0
 local known, list_in = {}, 0.0
 local function list_containers()
-    known = {}
+    known, main_by_class = {}, {}
     local g = ghost.get()
     for _, comp in ipairs(FindAllOf("BP_JigComponent_C") or {}) do
         local owner
@@ -366,7 +443,7 @@ end
 
 function loot.guest_arriving()
     pushed, push_q, ahead, ahead_scan_in, list_in = {}, {}, {}, 0.0, 0.0
-    alias, rev, added_once, put_sent = {}, {}, {}, {}
+    alias, rev, added_once, put_sent, ack = {}, {}, {}, {}, {}
     log.info("loot: a guest is arriving - container contents will be sent again ahead of time")
 end
 
@@ -392,6 +469,18 @@ local request_fn = function(self, JigMpCompRef)
     util.safe(function() on_generated(JigMpCompRef:get(), "request") end, "loot.request")
 end
 local hook_fn = function(self, ItemUID) util.safe(on_removed, "loot.removed", self, ItemUID) end
+-- Dropping an item out of a container (all of it or part of a stack) fires no "removed" event on the
+-- container: the drop request on its component is the only sign.
+local drop_fn = function(self, ItemUID)
+    util.safe(function()
+        local comp = util.obj(self)
+        if not comp then return end
+        local owner
+        pcall(function() owner = comp:GetOwner() end)
+        if not (util.valid(owner) and is_main(owner)) then return end
+        on_removed({ get = function() return owner end }, ItemUID)
+    end, "loot.dropped")
+end
 local main_removed_fn = function(self, FromContainerUID, ItemUID) util.safe(on_removed, "loot.main_removed", self, ItemUID) end
 local main_added_fn = function(self, ToContainerUID, ItemUID, ToContainerName, ItemInfo)
     util.safe(on_added, "loot.added", self, ItemUID, ItemInfo)
@@ -411,6 +500,7 @@ function loot.tick(dt)
             util.ensure_hook(c .. ":OnBeginInteract", prefetch_fn)
             util.ensure_hook(c .. ":OnExecuteInteract", prefetch_fn)
         end
+        util.ensure_hook(JIG_COMP .. ":HandleServerDropRequest", drop_fn)
         for _, c in ipairs(MAIN) do
             util.ensure_hook(c .. ":JigMP_OnItemRemoved", hook_fn)
             util.ensure_hook(c .. ":JigMP_OnItemAdded", item_added_fn)
@@ -420,6 +510,7 @@ function loot.tick(dt)
         if not shared() then
             alias, rev, added_once, put_sent = {}, {}, {}, {}
             pushed, push_q, host_list, opened, asked, synced, apply_q = {}, {}, {}, {}, {}, {}, {}
+            pending, held, ack, main_by_class = {}, {}, {}, {}
         end
     end
     if role == "host" then
@@ -430,14 +521,31 @@ function loot.tick(dt)
             if now >= at then apply_q[id] = nil; util.safe(sync_from_host, "loot.sync", id) end
         end
     end
+    local function take_contents(p)
+        if role == "host" or not shared() then return end
+        local id, a, rest = p:match("^C (%S+) (%d+) ?(.*)$")
+        if not id then return end
+        host_list[id] = jig.decode(rest)
+        if (pending[id] or 0) <= tonumber(a) then util.safe(sync_from_host, "loot.sync", id) end
+    end
+    cchan:pump(take_contents)
     channel:pump(function(p)
         local k = p:sub(1, 2)
-        if k ~= "C " and k ~= "Q " then traded() end
+        if is_trade(p) then traded() end
         if k == "A " then util.safe(apply_add, "loot.apply_add", p)
-        elseif k == "C " then
+        elseif k == "C " then take_contents(p)
+        elseif k == "R " then
             if role ~= "host" and shared() then
-                local id, rest = p:match("^C (%S+) ?(.*)$")
-                if id then host_list[id] = jig.decode(rest); util.safe(sync_from_host, "loot.sync", id) end
+                local id, uid, da = p:match("^R (%S+) (%S+) (%S+)$")
+                if id then
+                    held[id] = held[id] or {}
+                    held[id][uid] = true
+                    stats.rejected = (stats.rejected or 0) + 1
+                    local name = (da:match("([%w_]+)$") or da):gsub("^DA_", "")
+                    log.warn("loot: the host had no room for your " .. name .. " in " .. id .. " - it is only in your copy")
+                    require("mirror.notify").show("The host's copy of that container had no room for your " .. name ..
+                        ". Take it back out, or it stays only on your screen.", "bad", "loot_rejected")
+                end
             end
         elseif k == "Q " then
             if role == "host" then
@@ -452,9 +560,9 @@ function loot.is_shared(actor) return is_main(actor) end
 function loot.prefetch(actor) util.safe(prefetch, "loot.prefetch", actor) end
 
 function loot.status()
-    return string.format("loot: taken sent %d, applied %d | put in sent %d, added %d | first opens sent %d (ahead %d), taken over %d%s",
+    return string.format("loot: taken sent %d, applied %d | put in sent %d, added %d | contents sent %d (ahead %d), taken over %d, corrected %d, no room %d%s",
         stats.sent, stats.applied, stats.put, stats.added, stats.pushed or 0, stats.ahead or 0, stats.synced or 0,
-        stats.missing > 0 and (", container not found " .. stats.missing) or "")
+        stats.fixed or 0, stats.rejected or 0, stats.missing > 0 and (", container not found " .. stats.missing) or "")
 end
 
 function loot.init(c, r, s)

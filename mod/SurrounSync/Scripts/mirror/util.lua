@@ -35,10 +35,30 @@ function util.job_running(name) return false end
 function util.pause() end
 function util.jobs_tick() end
 
+-- UE4SS hands out non-nil wrappers for null objects; any method on one but
+-- IsValid reads through a null pointer and kills the game (pcall can't catch it).
 function util.valid(obj)
-    if obj == nil then return false end
-    local ok, v = pcall(function() return obj:IsValid() end)
+    local t = type(obj)
+    if t ~= "userdata" and t ~= "table" then return false end
+    local ok, v = pcall(obj.IsValid, obj)
     return ok and v == true
+end
+
+-- Object-typed hook parameter -> valid object or nil.
+function util.obj(param)
+    local t = type(param)
+    if t ~= "userdata" and t ~= "table" then return nil end
+    local ok, o = pcall(param.get, param)
+    if ok and util.valid(o) then return o end
+    return nil
+end
+
+function util.class_path(obj)
+    if not util.valid(obj) then return nil end
+    local ok, c = pcall(obj.GetClass, obj)
+    if not (ok and c) then return nil end
+    local ok2, n = pcall(c.GetFullName, c)
+    return ok2 and type(n) == "string" and n:match("^%S+ (.+)$") or nil
 end
 
 -- Object addresses get reused after GC: don't use them as long-lived ids.
@@ -55,17 +75,28 @@ end
 
 function util.class_name(obj)
     if not util.valid(obj) then return nil end
-    local ok, n = pcall(function() return obj:GetClass():GetFName():ToString() end)
-    return ok and n or nil
+    local ok, c = pcall(obj.GetClass, obj)
+    if not (ok and c) then return nil end
+    local ok2, n = pcall(function() return c:GetFName():ToString() end)
+    return ok2 and n or nil
 end
 
-function util.find_by_id(id, near)
-    local cls, gx, gy, gz = id:match("^([^@]+)@(%-?%d+),(%-?%d+),(%-?%d+)$")
-    if not cls then return nil end
-    gx, gy, gz = tonumber(gx) * 10, tonumber(gy) * 10, tonumber(gz) * 10
+-- FindAllOf walks every object in the game; lookups of the same class share one result for a few seconds.
+local all_cache, ALL_TTL = {}, 5.0
+function util.all_of(cls, max_age)
+    local t = os.clock()
+    local c = all_cache[cls]
+    if c and t - c.at <= (max_age or ALL_TTL) then return c.list, t - c.at end
+    local list = {}
+    pcall(function() list = FindAllOf(cls) or {} end)
+    all_cache[cls] = { at = t, list = list }
+    return list, 0
+end
+
+local function nearest_of(list, gx, gy, gz, near)
     local best, best_d = nil, near or -1
     pcall(function()
-        for _, o in ipairs(FindAllOf(cls) or {}) do
+        for _, o in ipairs(list) do
             if util.valid(o) and not o:GetFullName():find("Default__", 1, true) then
                 local ok, l = pcall(function() return o:K2_GetActorLocation() end)
                 if ok and l then
@@ -77,6 +108,16 @@ function util.find_by_id(id, near)
             end
         end
     end)
+    return best
+end
+
+function util.find_by_id(id, near)
+    local cls, gx, gy, gz = id:match("^([^@]+)@(%-?%d+),(%-?%d+),(%-?%d+)$")
+    if not cls then return nil end
+    gx, gy, gz = tonumber(gx) * 10, tonumber(gy) * 10, tonumber(gz) * 10
+    local list, age = util.all_of(cls)
+    local best = nearest_of(list, gx, gy, gz, near)
+    if not best and age > 0.5 then best = nearest_of(util.all_of(cls, 0), gx, gy, gz, near) end
     return best
 end
 
@@ -132,19 +173,19 @@ function util.new_frame() frame_no = frame_no + 1 end
 function util.ensure_hook(path, pre, post)
     local t = os.clock()
     local hk = path .. "|" .. tostring(pre)
-    if next_check[path] and t < next_check[path] then return hooked_fn[hk] ~= nil end
+    if next_check[hk] and t < next_check[hk] then return hooked_fn[hk] ~= nil end
     if lookup_frame ~= frame_no then lookup_frame, lookups = frame_no, 0 end
-    if lookups >= LOOKUPS_PER_FRAME and next_check[path] then return hooked_fn[hk] ~= nil end
+    if lookups >= LOOKUPS_PER_FRAME and next_check[hk] then return hooked_fn[hk] ~= nil end
     lookups = lookups + 1
     lookup_count[path] = (lookup_count[path] or 0) + 1
     local fn = StaticFindObject(path)
     if not util.valid(fn) then
-        backoff[path] = math.min((backoff[path] or 1) * 2, MAX_BACKOFF)
-        next_check[path] = t + backoff[path]
+        backoff[hk] = math.min((backoff[hk] or 1) * 2, MAX_BACKOFF)
+        next_check[hk] = t + backoff[hk]
         return false
     end
-    backoff[path] = nil
-    next_check[path] = t + RECHECK
+    backoff[hk] = nil
+    next_check[hk] = t + RECHECK
     local a = util.addr(fn)
     if hooked_fn[hk] == a then return true end
     if util.hook(path, pre, post, true) then hooked_fn[hk] = a; return true end
@@ -164,7 +205,7 @@ function util.hook_state(path)
     local hooked = {}
     for k, a in pairs(hooked_fn) do if k:sub(1, #path + 1) == path .. "|" then hooked[#hooked + 1] = tostring(a) end end
     return string.format("next check in %s s, backoff %s, hooked %s, found now %s",
-        next_check[path] and string.format("%.1f", next_check[path] - os.clock()) or "-", tostring(backoff[path]),
+        (function() for k, v in pairs(next_check) do if k:sub(1, #path + 1) == path .. "|" then return string.format("%.1f", v - os.clock()) end end return "-" end)(), "-",
         #hooked > 0 and table.concat(hooked, ",") or "no", tostring(util.valid(StaticFindObject(path))))
 end
 

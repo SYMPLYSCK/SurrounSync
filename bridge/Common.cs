@@ -158,6 +158,24 @@ namespace SurrounSyncShared
     {
         public const string AppId = "1645820";
         public const string Exe = "SurrounDead-Win64-Shipping.exe";
+        // Engine the mod (and its UE4SS signatures and bundled pak) are made for.
+        public const string Engine = "5.6";
+
+        public static string EngineOf(string win64)
+        {
+            try
+            {
+                var v = FileVersionInfo.GetVersionInfo(Path.Combine(win64, Exe));
+                return v.FileMajorPart + "." + v.FileMinorPart + "." + v.FileBuildPart;
+            }
+            catch { return null; }
+        }
+
+        public static bool EngineOk(string win64)
+        {
+            string e = EngineOf(win64);
+            return e == null || e.StartsWith(Engine + ".");
+        }
 
         public static string Win64(string game) { return Path.Combine(game, "SurrounDead", "Binaries", "Win64"); }
         public static bool IsGame(string game)
@@ -385,6 +403,34 @@ namespace SurrounSyncShared
             string uv = "missing";
             try { if (ue4ss != null && File.Exists(ue4ss)) uv = FileVersionInfo.GetVersionInfo(ue4ss).FileVersion ?? "present"; } catch { }
             sb.AppendLine("UE4SS: " + uv);
+            if (win64 != null)
+            {
+                string eng = Game.EngineOf(win64);
+                long size = 0;
+                try { size = new FileInfo(Path.Combine(win64, Game.Exe)).Length; } catch { }
+                sb.AppendLine("Game program: Unreal " + (eng ?? "?") + ", " + size + " bytes" + (Game.EngineOk(win64) ? "" :
+                    "  <-- NOT the current game (needs Unreal " + Game.Engine + "): mismatched game files. Verify the game files in Steam."));
+                string ul = ReadText(Path.Combine(win64, "ue4ss", "UE4SS.log"));
+                if (ul != null && (ul.Contains("Fatal Error") || ul.Contains("AOB scans could not be completed")))
+                    sb.AppendLine("UE4SS start: FAILED (" + (ul.Contains("Found EngineVersion: " + Game.Engine) ? "signature scan" : "game version not supported") +
+                        ") - no mods ran in that game run");
+                sb.AppendLine(@"Pak mods (Content\Paks\~mods, LogicMods):");
+                int paks = 0;
+                foreach (var sub in new[] { "~mods", "LogicMods" })
+                    try
+                    {
+                        string d = Path.Combine(game, "SurrounDead", "Content", "Paks", sub);
+                        if (!Directory.Exists(d)) continue;
+                        foreach (var f in Directory.GetFiles(d, "*.pak", SearchOption.AllDirectories))
+                        {
+                            var fi = new FileInfo(f);
+                            sb.AppendLine("  " + sub + "\\" + f.Substring(d.Length + 1) + " (" + fi.Length + " bytes, " + fi.LastWriteTime.ToString("yyyy-MM-dd") + ")");
+                            paks++;
+                        }
+                    }
+                    catch { }
+                if (paks == 0) sb.AppendLine("  none");
+            }
             sb.AppendLine("Windows: " + WindowsName() + " (" + (Environment.Is64BitOperatingSystem ? "64" : "32") + "-bit)");
             sb.AppendLine("Memory: " + MemoryText());
             sb.AppendLine("Steam running: " + (Process.GetProcessesByName("steam").Length > 0 ? "yes" : "no"));
@@ -424,8 +470,14 @@ namespace SurrounSyncShared
                 try
                 {
                     var ctx = Path.Combine(crash, "CrashContext.runtime-xml");
-                    var m = Regex.Match(File.ReadAllText(ctx), "<ErrorMessage>([^<]*)</ErrorMessage>");
+                    string xml = File.ReadAllText(ctx);
+                    var m = Regex.Match(xml, "<ErrorMessage>([^<]*)</ErrorMessage>");
                     if (m.Success) sb.AppendLine("  " + m.Groups[1].Value.Trim());
+                    var en = Regex.Match(xml, "<EngineVersion>([^<]*)</EngineVersion>");
+                    if (en.Success) sb.AppendLine("  engine at crash: " + en.Groups[1].Value.Trim());
+                    var cs = Regex.Match(xml, @"<CallStack>([^<\s]*)");
+                    if (cs.Success) sb.AppendLine("  crashed in: " + cs.Groups[1].Value.Trim() +
+                        (cs.Groups[1].Value.StartsWith("UE4SS") ? " (a script mod's call - SurrounSync, PDS or another UE4SS mod)" : " (the game itself)"));
                 }
                 catch { }
             }
@@ -462,6 +514,12 @@ namespace SurrounSyncShared
         {
             using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
             using (var m = new MemoryStream()) { f.CopyTo(m); return m.ToArray(); }
+        }
+
+        static string ReadText(string path)
+        {
+            try { var d = File.Exists(path) ? ReadShared(path) : null; return d == null ? null : Encoding.UTF8.GetString(d); }
+            catch { return null; }
         }
 
         static IEnumerable<string> ReadLines(string path)

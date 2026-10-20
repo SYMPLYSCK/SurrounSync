@@ -1,6 +1,7 @@
 -- Connection quality shown on the other player's name tag.
 
 local events = require("mirror.events")
+local link = require("mirror.link")
 
 local netq = {}
 
@@ -12,8 +13,19 @@ local age = math.huge
 
 local function ms() return os.clock() * 1000.0 end
 
+-- The name tag shows the network's own round trip, measured by the connectors between themselves. The
+-- game-to-game trip below also counts both games' frames and the file hand-offs (and every loading stall).
+local net_rtt, net_in = nil, 0.0
+local function read_net_rtt()
+    local s = link.status() or ""
+    local r = tonumber(s:match("rtt (%d+) ms"))
+    net_rtt = r
+end
+
 function netq.tick(dt, update_age)
     age = update_age or math.huge
+    net_in = net_in - dt
+    if net_in <= 0 then net_in = 2.0; pcall(read_net_rtt) end
     ping_in = ping_in - dt
     if ping_in <= 0 then
         ping_in = 2.0
@@ -42,7 +54,7 @@ function netq.status()
     elseif age > 1.5 or (r and r > 900) then state = "poor"
     elseif age > 0.5 or (r and r > 400) then state = "moderate"
     else state = "good" end
-    return { state = state, rtt = r }
+    return { state = state, rtt = r, net = net_rtt }
 end
 
 local COLOR = {
@@ -52,10 +64,11 @@ local COLOR = {
 }
 function netq.tag(name)
     local s = netq.status()
-    local extra = s.state == "lost" and " · no signal" or (s.rtt and string.format(" · %d ms", math.floor(s.rtt + 0.5)) or "")
+    local shown = s.net or s.rtt
+    local extra = s.state == "lost" and " · no signal" or (shown and string.format(" · %d ms", math.floor(shown + 0.5)) or "")
     return name .. extra, COLOR[s.state]
 end
 
-function netq.reset() rtt, rtt_at, age = nil, nil, math.huge end
+function netq.reset() rtt, rtt_at, age, net_rtt = nil, nil, math.huge, nil end
 
 return netq

@@ -15,7 +15,7 @@ local TYPES = { "4x4Jeep", "APC", "Ambulance", "BigRig", "Buggy", "Charger", "Da
                 "PickupUtilityTruck", "Van" }
 local SPAWNERS = { "BP_VehicleSpawner_C", "BP_VehicleUniqueSpawner_C" }
 local SIT = "/Game/Character/Anims/Interaction/Chr_SitInCar_Montage.Chr_SitInCar_Montage"
-local SEND_EVERY = 0.05
+local CLASS_EVERY = 1.0
 
 local cfg, role, session
 local cars = {}
@@ -63,11 +63,7 @@ local function on_car_begin(self)
     local n = name_of(a)
     if n and not alive(cars[n]) then cars[n] = a; new_car = true; log.info("vehicles: a new car here (" .. n .. ") - telling the other game") end
 end
-local function class_path(a)
-    local p
-    pcall(function() p = a:GetClass():GetFullName():match("^%S+ (.+)$") end)
-    return p
-end
+local function class_path(a) return util.class_path(a) end
 local master_cls = nil
 local function is_car(a)
     if not util.valid(a) then return false end
@@ -184,6 +180,8 @@ local function place_when_near(car, l, r)
 end
 local pending = {}
 local made_for_drive = {}
+local parked = {}
+local MIN_DELAY, MAX_DELAY = 0.08, 0.35
 local function add_car(n, cp, l, r, sc, sf, sh)
     local pl = player_loc()
     if pl and util.dist(pl, l) > NEAR_M * 100 then
@@ -306,7 +304,10 @@ local function send_drive(dt)
         if driving and alive(driving) then
             local l, r = transform(driving)
             local n = peer_name(driving)
-            if l and n then link.put_blob("drive", "P " .. n .. " " .. fmt(l, r) .. " " .. state_of(driving)); log.info("vehicles: parked " .. n) end
+            if l and n then
+                link.put_blob("drive", "P " .. n .. " " .. fmt(l, r) .. " " .. state_of(driving) .. string.format(" %.3f", now))
+                log.info("vehicles: parked " .. n)
+            end
             resend = true
         end
         driving = car
@@ -318,19 +319,28 @@ local function send_drive(dt)
         if car then log.info("vehicles: driving " .. tostring(peer_name(car)) .. " - the other game follows") end
     end
     if not driving then return end
+    -- The car's movement rides in the pose packets (vehicles.drive_line); this reliable copy, with the
+    -- car's class, is only for a car the other game doesn't have yet.
     send_in = send_in - dt
     if send_in > 0 then return end
-    send_in = SEND_EVERY
+    send_in = CLASS_EVERY
+    local line = vehicles.drive_line()
+    if line then link.put_blob("drive", line .. " " .. (class_path(driving) or "-")) end
+end
+
+-- One sample of the car being driven, sent with every pose (unreliable, with the previous two).
+function vehicles.drive_line()
+    if not (in_world and driving and alive(driving)) then return nil end
     local l, r = transform(driving)
     local n = peer_name(driving)
-    if not (l and n) then return end
+    if not (l and n) then return nil end
     local v = { X = 0, Y = 0, Z = 0 }
     pcall(function() local vv = driving:GetVelocity(); v = { X = vv.X, Y = vv.Y, Z = vv.Z } end)
     local eng, lit = false, false
     pcall(function() eng = driving["EngineOn?"] == true end)
     pcall(function() lit = driving["LightsOn?"] == true end)
-    link.put_blob("drive", string.format("D %s %s %.0f %.0f %.0f %d %d %.3f %s", n, fmt(l, r), v.X, v.Y, v.Z, eng and 1 or 0,
-        lit and 1 or 0, now, class_path(driving) or "-"))
+    return string.format("D %s %.0f %.0f %.0f %.1f %.1f %.1f %.0f %.0f %.0f %d %d %.3f", n, l.X, l.Y, l.Z, r.Pitch, r.Yaw, r.Roll,
+        v.X, v.Y, v.Z, eng and 1 or 0, lit and 1 or 0, now)
 end
 
 seat_point = function(car, passenger)
@@ -411,6 +421,7 @@ local function apply_drive(body)
     local l = { X = nums[1], Y = nums[2], Z = nums[3] }
     local r = { Pitch = nums[4], Yaw = nums[5], Roll = nums[6] }
     if k == "P" then
+        if nums[10] then parked[n] = nums[10] end
         if driving and util.same(car_named(n), driving) then return end
         local pc = car_named(n)
         if pc then set_state(pc, nums[7], nums[8], nums[9]) end
@@ -423,6 +434,8 @@ local function apply_drive(body)
         return
     end
     if k ~= "D" then return end
+    local ts0 = nums[12]
+    if parked[n] and ts0 and ts0 <= parked[n] then return end
     local mine = driving and car_named(n)
     if mine and util.same(mine, driving) then return end
     if peer and peer.name ~= n then release_peer_car() end
@@ -470,6 +483,11 @@ local function apply_drive(body)
         local m = offs[1]
         for i = 2, #offs do if offs[i] < m then m = offs[i] end end
         peer.off = m
+        -- Playback delay: how late samples arrive beyond the fastest one (90th percentile), plus a margin.
+        local late = {}
+        for i = 1, #offs do late[i] = offs[i] - m end
+        table.sort(late)
+        peer.delay = math.max(MIN_DELAY, math.min(MAX_DELAY, (late[math.ceil(#late * 0.9)] or 0) + 0.04))
     end
     local eng, lit = (nums[10] or 0) == 1, (nums[11] or 0) == 1
     if eng ~= peer.engine or lit ~= peer.lights then
@@ -494,7 +512,6 @@ apply_ride = function(body)
     log.info("vehicles: the other player rides along in " .. n)
 end
 
-local DELAY = 0.15
 local lerp, lerp_deg = util.lerp, util.lerp_angle
 local function follow(dt)
     if not (peer and peer.samples and peer.off and alive(peer.car)) then return end
@@ -504,7 +521,7 @@ local function follow(dt)
         return
     end
     local q = peer.samples
-    local t = now - peer.off - DELAY
+    local t = now - peer.off - (peer.delay or 0.15)
     local a, b
     for i = #q, 1, -1 do
         if q[i].t <= t then a, b = q[i], q[i + 1]; break end
@@ -540,6 +557,12 @@ local function follow(dt)
     pcall(function() car.Mesh:SetPhysicsAngularVelocityInDegrees({ X = 0, Y = 0, Z = 0 }, false, FName("None")) end)
 end
 
+-- A sample of the car the other player drives, from their pose packets.
+function vehicles.drive_sample(body)
+    if not (cfg and cfg.mirror_vehicles and in_world) then return end
+    util.safe(apply_drive, "vehicles.drive", body)
+end
+
 function vehicles.tick(dt)
     if not (cfg and cfg.mirror_vehicles) then return end
     now = now + dt
@@ -551,7 +574,7 @@ function vehicles.tick(dt)
         if not inside then
             release_peer_car(); peer_rides = nil; unseat_ghost()
             alias, rev, driving, retired, frozen, unknown, wake_at, pending = {}, {}, nil, {}, {}, {}, {}, {}
-            made_for_drive = {}
+            made_for_drive, parked = {}, {}
         end
     end
     if not in_world then return end

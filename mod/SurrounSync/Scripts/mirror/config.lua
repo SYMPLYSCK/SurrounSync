@@ -92,11 +92,11 @@ local config = {
 
     save = {
         destroy_ghost_on_save = true,  -- keeps the other player out of your save files
-        respawn_delay = 2.0,
+        respawn_delay = 0.5,
         backups_kept = 10,             -- per save, plus the first one (never deleted)
-        checkpoints = true,            -- save shortly after items change hands
-        checkpoint_delay = 5.0,
-        checkpoint_min_interval = 20.0,
+        checkpoints = true,            -- save shortly after items change hands between players
+        checkpoint_delay = 10.0,
+        checkpoint_min_interval = 90.0, -- any save (also the game's autosave) restarts this
         host_gone_countdown = 30,      -- guest goes home this long after the host's game closes
         peer_gone_after = 15,
         file_link_gone_after = 45,

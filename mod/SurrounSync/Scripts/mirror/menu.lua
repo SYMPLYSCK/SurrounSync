@@ -114,7 +114,7 @@ local function stopping_tick(dt)
     if not stopping then return end
     stopping.t = stopping.t + dt
     local w = p1().peer_where()
-    local guest_in = w == "joined" or w == "loading" or w == "leaving"
+    local guest_in = w == "joined" or w == "loading" or w == "arriving" or w == "leaving"
     if guest_in and stopping.t < 15 then return end
     if stopping.t < 1.5 then return end
     if guest_in then log.warn("menu: stop hosting - the guest didn't leave within 15 s (unreachable?) - stopping anyway") end

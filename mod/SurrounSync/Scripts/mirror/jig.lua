@@ -30,6 +30,56 @@ function jig.full_path(obj)
     return p
 end
 
+-- An item's stats (what food/water restores, armour values...) live in the item itself, not the asset:
+-- an item made without them looks right but does nothing when used. The game's own default
+-- (GetPickupInfoFromDT) is the asset's ItemStats; built as fresh tables, never game structs passed back in.
+local STATS = "Stats_26_C770972746930CB80CC49AB7A6D19359"
+jig.STATS = STATS
+local S_TAG, S_PREFIX = "STAT_NAME_13_8D9D8D5D48A145FB1BAD6E98C69D0A10", "Prefix_16_994B3BFF49FB68BE6A485DB9498EB954"
+local S_MIN, S_MAX = "MinValue_6_4B4822A7420F784740B6A58155973EE6", "MaxValue_8_04A5809A498E900862BCCA9A6E412BD7"
+local S_TXT = "Txt_12_F1BE8023414240AC50F4B09BF1B79D58"
+local stats_cache = {}
+local function name_str(n)
+    local s
+    pcall(function() s = n:ToString() end)
+    return s
+end
+function jig.base_stats(asset)
+    if not util.valid(asset) then return {} end
+    local key = util.addr(asset) or 0
+    local raw = stats_cache[key]
+    if not raw then
+        raw = {}
+        pcall(function()
+            asset.ItemStats:ForEach(function(_, e)
+                local s = e:get()
+                raw[#raw + 1] = { tag = name_str(s[S_TAG].TagName), prefix = name_str(s[S_PREFIX]),
+                                  min = tonumber(s[S_MIN]) or 0, max = tonumber(s[S_MAX]) or 0, txt = name_str(s[S_TXT]) }
+            end)
+        end)
+        stats_cache[key] = raw
+    end
+    local out = {}
+    for i, r in ipairs(raw) do
+        out[i] = { [S_TAG] = { TagName = FName(r.tag or "None") }, [S_PREFIX] = FName(r.prefix or "None"),
+                   [S_MIN] = r.min, [S_MAX] = r.max, [S_TXT] = FName(r.txt or "None") }
+    end
+    return out
+end
+-- Fills the Stats of an item info already in the game (a dropped copy); returns how many were written.
+function jig.write_stats(info, asset)
+    local want = jig.base_stats(asset)
+    if #want == 0 then return 0 end
+    local n = 0
+    local ok, err = pcall(function()
+        local arr = info[STATS]
+        if arr:GetArrayNum() > 0 then n = -1; return end
+        for i, s in ipairs(want) do arr[i] = s; n = i end
+    end)
+    if not ok then return nil, tostring(err) end
+    return n
+end
+
 function jig.uid_str(g) return string.format("%d_%d_%d_%d", g.A, g.B, g.C, g.D) end
 
 function jig.guid(uid)
@@ -163,7 +213,10 @@ function jig.add_item(comp, da, count, dx, dy, conts)
             if not ok then err = e; break end
             if out.Added == true then
                 for _, h in ipairs(jig.contents_of(comp)) do
-                    if not before[h.uid] then return h.uid end
+                    if not before[h.uid] then
+                        pcall(function() jig.write_stats(h.el:get()[INFO], asset) end)
+                        return h.uid
+                    end
                 end
             end
         end

@@ -29,6 +29,7 @@ local function drop(r) why[r] = (why[r] or 0) + 1 end
 local function shared() return role == "host" or (session and session.in_world()) end
 
 local function path_of(o)
+    if not util.valid(o) then return nil end
     local p
     pcall(function() p = o:GetFullName():match("^%S+ (.+)$") end)
     return p
@@ -97,13 +98,11 @@ local function hook_all()
                 RegisterHook(GS .. fn, function(self, a, b, c, d, e, f, g, h, i)
                     local ctx, snd, l, vol, pitch
                     if kind == "attached" then
-                        pcall(function() snd = a:get() end)
-                        pcall(function() ctx = b:get() end)
-                        pcall(function() l = vec_of(ctx:K2_GetComponentLocation()) end)
+                        snd, ctx = util.obj(a), util.obj(b)
+                        if ctx then pcall(function() l = vec_of(ctx:K2_GetComponentLocation()) end) end
                         pcall(function() vol, pitch = h:get(), i:get() end)
                     else
-                        pcall(function() ctx = a:get() end)
-                        pcall(function() snd = b:get() end)
+                        ctx, snd = util.obj(a), util.obj(b)
                         pcall(function() l = vec_of(c:get()) end)
                         pcall(function() vol, pitch = e:get(), f:get() end)
                     end

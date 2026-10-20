@@ -155,7 +155,7 @@ function power.tick(dt)
     if role == "off" then return end
     poll_in, blob_in = poll_in - dt, blob_in - dt
     scan_in = scan_in - dt
-    if scan_in <= 0 then scan_in = 2.0; util.safe(scan_step, "power.scan") end
+    if scan_in <= 0 then scan_in = 8.0; util.safe(scan_step, "power.scan") end
     if poll_in <= 0 then
         poll_in = 0.5
         if shared() then util.safe(poll, "power.poll") end

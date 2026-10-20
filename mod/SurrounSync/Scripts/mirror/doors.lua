@@ -21,7 +21,9 @@ local KINDS = {
 }
 
 local POLL = 0.25
-local RESCAN = 2.0
+-- FindAllOf walks every object in the game (~30 ms on slow PCs): level doors are scanned once,
+-- only player-built ones again, one class at a time.
+local RESCAN = 6.0
 local EXPECT = 5.0
 
 local cfg, role, session
@@ -43,9 +45,13 @@ local function key(obj, cls)
     return string.format("%s@%d,%d,%d", cls, math.floor(l.X / 10 + 0.5), math.floor(l.Y / 10 + 0.5), math.floor(l.Z / 10 + 0.5))
 end
 
-local CLASSES = {}
-for cls in pairs(KINDS) do CLASSES[#CLASSES + 1] = cls end
+local CLASSES, BUILT = {}, {}
+for cls in pairs(KINDS) do
+    CLASSES[#CLASSES + 1] = cls
+    if cls:find("^Buildable_") then BUILT[#BUILT + 1] = cls end
+end
 table.sort(CLASSES)
+table.sort(BUILT)
 local scan_idx = 0
 local warm = 0
 
@@ -183,8 +189,8 @@ function doors.tick(dt)
     scan_in = scan_in - dt
     if scan_in <= 0 then
         scan_in = RESCAN
-        scan_idx = scan_idx % #CLASSES + 1
-        rescan_class(CLASSES[scan_idx])
+        scan_idx = scan_idx % #BUILT + 1
+        rescan_class(BUILT[scan_idx])
         for id, e in pairs(pending) do
             if apply(id, e) then pending[id] = nil end
         end

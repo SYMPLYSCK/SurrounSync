@@ -17,9 +17,9 @@ local seen = {}
 local cache = {}
 
 local function path_of(obj)
+    if not util.valid(obj) then return nil end
     local p
-    pcall(function() p = obj:GetPathName() end)
-    if not p then pcall(function() p = obj:GetFullName():match("^%S+ (.+)$") end) end
+    pcall(function() p = obj:GetFullName():match("^%S+ (.+)$") end)
     return p
 end
 

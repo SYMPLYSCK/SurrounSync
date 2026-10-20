@@ -533,7 +533,10 @@ local function firewall(why)
             cur, world_slot, tostring(ok)))
     end
 end
-require("mirror.save_guard").set_before_save(function() util.safe(firewall, "session.firewall", "the game's save") end)
+require("mirror.save_guard").set_before_save(function()
+    util.safe(firewall, "session.firewall", "the game's save")
+    session.on_any_save()
+end)
 
 local function hold_autosave()
     pcall(function()
@@ -1071,11 +1074,14 @@ local cp_clock, cp_due, cp_last, cp_first = 0.0, nil, -math.huge, nil
 local guest_in = function() return false end
 function session.set_guest_in(fn) guest_in = fn end
 function session.guest_in_world() return role == "host" and guest_in() end
+-- Any save (the game's autosave, a manual one, ours) covers the trades made before it.
+function session.on_any_save() cp_due, cp_last = nil, cp_clock end
 function session.checkpoint(reason)
     if not (cfg and cfg.save and cfg.save.checkpoints ~= false) then return end
     if role == "host" and not guest_in() then return end
+    local delay = cfg.save.checkpoint_delay or 10.0
     cp_first = cp_due and cp_first or cp_clock
-    cp_due = math.min(cp_clock + (cfg.save.checkpoint_delay or 5.0), cp_first + (cfg.save.checkpoint_delay or 5.0) + 15.0)
+    cp_due = math.min(cp_clock + delay, cp_first + delay + 30.0)
     log.debug("session: checkpoint due (" .. tostring(reason) .. ")")
 end
 
@@ -1083,7 +1089,7 @@ local function checkpoint_tick(dt)
     cp_clock = cp_clock + dt
     if not cp_due or cp_clock < cp_due then return end
     if cfg.save and cfg.save.checkpoints == false then cp_due = nil; return end
-    if cp_clock < cp_last + (cfg.save.checkpoint_min_interval or 20.0) then return end
+    if cp_clock < cp_last + (cfg.save.checkpoint_min_interval or 90.0) then return end
     if role == "guest" then
         if state == "idle" then cp_due = nil; return end
         if state ~= "joined" or tp then return end
@@ -1113,9 +1119,22 @@ function session.role() return started and role or nil end
 function session.request_toggle() want_toggle = true end
 function session.in_world() return state == "joined" and tp == nil end
 
+-- "arriving": loaded into the host's world and already next to the host, but the spot isn't confirmed yet
+-- (the game can still move the player for a few seconds). Enough to show both players to each other.
+local function arrived_spot()
+    if not (tp and tp.goal == "host") or saving() then return false end
+    local p, target = game.player(), tp_target()
+    if not (util.valid(p) and target and util.same(p, tp.player)) then return false end
+    local pl
+    pcall(function() pl = util.vec(p:K2_GetActorLocation()) end)
+    return pl ~= nil and util.dist(target, pl) <= cfg.phase2.teleport_tolerance
+end
 function session.where()
     if role ~= "guest" then return "host" end
-    if state == "joined" then return tp and "loading" or "joined" end
+    if state == "joined" then
+        if not tp then return "joined" end
+        return arrived_spot() and "arriving" or "loading"
+    end
     if state == "leaving_save" or (tp and tp.goal == "home") then return "leaving" end
     return "own"
 end

@@ -45,7 +45,7 @@ end
 
 local function shared() return role == "host" or (session and session.in_world()) end
 local function traded() if session and session.checkpoint and shared() then session.checkpoint("corpses") end end
-channel.send = function(self, p) if p:find("^T ") then traded() end return events.send(self, p) end
+channel.send = function(self, p) if p:find("^A ") then traded() end return events.send(self, p) end
 
 local function is_dead(z)
     local d = false
@@ -243,7 +243,7 @@ function corpses.tick(dt)
     channel:pump(function(p)
         if not shared() then return end
         local k = p:sub(1, 1)
-        if k == "T" or k == "A" then traded() end
+        if k == "A" then traded() end
         if k == "L" and role ~= "host" then
             local id, rest = p:match("^L (%d+) ?(.*)$")
             if id then lists[tonumber(id)] = { items = jig.decode(rest), at = zombies.now() } end

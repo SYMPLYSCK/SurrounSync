@@ -11,10 +11,19 @@ function clockmap.new(min_d, max_d, start)
                           off = nil, last_sent = nil, last_place = nil, late_sum = 0.0, late_n = 0 }, clockmap)
 end
 
-function clockmap:place(sent, now)
+-- quiet: a late copy of an older update; place it but keep it out of the timing stats.
+function clockmap:place(sent, now, quiet)
     if not sent then return nil end
     if self.last_sent and (sent < self.last_sent - 1.0 or sent > self.last_sent + 30.0) then self.off = nil end
     local sample = now - sent
+    if quiet then
+        if not self.off then return nil end
+        local t = sent + self.off
+        if self.last_place and t <= self.last_place then return nil end
+        if t > now then t = now end
+        self.last_place = t
+        return t
+    end
     if not self.off or sample < self.off or sample > self.off + 0.5 then self.off = sample
     else self.off = self.off + (sample - self.off) * 0.01 end
     local late = sample - self.off

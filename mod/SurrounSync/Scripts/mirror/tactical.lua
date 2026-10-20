@@ -12,7 +12,7 @@ local tactical = {}
 local DIR = "/Game/Inventory/Items/LocalAttachments/Tactical/"
 local NAMES = { "BP_SmallTacticalLaserSightLocalAttachment", "BP_TacticalLaserLightComboLocalAttachment",
                 "BP_SmallTacticalLightLocalAttachment", "BP_TacticalLightLocalAttachment" }
-local SCAN_EVERY = 5.0
+local SCAN_EVERY = 30.0
 
 local cfg
 local mine = {}

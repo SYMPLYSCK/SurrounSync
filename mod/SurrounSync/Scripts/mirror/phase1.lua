@@ -18,6 +18,7 @@ local drops = require("mirror.drops")
 local notify = require("mirror.notify")
 local world = require("mirror.world")
 local doors = require("mirror.doors")
+local infest = require("mirror.infest")
 local power = require("mirror.power")
 local audio = require("mirror.audio")
 local loot = require("mirror.loot")
@@ -31,6 +32,7 @@ local deathbags = require("mirror.deathbags")
 local nametag = require("mirror.nametag")
 local netq = require("mirror.netq")
 local clockmap = require("mirror.clockmap")
+local posepack = require("mirror.posepack")
 local chat = require("mirror.chat")
 local compat = require("mirror.compat")
 local voice = require("mirror.voice")
@@ -116,6 +118,7 @@ local pose_clock = clockmap.new(0.05, 0.25, 0.15)
 local pose_gaps = { seq = nil, got = 0, skipped = 0 }
 
 local pose_line = nil
+local pose_out = posepack.new(2)
 local function sample(player)
     pose_line = nil
     pcall(function()
@@ -162,15 +165,15 @@ local function status()
     local q = netq.status()
     local late, shown = pose_clock:report()
     local lost = pose_gaps.got + pose_gaps.skipped > 0 and (100 * pose_gaps.skipped / (pose_gaps.got + pose_gaps.skipped)) or 0
-    log.info(string.format("phase1: net round trip %s, poses %d/s (%.0f%% skipped), late avg %.0f ms, shown %.0f ms behind%s",
+    log.info(string.format("phase1: net round trip %s, poses %d/s (%.0f%% skipped, %d recovered), late avg %.0f ms, shown %.0f ms behind%s",
         q.rtt and string.format("%.0f ms", q.rtt) or "?", math.floor(pose_gaps.got / cfg.phase1.status_interval + 0.5), lost,
-        late, shown, zombies.net_report and (" | zombies " .. zombies.net_report()) or ""))
-    pose_gaps.got, pose_gaps.skipped = 0, 0
+        pose_gaps.recovered or 0, late, shown, zombies.net_report and (" | zombies " .. zombies.net_report()) or ""))
+    pose_gaps.got, pose_gaps.skipped, pose_gaps.recovered = 0, 0, 0
     log.info(string.format("phase1[%s]: rx %.1f/s, last %.2fs ago | ghost %s%s",
         role, rx_count / cfg.phase1.status_interval, age,
         ghost.exists() and ghost.kind() or "none",
         ((gl and pl) and string.format(" %.0f m from you", util.dist(gl, pl) / 100) or "")
-        .. " | zombies: " .. zombies.status() .. " | " .. fire.status() .. " | " .. drops.status() .. " | " .. world.status() .. " | " .. doors.status() .. " | " .. power.status() .. " | " .. audio.status() .. " | " .. loot.status() .. " | " .. builds.status() .. " | " .. corpses.status() .. " | " .. deathbags.status() .. " | " .. tactical.status() .. " | " .. throwables.status() .. " | " .. vehicles.status()))
+        .. " | zombies: " .. zombies.status() .. " | " .. fire.status() .. " | " .. drops.status() .. " | " .. world.status() .. " | " .. doors.status() .. " | " .. infest.status() .. " | " .. power.status() .. " | " .. audio.status() .. " | " .. loot.status() .. " | " .. builds.status() .. " | " .. corpses.status() .. " | " .. deathbags.status() .. " | " .. tactical.status() .. " | " .. throwables.status() .. " | " .. vehicles.status()))
     rx_count = 0
 end
 
@@ -178,7 +181,7 @@ local my_where, peer_where = nil, nil
 local guest_gone_t = nil
 local time_check_in = 0.0
 local guest_announced = false
-local function busy_where(w) return w == "loading" or w == "leaving" end
+local function busy_where(w) return w == "loading" or w == "arriving" or w == "leaving" end
 local function same_world()
     if role == "guest" then return session.in_world() end
     return peer_where == "joined"
@@ -200,22 +203,31 @@ local function on_tick(dt)
     if send_in <= 0 then
         send_in = 1.0 / cfg.phase1.send_hz
         perf.run("pose", sample, player)
-        if pose_line then seq = seq + 1; link.send(seq, pose_line) end
+        if pose_line then
+            seq = seq + 1
+            -- The car we're driving travels with the pose: same rate, same redundancy.
+            local car = vehicles.drive_line()
+            link.send(seq, pose_out:pack(seq, car and (pose_line .. "|" .. car) or pose_line))
+        end
     end
 
     local pseq, payload = link.poll()
     pseq = tonumber(pseq)
-    if pseq then
-        if pose_gaps.seq and pseq > pose_gaps.seq then pose_gaps.skipped = pose_gaps.skipped + (pseq - pose_gaps.seq - 1) end
-        if not pose_gaps.seq or pseq > pose_gaps.seq or pseq < pose_gaps.seq - 1000 then pose_gaps.seq = pseq end
-        pose_gaps.got = pose_gaps.got + 1
-    end
-    if payload then
-        local pose = parse(payload)
-        if pose then
-            local t = pose_clock:place(pose.sent, now)
-            if t or not pose.sent then remote:push(t or now, pose) end
-            last_rx = now; first_rx = first_rx or now; rx_count = rx_count + 1
+    if pseq and payload then
+        -- A big step back means the other game restarted its count; a small one is a late packet.
+        if pose_gaps.seq and pseq < pose_gaps.seq - 30 then pose_gaps.seq = nil end
+        for _, e in ipairs(posepack.unpack(pseq, payload, pose_gaps.seq)) do
+            if pose_gaps.seq then pose_gaps.skipped = pose_gaps.skipped + (e.seq - pose_gaps.seq - 1) end
+            pose_gaps.seq = e.seq
+            if e.live then pose_gaps.got = pose_gaps.got + 1 else pose_gaps.recovered = (pose_gaps.recovered or 0) + 1 end
+            local body, car = e.line:match("^([^|]*)|?(.*)$")
+            if car ~= "" then vehicles.drive_sample(car) end
+            local pose = parse(body)
+            if pose then
+                local t = pose_clock:place(pose.sent, now, not e.live)
+                if t or not pose.sent then remote:push(t or now, pose) end
+                last_rx = now; first_rx = first_rx or now; rx_count = rx_count + 1
+            end
         end
     end
     if not connected and now - last_rx < 1 then
@@ -309,7 +321,9 @@ local function on_tick(dt)
     end
 
     local fresh = now - last_rx < cfg.phase1.peer_timeout
-    local together = same_world()
+    -- The players can see each other a little before the arrival is confirmed (see session.where).
+    local together = same_world() or (role == "guest" and session.where() == "arriving")
+        or (role ~= "guest" and peer_where == "arriving")
     time_check_in = time_check_in - dt
     if my_dead and together and time_check_in <= 0 then
         time_check_in = 0.5
@@ -411,6 +425,7 @@ local function on_tick(dt)
     perf.run("drops", drops.tick, dt)
     perf.run("world", world.tick, dt)
     perf.run("doors", doors.tick, dt)
+    perf.run("infest", util.safe, infest.tick, "infest.tick", dt)
     perf.run("jobs", util.jobs_tick, 0.004)
     perf.run("power", util.safe, power.tick, "power.tick", dt)
     perf.run("audio", util.safe, audio.tick, "audio.tick", dt)
@@ -440,7 +455,7 @@ function phase1.connected() return now - last_rx < 15 end
 function phase1.can_switch()
     if not started then return true end
     if role == "guest" then return session.state() == "idle" end
-    return not (peer_where == "joined" or peer_where == "loading" or peer_where == "leaving")
+    return not (peer_where == "joined" or busy_where(peer_where))
 end
 
 local function reset_link_state()
@@ -452,6 +467,7 @@ local function reset_link_state()
     my_where, peer_where, guest_announced = nil, nil, false
     netq.reset()
     compat.reset()
+    pose_gaps.seq = nil
 end
 
 function phase1.peer_where() return peer_where end
@@ -498,6 +514,7 @@ function phase1.init(c, r, peer_id)
     drops.init(cfg, role, session)
     world.init(cfg, role, session, phase1.connected)
     doors.init(cfg, role, session, phase1.connected)
+    infest.init(cfg, role, session, same_world)
     power.init(cfg, role, session)
     audio.init(cfg, role, session, zombies, fire)
     loot.init(cfg, role, session)

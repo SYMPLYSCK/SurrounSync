@@ -81,10 +81,14 @@ local function saving(world)
     return busy
 end
 
+-- The ghost comes back once the save system has been idle for a moment (a save runs in two parts).
+local idle = 0.0
 function save_guard.tick(dt, world)
-    if not pending then return end
+    if not pending then idle = 0.0; return end
     since = since + dt
-    if since < cfg.save.respawn_delay or saving(world) then return end
+    if saving(world) then idle = 0.0; return end
+    idle = idle + dt
+    if since < cfg.save.respawn_delay or idle < 0.3 then return end
     pending = false
     log.info("save finished; respawning ghost where it stood")
     if on_respawn then on_respawn(saved_pose) end

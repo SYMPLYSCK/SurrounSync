@@ -24,8 +24,7 @@ local lasers_follow_aim
 local function path_of(obj)
     if not util.valid(obj) then return nil end
     local p
-    pcall(function() p = obj:GetPathName() end)
-    if not p then pcall(function() p = obj:GetFullName():match("^%S+ (.+)$") end) end
+    pcall(function() p = obj:GetFullName():match("^%S+ (.+)$") end)
     return p
 end
 
@@ -239,7 +238,7 @@ end
 
 local LASERS = { "BP_SmallTacticalLaserSightLocalAttachment_C", "BP_TacticalLaserLightComboLocalAttachment_C" }
 local laser_in, laser_fixed = 0.0, 0
-local LIST_EVERY = 5.0
+local LIST_EVERY = 20.0
 local laser_list, list_in, list_idx = {}, 0.0, 0
 
 fix_lasers = function(dt)

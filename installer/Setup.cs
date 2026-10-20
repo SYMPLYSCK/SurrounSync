@@ -226,8 +226,24 @@ namespace SurrounSyncSetup
                     EnableMod(mods, "PDS");
                     var paks = new List<string>();
                     string pakDir = Path.Combine(game, "SurrounDead", "Content", "Paks", "~mods");
+                    // A cooked pak only loads into the game build it was made for (or a newer one with the same engine):
+                    // anything else crashes the game with "package may be corrupt".
+                    string madeFor = PayloadText("made_for_build.txt"), have = Game.BuildId(game);
+                    long mf, hv;
+                    bool pakFits = Game.EngineOk(w64) &&
+                        !(long.TryParse(madeFor, out mf) && long.TryParse(have, out hv) && hv < mf);
+                    if (!pakFits)
+                    {
+                        string ours;
+                        if (rec.TryGetValue("paks", out ours))
+                            foreach (var n in ours.Split('|'))
+                                try { string f = Path.Combine(pakDir, n); if (File.Exists(f)) File.Delete(f); } catch { }
+                        rec.Remove("paks");
+                        Log("Skipped the blood pak: it is made for game build " + madeFor + " (Unreal " + Game.Engine +
+                            "), this game is build " + have + " (Unreal " + (Game.EngineOf(w64) ?? "?") + ").");
+                    }
                     foreach (var e in z.Entries)
-                        if (N(e).StartsWith("paks/") && N(e).EndsWith(".pak"))
+                        if (pakFits && N(e).StartsWith("paks/") && N(e).EndsWith(".pak"))
                         {
                             Directory.CreateDirectory(pakDir);
                             string to = Path.Combine(pakDir, e.Name);
@@ -586,6 +602,11 @@ namespace SurrounSyncSetup
                         "It usually works, but a game update can break parts of the mod.",
                         "If something doesn't work, check for a SurrounSync update (this window shows the newest release) and send a bug report.");
             }
+            if (!Game.EngineOk(w64))
+                add("problem", "Your SurrounDead program is an old version (Unreal " + Game.EngineOf(w64) + ") - SurrounSync needs the current game (Unreal " +
+                    Game.Engine + "). Mods won't start, and pak mods made for the current game crash it while loading.",
+                    "In Steam: right-click SurrounDead -> Properties -> Betas -> pick \"None\", then Installed Files -> Verify integrity of game files. " +
+                    "Then run this setup again (REPAIR).");
             if (Game.Running(game)) add("info", "SurrounDead is running.", "Close the game before you install, repair or uninstall.");
 
             if (File.Exists(Path.Combine(w64, "UE4SS.dll")))

@@ -70,7 +70,7 @@ local function fam_class(path)
     return nil
 end
 local function family_of(o)
-    if not o then return nil end
+    if not util.valid(o) then return nil end
     for _, f in ipairs(FAMILIES) do
         local c = fam_class(f[2])
         if c then
@@ -83,7 +83,7 @@ end
 local function is_zombie(o) return family_of(o) ~= nil end
 zombies.family_of = family_of
 local function ai_of(a)
-    if not a then return nil end
+    if not util.valid(a) then return nil end
     if family_of(a) then return a end
     for _, f in ipairs({ "GetOwner", "GetInstigator" }) do
         local o
@@ -123,7 +123,7 @@ local function all_zombies()
     return out
 end
 
-local ZLIST_FULL_EVERY, ZLIST_PRUNE_EVERY = 30.0, 0.0
+local ZLIST_FULL_EVERY, ZLIST_PRUNE_EVERY = 120.0, 0.0
 local zlist, zlist_at, zlist_pruned = {}, -100, -100
 local zlist_new, zlist_set, zlist_addr = {}, {}, {}
 local notify_on = false
@@ -195,10 +195,27 @@ end
 local function path_of(obj)
     if not util.valid(obj) then return nil end
     local p
-    pcall(function() p = obj:GetPathName() end)
-    if not p then pcall(function() p = obj:GetFullName():match("^%S+ (.+)$") end) end
+    pcall(function() p = obj:GetFullName():match("^%S+ (.+)$") end)
     return p
 end
+
+-- Montages are long-lived assets: their paths are cached by address.
+local asset_paths, asset_paths_n = {}, 0
+local function asset_path(obj)
+    local a = util.addr(obj)
+    if not a then return nil end
+    local p = asset_paths[a]
+    if p then return p end
+    p = path_of(obj)
+    if p then
+        if asset_paths_n > 512 then asset_paths, asset_paths_n = {}, 0 end
+        asset_paths[a], asset_paths_n = p, asset_paths_n + 1
+    end
+    return p
+end
+local far_until = setmetatable({}, { __mode = "k" })
+local znames = setmetatable({}, { __mode = "k" })
+local CLOSING_SPEED = 4000
 
 local cache = {}
 local missed, appeared = {}, {}
@@ -404,21 +421,29 @@ local function host_tick(dt)
     local alive = {}
     local radius = cfg.zombies.radius
     for _, z in ipairs(zombies_cached(now)) do
+        local skip_until = far_until[z]
         local l, is_dead = nil, false
-        pcall(function() l = z:K2_GetActorLocation() end)
-        if l and math.abs(l.X) < 1 and math.abs(l.Y) < 1 and math.abs(l.Z) < 1 then
-            is_dead = dead_of(z)
-            l = nil
-            if is_dead then pcall(function() l = z.Mesh:K2_GetComponentLocation() end) end
+        if not (skip_until and now < skip_until) then
+            pcall(function() l = z:K2_GetActorLocation() end)
+            if l and math.abs(l.X) < 1 and math.abs(l.Y) < 1 and math.abs(l.Z) < 1 then
+                is_dead = dead_of(z)
+                l = nil
+                if is_dead then pcall(function() l = z.Mesh:K2_GetComponentLocation() end) end
+            end
         end
-        if l and util.dist(gl, l) <= radius then
+        local d = l and util.dist(gl, l)
+        if d and d > radius then far_until[z] = now + math.min(2.0, (d - radius) / CLOSING_SPEED) end
+        if d and d <= radius then
             local gone = not util.valid(z)
             if not gone then pcall(function() gone = z.bHidden == true end) end
             if not gone then pcall(function() gone = z:IsActorBeingDestroyed() == true end) end
             if not gone then
-                local a
-                pcall(function() a = z:GetFName():ToString() end)
-                a = a or tostring(util.addr(z))
+                local a = znames[z]
+                if not a then
+                    pcall(function() a = z:GetFName():ToString() end)
+                    a = a or tostring(util.addr(z))
+                    znames[z] = a
+                end
                 local id = ids[a]
                 if not id then next_id = next_id + 1; id = next_id; ids[a] = id end
                 by_id[id] = z
@@ -451,7 +476,7 @@ local function host_tick(dt)
                 end
                 lines[#lines + 1] = string.format("Z %d %d %d %d %.1f %.1f %.1f %.1f %.1f %.1f %.1f %d %.2f %d",
                     id, idx(st.cls), idx(st.mesh), idx(st.mat),
-                    l.X, l.Y, l.Z, yaw, v.X, v.Y, v.Z, idx(path_of(mont)), mpos or 0, dead and 1 or 0)
+                    l.X, l.Y, l.Z, yaw, v.X, v.Y, v.Z, idx(mont and asset_path(mont)), mpos or 0, dead and 1 or 0)
                 if st.look then
                     local parts = {}
                     for _, k in ipairs(LOOK_KEYS) do parts[#parts + 1] = tostring(idx(st.look[k])) end
@@ -742,7 +767,7 @@ local function suppress_natives()
     native_in = native_in - 2.0
     local n_z = 0
     local sweep = native_in <= 0 and not spawners_scanned
-    if sweep then native_in = 6.0 end
+    if sweep then native_in = 2.0 end
     for _, z in ipairs(sweep and zombies_cached(now) or {}) do
         util.pause()
         local a = util.addr(z) or 0
@@ -1293,9 +1318,10 @@ end
 
 local SAI = "/Game/SmartAI/Blueprints/AI/Components/BP_SmartAIComponent.BP_SmartAIComponent_C"
 local function fx_id(comp_param)
-    local comp, owner, id
-    pcall(function() comp = comp_param:get() end)
+    local comp, owner, id = util.obj(comp_param), nil, nil
+    if not comp then return nil end
     pcall(function() owner = comp:GetOwner() end)
+    if not util.valid(owner) then return nil end
     pcall(function() id = ids[owner:GetFName():ToString()] end)
     return id
 end
@@ -1388,13 +1414,12 @@ function zombies.init(c, r, s)
     game.keybind("F12", { ModifierKey.CONTROL }, function() want_steamtest = true end)
     if not cfg.zombies.enabled then return end
     game.player_hook("ReceiveAnyDamage", function(self, Damage, DamageType, InstigatedBy, DamageCauser)
-        local causer
-        pcall(function() causer = DamageCauser:get() end)
+        local causer = util.obj(DamageCauser)
         local ai = (role == "host") and causer and ai_of(causer) or nil
         if role == "host" and ai and ghost.is(self:get()) then
             local amt, cls, id, l = 0, "-", -1, { X = 0, Y = 0, Z = 0 }
             pcall(function() amt = Damage:get() end)
-            pcall(function() cls = path_of(DamageType:get():GetClass()) or "-" end)
+            cls = util.class_path(util.obj(DamageType)) or "-"
             pcall(function() id = ids[ai:GetFName():ToString()] or -1 end)
             pcall(function() l = ai:K2_GetActorLocation() end)
             local fam = family_of(ai)
@@ -1411,7 +1436,7 @@ function zombies.init(c, r, s)
             for _, f in ipairs({ "GetOwner", "GetInstigator" }) do
                 local o
                 pcall(function() o = causer[f](causer) end)
-                if o and zombies.is_copy(o) then from_copy = true end
+                if zombies.is_copy(o) then from_copy = true end
             end
         end
         if from_copy then
@@ -1429,11 +1454,11 @@ function zombies.init(c, r, s)
             local id
             pcall(function() id = ids[owner:GetFName():ToString()] end)
             if not id then return end
-            pcall(function() causer = DmgCauser:get() end)
+            causer = util.obj(DmgCauser)
             if causer and ghost.is(causer) then return end
             local amt, cls = 0, "-"
             pcall(function() amt = DmgAmount:get() end)
-            pcall(function() cls = path_of(DmgType:get():GetClass()) or "-" end)
+            cls = util.class_path(util.obj(DmgType)) or "-"
             if amt > 0 then
                 zhits:send(string.format("%d %.3f %s", id, amt, cls))
                 zhit_stats.sent = zhit_stats.sent + 1
@@ -1443,13 +1468,11 @@ function zombies.init(c, r, s)
         install_host_hooks = function() util.ensure_hook(DC .. ":DamageTaken", on_host_damage) end
         local function zinfo(actor_param, ctx_param)
             if role ~= "host" then return nil end
-            local target
-            pcall(function() target = actor_param:get() end)
+            local target = util.obj(actor_param)
             if not (target and ghost.is(target)) then return nil end
             local gl, best, bd = ghost.location(), nil, math.huge
-            local ctx
-            pcall(function() ctx = ctx_param:get() end)
-            if ctx and util.valid(ctx) and is_zombie(ctx) then best, bd = ctx, 0 end
+            local ctx = util.obj(ctx_param)
+            if ctx and is_zombie(ctx) then best, bd = ctx, 0 end
             for _, zz in ipairs(best and {} or zombies_cached(now)) do
                 local l
                 pcall(function() l = zz:K2_GetActorLocation() end)
@@ -1488,9 +1511,7 @@ function zombies.init(c, r, s)
         end)
     else
         local function from_copy(actor_param, ctx_param)
-            local target, ctx
-            pcall(function() target = actor_param:get() end)
-            pcall(function() ctx = ctx_param:get() end)
+            local target, ctx = util.obj(actor_param), util.obj(ctx_param)
             if not (target and ctx and zombies.is_copy(ctx)) then return false end
             local p = game.player()
             return p ~= nil and util.addr(target) == util.addr(p)
@@ -1520,12 +1541,11 @@ function zombies.init(c, r, s)
     }
     local function on_any_damage(self, Damage, DamageType, InstigatedBy, DamageCauser)
         if killing then return end
-        local z, causer, amt, tp = nil, nil, 0, "-"
-        pcall(function() z = self:get() end)
+        local z, amt = util.obj(self), 0
         if not z then return end
-        pcall(function() causer = DamageCauser:get() end)
+        local causer = util.obj(DamageCauser)
         pcall(function() amt = Damage:get() end)
-        pcall(function() tp = path_of(DamageType:get()) or "-" end)
+        local tp = path_of(util.obj(DamageType)) or "-"
         if not (amt and amt > 0) then return end
         if role == "guest" then
             local id = copy_addr[util.addr(z) or 0]
@@ -1536,8 +1556,7 @@ function zombies.init(c, r, s)
             local id
             pcall(function() id = ids[z:GetFName():ToString()] end)
             if not id or (causer and ghost.is(causer)) then return end
-            local cls = "-"
-            pcall(function() cls = path_of(DamageType:get():GetClass()) or "-" end)
+            local cls = util.class_path(util.obj(DamageType)) or "-"
             zhits:send(string.format("%d %.3f %s", id, amt, cls))
             zhit_stats.sent = zhit_stats.sent + 1
         end
@@ -1549,6 +1568,13 @@ function zombies.init(c, r, s)
     install_host_hooks = function() old_host_hooks(); install_rad(); install_fx_hooks() end
     if role == "guest" then
         local DC = "/Game/Blueprints/Components/DamageComponent.DamageComponent_C"
+        local body_cdo
+        local function body_type()
+            if not util.valid(body_cdo) then
+                body_cdo = StaticFindObject("/Game/Blueprints/Other/Damage/Damage_Body.Default__Damage_Body_C")
+            end
+            return util.valid(body_cdo) and body_cdo or nil
+        end
         local function copy_id(self)
             local owner
             pcall(function() owner = self:get():GetOwner() end)
@@ -1560,19 +1586,18 @@ function zombies.init(c, r, s)
             if not id then return end
             if replaying then
                 pcall(function() DmgAmount:set(0) end)
-                local body = StaticFindObject("/Game/Blueprints/Other/Damage/Damage_Body.Default__Damage_Body_C")
-                if util.valid(body) then pcall(function() DmgType:set(body) end) end
+                local body = body_type()
+                if body then pcall(function() DmgType:set(body) end) end
                 return
             end
-            local causer
-            pcall(function() causer = DmgCauser:get() end)
+            local causer = util.obj(DmgCauser)
             if causer and zombies.is_copy(causer) then pcall(function() DmgAmount:set(0) end); return end
-            local amt, tp = 0, "-"
+            local amt = 0
             pcall(function() amt = DmgAmount:get() end)
-            pcall(function() tp = path_of(DmgType:get()) or "-" end)
+            local tp = path_of(util.obj(DmgType)) or "-"
             pcall(function() DmgAmount:set(0) end)
-            local body = StaticFindObject("/Game/Blueprints/Other/Damage/Damage_Body.Default__Damage_Body_C")
-            if util.valid(body) then pcall(function() DmgType:set(body) end) end
+            local body = body_type()
+            if body then pcall(function() DmgType:set(body) end) end
             if amt > 0 then hits:send(string.format("D %d %.3f 0 %s", id, amt, tp)) end
         end
         local function on_fire_damage(self, DmgAmount)
