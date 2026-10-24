@@ -29,8 +29,9 @@ function ghost.get()
 end
 
 -- The world it stood in is gone: forget it without touching it.
+local aio_sub = nil
 function ghost.forget()
-    actor, addr, view, kind = nil, nil, nil, nil
+    actor, addr, view, kind, aio_sub = nil, nil, nil, nil, nil
     generation = generation + 1
 end
 
@@ -63,8 +64,17 @@ local function contain(g)
 end
 
 function ghost.optimizer()
+    if util.valid(aio_sub) then return aio_sub end
     local sub = FindFirstOf("AIOptimizerSubsystem")
-    return util.valid(sub) and sub or nil
+    aio_sub = util.valid(sub) and sub or nil
+    return aio_sub
+end
+
+-- How many AI the AI optimizer has spawned in this game right now (-1 = unknown).
+function ghost.ai_count()
+    local sub, n = ghost.optimizer(), -1
+    if sub then pcall(function() n = sub.SpawnedSubjects:GetArrayNum() end) end
+    return n
 end
 
 function ghost.invoker_index()
@@ -73,6 +83,23 @@ function ghost.invoker_index()
     local idx = -1
     pcall(function() idx = sub:GetInvokerIndex(g.AIOInvoker) end)
     return idx
+end
+
+-- P8 load split (host): out of the optimizer, the ghost no longer keeps AI alive or spawning around the
+-- guest (the host's game despawns them as if nobody were there); back in on a merge. Returns the index after.
+function ghost.set_invoker(on)
+    local g, sub = ghost.get(), ghost.optimizer()
+    if not (g and sub) then return -1 end
+    local idx = ghost.invoker_index()
+    if on and idx < 0 then
+        local ok = false
+        pcall(function() ok = sub:RegisterInvoker(g.AIOInvoker) end)
+        if ok then we_registered_invoker = true end
+    elseif not on and idx >= 0 then
+        pcall(function() sub:UnregisterInvoker(g.AIOInvoker) end)
+        we_registered_invoker = false
+    end
+    return ghost.invoker_index()
 end
 
 local function ensure_invoker()

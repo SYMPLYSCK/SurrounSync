@@ -14,6 +14,8 @@ hostrules.LIST = {
     { key = "pvp", label = "PVP", hint = "Players can hurt each other.", default = false },
     { key = "itemclean", label = "ITEM CLEANUP", hint = "Items dropped on the ground vanish after 20 minutes (death bags stay).",
       default = false },
+    { key = "loadsplit", label = "LOAD SPLITTING (EXPERIMENTAL)", hint = "When you're far apart, your friend's PC runs the zombies around them instead of yours.",
+      default = false },
 }
 
 local mine = {}

@@ -20,11 +20,13 @@ local MENU = "/Game/JigSInventory/Jigsaw/Widgets/JContextMenu/JigContextMenuComp
 local JIG_COMP = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
 local BACKPACKS = "/Equipment/Backpacks/"
 local WHITE = { R = 1, G = 1, B = 1, A = 1 }
+local BLACK = { R = 0, G = 0, B = 0, A = 1 }
 
 local store, count, loaded = {}, 0, false
 local menu = nil      -- { uid, canvas, w, btn, bg }: our RENAME row while the game's right-click menu is open
 local popup = nil     -- { w, box, save, clear, cancel, uid }
 local clicks = {}
+local where = {}      -- named item uid -> { holder, slot, cell, da }: where it last sat (see names.moved)
 
 local function clean(s)
     s = tostring(s or ""):gsub("[%c|;,%%]", " "):gsub("^%s+", ""):gsub("%s+$", "")
@@ -69,9 +71,82 @@ function names.set(uid, name, quiet)
         count = count + 1
     elseif not name then count = count - 1 end
     store[uid] = name
+    if not name then where[uid] = nil end
     save_file()
     if not quiet then log.info("names: " .. uid .. " -> " .. tostring(name)) end
     return true
+end
+
+-- The game gives an item - and everything inside it - brand-new UIDs whenever it comes out of a container
+-- (BP_JigComponent RemoveGetInfo: every drop and every move to another inventory/container), so a name kept
+-- under the old UID would be lost. where[uid] (top of the file) remembers where each named item last sat (the
+-- UID of the item holding it, its compartment and cell) so names inside a moved backpack can follow too.
+
+-- note where the named items in comp sit (cheap when nothing is named)
+function names.note(comp)
+    if not loaded then load_file() end
+    if count == 0 or not util.valid(comp) then return end
+    for _, h in ipairs(require("mirror.jig").contents_of(comp)) do
+        if store[h.uid] then where[h.uid] = { holder = h.holder, slot = h.slot, cell = h.cell, da = h.da } end
+    end
+end
+
+-- old -> new: an item got new UIDs; comp holds its contents now (the dropped pickup, or the inventory it went to)
+function names.moved(old, new, comp)
+    if not loaded then load_file() end
+    if count == 0 or not old or not new or old == new then return end
+    local list = nil
+    local changed = false
+    local function carry(o, n, depth)
+        if store[o] and not store[n] then
+            store[n], store[o] = store[o], nil
+            where[n], where[o] = where[o], nil
+            changed = true
+            log.info("names: " .. o .. " got a new UID " .. n .. " - name \"" .. store[n] .. "\" kept")
+        end
+        if depth > 6 then return end
+        local kids = {}
+        for uid, w in pairs(where) do if w.holder == o then kids[#kids + 1] = uid end end
+        if #kids == 0 then return end
+        list = list or (util.valid(comp) and require("mirror.jig").contents_of(comp)) or {}
+        for _, k in ipairs(kids) do
+            local w, hit, same_da, n_da = where[k], nil, nil, 0
+            for _, h in ipairs(list) do
+                if h.holder == n and h.da == w.da then
+                    n_da = n_da + 1
+                    same_da = h
+                    if h.slot == w.slot and h.cell == w.cell then hit = h end
+                end
+            end
+            hit = hit or (n_da == 1 and same_da) or nil
+            if hit then
+                w.holder = n
+                carry(k, hit.uid, depth + 1)
+            end
+        end
+    end
+    carry(old, new, 0)
+    if changed then save_file() end
+end
+
+-- Handle Comp to Comp Move ran (UE4SS calls this after it): the item now sits in To at ToContainer/ToIndex
+local function on_comp_move(From, To, ItemUID, ToIndex, ToContainer)
+    if count == 0 then return end
+    local old, dest, cell
+    pcall(function() old = string.format("%d_%d_%d_%d", ItemUID.A, ItemUID.B, ItemUID.C, ItemUID.D) end)
+    local kids = false
+    for _, w in pairs(where) do if w.holder == old then kids = true; break end end
+    if not (old and (store[old] or kids)) then return end
+    pcall(function() dest = string.format("%d_%d_%d_%d", ToContainer.A, ToContainer.B, ToContainer.C, ToContainer.D) end)
+    pcall(function() cell = ToIndex end)
+    if not (old and dest and util.valid(To)) then return end
+    for _, h in ipairs(require("mirror.jig").contents_of(To)) do
+        if h.mother == dest and h.cell == cell then
+            if h.uid ~= old then names.moved(old, h.uid, To) end
+            if store[h.uid] then where[h.uid] = { holder = h.holder, slot = h.slot, cell = h.cell, da = h.da } end
+            return
+        end
+    end
 end
 
 -- For item lists and event lines: a name as one field without , ; | or spaces
@@ -179,6 +254,13 @@ local function open_box(o)
     local font = o.font
     vb:AddChildToVerticalBox(label(tree, o.title, font, 20))
     local box = new(o.multiline and "MultiLineEditableTextBox" or "EditableTextBox", tree)
+    -- black text on the light box, typing or not (the default focused/unfocused colours are a pale grey),
+    -- like the handbook's own input boxes; set before the box is first drawn
+    local ink = { SpecifiedColor = BLACK, ColorUseRule = 0 }
+    pcall(function() box.WidgetStyle.ForegroundColor = ink end)
+    pcall(function() box.WidgetStyle.FocusedForegroundColor = ink end)
+    pcall(function() box.WidgetStyle.TextStyle.ColorAndOpacity = ink end)
+    pcall(function() box:SetForegroundColor(BLACK) end)
     pcall(function() box:SetText(FText(o.text or "")) end)
     pcall(function() box:SetHintText(FText(o.hint or "")) end)
     pcall(function() box.MinimumDesiredWidth = o.multiline and 520 or 320 end)
@@ -214,6 +296,9 @@ local function open_popup(uid, font)
     if not open_box({ title = "NAME THIS BACKPACK", text = names.get(uid), hint = "e.g. Med kit bag", font = font,
                       done = function(name)
                           names.set(uid, name)
+                          local comp
+                          pcall(function() comp = game.player().BP_JigComponent end)
+                          util.safe(names.note, "names.note", comp)
                           name = names.get(uid)
                           notify.show(name and ("Backpack named \"" .. name .. "\".") or "Backpack name cleared.", "good")
                       end }) then return end
@@ -348,6 +433,7 @@ end
 local pending_menu = nil   -- the JigContextMenuComp that just got a right-click
 local function on_right_click(self) pending_menu = self end
 
+local noted_at = -100.0
 local hovered = nil   -- { tip = the tooltip widget, uid }: my backpack under the mouse (F2 renames it)
 -- the hint goes at the end of the small description text, not next to the name
 local HINT = "(F2: rename)"
@@ -360,6 +446,13 @@ local function on_tooltip(self)
     if name then pcall(function() self.NameText:SetText(FText(name)) end) end
     if uid and is_backpack(item) and mine(uid) then
         hovered = { tip = self, uid = uid }
+        if count > 0 and os.clock() - noted_at > 2.0 then
+            noted_at = os.clock()
+            local p = game.player()
+            local comp
+            pcall(function() comp = p.BP_JigComponent end)
+            names.note(comp)
+        end
         pcall(function()
             local d = self.descr:GetText():ToString() or ""
             if not d:find(HINT, 1, true) then self.descr:SetText(FText(d == "" and HINT or (d .. "\n" .. HINT))) end
@@ -382,6 +475,10 @@ end
 -- the inventory widgets load the first time the inventory opens: keep asking until both hooks took
 local hook_in = 0.0
 local tooltip_fn = function(self) util.safe(on_tooltip, "names.tooltip", self:get()) end
+local move_fn = function(self, From, To, ItemUID, FinalRotation, ToIndex, ToContainer)
+    util.safe(function() on_comp_move(From:get(), To:get(), ItemUID:get(), ToIndex:get(), ToContainer:get()) end, "names.move")
+end
+local COMP_MOVE = JIG_COMP .. ":Handle Comp to Comp Move"
 local menu_fn = function(self) util.safe(on_right_click, "names.menu", self:get()) end
 
 function names.init()
@@ -395,6 +492,7 @@ function names.tick(dt)
     if hook_in <= 0 then
         hook_in = 1.0
         util.ensure_hook(TOOLTIP, tooltip_fn)
+        util.ensure_hook(COMP_MOVE, move_fn)
     end
     if pending_menu then
         local comp = pending_menu
@@ -410,7 +508,7 @@ function names.tick(dt)
 end
 
 names._open = function(uid) open_popup(uid) end  -- devtest
-function names.forget() close_menu(); pending_menu, clicks, hovered = nil, {}, nil; close_popup() end
+function names.forget() close_menu(); pending_menu, clicks, hovered, where = nil, {}, nil, {}; close_popup() end
 game.on_world_reset(names.forget)
 
 return names

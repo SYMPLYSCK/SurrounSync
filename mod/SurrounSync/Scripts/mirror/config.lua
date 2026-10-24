@@ -48,6 +48,24 @@ local config = {
         offscreen_anim = true,       -- copies past 40 m skip their pose while not drawn (false = always animate)
         dmg_reach = 350,             -- a hit from further away than this counts as dodged
         area_reach = 1000,           -- same for radiation clouds / blasts
+        -- P8 load split (host setting LOAD SPLITTING, off by default): far apart, the guest's game runs
+        -- the AI around the guest instead of the host's (mirror/split.lua). Distances in cm.
+        split = {
+            split_radius = 40000,    -- players further apart than this ...
+            split_after = 10.0,      -- ... for this many seconds -> split
+            merge_radius = 30000,    -- closer than this -> merge (once the guest isn't fighting)
+            force_radius = 20000,    -- closer than this -> merge even mid-fight
+            quiet_radius = 6000,     -- no split while a host AI (or body) is this close to the guest
+            ack_timeout = 10.0,      -- the guest must take over within this, else stay merged
+            retry_after = 30.0,      -- after a failed or blocked attempt
+            horde_radius = 25000,    -- an active horde beacon this close to the guest blocks / ends a split
+            nest_hit_s = 90.0,       -- a guest hit on an infestation this recent blocks / ends a split
+            drain_radius = 6000,     -- guest: own AI this close at a merge are kept until done ...
+            drain_s = 90.0,          -- ... at most this long
+            corpse_radius = 15000,   -- own bodies this close are kept for looting ...
+            corpse_s = 300.0,        -- ... this long
+            host_near = 12000,       -- ... unless the host comes this close to them
+        },
     },
 
     transport = "steam",             -- "file" = two games on one PC (testing)

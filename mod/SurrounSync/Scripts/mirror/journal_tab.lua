@@ -278,10 +278,12 @@ local function build_content(page, qtree, qpage)
     u.chat_row = cr
     u.chat_lines = {}
     for i = 1, 3 do local t = text("", 16, BLACK, LIST_WIDTH); vadd(u.friends_box, t, 1); u.chat_lines[i] = t end
-    u.tp_row = new("HorizontalBox", S.tree, "TeleportRow"); vadd(u.friends_box, u.tp_row, 6)
-    u.tp_name = text("", 18); hadd(u.tp_row, u.tp_name)
-    u.tp_accept = button("ACCEPT", 20); hadd(u.tp_row, u.tp_accept, 14)
-    u.tp_decline = button("DECLINE", 20); hadd(u.tp_row, u.tp_decline, 10)
+    -- the request text wraps on its own line (a long name ran past the page), the buttons go under it
+    u.tp_row = new("VerticalBox", S.tree, "TeleportRow"); vadd(u.friends_box, u.tp_row, 6)
+    u.tp_name = text("", 18, BLACK, LIST_WIDTH); vadd(u.tp_row, u.tp_name)
+    local tb = new("HorizontalBox", S.tree, "TeleportButtons"); vadd(u.tp_row, tb, 2)
+    u.tp_accept = button("ACCEPT", 20); hadd(tb, u.tp_accept)
+    u.tp_decline = button("DECLINE", 20); hadd(tb, u.tp_decline, 10)
 
     local helpers = {
         new = function(cls, _tree) return new(cls, S.tree, "B" .. cls) end,

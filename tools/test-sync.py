@@ -296,6 +296,9 @@ def vehicles_keep_this_worlds_fuel():
             return obj({ VehicleColor = 0, Colors = {}, Mesh = { SetMaterial = function() end }, ["EngineOn?"] = health > 0,
                          FuelComponent = { CurrentFuel = fuel, MaxFuel = 100, Empty = fuel <= 0 },
                          VehicleHealthComponent = { CurrentHealth = health, MaxHealth = 100 },
+                         FuelWidget = { GetUserWidgetObject = function() return { UpdateFuel = function(_, f) SHOWN_FUEL = f end } end },
+                         RepairWidget = { GetUserWidgetObject = function() return { UpdateHealth = function(_, h) SHOWN_HEALTH = h end } end },
+                         Svr_UpdateFuel = function(_, f) HUD_FUEL = f end, Svr_UpdateEngine = function(_, h) HUD_HEALTH = h end,
                          K2_GetActorLocation = function() return { X = 100, Y = 0, Z = 0 } end,
                          K2_GetActorRotation = function() return { Pitch = 0, Yaw = 0, Roll = 0 } end,
                          K2_SetActorLocationAndRotation = function() end, VehicleEngineFX = function() end,
@@ -323,6 +326,9 @@ def vehicles_keep_this_worlds_fuel():
           "a refuel from the other game clears the empty flag")
     check(L.eval('B.VehicleHealthComponent.CurrentHealth') == 50 and L.eval('B["EngineOn?"]') is True,
           "a repair from the other game turns a wreck's engine back on")
+    check(L.eval('SHOWN_FUEL') == 50 and L.eval('SHOWN_HEALTH') == 50,
+          "the car's own fuel and repair widgets show the other player's refuel/repair at once")
+    check(L.eval('HUD_FUEL') == 50 and L.eval('HUD_HEALTH') == 50, "the HUD stats of the car next to me are refreshed too")
     L.execute('blobs_out.carstate = nil; for i = 1, 30 do vehicles.tick(0.1) end')
     check(L.eval('blobs_out.carstate') is None, "applied state is not echoed back")
     L.execute('A.FuelComponent.CurrentFuel = 97.5; for i = 1, 30 do vehicles.tick(0.1) end')
@@ -455,6 +461,178 @@ def zombie_copies_take_the_hosts_look():
     check(L.eval('C.Mesh.mat == MAT'), "eyes the host's doesn't show are turned off")
 
 
+def nests_keep_real_health():
+    print("nests_keep_real_health")
+    def setup(role):
+        L = lua()
+        L.execute(FAKES + r"""
+            local role = ...
+            NOW = 0
+            HOOKS, TIMERS, KILLS = {}, {}, {}
+            SENT, INBOX = {}, {}
+            package.loaded["mirror.events"] = { new = function(name)
+                return { send = function(self, p) SENT[#SENT + 1] = p end,
+                         pump = function(self, fn) local q = INBOX; INBOX = {}; for _, p in ipairs(q) do fn(p) end end } end }
+            GHOST = obj({})
+            package.loaded["mirror.ghost"] = { get = function() return GHOST end, location = function() return nil end }
+            PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end })
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+                                              on_tick = function() end }
+            TEMPLATE = { StandardHealthValue = 2000, MaxHealth = 3000 }
+            StaticFindObject = function(p) if p:find(":DamageComponent_GEN_VARIABLE", 1, true) then return obj(TEMPLATE) end return obj({}) end
+            util = require("mirror.util")
+            util.ensure_hook = function(p, fn) HOOKS[p:match(":(.+)$")] = fn; return true end
+            local ksl = obj({ K2_SetTimer = function(self, o, fname) TIMERS[#TIMERS + 1] = fname end,
+                              GetConsoleVariableFloatValue = function(self, n) if n == "Difficulty.InfestationsHealth" then return 1.5 end return 0 end,
+                              IsValid = function() return true end })
+            util.cdo = function() return ksl end
+            function nest(x, std, cur, max)
+                local n = obj({ ["IsDestroyed?"] = false, ["PrimaryInfestation?"] = false, ["CanDamagePrimary?"] = true,
+                                DamageComponent = { StandardHealthValue = std, CurrentHealth = cur, MaxHealth = max },
+                                K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end })
+                n.GetClass = function() return obj({ GetFullName = function() return "BlueprintGeneratedClass /Game/Infestation/BP_Infestation.BP_Infestation_C" end }) end
+                n.Damage_Object = function(self, amt) KILLS[#KILLS + 1] = amt
+                    self.DamageComponent.CurrentHealth = self.DamageComponent.CurrentHealth - amt
+                    if self.DamageComponent.CurrentHealth <= 0 then self["IsDestroyed?"] = true end end
+                n.Event_OnDestroyed = function(self) self["IsDestroyed?"] = true end
+                return n
+            end
+            A = nest(0, 3000, 3000, 3000)
+            BAD = nest(5000, 1500000, 750000, 3000)
+            util.instances = function(cls) if cls == "BP_Infestation_C" then return { A, BAD }, true end return {}, true end
+            infest = require("mirror.infest")
+            infest.init({}, role, {}, function() return true end)
+            for i = 1, 10 do infest.tick(0.1) end
+            function dc(n) return n.DamageComponent end
+            function hook(name, self, ...) local args = { ... }
+                local w = {}; for i, v in ipairs(args) do w[i] = { get = function() return v end } end
+                HOOKS[name]({ get = function() return self end }, table.unpack(w)) end
+        """, role)
+        return L
+    L = setup("host")
+    check(L.eval("dc(A).StandardHealthValue") == 3000 and L.eval("dc(A).CurrentHealth") == 3000,
+          "host: nests keep their real health (no million-point pin)")
+    check(L.eval("dc(BAD).StandardHealthValue") == 3000 and L.eval("dc(BAD).CurrentHealth") == 1500,
+          "a nest saved with a pinned million-point health gets its real health back (game defaults x difficulty, same %)")
+    L.execute('INBOX = { "' + "BP_Infestation_C@0,0,0" + ' 500" }; infest.tick(0.1)')
+    check(L.eval("dc(A).CurrentHealth") == 2500 and L.eval("#TIMERS") == 0 and L.eval("#KILLS") == 0,
+          "host: a guest hit lowers the real health, no waves above 2/3")
+    L.execute('INBOX = { "BP_Infestation_C@0,0,0 600" }; infest.tick(0.1)')
+    check(L.eval("dc(A).CurrentHealth") == 1900 and L.eval("#TIMERS") == 1 and L.eval("TIMERS[1]") == "SpawnWave",
+          "host: a guest hit below 2/3 starts the waves once, from a timer")
+    check(L.eval("dc(A).MaxHealth") == 0, "host: the nest's own 2/3 check is closed so a later hit can't start a second wave chain")
+    L.execute('hook("ActorPreSave", A)')
+    check(L.eval("dc(A).MaxHealth") == 3000 and L.eval("dc(A).StandardHealthValue") == 3000, "saving writes the real values")
+    L.execute('hook("ActorSaved", A)')
+    check(L.eval("dc(A).MaxHealth") == 0, "after the save the wave guard is back")
+    L.execute('INBOX = { "BP_Infestation_C@0,0,0 300" }; infest.tick(0.1)')
+    check(L.eval("#TIMERS") == 1, "no second wave chain")
+    L.execute("NOW = 2; infest.tick(1.1)")
+    st = L.eval("blobs_out.nests") or ""
+    check("BP_Infestation_C@0,0,0 0 1600.0 3000.0" in st, "host state carries the real health numbers")
+    L.execute('INBOX = { "BP_Infestation_C@0,0,0 5000" }; infest.tick(0.1)')
+    check(L.eval("A['IsDestroyed?']") is True and L.eval("KILLS[1]") == 1.0, "host: a lethal guest hit runs the nest's own death")
+    L.execute('hook("Damage_Object", BAD, 100.0, PLAYER, nil)')
+    check(L.eval("dc(BAD).CurrentHealth") == 1500, "host: the host's own hits stay the game's (nothing re-applied)")
+
+    H = setup("host")
+    H.execute('dc(A).CurrentHealth = 1800; INBOX = { "BP_Infestation_C@0,0,0 100" }; infest.tick(0.1)')
+    check(H.eval("#TIMERS") == 0 and H.eval("dc(A).CurrentHealth") == 1700,
+          "host: a nest already under 2/3 (its waves already ran or wait for the game's own check) gets no second chain")
+    H.execute(r"""
+        LATE = nest(9000, 3000, 3000, 3000)
+        LATE.GetClass = function() return obj({ GetFullName = function() return "BlueprintGeneratedClass /Game/Infestation/BP_Infestation_Wall.BP_Infestation_Wall_C" end,
+                                                GetFName = function() return { ToString = function() return "BP_Infestation_Wall_C" end } end }) end
+    """)
+    G2 = setup("guest")
+    G2.execute(r"""
+        LATE = nest(9000, 3000, 3000, 3000)
+        LATE.GetClass = function() return obj({ GetFullName = function() return "BlueprintGeneratedClass /Game/Infestation/BP_Infestation_Wall.BP_Infestation_Wall_C" end,
+                                                GetFName = function() return { ToString = function() return "BP_Infestation_Wall_C" end } end }) end
+        hook("Damage_Object", LATE, 50.0, PLAYER, nil)
+    """)
+    check(G2.eval("SENT[#SENT]") == "BP_Infestation_Wall_C@900,0,0 50.000" and G2.eval("dc(LATE).MaxHealth") == 0,
+          "guest: a hit on a nest the scan hasn't reached yet still goes to the host (and the copy can't start waves)")
+
+    G = setup("guest")
+    check(G.eval("dc(A).StandardHealthValue") == 3000 and G.eval("dc(A).MaxHealth") == 0,
+          "guest: copies show real health and can't start waves of their own")
+    G.execute('blobs_in.nests = "BP_Infestation_C@0,0,0 0 1234.0 3000.0"; infest.tick(0.1)')
+    check(G.eval("dc(A).CurrentHealth") == 1234 and G.eval("dc(A).StandardHealthValue") == 3000,
+          "guest: the copy shows the host's exact health")
+    G.execute('dc(A).CurrentHealth = 1134; hook("Damage_Object", A, 100.0, PLAYER, nil)')
+    check(G.eval("SENT[#SENT]") == "BP_Infestation_C@0,0,0 100.000", "guest: its hit goes to the host")
+    G.execute('blobs_in.nests = "BP_Infestation_C@0,0,0 1 0.0 3000.0"; infest.tick(0.1)')
+    check(G.eval("A['IsDestroyed?']") is True, "guest: a nest destroyed on the host is destroyed here")
+
+
+def horde_beacon_runs_only_on_the_host():
+    print("horde_beacon_runs_only_on_the_host")
+    def setup(role):
+        L = lua()
+        L.execute(FAKES + r"""
+            local role = ...
+            HOOKS, SENT, INBOX, DISH, NOTES = {}, {}, {}, {}, {}
+            package.loaded["mirror.events"] = { new = function(name)
+                return { send = function(self, p) SENT[#SENT + 1] = p end,
+                         pump = function(self, fn) local q = INBOX; INBOX = {}; for _, p in ipairs(q) do fn(p) end end } end }
+            package.loaded["mirror.ghost"] = { get = function() return nil end, location = function() return nil end }
+            PLAYER = obj({ CreateNotificationUI = function(self, t) NOTES[#NOTES + 1] = t end })
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end }
+            FText = function(s) return s end
+            util = require("mirror.util")
+            util.ensure_hook = function(p, fn) HOOKS[p:match(":(.+)$")] = fn; return true end
+            B = obj({ ["HordeStarted?"] = false, ["CanStopHorde?"] = false, STARTS = 0, STOPS = 0,
+                      K2_GetActorLocation = function() return { X = 100, Y = 0, Z = 0 } end })
+            B.GetClass = function() return cls("Buildable_HordeBeacon_C") end
+            B.Event_StartHorde = function(self) self.STARTS = self.STARTS + 1; self["HordeStarted?"] = true; self["CanStopHorde?"] = true end
+            B.Event_StopHorde = function(self) self.STOPS = self.STOPS + 1; self["HordeStarted?"] = false end
+            B.Event_DishMovement = function(self, on) DISH[#DISH + 1] = on end
+            util.find_by_id = function(id) if id == "Buildable_HordeBeacon_C@10,0,0" then return B end end
+            horde = require("mirror.horde")
+            horde.init({}, role, { in_world = function() return true end }, function() return true end)
+            horde.tick(0.1)
+            function hook(name, self, ...) local w, n = {}, select("#", ...)
+                for i = 1, n do local v = select(i, ...); w[i] = { get = function() return v end } end
+                HOOKS[name]({ get = function() return self end }, table.unpack(w, 1, n)) end
+        """, role)
+        return L
+    ID = "Buildable_HordeBeacon_C@10,0,0"
+    H = setup("host")
+    H.execute('INBOX = { "I %s start" }; horde.tick(0.1); horde.tick(1.1)' % ID)
+    check(H.eval("B.STARTS") == 1, "host: a guest press starts the host's beacon")
+    check(H.eval("blobs_out.hordes") == ID + " 1", "host: its horde state goes to the guest")
+    H.execute('INBOX = { "I %s start" }; horde.tick(0.1)' % ID)
+    check(H.eval("B.STARTS") == 1, "host: a second start while it runs is ignored (no double horde)")
+    H.execute('B["CanStopHorde?"] = false; INBOX = { "I %s stop" }; horde.tick(0.1)' % ID)
+    check(H.eval("B.STOPS") == 0, "host: a stop after the countdown is ignored, like the game's own press")
+    H.execute('B["CanStopHorde?"] = true; INBOX = { "I %s stop" }; horde.tick(0.1); horde.tick(1.1)' % ID)
+    check(H.eval("B.STOPS") == 1 and H.eval("blobs_out.hordes") == "", "host: a stop in the countdown stops it, the guest is told")
+    H.execute('hook("CreateNotificationUI", {}, { ToString = function() return "Wave: 1 Begin!" end }, nil, nil, 2.0, false, B)')
+    H.execute('hook("CreateNotificationUI", {}, { ToString = function() return "picked up" end }, nil, nil, 2.0, false, PLAYER)')
+    check(H.eval("SENT[#SENT]") == "T %s Wave: 1 Begin!" % ID and H.eval("#SENT") == 1,
+          "host: only the beacon's own messages go to the guest")
+
+    G = setup("guest")
+    G.execute('B.Event_StartHorde(B); hook("Event_StartHorde", B)')
+    check(G.eval('B["HordeStarted?"]') is False and G.eval("SENT[1]") == "I %s start" % ID,
+          "guest: a press doesn't run the copy's horde, it asks the host")
+    G.execute('INBOX = { "T %s Horde incoming" }; horde.tick(0.1)' % ID)
+    check(G.eval("#NOTES") == 0, "guest: the host's repeat of the press's own message isn't shown twice")
+    G.execute('blobs_in.hordes = "%s 1"; for i = 1, 40 do horde.tick(0.1) end' % ID)
+    check(G.eval('B["HordeStarted?"]') is False, "guest: the copy's own countdown is left to die first")
+    G.execute('for i = 1, 160 do horde.tick(0.1) end')
+    check(G.eval('B["HordeStarted?"]') is True and G.eval('B["CanStopHorde?"]') is True,
+          "guest: then the copy shows the host's horde (a press now means stop)")
+    G.execute('INBOX = { "T %s Wave: 1 Begin!" }; horde.tick(0.1)' % ID)
+    check(G.eval("NOTES[1]") == "Wave: 1 Begin!", "guest: the host's wave messages are shown")
+    G.execute('blobs_in.hordes = ""; horde.tick(0.1)')
+    check(G.eval('B["HordeStarted?"]') is False and G.eval("DISH[#DISH]") is False, "guest: the host's horde ended - the dish stops here")
+    G2 = setup("guest")
+    G2.execute('B.Event_StartHorde(B); hook("Event_StartHorde", B); for i = 1, 50 do horde.tick(0.1) end')
+    check(G2.eval("DISH[#DISH]") is False, "guest: a press the host turned down doesn't leave the dish turning")
+
+
 def copy_radiation_is_taken_back():
     print("copy_radiation_is_taken_back")
     L = lua()
@@ -563,6 +741,28 @@ def backpack_names_travel_with_the_item():
     check(L.eval('names.get("1_2_3_4")') == "Bob's med bag", "names survive a restart (file)")
     L.execute('names.set("1_2_3_4", "")')
     check(L.eval('names.get("1_2_3_4")') is None, "an empty name clears it")
+    # the game re-rolls UIDs when an item leaves a container (RemoveGetInfo): names follow, nested ones too
+    L.execute(r"""
+        names.set("10_0_0_1", "Outer"); names.set("20_0_0_2", "Inner")
+        local real = jig.contents_of
+        jig.contents_of = function(c) return c.list end
+        local real_valid = util.valid
+        util.valid = function(o) return o ~= nil end
+        -- before: Outer in my inventory, Inner in Outer's compartment 1, cell 7
+        names.note({ list = { { uid = "10_0_0_1", da = "/G/BP.Big", holder = "INV", slot = 0, cell = 3 },
+                              { uid = "20_0_0_2", da = "/G/BP.Small", holder = "10_0_0_1", slot = 1, cell = 7 },
+                              { uid = "30_0_0_3", da = "/G/BP.Small", holder = "10_0_0_1", slot = 0, cell = 7 } } })
+        -- dropped: new UIDs everywhere, the pickup holds the contents
+        names.moved("10_0_0_1", "11_0_0_1", { list = { { uid = "31_0_0_3", da = "/G/BP.Small", holder = "11_0_0_1", slot = 0, cell = 7 },
+                                                      { uid = "21_0_0_2", da = "/G/BP.Small", holder = "11_0_0_1", slot = 1, cell = 7 } } })
+        jig.contents_of = real
+        util.valid = real_valid
+    """)
+    check(L.eval('names.get("11_0_0_1")') == "Outer" and L.eval('names.get("10_0_0_1")') is None, "a dropped backpack keeps its name")
+    check(L.eval('names.get("21_0_0_2")') == "Inner" and L.eval('names.get("31_0_0_3")') is None,
+          "a named backpack inside it keeps its name (matched by compartment + cell)")
+    L.execute('names.moved("99_0_0_9", "98_0_0_9", nil)')
+    check(L.eval('names.get("98_0_0_9")') is None, "unnamed items stay unnamed")
 
 
 def container_items_keep_their_cell_and_rotation():
@@ -897,7 +1097,7 @@ def horde_rewards_reach_the_other_game():
         StaticFindObject = function() return obj({}) end
         util = require("mirror.util")
         HOOKS = {}
-        util.ensure_hook = function(path, fn) HOOKS[path:match("([%w_]+:[%w_]+)$")] = fn; return true end
+        util.ensure_hook = function(path, fn) HOOKS[path:match("([%w_]+:[%w_ ]+)$")] = fn; return true end
         util.cdo = function() return nil end
         I = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
         function pickup(x, name)
@@ -936,6 +1136,195 @@ def horde_rewards_reach_the_other_game():
     check(len(set(uids)) == 2 and "0_0_0_0" not in uids, "each reward without a UID gets its own")
     L.execute('SENT = {}; drops.tick(0.6)')
     check(len([m for m in L.eval('SENT').values() if m.startswith("drops:D ")]) == 0, "rewards are sent once")
+
+
+def loose_magazine_rounds_reach_the_picker():
+    print("loose_magazine_rounds_reach_the_picker")
+    L = lua()
+    L.execute(FAKES + r"""
+        PC = obj({})
+        PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end, BP_JigMultiplayer = PC })
+        COMP = obj({ PickupInfo = { ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = {},
+                                    UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = { A = 7, B = 7, C = 7, D = 7 } } })
+        COPY = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end,
+                     IsActorBeingDestroyed = function() return false end, GetAttachParentActor = function() return nil end,
+                     GetComponentByClass = function() return COMP end, K2_DestroyActor = function() end })
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+            world = function() return { SpawnActor = function() return COPY end } end }
+        SENT, IN = {}, {}
+        package.loaded["mirror.events"] = { new = function(name) return {
+            send = function(self, m) SENT[#SENT + 1] = m end,
+            pump = function(self, fn) local q = IN; IN = {}; for _, p in ipairs(q) do fn(p) end end } end,
+            send = function(self, m) SENT[#SENT + 1] = m end }
+        CLIP = "/Game/Items/DA_AR45Clip.DA_AR45Clip"
+        StaticFindObject = function(p)
+            if p == CLIP then return obj({ PickupClass = obj({}), ["IsContainer?"] = true }) end
+            return obj({})
+        end
+        INV, FILLED = {}, nil
+        package.loaded["mirror.jig"] = {
+            full_path = function() return CLIP end, guid = function() return {} end,
+            uid_str = function(g) return string.format("%d_%d_%d_%d", g.A, g.B, g.C, g.D) end,
+            contents_of = function(c) if c == PC then return INV end return {} end,
+            apply_contents = function(c, want) return 0, 0, 0, #want end,   -- the copy has no container
+            fill = function(c, uid, list) FILLED = { comp = c, uid = uid, list = list }; return #list - 1, 0 end }
+        package.loaded["mirror.names"] = { set = function() end, decode = function(s) return s end, moved = function() end }
+        util = require("mirror.util")
+        HOOKS = {}
+        util.ensure_hook = function(path, pre, post) HOOKS[path:match("([%w_]+:[%w_ ]+)$")] = { pre, post }; return true end
+        util.cdo = function() return nil end
+        function P(v) return { get = function() return v end } end
+        drops = require("mirror.drops")
+        drops.init({ mirror_drops = true }, "host", nil)
+        IN = { "D 1_2_3_4 " .. CLIP .. " 1 0 0 0 0 0 0 0 0 1 2 0.2 10",
+               "I 1_2_3_4 /Game/Items/DA_45ACPAmmo.DA_45ACPAmmo 25 0.000 0.000 0 0" }
+        drops.tick(0.1)
+        drops.tick(0.6)
+        REP = COMP.RepCapacity
+        INV = { { uid = "1_1_1_1", da = "/Game/Items/DA_Knife.DA_Knife" } }
+        HOOKS["BP_JigComponent_C:ServerFunc_HandleRequestAddActorToContainer"][1](obj({}), P(COPY))
+        INV[2] = { uid = "9_9_9_9", da = CLIP }
+        HOOKS["BP_PlayerCharacter_C:JigMP_OnPickupAdded"][1](P(PLAYER), P({}), P({ A = 9, B = 9, C = 9, D = 9 }))
+        HOOKS["BP_JigComponent_C:ServerFunc_HandleRequestAddActorToContainer"][2]()
+        EARLY = FILLED
+        drops.tick(0.4)
+    """)
+    check(L.eval('REP') == 25, "the copy on the ground shows the mag's 25 rounds")
+    check(L.eval('EARLY') is None, "the rounds go in only after the pickup has finished")
+    check(L.eval('FILLED and FILLED.uid') == "9_9_9_9" and L.eval('FILLED.comp == PC'),
+          "the rounds go into the picked-up magazine in the picker's inventory")
+    check(L.eval('FILLED and FILLED.list[2].da') == "/Game/Items/DA_45ACPAmmo.DA_45ACPAmmo"
+          and L.eval('FILLED.list[2].count') == 25 and L.eval('FILLED.list[2].parent') == 1, "all 25 rounds, inside the mag")
+    check(any(m == "T 1_2_3_4" for m in L.eval('SENT').values()), "the other game is told it was taken (the original goes)")
+    L.execute('FILLED = nil; drops.tick(1.0)')
+    check(L.eval('FILLED') is None, "the rounds are put in once")
+
+
+def ground_weapon_attachments_reach_the_other_game():
+    print("ground_weapon_attachments_reach_the_other_game")
+    L = lua()
+    L.execute(FAKES + r"""
+        PC = obj({})
+        PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end, BP_JigMultiplayer = PC })
+        COMP = obj({ PickupInfo = { ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = {},
+                                    UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = { A = 7, B = 7, C = 7, D = 7 } } })
+        COPY = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end,
+                     IsActorBeingDestroyed = function() return false end, GetAttachParentActor = function() return nil end,
+                     GetComponentByClass = function() return COMP end, K2_DestroyActor = function() end })
+        COMP.GetOwner = function() return COPY end
+        PC.GetOwner = function() return PLAYER end
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+            world = function() return { SpawnActor = function() return COPY end } end }
+        SENT, IN = {}, {}
+        package.loaded["mirror.events"] = { new = function(name) return {
+            send = function(self, m) SENT[#SENT + 1] = m end,
+            pump = function(self, fn) local q = IN; IN = {}; for _, p in ipairs(q) do fn(p) end end } end,
+            send = function(self, m) SENT[#SENT + 1] = m end }
+        RIFLE = "/Game/Items/DA_Rifle.DA_Rifle"
+        StaticFindObject = function(p)
+            if p == RIFLE then return obj({ PickupClass = obj({}), ["IsContainer?"] = false }) end
+            return obj({})
+        end
+        HAVE, APPLIED = {}, nil
+        package.loaded["mirror.jig"] = {
+            full_path = function() return RIFLE end, guid = function() return {} end,
+            uid_str = function(g) return string.format("%d_%d_%d_%d", g.A, g.B, g.C, g.D) end,
+            write_stats = function() return 0 end,
+            contents_of = function(c) if c == COMP then return HAVE end return {} end,
+            encode = function(list) local t = {}; for _, h in ipairs(list) do t[#t + 1] = h.da end; return table.concat(t, ";") end,
+            decode = function(s) local t = {}; for d in s:gmatch("[^;]+") do t[#t + 1] = { da = d } end; return t end,
+            apply_contents = function(c, want) APPLIED = { comp = c, want = want }; return 0, #want, 0, 0 end }
+        package.loaded["mirror.names"] = { set = function() end, get = function() end, decode = function(s) return s end,
+                                           moved = function() end }
+        util = require("mirror.util")
+        HOOKS = {}
+        util.ensure_hook = function(path, pre, post) HOOKS[path:match("([%w_]+:[%w_ ]+)$")] = { pre, post }; return true end
+        util.cdo = function() return nil end
+        function P(v) return { get = function() return v end } end
+        function MOVE(from, to) HOOKS["BP_JigComponent_C:Handle Comp to Comp Move"][1](P(PC), P(from), P(to), P({ A = 1, B = 1, C = 1, D = 1 }),
+            P({}), P(0), P({ A = 0, B = 0, C = 0, D = 0 })) end
+        drops = require("mirror.drops")
+        drops.init({ mirror_drops = true }, "host", nil)
+        IN = { "D 1_2_3_4 " .. RIFLE .. " 1 0 0 0 0 0 0 0 0 4 2 3 100" }
+        drops.tick(0.6)
+        SENT = {}
+        HAVE = { { uid = "5_5_5_5", da = "/Game/Items/DA_Scope.DA_Scope", parent = nil } }
+        MOVE(PC, COMP)
+        EARLY = #SENT
+        drops.tick(0.4)
+        FIRST = SENT
+        SENT = {}
+        MOVE(PC, COMP)
+        drops.tick(0.4)
+        SAME = #SENT
+        HAVE = {}
+        MOVE(COMP, PC)
+        drops.tick(0.4)
+        TAKEN = SENT
+        SENT = {}
+        MOVE(PC, obj({ GetOwner = function() return obj({}) end }))
+        drops.tick(0.4)
+        OTHER = #SENT
+        IN = { "C 1_2_3_4 /Game/Items/DA_Scope.DA_Scope;/Game/Items/DA_Grip.DA_Grip" }
+        drops.tick(0.1)
+        drops.tick(0.4)
+        ECHO = #SENT
+    """)
+    first = list(L.eval('FIRST').values())
+    check(L.eval('EARLY') == 0, "the change is sent once the move has settled")
+    check(first == ["C 1_2_3_4 /Game/Items/DA_Scope.DA_Scope"], "an attachment put on a dropped weapon is sent with its uid")
+    check(L.eval('SAME') == 0, "an unchanged weapon isn't sent again")
+    check(list(L.eval('TAKEN').values()) == ["C 1_2_3_4 "], "taking the attachment off is sent too")
+    check(L.eval('OTHER') == 0, "moves between untracked containers send nothing")
+    check(L.eval('APPLIED and APPLIED.comp == COMP') and L.eval('#APPLIED.want') == 2,
+          "the other game's change goes onto this game's copy")
+    check(L.eval('ECHO') == 0, "applying the other game's change isn't echoed back")
+
+
+def ghost_gun_in_hand_is_known():
+    print("ghost_gun_in_hand_is_known")
+    L = lua()
+    L.execute(FAKES + r"""
+        StaticFindObject = function() return obj({}) end
+        G = obj({ Mesh = obj({}), AddComponentByClass = function() return obj({}) end })
+        look = require("mirror.look")
+        local A = function(id, parent, sock) return table.concat({ "A", id, parent, "S", sock, "-", "", "0,0,0", "0,0,0", "1,1,1", 0 }, "\t") end
+        look.apply(G, table.concat({ A(1, 0, "PrimaryWeaponBackpack"), A(2, 1, "None"), A(3, 0, "Rifle_Hand"), A(4, 3, "None") }, "\n"))
+        R = { look.in_hand(1), look.in_hand(2), look.in_hand(3), look.in_hand(4) }
+        look.forget()
+        GONE = look.in_hand(3)
+    """)
+    r = list(L.eval('R').values())
+    check(r == [False, False, True, True], "pieces under a hand socket are the held gun, the holstered one isn't")
+    check(L.eval('GONE') is False, "forgetting the gear forgets the hand pieces")
+
+
+def missing_zombie_looks_get_loaded():
+    print("missing_zombie_looks_get_loaded")
+    import tempfile
+    d = tempfile.mkdtemp()
+    L = lua()
+    L.execute(FAKES + r"""
+        local d = ...
+        os.getenv = function() return d end
+        LOADED, CALLS = {}, 0
+        StaticFindObject = function(p)
+            if LOADED[p] then return obj({}) end
+            return { IsValid = function() return false end }
+        end
+        LoadAsset = function(p) CALLS = CALLS + 1; LOADED[p] = true end
+        NOW = 0; os.clock = function() return NOW end
+        loader = require("mirror.loader")
+        loader.configure({ asset_loader = true })
+        loader.want("/Game/Zombies/SK_Zombie_Punk_Male_01.SK_Zombie_Punk_Male_01")
+        NOW = 10; loader.tick(0.1, false)
+        R1 = CALLS
+        loader.want("/Game/Zombies/SK_Zombie_Punk_Male_01.SK_Zombie_Punk_Male_01")
+        NOW = 20; loader.tick(0.1, false)
+        R2 = CALLS
+    """, d)
+    check(L.eval("R1") == 1, "a missing look (NULL wrapper from StaticFindObject) is loaded")
+    check(L.eval("R2") == 1, "a loaded look is not loaded again")
 
 
 def random_and_debug_weather_is_shared():
@@ -1202,15 +1591,184 @@ def standing_hooks_skip_the_lookup():
     check(L.eval("R3") is True and L.eval("R4") == 1, "a gone function is looked up and hooked again")
 
 
+SPLIT_FAKES = r"""
+    local role = ...
+    package.loaded["mirror.link"].reset_blob = function(n) RESET = n end
+    SPLIT, FIGHT, NEAR, SETTING, GUEST, INWORLD, SAVING, NEST, HORDE = false, false, 1e9, true, true, true, false, 1e9, false
+    GHOST, INV, AI = true, 0, 40
+    GL, HL = { X = 0, Y = 0, Z = 0 }, { X = 0, Y = 0, Z = 0 }
+    package.loaded["mirror.zombies"] = { set_split = function(on) SPLIT = on end, is_split = function() return SPLIT end,
+        guest_busy = function() return FIGHT end, near_guest = function() return NEAR, 0.5 end, own_count = function() return 7 end }
+    package.loaded["mirror.ghost"] = { exists = function() return GHOST end, location = function() return GHOST and GL or nil end,
+        set_invoker = function(on) INV = on and 0 or -1; return INV end, invoker_index = function() return INV end,
+        ai_count = function() return AI end }
+    package.loaded["mirror.game"] = { player = function() return { K2_GetActorLocation = function() return HL end } end,
+                                      on_world_reset = function() end }
+    package.loaded["mirror.hostrules"] = { mine = function() return SETTING end }
+    package.loaded["mirror.save_guard"] = { busy = function() return SAVING end }
+    package.loaded["mirror.infest"] = { guest_hit_age = function() return NEST end }
+    package.loaded["mirror.horde"] = { active_near = function() return HORDE end }
+    util = require("mirror.util")
+    split = require("mirror.split")
+    CFG = { zombies = { split = { split_radius = 40000, split_after = 10.0, merge_radius = 30000, force_radius = 20000,
+        quiet_radius = 6000, ack_timeout = 10.0, retry_after = 30.0, horde_radius = 25000, nest_hit_s = 90.0 } } }
+    split.init(CFG, role, { guest_in_world = function() return GUEST end, in_world = function() return INWORLD end })
+    function run(secs) for i = 1, math.floor(secs * 10 + 0.5) do split.tick(0.1) end end
+"""
+
+
+def load_split_switches_only_when_both_agree():
+    print("load_split_switches_only_when_both_agree")
+    H, G = lua(), lua()
+    H.execute(FAKES + SPLIT_FAKES, "host")
+    G.execute(FAKES + SPLIT_FAKES, "guest")
+    def to_guest():
+        b = H.eval('blobs_out.p8')
+        if b is not None: G.execute('blobs_in.p8 = %r' % b)
+    def to_host():
+        b = G.eval('blobs_out.p8g')
+        if b is not None: H.execute('blobs_in.p8g = %r' % b)
+    def handshake():
+        to_guest(); G.execute('run(0.6)'); to_host(); H.execute('run(0.3)')
+    H.execute('SETTING = false; GL = { X = 50000, Y = 0, Z = 0 }; run(60)')
+    check(H.eval('split.state()') == "merged" and H.eval('INV') == 0, "setting off: the host keeps running everything (no split)")
+    H.execute('SETTING = true; run(9)')
+    check(H.eval('split.state()') == "merged", "on, far apart: no split before split_after seconds")
+    H.execute('run(3)')
+    check(H.eval('split.state()') == "splitting" and H.eval('blobs_out.p8') == "s 1" and H.eval('INV') == 0,
+          "then the host asks the guest first - its ghost still keeps the AI there")
+    H.execute('run(11)')
+    check(H.eval('split.state()') == "merged" and H.eval('INV') == 0 and H.eval('blobs_out.p8') == "m 2",
+          "a guest that never answers (older version) -> stays merged")
+    H.execute('run(20)')
+    check(H.eval('split.state()') == "merged", "no new attempt before retry_after")
+    H.execute('run(11)')
+    check(H.eval('split.state()') == "splitting" and H.eval('blobs_out.p8') == "s 3", "retried later")
+    to_guest(); G.execute('run(0.6)')
+    check(G.eval('SPLIT') is True and G.eval('blobs_out.p8g') == "s 3 0", "guest: takes over and answers with the epoch")
+    H.execute('blobs_in.p8g = "s 2 0"; run(0.3)')
+    check(H.eval('split.state()') == "splitting", "host: an answer to an old epoch doesn't count")
+    to_host(); H.execute('run(0.3)')
+    check(H.eval('split.state()') == "split" and H.eval('INV') == -1 and H.eval('SPLIT') is True,
+          "host: only on that answer the ghost leaves the optimizer and snapshots stop")
+    H.execute('INV = 0; run(1.1)')
+    check(H.eval('INV') == -1, "a ghost respawned after a save is taken out again")
+    H.execute('SAVING = true; GHOST = false; run(3); SAVING = false; run(3)')
+    check(H.eval('split.state()') == "split", "a save (ghost gone for a moment) doesn't merge")
+    H.execute('GHOST = true; GL = { X = 25000, Y = 0, Z = 0 }; blobs_in.p8g = "s 3 1"; run(2)')
+    check(H.eval('split.state()') == "split", "closer than merge_radius but the guest is fighting: still split")
+    H.execute('GL = { X = 15000, Y = 0, Z = 0 }; run(1.1)')
+    check(H.eval('split.state()') == "merged" and H.eval('INV') == 0 and H.eval('SPLIT') is False and H.eval('blobs_out.p8') == "m 4",
+          "within force_radius: merged even mid-fight, ghost back in the optimizer")
+    to_guest(); G.execute('run(0.6)')
+    check(G.eval('SPLIT') is False and G.eval('blobs_out.p8g') == "m 4 0", "guest: follows the merge")
+    H.execute('GL = { X = 50000, Y = 0, Z = 0 }; run(12)'); handshake()
+    check(H.eval('split.state()') == "split", "split again")
+    H.execute('NEST = 0.2; split.tick(0.016)')
+    check(H.eval('split.state()') == "merged" and H.eval('INV') == 0, "a guest hit on an infestation merges in the same frame")
+    H.execute('NEST = 1e9; run(13)')
+    check(H.eval('split.state()') == "splitting", "after the fight, splitting again")
+    H.execute('HORDE = true; run(0.3)')
+    check(H.eval('split.state()') == "merged", "a horde near the guest cancels the split")
+    H.execute('HORDE = false; NEAR = 3000; run(60)')
+    check(H.eval('split.state()') == "merged", "a host AI (or body) near the guest blocks the split")
+    H.execute('NEAR = 1e9; run(12)'); handshake()
+    check(H.eval('split.state()') == "split", "split once nothing is near the guest")
+    H.execute('SETTING = false; run(0.2)')
+    check(H.eval('split.state()') == "merged" and H.eval('INV') == 0, "setting turned off mid-split: merged at once")
+    H.execute('SETTING = true; run(11)'); handshake()
+    H.execute('GUEST = false; run(0.2)')
+    check(H.eval('split.state()') == "merged" and H.eval('INV') == 0, "the guest leaves: merged at once")
+    G.execute('INWORLD = false; run(0.2)')
+    check(G.eval('RESET') == "p8", "guest out of the world: the host's state is read fresh on the next join")
+    G.execute('SPLIT = false; INWORLD = true; blobs_in.p8 = "m 9"; run(0.6)')
+    check(G.eval('blobs_out.p8g') == "m 9 0" and G.eval('SPLIT') is False, "guest: answers the host's epoch after a rejoin")
+
+
+def load_split_hands_the_ai_to_the_guest():
+    print("load_split_hands_the_ai_to_the_guest")
+    L = lua()
+    L.execute(FAKES + r"""
+        ME, HOST = { X = 0, Y = 0, Z = 0 }, { X = 90000, Y = 0, Z = 0 }
+        package.loaded["mirror.game"] = { player = function() return { K2_GetActorLocation = function() return ME end } end,
+            world = function() return nil end, on_world_reset = function() end, keybind = function() end }
+        package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end,
+                                           location = function() return HOST end }
+        package.loaded["mirror.loader"] = { want = function() end }
+        package.loaded["mirror.invdiag"] = { summary = function() return "-" end }
+        local MZ = cls("BP_MasterZombie_C")
+        StaticFindObject = function(p) if p:find("BP_MasterZombie", 1, true) then return MZ end end
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        LIST, SPAWNERS = {}, {}
+        FindAllOf = function(c) if c == "Character" then return LIST elseif c == "BP_AISpawner_Master_C" then return SPAWNERS end end
+        util.instances = function(c) return c == "BP_AISpawner_Master_C" and SPAWNERS or {} end
+        zombies = require("mirror.zombies")
+        function zombie(name, x, dead)
+            local z
+            z = obj({ Mesh = { K2_GetComponentLocation = function() return { X = x, Y = 0, Z = 0 } end }, DamageComponent = {},
+                      bHidden = false, ["IsDead?"] = dead or false, gone = false,
+                      IsA = function(self, c) return c == MZ end,
+                      GetFName = function() return { ToString = function() return name end } end,
+                      GetClass = function() return cls("BP_Zombie_Roamer_C") end,
+                      K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end,
+                      K2_GetActorRotation = function() return { Yaw = 90 } end,
+                      GetVelocity = function() return { X = 0, Y = 0, Z = 0 } end,
+                      GetCurrentMontage = function() return nil end,
+                      IsActorBeingDestroyed = function() return false end,
+                      K2_DestroyActor = function(self) self.gone = true end })
+            return z
+        end
+        function spawner() local s = obj({ IsSpawningStopped = false })
+            s.SetIsSpawningStopped = function(self, v) self.IsSpawningStopped = v end; return s end
+        CFG = { zombies = { enabled = true, radius = 15000, send_hz = 15, split = { drain_radius = 6000, drain_s = 90.0,
+                corpse_radius = 15000, corpse_s = 300.0, host_near = 12000, quiet_radius = 6000 } } }
+    """)
+    # Host: the merged snapshot is unchanged (same Z/X lines as without the feature), and stops only while split.
+    L.execute('HOST = ME; LIST = { zombie("Near", 4000), zombie("Far", 9000) }; snap0 = zombies._host.tick(CFG, 0.1); snap0 = blobs_out.zombies; '
+              'd = zombies.near_guest()')
+    check(abs(L.eval('d') - 4000) < 1, "host: the nearest AI to the guest is known from the snapshot scan")
+    check(len([l for l in L.eval('snap0').split("\n") if l.startswith("Z ")]) == 2 and
+          len([l for l in L.eval('snap0').split("\n") if l.startswith("X ")]) == 2,
+          "host merged: zombies and their looks (X lines) are sent as before")
+    L.execute('zombies._test.setup(CFG, "host"); zombies.set_split(true); blobs_out.zombies = nil; '
+              'for i = 1, 20 do zombies._host.tick(CFG, 0.1) end')
+    check(L.eval('blobs_out.zombies') is None, "host: no zombie snapshots while split")
+    L.execute('zombies.set_split(false); for i = 1, 2 do zombies._host.tick(CFG, 0.1) end')
+    check(L.eval('blobs_out.zombies') is not None, "host: snapshots resume on the merge")
+    # Guest
+    L.execute('HOST = { X = 90000, Y = 0, Z = 0 }; zombies._test.setup(CFG, "guest"); S1, S2 = spawner(), spawner(); S2.IsSpawningStopped = true; SPAWNERS = { S1, S2 }; '
+              'LIST = {}; zombies._test.sweep(10)')
+    check(L.eval('S1.IsSpawningStopped') is True, "guest merged: its spawners are stopped (as before)")
+    L.execute('zombies.set_split(true)')
+    check(L.eval('S1.IsSpawningStopped') is False and L.eval('S2.IsSpawningStopped') is True,
+          "guest split: only the spawners the mod stopped run again")
+    L.execute('A, B, C, D = zombie("Fighting", 3000), zombie("Away", 50000), zombie("Body", 10000, true), zombie("NearHost", 85000); '
+              'LIST = { A, B, C, D }')
+    check(L.eval('zombies.own_count()') == 4, "guest split: its own AI are counted")
+    # (while split guest_tick runs no sweep at all - only the busy check)
+    L.execute('zombies.set_split(false); zombies._test.sweep(10); zombies._test.sweep(10)')
+    check(L.eval('A.gone') is False and L.eval('C.gone') is False, "guest merge: the zombie near me and the body stay (drain)")
+    check(L.eval('B.gone') is True and L.eval('D.gone') is True, "guest merge: the others are removed")
+    check(L.eval('S1.IsSpawningStopped') is True, "guest merge: spawners stopped again")
+    L.execute('HOST = { X = 3500, Y = 0, Z = 0 }; zombies._test.sweep(10)')
+    check(L.eval('A.gone') is True and L.eval('C.gone') is True, "guest: the host coming near ends the drain")
+    L.execute('HOST = { X = 90000, Y = 0, Z = 0 }; zombies.set_split(true); E = zombie("Late", 2000); LIST = { E }; '
+              'zombies.set_split(false); zombies._test.sweep(10); zombies._test.sweep(95)')
+    check(L.eval('E.gone') is True, "guest: a kept zombie goes after drain_s")
+
+
 for t in (posepack_recovers_lost_packets, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, tactical_reads_only_lights_the_class_has,
           vehicles_keep_this_worlds_fuel, harvest_uses_up_nodes_once, zombie_copies_take_the_hosts_look,
-          copy_radiation_is_taken_back, goto_and_bring_move_only_your_own_player, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
+          copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
           ghost_swims_without_its_own_water_detection, audio_spatializes_and_shares_without_echo,
-          throws_and_mines_reach_the_other_game, horde_rewards_reach_the_other_game, random_and_debug_weather_is_shared,
+          throws_and_mines_reach_the_other_game, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, ground_weapon_attachments_reach_the_other_game, ghost_gun_in_hand_is_known, missing_zombie_looks_get_loaded,
+          random_and_debug_weather_is_shared,
           trader_stock_is_the_hosts, instances_walk_once_then_follow_beginplay,
           link_reads_only_blobs_the_index_says_changed, host_settled_corpses_cost_almost_nothing,
-          standing_hooks_skip_the_lookup, container_items_keep_their_cell_and_rotation):
+          standing_hooks_skip_the_lookup, container_items_keep_their_cell_and_rotation,
+          load_split_switches_only_when_both_agree, load_split_hands_the_ai_to_the_guest):
     try:
         t()
     except Exception as e:

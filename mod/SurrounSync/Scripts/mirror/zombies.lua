@@ -468,6 +468,11 @@ local statics = {}
 local STATICS_EVERY = 3.0
 
 local guest_center = function() return ghost.location() end
+-- P8 load split (mirror/split.lua): while split the guest's game runs the AI around the guest, so the
+-- host sends no zombies; near_ai = how close the nearest host AI (alive or dead) was to the guest.
+local p8 = { on = false, near = { d = math.huge, at = -100 }, stopped = {}, drain = {}, fighting = false }
+-- p8.stopped: guest, addr -> spawner this mod stopped (only these are handed back on a split)
+-- p8.drain: guest, addr -> { till, dead } own AI kept for a while after a merge (no pop mid-fight)
 local function host_tick(dt)
     hits:pump(apply_hit)
     if watch_dead then
@@ -490,6 +495,7 @@ local function host_tick(dt)
     aifx:pump(function() end)
     install_host_hooks()
     hook_archetypes()
+    if p8.on then return end
     send_in = send_in - dt
     if send_in > 0 then return end
     send_in = 1.0 / cfg.zombies.send_hz
@@ -505,6 +511,7 @@ local function host_tick(dt)
     end
     local alive = {}
     local radius = cfg.zombies.radius
+    local nearest = math.huge
     for _, z in ipairs(zombies_cached(now)) do
         local skip_until = far_until[z]
         local l, is_dead = nil, false
@@ -530,6 +537,7 @@ local function host_tick(dt)
             if not gone then pcall(function() gone = z.bHidden == true end) end
             if not gone then pcall(function() gone = z:IsActorBeingDestroyed() == true end) end
             if not gone then
+                if d < nearest then nearest = d end
                 local a = znames[z]
                 if not a then
                     pcall(function() a = z:GetFName():ToString() end)
@@ -599,6 +607,7 @@ local function host_tick(dt)
             end
         end
     end
+    p8.near.d, p8.near.at = nearest, now
     for a, id in pairs(ids) do
         if not alive[a] then
             ids[a] = nil; by_id[id] = nil; statics[id] = nil
@@ -871,6 +880,37 @@ end
 local spawner_in = 0.0
 local volumes_stopped = {}
 local native_in = 0.0
+
+function p8.body_loc(z)
+    local l
+    pcall(function() l = z:K2_GetActorLocation() end)
+    if l and math.abs(l.X) < 1 and math.abs(l.Y) < 1 and math.abs(l.Z) < 1 then
+        l = nil
+        pcall(function() l = z.Mesh:K2_GetComponentLocation() end)
+    end
+    return l
+end
+
+function p8.my_location()
+    local l
+    pcall(function() l = game.player():K2_GetActorLocation() end)
+    return l
+end
+
+-- An own zombie still kept after a merge: until its time is up, the host comes near it, or (alive) it is
+-- far from me.
+function p8.drained(z, a)
+    local k = p8.drain[a]
+    if not k then return false end
+    local sp = cfg.zombies.split
+    local l, me, host = p8.body_loc(z), p8.my_location(), ghost.location()
+    local keep = l ~= nil and now < k.till
+        and not (host and util.dist(host, l) < sp.host_near)
+        and not (not k.dead and me and util.dist(me, l) > 2 * sp.drain_radius)
+    if not keep then p8.drain[a] = nil end
+    return keep
+end
+
 local function suppress_natives()
     for a, t in pairs(destroyed) do if now - t > 120 then destroyed[a] = nil end end
     local n_sp = 0
@@ -884,7 +924,10 @@ local function suppress_natives()
                 if util.valid(s) then
                     local stopped = false
                     pcall(function() stopped = s.IsSpawningStopped == true end)
-                    if not stopped then pcall(function() s:SetIsSpawningStopped(true) end); n_sp = n_sp + 1 end
+                    if not stopped then
+                        pcall(function() s:SetIsSpawningStopped(true) end); n_sp = n_sp + 1
+                        p8.stopped[util.addr(s) or 0] = s
+                    end
                 end
             end
         end
@@ -907,7 +950,7 @@ local function suppress_natives()
     for _, z in ipairs(sweep and zombies_cached(now) or {}) do
         util.pause()
         local a = util.addr(z) or 0
-        if not zombies.is_copy(z) and not (destroyed[a] and now - destroyed[a] < 120) then
+        if not zombies.is_copy(z) and not (destroyed[a] and now - destroyed[a] < 120) and not p8.drained(z, a) then
             destroyed[a] = now
             pcall(function()
                 local c = z.Controller
@@ -1004,6 +1047,7 @@ end
 zombies._look = { arch_of = function(z, n) return arch_of(z, n) end, bones_of = function(z) return bones_of(z) end,
                   sync = function(id, c, e, x) xlooks[id] = x; sync_look(id, c, e) end }
 zombies._host = { tick = function(c, dt) cfg = cfg or c; now = now + dt; host_tick(dt) end }
+zombies._test = { setup = function(c, r) cfg, role = c, r end, sweep = function(dt) now = now + (dt or 0); suppress_natives() end }
 
 local function read_snapshot()
     local body = link.get_blob("zombies")
@@ -1204,6 +1248,26 @@ local apply_dmg, apply_med, apply_zhit
 local apply_fx
 local fx_errors = 0
 
+-- Guest, while split: is one of my own AI alive within quiet_radius of me (I'm fighting)? The host then
+-- waits with the merge until the players are close (force_radius).
+function p8.note_busy()
+    local me, q = p8.my_location(), cfg.zombies.split.quiet_radius
+    local found = false
+    for _, z in ipairs(me and zombies_cached(now) or {}) do
+        if not zombies.is_copy(z) then
+            local l = p8.body_loc(z)
+            if l and util.dist(me, l) < q and not dead_of(z) then found = true; break end
+        end
+    end
+    p8.fighting = found
+end
+
+function p8.count_own()
+    local n = 0
+    for _, z in ipairs(zombies_cached(now)) do if not zombies.is_copy(z) and util.valid(z) then n = n + 1 end end
+    return n
+end
+
 local function guest_tick(dt)
     frame_dt = dt
     hits:pump(function() end)
@@ -1226,6 +1290,7 @@ local function guest_tick(dt)
         active, active_at = joined, now
         if not active then destroy_all_copies("left the host's world")
         else log.info("zombies: in the host's world - showing the host's zombies") end
+        p8.on, p8.fighting, p8.drain, p8.stopped = false, false, {}, {}
         spawner_in = 0.0
         volumes_stopped = {}
         native_in = 0.0
@@ -1240,7 +1305,9 @@ local function guest_tick(dt)
         pass_in = 2.0
         local ok, missing = loot_ready()
         loot_ok = ok
-        if ok then
+        if ok and p8.on then
+            p8.note_busy()
+        elseif ok then
             util.job("zombies.sweep", suppress_natives)
         elseif now - loot_wait_logged > 10 then
             loot_wait_logged = now
@@ -1250,9 +1317,56 @@ local function guest_tick(dt)
         install_hit_hooks()
         hook_archetypes()
     end) end
-    perf.run("z.read", read_snapshot)
+    if not p8.on then perf.run("z.read", read_snapshot) end
     perf.run("z.drive", drive, dt)
 end
+
+-- P8 load split, switched by mirror/split.lua (the host decides; the guest follows and answers).
+-- Host on: no zombie snapshot, its ids forgotten (a late guest hit finds nothing to apply).
+-- Guest on: the host's copies go, the spawners this mod stopped run again and own AI isn't removed.
+-- Guest off: own AI near me (or bodies) are kept a while (drain), the rest go on the next sweep.
+function zombies.set_split(on)
+    on = on == true
+    if on == p8.on then return end
+    p8.on = on
+    if role == "host" then
+        ids, by_id, statics = {}, {}, {}
+        p8.near.d, p8.near.at = math.huge, -100
+        return
+    end
+    if on then
+        destroy_all_copies("load split - your game runs the AI around you")
+        local n = 0
+        for _, sp in pairs(p8.stopped) do
+            if util.valid(sp) then pcall(function() sp:SetIsSpawningStopped(false) end); n = n + 1 end
+        end
+        p8.stopped, p8.drain, p8.fighting = {}, {}, false
+        log.info(string.format("zombies: split - %d spawner(s) back on, my own AI stays", n))
+        return
+    end
+    local sp, me, kept = cfg.zombies.split, p8.my_location(), 0
+    p8.drain = {}
+    for _, z in ipairs(me and zombies_cached(now) or {}) do
+        if not zombies.is_copy(z) and util.valid(z) then
+            local l = p8.body_loc(z)
+            local dead = dead_of(z) == true
+            if l and util.dist(me, l) <= (dead and sp.corpse_radius or sp.drain_radius) then
+                p8.drain[util.addr(z) or 0] = { till = now + (dead and sp.corpse_s or sp.drain_s), dead = dead }
+                kept = kept + 1
+            end
+        end
+    end
+    p8.fighting = false
+    spawner_in, native_in, pass_in = 0.0, 0.0, 0.0
+    log.info(string.format("zombies: merged - the host runs the AI here again (%d of my own kept until they're done)", kept))
+end
+
+function zombies.is_split() return p8.on end
+function zombies.guest_busy() return p8.fighting end
+-- Host: distance from the guest to the nearest host AI the last snapshot found (math.huge = none in range), and its age.
+function zombies.near_guest() return p8.near.d, now - p8.near.at end
+-- Guest: AI this game runs itself (not copies).
+function zombies.own_count() return p8.count_own() end
 
 local selftest_in, selftest_copy = 0.0, nil
 local function selftest_file() return (os.getenv("LOCALAPPDATA") or ".") .. "\\SurrounDead\\mirror_selftest_" .. role .. ".txt" end
@@ -1672,6 +1786,7 @@ local function forget_world()
     ids, by_id, statics, watch_dead = {}, {}, {}, nil
     zlist, zlist_set, zlist_addr, zlist_new, zlist_at, zlist_pruned = {}, {}, {}, {}, -100, -100
     copies, copy_addr, destroyed, volumes_stopped, xlooks = {}, {}, {}, {}, {}
+    p8.on, p8.fighting, p8.drain, p8.stopped = false, false, {}, {}
     arch_seen, arch_seen_n = {}, 0
     rad.comp, rad.seen, rad.retry = nil, nil, 0
     cache, missed, appeared, loot_obj, fam_cls, fam_retry, player_cls = {}, {}, {}, {}, {}, {}, nil

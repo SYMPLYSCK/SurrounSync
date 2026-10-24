@@ -47,7 +47,9 @@ start_one() {
   for try in 1 2; do
     # the new game rewrites its log from line 1: start the wait there (a mark on the old, longer log never matched)
     if [ "$r" = host ]; then : > "$HL"; else : > "$GL"; fi 2>/dev/null; eval "M_$r=0"; launch "$dir" "$args" $side
-    waitnew $r "devtest: watching" 90 >/dev/null && cmd $r "continue $slot"
+    if ! waitnew $r "devtest: watching" 90 >/dev/null; then
+      echo "SETUP: $r has no devtest watcher (devtest = on missing in its mirror_settings.txt?)"; return 1; fi
+    cmd $r "continue $slot"
     waitnew $r "devtest: load " 60 >/dev/null
     if waitnew $r "real player is|new real player" 45 >/dev/null; then do_ $r god "devtest: god" 20; return 0; fi
     echo "SETUP: $r load hung - restarting it"
@@ -56,10 +58,33 @@ start_one() {
   done
   echo "SETUP: $r never loaded"; return 1
 }
+# The kit drives both games through the devtest watcher on the one-PC test network ("bridgetest" mode:
+# devtest = on, testnet, Link_Host/Link_Guest). tools/mirror-mode.ps1 steam (real 2-PC play) writes neither,
+# and then every kit step waited for a "devtest: watching" that never came. kit_mode switches to bridgetest
+# and keeps the play settings in *.kitbak; restore_mode puts them back.
+kit_mode() {
+  grep -q "^devtest = on" "$HW/mirror_settings.txt" 2>/dev/null && grep -q "^testnet" "$HW/mirror_settings.txt" 2>/dev/null     && grep -q "^devtest = on" "$GW/mirror_settings.txt" 2>/dev/null && return 0
+  local d f
+  for d in "$HW" "$GW"; do for f in mirror_settings.txt mirror_role.txt; do
+    [ -f "$d/$f" ] && [ ! -f "$d/$f.kitbak" ] && cp "$d/$f" "$d/$f.kitbak"
+  done; done
+  powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$(dirname "${BASH_SOURCE[0]}")/../mirror-mode.ps1")" bridgetest >/dev/null 2>&1
+  if grep -q "^devtest = on" "$HW/mirror_settings.txt" && grep -q "^devtest = on" "$GW/mirror_settings.txt"; then
+    echo "KIT: switched both installs to bridgetest mode (play settings kept as *.kitbak - restore_mode puts them back)"
+  else echo "KIT: couldn't switch to bridgetest mode"; return 1; fi
+}
+restore_mode() {
+  local d f n=0
+  for d in "$HW" "$GW"; do for f in mirror_settings.txt mirror_role.txt; do
+    [ -f "$d/$f.kitbak" ] && mv -f "$d/$f.kitbak" "$d/$f" && n=$((n + 1))
+  done; done
+  echo "KIT: restored $n play setting file(s)"
+}
 # fresh games in their saves, immune, host hosting (~30 s; a hung load costs one restart of that game)
 setup() {
   taskkill //IM SurrounDead-Win64-Shipping.exe //F >/dev/null 2>&1
   taskkill //IM SurrounSyncBridge.exe //F >/dev/null 2>&1      # orphaned connectors (one PC: they never see their game go)
+  kit_mode || return 1
   preflight ${NEED_GB:-15} || return 1
   rm -f "$SD/mirror_dev_Saved.txt" "$SD/mirror_dev_Saved_Guest.txt"
   : > "$HL" 2>/dev/null; : > "$GL" 2>/dev/null; M_host=0; M_guest=0
