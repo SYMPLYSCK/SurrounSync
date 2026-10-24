@@ -69,11 +69,31 @@ local function put_state()
     end
 end
 
+-- A finished beacon destroys itself right after SpawnRewards: it must leave `active` then, or the next zombie
+-- retarget / state step touches a freed object (host crash 0xc0000005 at 0x18, 2026-10-24).
+local finished = {}        -- host: addr -> time it finished (ignored by note() for a while)
 local function note(b)
     if not util.valid(b) then return end
+    local a = util.addr(b) or 0
+    if finished[a] and now - finished[a] < 30 then return end
     local ok, id = pcall(id_of, b)
-    if ok then active[util.addr(b) or 0] = { obj = b, id = id } end
+    local l
+    pcall(function() l = util.vec(b:K2_GetActorLocation()) end)
+    if ok and l then active[a] = { obj = b, id = id, loc = l } end
     state_in = 0
+end
+
+local function on_finished(self)
+    if role ~= "host" then return end
+    local b = util.obj(self)
+    local a = b and util.addr(b)
+    if not a then return end
+    finished[a] = now
+    if active[a] then
+        active[a] = nil
+        last_blob = nil
+        put_state()
+    end
 end
 
 local function on_host_event(self)
@@ -130,8 +150,7 @@ local function on_lock_target(self)
     if util.valid(p) then pcall(function() pl = util.vec(p:K2_GetActorLocation()) end) end
     if not (zl and gl and pl) then return end
     for _, h in pairs(active) do
-        local bl
-        if util.valid(h.obj) then pcall(function() bl = util.vec(h.obj:K2_GetActorLocation()) end) end
+        local bl = h.loc
         if bl and util.dist(zl, bl) < WAVE_RADIUS then
             if util.dist(gl, bl) < util.dist(pl, bl) then
                 retargeting = true
@@ -224,6 +243,7 @@ end
 local wave_fn = function(self) util.safe(on_host_event, "horde.wave", self) end
 local text_fn = function(...) util.safe(on_notification, "horde.text", ...) end
 local lock_fn = function(self) util.safe(on_lock_target, "horde.lock", self) end
+local finished_fn = function(self) util.safe(on_finished, "horde.finished", self) end
 
 function horde.tick(dt)
     if role ~= "host" and role ~= "guest" then return end
@@ -242,6 +262,7 @@ function horde.tick(dt)
             util.ensure_hook(BEACON .. ":FinalWaveDefeated?", wave_fn)
             util.ensure_hook(GFL .. ":CreateNotificationUI", text_fn)
             util.ensure_hook(SAI .. ":SetBB_LockOnTarget", lock_fn)
+            util.ensure_hook(BEACON .. ":SpawnRewards", finished_fn)
         end
     end
     if role == "host" then
@@ -264,11 +285,7 @@ end
 function horde.active_near(loc, r)
     if role ~= "host" or not loc then return false end
     for _, h in pairs(active) do
-        if util.valid(h.obj) and flags(h.obj) then
-            local l
-            pcall(function() l = h.obj:K2_GetActorLocation() end)
-            if l and util.dist(loc, l) < r then return true end
-        end
+        if h.loc and util.dist(loc, h.loc) < r then return true end
     end
     return false
 end
@@ -278,7 +295,7 @@ function horde.status()
         stats.requests, stats.started, stats.stopped, stats.ignored, stats.texts, stats.retargeted, stats.missing)
 end
 
-local function forget_world() active, shown, local_at, pressed_at, last_blob, guest_body = {}, {}, {}, {}, nil, "" end
+local function forget_world() active, shown, local_at, pressed_at, last_blob, guest_body, finished = {}, {}, {}, {}, nil, "", {} end
 function horde.init(c, r, s, sw)
     cfg, role, session = c, r, s
     if sw then same_world = sw end
