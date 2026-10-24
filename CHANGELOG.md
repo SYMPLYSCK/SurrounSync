@@ -2,6 +2,33 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 0.12.0 (2026-10-24)
+
+Hey everyone! This one took a while. I spent most of it chasing bugs you reported, plus one experiment I've wanted to try for a long time.
+
+**🧪 New (experimental): Load Splitting**
+Until now the host's PC has run *every* zombie in the world, including the ones around your friend on the other side of the map. That's a lot of work for one machine. With Load Splitting on, once you two are far apart (400 m or so), your friend's game takes over the zombies around them. When you meet up again it hands them back, and anything you're mid-fight with stays until it's dead, so nothing vanishes in your face.
+
+It's **off by default** and marked experimental for a reason. If you want to try it: CO-OP tab → ⚙️ → **LOAD SPLITTING (EXPERIMENTAL)**. Only the host can turn it on. If anything weird happens, turn it off and send me a bug report. That really helps.
+
+**🔧 Fixes**
+- **Horde beacons**: only the host's beacon runs the horde now. Either of you can start it, you both see the countdown and waves, and there's no more double horde. Also fixed a host crash right after a horde finished.
+- **Infestations**: no more nests with millions of health. Old saves that got stuck like that are repaired automatically.
+- **Tracers**: they come from the gun you're holding, not the one you just put away.
+- **Vehicles**: fuel and repairs show up for the other player right away, no need to hop in first.
+- **Backpack names**: a named bag keeps its name when you drop it or move it between containers.
+- **Bug reports**: Send works in single player too, tells you whether it went through, and won't double-send.
+- **Text boxes**: the rename and bug report boxes have readable black text now.
+- **Co-op teleport requests**: long names wrap properly instead of running off the page.
+
+**⚠️ Known issues** (working on these next)
+- Dropping a magazine with ammo: the other player still gets it empty.
+- Adding an attachment to a weapon lying on the ground doesn't show for the other player yet, and it can flicker for you.
+- A backpack inside another backpack can go invisible after a trip through a storage box. Drop it and pick it back up to fix it.
+- Some zombies may still look a bit different between the two games.
+
+Huge thanks to everyone who's been sending bug reports and testing with friends. A lot of these fixes came straight from you. Have fun out there, and as always, watch your back. 🧡
+
 ## 0.11.0 (2026-10-19)
 
 - Fixed a crash in long sessions: damage with no damage type or no attacker (fire, explosions, other mods) could
