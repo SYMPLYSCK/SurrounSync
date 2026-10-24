@@ -409,7 +409,8 @@ end
 -- RemoveGetInfo (what a move between containers uses): plain consuming left the bag's compartments and
 -- everything in them behind as loose loot ("everything spilled into the gas pump", 2026-10-24).
 function jig.remove_whole(comp, uid)
-    local ok, err = pcall(function() comp:RemoveGetInfo(jig.guid(uid), -1, {}, {}, 0, false) end)
+    -- ItemInfo, RepContainers, VendorNewCount and CountRemoved? are all out params: each needs a table
+    local ok, err = pcall(function() comp:RemoveGetInfo(jig.guid(uid), -1, {}, {}, {}, {}) end)
     if ok then pcall(function() comp:MC_ItemRemoved(jig.guid(uid)) end)
     else log.warn("jig: couldn't remove a bag whole: " .. tostring(err)) end
     return ok

@@ -349,30 +349,33 @@ local pending_menu = nil   -- the JigContextMenuComp that just got a right-click
 local function on_right_click(self) pending_menu = self end
 
 local hovered = nil   -- { tip = the tooltip widget, uid }: my backpack under the mouse (F2 renames it)
-local HINT = "   [F2 rename]"
+-- the hint goes at the end of the small description text, not next to the name
+local HINT = "(F2: rename)"
 local function on_tooltip(self)
     local item
     pcall(function() item = self.ItemRef end)
     if not util.valid(item) then return end
     local uid = uid_of(item)
     local name = names.get(uid)
-    local text = name
+    if name then pcall(function() self.NameText:SetText(FText(name)) end) end
     if uid and is_backpack(item) and mine(uid) then
         hovered = { tip = self, uid = uid }
-        if not text then pcall(function() text = self.NameText:GetText():ToString() end) end
-        if text and not text:find(HINT, 1, true) then text = text .. HINT end
+        pcall(function()
+            local d = self.descr:GetText():ToString() or ""
+            if not d:find(HINT, 1, true) then self.descr:SetText(FText(d == "" and HINT or (d .. "\n" .. HINT))) end
+        end)
     end
-    if text then pcall(function() self.NameText:SetText(FText(text)) end) end
 end
 local function rename_hovered()
     local h = hovered
     if not (h and util.valid(h.tip)) then return end
-    local shown = false
-    pcall(function() shown = h.tip:IsVisible() and h.tip:IsInViewport() end)
-    if not shown then hovered = nil; return end
+    -- (the tooltip is never "in the viewport" - it lives in the inventory's hover layer)
+    local shown = true
+    pcall(function() shown = h.tip:IsVisible() end)
+    if not shown then log.info("names: F2 - the backpack tooltip is closed"); hovered = nil; return end
     local item
     pcall(function() item = h.tip.ItemRef end)
-    if not (util.valid(item) and uid_of(item) == h.uid) then return end
+    if not (util.valid(item) and uid_of(item) == h.uid) then log.info("names: F2 - hovering another item now"); return end
     open_popup(h.uid, nil)
 end
 
