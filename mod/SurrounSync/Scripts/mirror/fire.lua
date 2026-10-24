@@ -6,6 +6,7 @@ local game = require("mirror.game")
 local ghost = require("mirror.ghost")
 local look = require("mirror.look")
 local events = require("mirror.events")
+local audio = require("mirror.audio")
 
 local fire = {}
 
@@ -155,7 +156,7 @@ local function play(payload)
     local rot = { Pitch = 0, Yaw = 0, Roll = 0 }
     local sound, emitter = find(sp), find(ep)
     if sound and gs then
-        pcall(function() gs:PlaySoundAtLocation(g, sound, loc, rot, 1.0, 1.0, 0.0, nil, nil, nil, nil) end)
+        pcall(function() gs:PlaySoundAtLocation(g, sound, loc, rot, 1.0, 1.0, 0.0, audio.attenuation_for(sound, sp), nil, nil, nil) end)
     end
     if emitter and muzzle and gs then
         pcall(function()
@@ -170,6 +171,67 @@ local function play(payload)
         end
     end
     stats.played = stats.played + 1
+end
+
+-- Bullet tracers: the game draws them only for its own player (BP_FirearmPickup SpawnTrail = Niagara
+-- LP_BulletTrailEmitter_System at the muzzle, "EndPoint" = where the bullet hit; skipped while scoped or with the
+-- Video.BulletTrail setting off). Svr_SpawnTrail runs for every shot: send muzzle + end point, the other game
+-- draws the same tracer from the other player's visible muzzle - if its own bullet trail setting is on.
+local trails = events.new("trail", 32, 2)
+local TRAIL = "/Game/FX/LP_BulletTrailEmitter_System.LP_BulletTrailEmitter_System"
+local NIAGARA = "/Script/Niagara.Default__NiagaraFunctionLibrary"
+local KSL = "/Script/Engine.Default__KismetSystemLibrary"
+local trail_stats = { sent = 0, played = 0 }
+local trail_warned = false
+
+local function on_trail(self, MuzzleLocation, EndPointLocation)
+    local w = self:get()
+    local p, owner, parent = game.player(), nil, nil
+    pcall(function() owner = w:GetOwner() end)
+    pcall(function() parent = w:GetAttachParentActor() end)
+    if not (util.same(owner, p) or util.same(parent, p)) then return end
+    local m, e
+    pcall(function() local v = MuzzleLocation:get(); m = { X = v.X, Y = v.Y, Z = v.Z } end)
+    pcall(function() local v = EndPointLocation:get(); e = { X = v.X, Y = v.Y, Z = v.Z } end)
+    if not (m and e) then return end
+    trails:send(string.format("%.1f %.1f %.1f %.1f %.1f %.1f", m.X, m.Y, m.Z, e.X, e.Y, e.Z))
+    trail_stats.sent = trail_stats.sent + 1
+end
+local function trail_hook(self, MuzzleLocation, EndPointLocation)
+    util.safe(on_trail, "fire.trail_capture", self, MuzzleLocation, EndPointLocation)
+end
+
+local trail_setting, trail_setting_at = true, -100
+local function trails_on()
+    if os.clock() - trail_setting_at < 5 then return trail_setting end
+    trail_setting_at = os.clock()
+    local ksl = util.cdo(KSL)
+    local ok, v = pcall(function() return ksl:GetConsoleVariableBoolValue("Video.BulletTrail") end)
+    trail_setting = not ok or v ~= false
+    return trail_setting
+end
+
+local function play_trail(payload)
+    local mx, my, mz, ex, ey, ez = payload:match("^(%S+) (%S+) (%S+) (%S+) (%S+) (%S+)$")
+    if not mx or not trails_on() then return end
+    local g = ghost.get()
+    local nf, sys, ctx = util.cdo(NIAGARA), find(TRAIL), game.player()
+    if not (g and nf and sys and util.valid(ctx)) then
+        if not trail_warned and not sys then trail_warned = true; log.warn("fire: bullet tracer effect not loaded here: " .. TRAIL) end
+        return
+    end
+    local from = { X = tonumber(mx), Y = tonumber(my), Z = tonumber(mz) }
+    local muzzle = ghost_muzzle()
+    if muzzle then pcall(function() local v = muzzle:GetSocketLocation(FName("Muzzle")); from = { X = v.X, Y = v.Y, Z = v.Z } end) end
+    local to = { X = tonumber(ex), Y = tonumber(ey), Z = tonumber(ez) }
+    local dx, dy, dz = to.X - from.X, to.Y - from.Y, to.Z - from.Z
+    local rot = { Pitch = math.deg(math.atan(dz, math.sqrt(dx * dx + dy * dy))), Yaw = math.deg(math.atan(dy, dx)), Roll = 0 }
+    local ok, err = pcall(function()
+        local fx = nf:SpawnSystemAtLocation(ctx, sys, from, rot, { X = 1, Y = 1, Z = 1 }, true, true, 0, true)
+        fx:SetVectorParameter(FName("EndPoint"), to)
+    end)
+    if not ok and not trail_warned then trail_warned = true; log.warn("fire: bullet tracer failed: " .. tostring(err)) end
+    if ok then trail_stats.played = trail_stats.played + 1 end
 end
 
 local hurts = events.new("hurt", 32, 2)
@@ -230,15 +292,21 @@ function fire.tick(dt)
         check_in = 2.0
         hooked = util.ensure_hook(FIREARM .. ":Svr_WeaponEffects", capture_hook)
         util.ensure_hook(FIREARM .. ":FireSurfaceHit", surface_hook)
+        util.ensure_hook(FIREARM .. ":Svr_SpawnTrail", trail_hook)
     end
+    trails:pump(function(payload) util.safe(play_trail, "fire.trail", payload) end)
     shots:pump(function(payload) util.safe(play, "fire.play", payload) end)
     impacts:pump(function(payload) util.safe(play_impact, "fire.impact", payload) end)
     hurts:pump(function(payload) util.safe(play_hurt, "fire.hurt", payload) end)
 end
 
 local LASERS = { "BP_SmallTacticalLaserSightLocalAttachment_C", "BP_TacticalLaserLightComboLocalAttachment_C" }
+local function lasers(i)
+    local n = LASERS[i]:gsub("_C$", "")
+    return util.instances(LASERS[i], "/Game/Inventory/Items/LocalAttachments/Tactical/" .. n .. "." .. LASERS[i])
+end
 local laser_in, laser_fixed = 0.0, 0
-local LIST_EVERY = 20.0
+local LIST_EVERY = 2.0
 local laser_list, list_in, list_idx = {}, 0.0, 0
 
 fix_lasers = function(dt)
@@ -246,7 +314,7 @@ fix_lasers = function(dt)
     if list_in <= 0 then
         list_in = LIST_EVERY
         list_idx = list_idx % #LASERS + 1
-        laser_list[list_idx] = FindAllOf(LASERS[list_idx]) or {}
+        laser_list[list_idx] = lasers(list_idx)
         return
     end
     laser_in = laser_in - dt
@@ -280,11 +348,14 @@ fix_lasers = function(dt)
 end
 
 function fire.status()
-    return string.format("shots sent %d, played %d | impacts sent %d, played %d | hurt sent %d, played %d",
-        stats.sent, stats.played, impact_stats.sent, impact_stats.played, hurt_stats.sent, hurt_stats.played)
+    return string.format("shots sent %d, played %d | tracers sent %d, played %d | impacts sent %d, played %d | hurt sent %d, played %d",
+        stats.sent, stats.played, trail_stats.sent, trail_stats.played, impact_stats.sent, impact_stats.played, hurt_stats.sent, hurt_stats.played)
 end
 
+-- Respawn/reload: the old world's objects are freed - drop them without touching them.
+local forget_world
 function fire.init(c, r)
+    game.on_world_reset(forget_world)
     cfg, role = c, r
     game.player_hook("ReceiveAnyDamage", function(self, Damage, DamageType, InstigatedBy, DamageCauser)
         util.safe(on_hurt, "fire.hurt_capture", self, Damage, DamageCauser)
@@ -341,7 +412,7 @@ lasers_follow_aim = function(dt)
         end
     end
     if ads and changed and #in_hand == 0 then
-        for i = 1, #LASERS do laser_list[i] = FindAllOf(LASERS[i]) or {} end
+        for i = 1, #LASERS do laser_list[i] = lasers(i) end
         for i = 1, #LASERS do
             for _, l in ipairs(laser_list[i]) do if util.valid(l) and laser_in_hand(l, p) then in_hand[#in_hand + 1] = l end end
         end
@@ -366,6 +437,10 @@ lasers_follow_aim = function(dt)
         if not keep[k] and util.valid(l) then laser_off(l) end
     end
     driven = keep
+end
+
+forget_world = function()
+    cache, laser_list, list_idx, driven, in_hand = {}, {}, 0, {}, {}
 end
 
 return fire

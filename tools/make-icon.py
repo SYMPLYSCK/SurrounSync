@@ -1,6 +1,7 @@
 """Builds installer/SurrounSync.ico and installer/SurrounSync.png from the badge art.
 
-    python tools/make-icon.py [art.png]    (needs Pillow; without an argument uses installer/icon-art.png)
+    python tools/make-icon.py [art.png]           (needs Pillow; without an argument uses installer/icon-art.png)
+    python tools/make-icon.py --square art.png    square art (e.g. the graffiti logo): rounded corners, no badge cut
 """
 import os
 import sys
@@ -37,8 +38,25 @@ def cut_badge(im):
     return im.crop((int(mx - r), int(my - r), int(mx + r) + 1, int(my + r) + 1))
 
 
+def round_square(im, radius=0.12):
+    """Square art: centre-crop to a square and round its corners."""
+    im = im.convert("RGBA")
+    w, h = im.size
+    n = min(w, h)
+    im = im.crop(((w - n) // 2, (h - n) // 2, (w - n) // 2 + n, (h - n) // 2 + n))
+    k = 4
+    mask = Image.new("L", (n * k, n * k), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, n * k - 1, n * k - 1), radius=int(n * k * radius), fill=255)
+    im.putalpha(mask.resize((n, n), Image.LANCZOS))
+    return im
+
+
 def main():
-    if len(sys.argv) > 1:
+    if len(sys.argv) > 2 and sys.argv[1] == "--square":
+        badge = round_square(Image.open(sys.argv[2])).resize((512, 512), Image.LANCZOS)
+        badge.save(ART)
+        print("wrote", os.path.normpath(ART))
+    elif len(sys.argv) > 1:
         badge = cut_badge(Image.open(sys.argv[1])).resize((512, 512), Image.LANCZOS)
         badge.save(ART)
         print("wrote", os.path.normpath(ART))

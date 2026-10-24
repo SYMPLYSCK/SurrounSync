@@ -51,12 +51,15 @@ local function master()
     return util.valid(master_cls) and master_cls or nil
 end
 
+local TRADER = "/Game/AI/Humans/Trader/BP_MasterTrader.BP_MasterTrader_C"
 local FAMILIES = {
     { "zombie", MASTER },
     { "boss", "/Game/AI/Zombies/Boss/BP_ZombieBoss.BP_ZombieBoss_C" },
     { "human", "/Game/AI/Humans/Bandits/BP_MasterBandit.BP_MasterBandit_C" },
     { "human", "/Game/AI/Humans/CoyoteSoldiers/BP_MasterCoyoteSoldier.BP_MasterCoyoteSoldier_C" },
     { "human", "/Game/AI/Humans/Scavengers/BP_MasterScavenger.BP_MasterScavenger_C" },
+    -- the wandering trader: one host-owned trader (own one per game wandered apart and stocked apart)
+    { "human", TRADER },
     { "animal", "/Game/AI/Animals/BP_Animal.BP_Animal_C" },
 }
 local fam_cls, fam_retry = {}, {}
@@ -69,6 +72,7 @@ local function fam_class(path)
     fam_retry[path] = os.clock() + 10
     return nil
 end
+local applying_hit = false
 local function family_of(o)
     if not util.valid(o) then return nil end
     for _, f in ipairs(FAMILIES) do
@@ -81,6 +85,12 @@ local function family_of(o)
     return nil
 end
 local function is_zombie(o) return family_of(o) ~= nil end
+function zombies.is_trader(o)
+    local c = fam_class(TRADER)
+    if not (c and util.valid(o)) then return false end
+    local ok, r = pcall(function() return o:IsA(c) end)
+    return ok and r == true
+end
 zombies.family_of = family_of
 local function ai_of(a)
     if not util.valid(a) then return nil end
@@ -102,6 +112,7 @@ local function smart_ai(z)
     return nil
 end
 zombies.smart_ai = smart_ai
+local destroy_holdables
 
 local function dead_of(z, fam)
     local d = false
@@ -143,6 +154,7 @@ local BEGIN_CLASSES = {
     "/Game/AI/Humans/Bandits/BP_MasterBandit.BP_MasterBandit_C",
     "/Game/AI/Humans/CoyoteSoldiers/BP_MasterCoyoteSoldier.BP_MasterCoyoteSoldier_C",
     "/Game/AI/Humans/Scavengers/BP_MasterScavenger.BP_MasterScavenger_C",
+    TRADER,
     "/Game/AI/Animals/Deer/BP_AnimalDeer.BP_AnimalDeer_C",
     "/Game/AI/Animals/Wolf/BP_AnimalWolf.BP_AnimalWolf_C",
     "/Game/AI/Animals/Bear/BP_AnimalBear.BP_AnimalBear_C",
@@ -224,8 +236,16 @@ local function find(p)
     if not p or p == "-" then return nil end
     local o = cache[p]
     if util.valid(o) then return o end
+    -- a miss costs StaticFindObject ~15 ms (measured in-game): ask again for a missing path once for all
+    -- copies, 5 s after the first miss, doubling up to 60 s (most never load here - no safe LoadAsset)
+    local miss = missed[p]
+    if miss and not appeared[p] and os.clock() < miss.at then return nil end
     o = StaticFindObject(p)
-    if not util.valid(o) then missed[p] = true; return nil end
+    if not util.valid(o) then
+        local wait = miss and math.min(miss.wait * 2, 60.0) or SETTLE
+        missed[p] = { at = os.clock() + wait, wait = wait }
+        return nil
+    end
     if missed[p] then
         appeared[p] = appeared[p] or os.clock()
         if os.clock() - appeared[p] < SETTLE then return nil end
@@ -300,6 +320,64 @@ local function material_asset(m)
     return m
 end
 
+-- Zombie archetypes: BP_MasterZombie rolls one in SelectArchetype 1.0-1.25 s after BeginPlay and crawlers
+-- roll ToughenedCrawler (and which legs are missing) inside BeginPlay, so each game rolls its own. The host
+-- sends its archetype, hidden bones and whether the eyes glow (EyesColour's dynamic material); copies match.
+local MZ = "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C"
+local ARCH = { "Sprinter", "UltraRadiated", "Acidic", "Screamer", "Grenadier", "ToughenedCrawler" }
+local ARCH_CHANCES = { "SprinterArchetypeChance", "UltraRadiatedArchetypeChance", "AcidicArchetypeChance",
+    "ScreamerArchetypeChance", "GrenadierArchetypeChance" }
+local BONES = { "Jaw", "lowerarm_r", "lowerarm_l", "calf_l", "Foot_R", "calf_r", "Foot_L" }
+local BIT = { 1, 2, 4, 8, 16, 32, 64 }
+local bone_fnames = {}
+local arch_seen, arch_seen_n = {}, 0
+local arch_hooks = {}
+for i, a in ipairs(ARCH) do
+    arch_hooks[i] = function(self)
+        local n
+        pcall(function() n = self:get():GetFName():ToString() end)
+        if not n then return end
+        if arch_seen_n > 4000 then arch_seen, arch_seen_n = {}, 0 end
+        if not arch_seen[n] then arch_seen_n = arch_seen_n + 1 end
+        arch_seen[n] = i
+    end
+end
+local function hook_archetypes()
+    for i, a in ipairs(ARCH) do util.ensure_hook(MZ .. ":Archetype_" .. a, arch_hooks[i]) end
+end
+local function bone_fname(i)
+    local f = bone_fnames[i]
+    if not f then f = FName(BONES[i]); bone_fnames[i] = f end
+    return f
+end
+local function bones_of(z)
+    local m = 0
+    for i = 1, #BONES do
+        local h = false
+        pcall(function() h = z.Mesh:IsBoneHiddenByName(bone_fname(i)) end)
+        if h == true then m = m + BIT[i] end
+    end
+    return m
+end
+local function eyes_of(z)
+    local m
+    pcall(function() m = z.Mesh:GetMaterial(0) end)
+    return (util.valid(m) and util.class_name(m) == "MaterialInstanceDynamic") and 1 or 0
+end
+local function arch_of(z, name)
+    if name and arch_seen[name] then return arch_seen[name] end
+    -- Rolled before the hooks took: the archetypes that leave a trace (a Sprinter leaves none).
+    local a = 0
+    pcall(function()
+        if util.valid(z.ZombieMist) then a = 2
+        elseif util.valid(z.BloodSpitFX) then a = 3
+        elseif (path_of(z.Mesh:GetSkinnedAsset()) or ""):find("Zombie_grenadier", 1, true) then a = 5
+        elseif z.Mesh:IsBoneHiddenByName(bone_fname(1)) then a = 4
+        elseif (util.class_name(z) or ""):find("Crawler", 1, true) and z.DamageComponent["CanHeadshot1Shot?"] == false then a = 6 end
+    end)
+    return a
+end
+
 LOOK_KEYS = { "hair", "beard", "backpack", "antlers", "ranged", "melee" }
 local LOOK_COMPS = { hair = "HairMesh", beard = "BeardMesh", backpack = "BackpackMesh", antlers = "Antlers" }
 health_of = function(z, fam)
@@ -353,9 +431,11 @@ local function apply_hit(payload)
         local dtc = tp and find((tp:gsub("%.Default__", "."))) or nil
         if dtc and util.class_name(dtc) ~= "BlueprintGeneratedClass" and util.class_name(dtc) ~= "Class" then dtc = nil end
         tname = " type " .. ((tp or "-"):match("([%w_]+)_C$") or tostring(tp))
+        applying_hit = true
         ok, err = xp.without(function()
             util.cdo("/Script/Engine.Default__GameplayStatics"):ApplyDamage(z, tonumber(amt) or 1, nil, g, dtc)
         end)
+        applying_hit = false
     elseif kind == "D" then
         local _, tp = rest:match("^(%d) (%S+)$")
         local dt = find(tp)
@@ -364,9 +444,13 @@ local function apply_hit(payload)
             if cls then pcall(function() dt = cls:GetCDO() end) end
         end
         tname = " type " .. ((tp or "-"):match("([%w_]+)_C$") or tostring(tp)) .. (dt and "" or " (NOT FOUND here)")
+        applying_hit = true
         ok, err = xp.without(function() z.DamageComponent:DamageTaken(tonumber(amt), dt, g) end)
+        applying_hit = false
     else
+        applying_hit = true
         ok, err = xp.without(function() z.DamageComponent:FireDamageTaken(tonumber(amt), g) end)
+        applying_hit = false
     end
     hit_count = hit_count + 1
     if not ok then log.warn("zombies: applying HIT failed: " .. tostring(err)) end
@@ -405,6 +489,7 @@ local function host_tick(dt)
     zkills:pump(function() end)
     aifx:pump(function() end)
     install_host_hooks()
+    hook_archetypes()
     send_in = send_in - dt
     if send_in > 0 then return end
     send_in = 1.0 / cfg.zombies.send_hz
@@ -423,7 +508,14 @@ local function host_tick(dt)
     for _, z in ipairs(zombies_cached(now)) do
         local skip_until = far_until[z]
         local l, is_dead = nil, false
-        if not (skip_until and now < skip_until) then
+        -- A body dead for STATICS_EVERY s only needs its last values: the guest's copy ragdolls on its
+        -- own and ignores a dead one's pose, montage and look. Gone/hidden is still checked below.
+        local a0 = znames[z]
+        local st0 = a0 and ids[a0] and statics[ids[a0]]
+        local cz = st0 and st0.corpse
+        if cz and cz.z ~= z then cz, st0.corpse = nil, nil end
+        if cz then l, is_dead = cz.l, true
+        elseif not (skip_until and now < skip_until) then
             pcall(function() l = z:K2_GetActorLocation() end)
             if l and math.abs(l.X) < 1 and math.abs(l.Y) < 1 and math.abs(l.Z) < 1 then
                 is_dead = dead_of(z)
@@ -449,25 +541,32 @@ local function host_tick(dt)
                 by_id[id] = z
                 alive[a] = true
                 local st = statics[id]
-                if not st or now - st.at > STATICS_EVERY then perf.run("z.statics", function()
+                if not (st and st.corpse) and (not st or now - st.at > STATICS_EVERY) then perf.run("z.statics", function()
                     local mesh, mat
                     pcall(function() mesh = z.Mesh:GetSkinnedAsset() end)
                     pcall(function() mat = material_asset(z.Mesh:GetMaterial(0)) end)
-                    st = { at = now, cls = path_of(z:GetClass()), mesh = path_of(mesh), mat = path_of(mat) }
+                    st = { at = now, cls = path_of(z:GetClass()), mesh = path_of(mesh), mat = path_of(mat), dead_at = st and st.dead_at }
                     st.fam = family_of(z)
-                    if st.fam ~= "zombie" then st.look = look_of(z, st.fam) end
+                    if st.fam ~= "zombie" then st.look = look_of(z, st.fam)
+                    else st.arch, st.bones, st.eyes = arch_of(z, a), bones_of(z), eyes_of(z) end
                     statics[id] = st
                 end) end
                 local yaw, v, mont, mpos, dead = 0, { X = 0, Y = 0, Z = 0 }, nil, 0, false
-                pcall(function() yaw = z:K2_GetActorRotation().Yaw end)
-                pcall(function() v = z:GetVelocity() end)
-                pcall(function() mont = z:GetCurrentMontage() end)
-                if util.valid(mont) then
-                    pcall(function() mpos = z.Mesh:GetAnimInstance():Montage_GetPosition(mont) end)
+                local cs = st.corpse
+                if cs then
+                    yaw, v, mont, mpos, dead = cs.yaw, cs.v, cs.mont, cs.mpos, true
                 else
-                    mont = nil
+                    pcall(function() yaw = z:K2_GetActorRotation().Yaw end)
+                    pcall(function() v = z:GetVelocity() end)
+                    pcall(function() mont = z:GetCurrentMontage() end)
+                    if util.valid(mont) then
+                        pcall(function() mpos = z.Mesh:GetAnimInstance():Montage_GetPosition(mont) end)
+                        mont = asset_path(mont)
+                    else
+                        mont = nil
+                    end
+                    if is_dead then dead = true else dead = dead_of(z, st.fam) end
                 end
-                if is_dead then dead = true else dead = dead_of(z, st.fam) end
                 if dead and not loot_logged[id] then
                     loot_logged[id] = true
                     util.safe(function()
@@ -476,18 +575,35 @@ local function host_tick(dt)
                 end
                 lines[#lines + 1] = string.format("Z %d %d %d %d %.1f %.1f %.1f %.1f %.1f %.1f %.1f %d %.2f %d",
                     id, idx(st.cls), idx(st.mesh), idx(st.mat),
-                    l.X, l.Y, l.Z, yaw, v.X, v.Y, v.Z, idx(mont and asset_path(mont)), mpos or 0, dead and 1 or 0)
+                    l.X, l.Y, l.Z, yaw, v.X, v.Y, v.Z, idx(mont), mpos or 0, dead and 1 or 0)
+                if st.arch then lines[#lines + 1] = string.format("X %d %d %d %d", id, st.arch, st.bones, st.eyes) end
                 if st.look then
                     local parts = {}
                     for _, k in ipairs(LOOK_KEYS) do parts[#parts + 1] = tostring(idx(st.look[k])) end
-                    local beh = -1
-                    if st.fam == "human" then pcall(function() beh = smart_ai(z)["AI Current Behaviour"] or -1 end) end
-                    lines[#lines + 1] = string.format("L %d %s %.1f %d", id, table.concat(parts, " "), health_of(z, st.fam) or -1, beh)
+                    local beh, h = -1, nil
+                    if cs then beh, h = cs.beh, cs.h
+                    else
+                        if st.fam == "human" then pcall(function() beh = smart_ai(z)["AI Current Behaviour"] or -1 end) end
+                        h = health_of(z, st.fam)
+                    end
+                    lines[#lines + 1] = string.format("L %d %s %.1f %d", id, table.concat(parts, " "), h or -1, beh)
+                    if dead and not cs then st.beh, st.h = beh, h end
+                end
+                if dead and not cs then
+                    st.dead_at = st.dead_at or now
+                    if now - st.dead_at >= STATICS_EVERY then
+                        st.corpse = { z = z, l = { X = l.X, Y = l.Y, Z = l.Z }, yaw = yaw, v = { X = 0, Y = 0, Z = 0 },
+                                      mont = nil, mpos = 0, beh = st.beh or -1, h = st.h }
+                    end
                 end
             end
         end
     end
-    for a, id in pairs(ids) do if not alive[a] then ids[a] = nil; by_id[id] = nil; statics[id] = nil end end
+    for a, id in pairs(ids) do
+        if not alive[a] then
+            ids[a] = nil; by_id[id] = nil; statics[id] = nil
+        end
+    end
     local out = {}
     for p, i in pairs(dict) do out[#out + 1] = "D " .. i .. " " .. p end
     for _, s in ipairs(lines) do out[#out + 1] = s end
@@ -497,6 +613,7 @@ end
 
 local copies = {}
 local looks, host_health, host_behaviour = {}, {}, {}
+local xlooks = {}
 local DEATH_WAIT = 0.6
 local spawn_gate, on_spawned = nil, nil
 local copy_addr = {}
@@ -554,6 +671,22 @@ local function contain_copy(z)
     end
 end
 
+-- A human's weapons are their own actors attached to its mesh (the game's body despawn hides
+-- them): destroying only the body leaves them floating where it was.
+destroy_holdables = function(z)
+    local ai = smart_ai(z)
+    if not ai then return end
+    local held = {}
+    pcall(function() held[#held + 1] = ai["Holdable Actor"] end)
+    pcall(function()
+        local list = ai["Attached Holdables"]
+        for i = 1, list:GetArrayNum() do held[#held + 1] = list[i]["Holdable_6_3FE52CBF435F83B34B5404918416EFB4"] end
+    end)
+    for _, h in ipairs(held) do
+        if util.valid(h) then pcall(function() h:K2_DestroyActor() end) end
+    end
+end
+
 local function destroy_copy(id, why)
     local c = copies[id]
     if not c then return end
@@ -561,9 +694,10 @@ local function destroy_copy(id, why)
         local a = util.addr(c.z) or 0
         copy_addr[a] = nil
         destroyed[a] = now
+        destroy_holdables(c.z)
         pcall(function() c.z:K2_DestroyActor() end)
     end
-    copies[id] = nil
+    copies[id], xlooks[id] = nil, nil
 end
 
 local function destroy_all_copies(why)
@@ -687,6 +821,8 @@ local function spawn_copy(id, e)
     if not (ok and util.valid(z)) then log.warn("zombies: spawn failed for " .. tostring(e.cls)); return nil end
     copy_addr[util.addr(z)] = id
     destroyed[util.addr(z)] = nil
+    -- SelectArchetype runs ~1 s from now: the copy takes the host's archetype instead (sync_look).
+    for _, k in ipairs(ARCH_CHANCES) do pcall(function() z[k] = 0 end) end
     step("spawned, containing")
     contain_copy(z)
     local t_contain = os.clock() - t0 - t_spawn
@@ -743,7 +879,7 @@ local function suppress_natives()
     if spawners_scanned then
         spawner_in = 10.0
         for _, cls in ipairs({ SPAWNER, "BP_AISpawner_Animals_C" }) do
-            for _, s in ipairs(FindAllOf(cls) or {}) do
+            for _, s in ipairs(util.instances(cls, "/Game/AI/AISpawners/BP_AISpawner_Master.BP_AISpawner_Master_C")) do
                 util.pause()
                 if util.valid(s) then
                     local stopped = false
@@ -753,7 +889,7 @@ local function suppress_natives()
             end
         end
         for _, cls in ipairs({ "BP_AISpawningVolume_Prefab_C", "BP_AISpawningVolume_RandomChanceToSpawn_C" }) do
-            for _, v in ipairs(FindAllOf(cls) or {}) do
+            for _, v in ipairs(util.instances(cls, "/Game/AI/Humans/" .. cls:gsub("_C$", "") .. "." .. cls)) do
                 util.pause()
                 local a = util.addr(v) or 0
                 if util.valid(v) and not volumes_stopped[a] then
@@ -775,6 +911,7 @@ local function suppress_natives()
             destroyed[a] = now
             pcall(function()
                 local c = z.Controller
+                destroy_holdables(z)
                 z:K2_DestroyActor()
                 if util.valid(c) then c:K2_DestroyActor() end
             end)
@@ -793,7 +930,7 @@ local snap_count = 0
 local relooked = 0
 local function keep_look(id, c, e)
     local z = c.z
-    if c.dead_at or now - (c.born or now) < 3.0 or not util.valid(z) then return end
+    if c.dead_at or not util.valid(z) then return end
     local mesh, mat = find(e.mesh), find(e.mat)
     if not mesh and e.mesh and e.mesh ~= "-" then loader.want(e.mesh) end
     if not mat and e.mat and e.mat ~= "-" then loader.want(e.mat) end
@@ -801,12 +938,12 @@ local function keep_look(id, c, e)
     if mesh then
         local cur
         pcall(function() cur = z.Mesh:GetSkinnedAsset() end)
-        if not util.same(cur, mesh) then pcall(function() z.Mesh:SetSkinnedAssetAndUpdate(mesh, false) end); fixed = true end
+        if not util.same(cur, mesh) then perf.run("z.look.mesh", function() pcall(function() z.Mesh:SetSkinnedAssetAndUpdate(mesh, false) end) end); fixed = true end
     end
     if mat then
         local cur
         pcall(function() cur = material_asset(z.Mesh:GetMaterial(0)) end)
-        if not util.same(cur, mat) then pcall(function() z.Mesh:SetMaterial(0, mat) end); fixed = true end
+        if not util.same(cur, mat) then perf.run("z.look.mat", function() pcall(function() z.Mesh:SetMaterial(0, mat) end) end); fixed = true end
     end
     if fixed then
         relooked = relooked + 1
@@ -814,12 +951,69 @@ local function keep_look(id, c, e)
     end
 end
 
+-- The copy's own delayed rolls (async mesh/material load, archetype, eye glow) land after the spawn:
+-- every few seconds put the host's back.
+local LOOK_AFTER, LOOK_EVERY = 2.0, 5.0
+local arch_mismatch = 0
+local function sync_look(id, c, e)
+    local z, x = c.z, xlooks[id]
+    if c.dead_at or not util.valid(z) then return end
+    if x and x.arch > 0 and c.arch ~= x.arch then
+        local mine
+        pcall(function() mine = arch_of(z, z:GetFName():ToString()) end)
+        if mine ~= x.arch then
+            local ok, err
+            perf.run("z.look.arch", function() ok, err = pcall(function() local f = z["Archetype_" .. ARCH[x.arch]]; f(z) end) end)
+            if not ok then log.warn("zombies: copy " .. id .. " archetype " .. ARCH[x.arch] .. ": " .. tostring(err)) end
+        end
+        c.arch = x.arch
+    elseif x and x.arch == 0 and not c.arch then
+        c.arch = 0
+        local mine
+        pcall(function() mine = arch_of(z, z:GetFName():ToString()) end)
+        if mine and mine > 0 then
+            arch_mismatch = arch_mismatch + 1
+            if arch_mismatch <= 5 then log.info("zombies: copy " .. id .. " rolled " .. ARCH[mine] .. " here, the host's has none (kept)") end
+        end
+    end
+    keep_look(id, c, e)
+    if not x then return end
+    local have = bones_of(z)
+    if have ~= x.bones then perf.run("z.look.bones", function()
+        for i = 1, #BONES do
+            local want, got = (x.bones // BIT[i]) % 2 == 1, (have // BIT[i]) % 2 == 1
+            if want and not got then pcall(function() z.Mesh:HideBoneByName(bone_fname(i), 0) end)
+            elseif got and not want and not c.bones_done then pcall(function() z.Mesh:UnHideBoneByName(bone_fname(i)) end) end
+        end
+    end) end
+    c.bones_done = true
+    local glow = eyes_of(z)
+    if x.eyes == 1 and glow == 0 then
+        local off = false
+        pcall(function()
+            off = util.cdo("/Script/Engine.Default__KismetSystemLibrary"):GetConsoleVariableBoolValue("Game.DisableZombieEyes") == true
+        end)
+        perf.run("z.look.eyes", function() pcall(function() z:Event_EyesCallback(off) end) end)
+    elseif x.eyes == 0 and glow == 1 then
+        local mat = find(e.mat)
+        if mat then pcall(function() z.Mesh:SetMaterial(0, mat) end) end
+    end
+end
+
+-- For tools/test-sync.py.
+zombies._look = { arch_of = function(z, n) return arch_of(z, n) end, bones_of = function(z) return bones_of(z) end,
+                  sync = function(id, c, e, x) xlooks[id] = x; sync_look(id, c, e) end }
+zombies._host = { tick = function(c, dt) cfg = cfg or c; now = now + dt; host_tick(dt) end }
+
 local function read_snapshot()
     local body = link.get_blob("zombies")
     if not body then return end
     snap_count = snap_count + 1
     local snap_t = zclock:place(tonumber(body:match("\nT (%S+)")), now) or now
     local dict, seen = {}, {}
+    -- at most 6 look checks per snapshot: copies spawned together would otherwise all re-check in one
+    -- frame every LOOK_EVERY (~40 ms hitch at 40 copies); the rest go on the next snapshots
+    local looks_left = 6
     for line in body:gmatch("[^\n]+") do
         local i, p = line:match("^D (%d+) (.+)$")
         if i then dict[tonumber(i)] = p end
@@ -836,6 +1030,9 @@ local function read_snapshot()
         looks[id] = lk
         host_health[id] = tonumber(f[#LOOK_KEYS + 1] or "")
         host_behaviour[id] = tonumber(f[#LOOK_KEYS + 2] or "")
+    end
+    for xid, a, b, ey in body:gmatch("\nX (%d+) (%d+) (%d+) (%d+)") do
+        xlooks[tonumber(xid)] = { arch = tonumber(a), bones = tonumber(b), eyes = tonumber(ey) }
     end
     for i1, c1, m1, t1, x, y, z, yw, vx, vy, vz, mo, mp, dd in body:gmatch(
             "Z (%d+) (%d+) (%d+) (%d+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%d+) (%S+) (%d)") do
@@ -874,6 +1071,11 @@ local function read_snapshot()
                         else pcall(function() c.z:StopAnimMontage(nil) end) end
                     end
                     c.montage, c.mpos = e.montage, e.mpos
+                    if c.fam == "zombie" and looks_left > 0 and now - (c.look_at or 0) > LOOK_EVERY
+                            and now - (c.born or now) > LOOK_AFTER then
+                        c.look_at, looks_left = now, looks_left - 1
+                        perf.run("z.look", function() util.safe(sync_look, "zombies.look", id, c, e) end)
+                    end
                 end
             end
         end
@@ -974,6 +1176,24 @@ local function drive(dt)
                     if my_loc then local dx, dy, dz = my_loc.X - px, my_loc.Y - py, my_loc.Z - pz; d = math.sqrt(dx * dx + dy * dy + dz * dz) end
                     c.lod = d > 10000 and 4 or (d > 6000 and 2 or 1)
                     c.lod_phase = c.lod_phase or (id % 4)
+                    -- Copies have the game's AI optimizer off, so their anim ran full rate even
+                    -- off-screen. Past 40 m the engine now skips the pose only on frames the copy
+                    -- isn't drawn (montages still tick); on screen it animates exactly as before.
+                    -- (enum: 0 AlwaysTickPoseAndRefreshBones, 1 AlwaysTickPose, 2 OnlyTickMontagesAndRefresh-
+                    -- BonesWhenPlayingMontages, 3 OnlyTickMontagesWhenNotRendered, 4 OnlyTickPoseWhenRendered;
+                    -- the game's zombie meshes already ship with 4, so this only matters for lower ones)
+                    local far = d > 4000 and cfg.zombies.offscreen_anim ~= false
+                    if far ~= (c.anim_far or false) then
+                        pcall(function()
+                            local m = c.z.Mesh
+                            if c.anim_tick0 == nil then
+                                c.anim_tick0 = m.VisibilityBasedAnimTickOption
+                                if not stats.anim_tick0 then stats.anim_tick0 = true; log.info("zombies: copies' own anim tick option is " .. tostring(c.anim_tick0)) end
+                            end
+                            m.VisibilityBasedAnimTickOption = far and math.max(c.anim_tick0, 3) or c.anim_tick0
+                            c.anim_far = far
+                        end)
+                    end
                 end
             end
         end
@@ -1028,6 +1248,7 @@ local function guest_tick(dt)
                 .. "your own spawners stay on until then", missing, #LOOT_TABLES))
         end
         install_hit_hooks()
+        hook_archetypes()
     end) end
     perf.run("z.read", read_snapshot)
     perf.run("z.drive", drive, dt)
@@ -1185,8 +1406,46 @@ function zombies.copies() return copies end
 function zombies.copy_id_of(z) return copy_addr[util.addr(z) or 0] end
 function zombies.now() return now end
 
+-- Guest: the local player's radiation, read every frame. A copy's radiation call (a radiated zombie's death
+-- blast) can't be stopped by zeroing its params - the hook may run after the function - so it is taken back
+-- to this value instead (the host's real zombie already sends its own).
+-- (one table: this file is near Lua's 200-locals limit)
+local rad = { path = "/Game/Blueprints/Components/RadiationComponent.RadiationComponent_C", retry = 0 }
+function rad.watch(dt)
+    if not util.valid(rad.comp) then
+        rad.comp, rad.seen = nil, nil
+        rad.retry = rad.retry - dt
+        if rad.retry > 0 then return end
+        rad.retry = 5
+        local p = game.player()
+        if not util.valid(p) then return end
+        rad.cls = util.valid(rad.cls) and rad.cls or StaticFindObject(rad.path)
+        if not util.valid(rad.cls) then return end
+        pcall(function() rad.comp = p:GetComponentByClass(rad.cls) end)
+        if not util.valid(rad.comp) then rad.comp = nil; return end
+    end
+    local v
+    pcall(function() v = rad.comp.CurrentRadiation end)
+    rad.seen = type(v) == "number" and v or nil
+end
+
+function rad.take_back(amount)
+    if not (util.valid(rad.comp) and rad.seen and amount and amount > 0) then return end
+    local cur
+    pcall(function() cur = rad.comp.CurrentRadiation end)
+    if type(cur) ~= "number" or cur >= rad.seen then return end
+    local back = math.min(rad.seen - cur, amount)
+    pcall(function()
+        rad.comp.CurrentRadiation = cur + back
+        rad.comp:DecreaseRadiation(0)
+    end)
+    log.info(string.format("zombies: took back %.2f radiation from a copy", back))
+end
+zombies._rad = rad
+
 function zombies.tick(dt)
     if not (cfg and cfg.zombies.enabled) then return end
+    if role ~= "host" then util.safe(rad.watch, "zombies.watch_rad", dt) end
     now = now + dt
     util.safe(selftest_tick, "zombies.selftest", dt)
     util.safe(pin_loot, "zombies.pin_loot", dt)
@@ -1408,8 +1667,19 @@ apply_fx = function(payload)
     end
 end
 
+-- The old world is gone: forget its zombies, copies and cached assets without touching them.
+local function forget_world()
+    ids, by_id, statics, watch_dead = {}, {}, {}, nil
+    zlist, zlist_set, zlist_addr, zlist_new, zlist_at, zlist_pruned = {}, {}, {}, {}, -100, -100
+    copies, copy_addr, destroyed, volumes_stopped, xlooks = {}, {}, {}, {}, {}
+    arch_seen, arch_seen_n = {}, 0
+    rad.comp, rad.seen, rad.retry = nil, nil, 0
+    cache, missed, appeared, loot_obj, fam_cls, fam_retry, player_cls = {}, {}, {}, {}, {}, {}, nil
+end
+
 function zombies.init(c, r, s)
     cfg, role, session = c, r, s
+    game.on_world_reset(forget_world)
     util.safe(watch_new_zombies, "zombies.watch")
     game.keybind("F12", { ModifierKey.CONTROL }, function() want_steamtest = true end)
     if not cfg.zombies.enabled then return end
@@ -1453,12 +1723,16 @@ function zombies.init(c, r, s)
             if not (owner and is_zombie(owner)) then return end
             local id
             pcall(function() id = ids[owner:GetFName():ToString()] end)
-            if not id then return end
-            causer = util.obj(DmgCauser)
-            if causer and ghost.is(causer) then return end
+            if not id or applying_hit then return end
+            -- bosses pass junk pointers here; reading them crashes outside pcall
+            local boss = family_of(owner) == "boss"
+            if not boss then
+                causer = util.obj(DmgCauser)
+                if causer and ghost.is(causer) then return end
+            end
             local amt, cls = 0, "-"
             pcall(function() amt = DmgAmount:get() end)
-            cls = util.class_path(util.obj(DmgType)) or "-"
+            if not boss then cls = util.class_path(util.obj(DmgType)) or "-" end
             if amt > 0 then
                 zhits:send(string.format("%d %.3f %s", id, amt, cls))
                 zhit_stats.sent = zhit_stats.sent + 1
@@ -1517,12 +1791,18 @@ function zombies.init(c, r, s)
             return p ~= nil and util.addr(target) == util.addr(p)
         end
         local function zero(...) for _, v in ipairs({ ... }) do pcall(function() v:set(0) end) end end
+        local function g(v) local r; pcall(function() r = v:get() end); return r end
         game.on_ready(function()
             util.hook(GFL .. ":ApplyMedicalEffect", function(self, Actor, Effects, CB, CHB, CBB, CI, Ctx)
                 if from_copy(Actor, Ctx) then zero(CB, CHB, CBB, CI); log.info("zombies: blocked a copy's medical effect") end
             end)
             util.hook(GFL .. ":ApplyRadiationDamage", function(self, Actor, Chance, Rad, Mask, Ctx)
-                if from_copy(Actor, Ctx) then zero(Chance, Rad); log.info("zombies: blocked a copy's radiation") end
+                if from_copy(Actor, Ctx) then
+                    local amount = g(Rad)
+                    zero(Chance, Rad)
+                    rad.take_back(amount)
+                    log.info("zombies: blocked a copy's radiation")
+                end
             end)
             util.hook(GFL .. ":ApplyBiteInfection", function(self, Actor, Chance, Crawler, Ctx)
                 if from_copy(Actor, Ctx) then zero(Chance); log.info("zombies: blocked a copy's bite infection") end
@@ -1533,6 +1813,7 @@ function zombies.init(c, r, s)
         "/Game/AI/Humans/Bandits/BP_MasterBandit.BP_MasterBandit_C",
         "/Game/AI/Humans/CoyoteSoldiers/BP_MasterCoyoteSoldier.BP_MasterCoyoteSoldier_C",
         "/Game/AI/Humans/Scavengers/BP_MasterScavenger.BP_MasterScavenger_C",
+        TRADER,
         "/Game/AI/Animals/Deer/BP_AnimalDeer.BP_AnimalDeer_C",
         "/Game/AI/Animals/Wolf/BP_AnimalWolf.BP_AnimalWolf_C",
         "/Game/AI/Animals/Bear/BP_AnimalBear.BP_AnimalBear_C",
@@ -1590,11 +1871,14 @@ function zombies.init(c, r, s)
                 if body then pcall(function() DmgType:set(body) end) end
                 return
             end
-            local causer = util.obj(DmgCauser)
-            if causer and zombies.is_copy(causer) then pcall(function() DmgAmount:set(0) end); return end
+            local boss = copies[id] and copies[id].fam == "boss"
+            if not boss then
+                local causer = util.obj(DmgCauser)
+                if causer and zombies.is_copy(causer) then pcall(function() DmgAmount:set(0) end); return end
+            end
             local amt = 0
             pcall(function() amt = DmgAmount:get() end)
-            local tp = path_of(util.obj(DmgType)) or "-"
+            local tp = not boss and path_of(util.obj(DmgType)) or "-"
             pcall(function() DmgAmount:set(0) end)
             local body = body_type()
             if body then pcall(function() DmgType:set(body) end) end

@@ -45,6 +45,7 @@ local config = {
         send_hz = 15,
         interp_delay = 0.12,
         despawn_after = 3.0,
+        offscreen_anim = true,       -- copies past 40 m skip their pose while not drawn (false = always animate)
         dmg_reach = 350,             -- a hit from further away than this counts as dodged
         area_reach = 1000,           -- same for radiation clouds / blasts
     },
@@ -72,6 +73,7 @@ local config = {
     mirror_tactical = true,
     mirror_throwables = true,
     mirror_vehicles = true,
+    harvest_sync = true,
     fix_stuck_lasers = true,
     lasers_follow_aim = true,
 

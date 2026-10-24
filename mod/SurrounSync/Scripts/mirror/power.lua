@@ -16,6 +16,13 @@ local CLASSES = {
 }
 local SCAN = {}
 for kind, list in pairs(CLASSES) do for _, c in ipairs(list) do SCAN[#SCAN + 1] = { kind, c } end end
+-- Whose ReceiveBeginPlay tells util.instances about new ones (BP_PowerGenerator has none).
+local GEN_MASTER = "/Game/Blueprints/BuildingSystem/Actors/Generator/Buildable_GeneratorMaster.Buildable_GeneratorMaster_C"
+local function hooks_of(kind, cls)
+    if kind == "g" then return GEN_MASTER end
+    if kind == "l" then local n = cls:gsub("_C$", ""); return "/Game/Blueprints/BuildingSystem/Actors/Lights/" .. n .. "." .. cls end
+    return nil
+end
 
 local cfg, role, session
 local channel = events.new("power", 64, 30)
@@ -49,19 +56,17 @@ end
 local function scan_step()
     scan_at = scan_at % #SCAN + 1
     local kind, cls = SCAN[scan_at][1], SCAN[scan_at][2]
+    local objs, walked = util.instances(cls, hooks_of(kind, cls))
+    if not walked then return end
     local seen = {}
-    for _, a in ipairs(FindAllOf(cls) or {}) do
-        local cdo = true
-        pcall(function() cdo = a:GetFullName():find("Default__", 1, true) ~= nil end)
-        if util.valid(a) and not cdo then
-            local ok, id = pcall(id_of, a)
-            if ok then
-                seen[id] = true
-                local k = known[id]
-                if not k or not util.same(k.a, a) then
-                    local on, fuel = read(a, kind)
-                    known[id] = { a = a, kind = kind, on = on, fuel = fuel }
-                end
+    for _, a in ipairs(objs) do
+        local ok, id = pcall(id_of, a)
+        if ok then
+            seen[id] = true
+            local k = known[id]
+            if not k or not util.same(k.a, a) then
+                local on, fuel = read(a, kind)
+                known[id] = { a = a, kind = kind, on = on, fuel = fuel }
             end
         end
     end
@@ -155,7 +160,7 @@ function power.tick(dt)
     if role == "off" then return end
     poll_in, blob_in = poll_in - dt, blob_in - dt
     scan_in = scan_in - dt
-    if scan_in <= 0 then scan_in = 8.0; util.safe(scan_step, "power.scan") end
+    if scan_in <= 0 then scan_in = 1.0; util.safe(scan_step, "power.scan") end
     if poll_in <= 0 then
         poll_in = 0.5
         if shared() then util.safe(poll, "power.poll") end
@@ -222,7 +227,10 @@ function power.status()
         stats.sent, stats.applied)
 end
 
+-- Respawn/reload: the old world's objects are freed - drop them without touching them.
+local function forget_world() known, by_class, scan_at, scan_in = {}, {}, 0, 0.0 end
 function power.init(c, r, s)
+    game.on_world_reset(forget_world)
     cfg, role, session = c, r, s
     if cfg.power_sync == false then role = "off" end
     log.info("power: " .. (role == "off" and "off" or "generators and lights are shared"))

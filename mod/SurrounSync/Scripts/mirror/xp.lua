@@ -62,7 +62,12 @@ function xp.reward_kill(z, amount)
     log.info(string.format("xp: my kill - %.1f XP %s", amount, ok and "given" or "FAILED"))
 end
 
+-- Animal and human deaths call AddXP and then always show a "+N XP" notification, even with
+-- the multipliers held at 0: hide the one that follows a held AddXP.
+local hide_next = false
+
 local function on_add_xp(_, amount)
+    if held and hold <= 0 then hide_next = true end
     if hold <= 0 then return end
     local was
     pcall(function() was = amount:get() end)
@@ -71,7 +76,8 @@ end
 
 local PANEL = "/Game/UI/Widgets/Notification/NotificationParentWidget.NotificationParentWidget_C"
 local function on_notification()
-    if hold <= 0 then return end
+    if hold <= 0 and not hide_next then return end
+    hide_next = false
     pcall(function()
         for _, n in ipairs(FindAllOf("NotficationUI_C") or {}) do
             local box = n:GetParent()
@@ -98,6 +104,7 @@ local function release_hold()
     if lc then for f, v in pairs(held.mults) do pcall(function() lc[f] = v end) end end
     for f, n in pairs(held.counts) do pcall(function() if pc[f] ~= n then pc[f] = n end end) end
     held = nil
+    hide_next = false
 end
 
 function xp.tick()

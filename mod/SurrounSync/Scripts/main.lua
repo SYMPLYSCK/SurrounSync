@@ -10,10 +10,21 @@ if not cfg.enabled then
     return
 end
 
+-- Most of the mod's garbage is short-lived (message strings, pose tables); the generational
+-- collector frees it in small minor steps instead of long incremental sweeps.
+-- cfg.gc_mode = "incremental" puts Lua's default back.
+require("mirror.perf").set_gc(cfg.gc_mode)
+
 local role, source = require("mirror.role").resolve(cfg)
 local V = require("mirror.version")
 log.info("SurrounSync " .. V.VERSION .. " (protocol " .. V.PROTOCOL .. ") starting (role=" .. role .. " from " .. source .. ")")
 local net_source = require("mirror.settings").apply(cfg)
+do
+    local crumb = require("mirror.crumb")
+    crumb.configure(cfg)
+    local prev = crumb.start()
+    if prev and prev:find("%S") then log.info("crash steps: the last run's final mod step was: " .. prev) end
+end
 log.configure(cfg)
 local util, devtest = require("mirror.util"), require("mirror.devtest")
 util.safe(devtest.startup_probe, "devtest.startup_probe")

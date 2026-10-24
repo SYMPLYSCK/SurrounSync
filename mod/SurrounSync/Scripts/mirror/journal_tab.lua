@@ -19,6 +19,10 @@ local TILT = { paper = 5.0, ribbon = 6.0, piece = 5.0, list = 3.5, banner = -2.0
 local RIBBON_STEP = { X = -13.0, Y = 150.0 }
 local LABEL_PAD = { Left = 98.0, Bottom = -287.0 }
 local LIST_WIDTH = 560.0
+local GEAR_TEX = "/Game/UI/Textures/over_250_survival_flat_icons/gear.gear"
+local CLOSE_TEX = "/Game/UI/Textures/CrossX.CrossX"
+local INK = { R = 0.12, G = 0.08, B = 0.06, A = 1.0 }
+local SETTING_ROWS = 6
 
 local ctx = nil
 local S = nil
@@ -157,6 +161,7 @@ local function add_ribbon(page_tree, canvas, owner, outer)
 end
 
 local function place(canvas, w, x, y, wd, ht, z)
+    if S.coop then S.coop[#S.coop + 1] = w end
     local sl = canvas:AddChildToCanvas(w)
     pcall(function() sl:SetZOrder(z or 5) end)
     pcall(function()
@@ -171,6 +176,7 @@ local function centered(t) pcall(function() t:SetJustification(1) end) end
 
 local function build_content(page, qtree, qpage)
     local u = S.ui
+    S.coop = {}
     local function tex(name) local w = find(qtree, name, qpage); return w and texture_of(w) end
 
     u.headline = text("", 36, DARK_RED, 635); centered(u.headline); tilt(u.headline, TILT.piece)
@@ -272,6 +278,10 @@ local function build_content(page, qtree, qpage)
     u.chat_row = cr
     u.chat_lines = {}
     for i = 1, 3 do local t = text("", 16, BLACK, LIST_WIDTH); vadd(u.friends_box, t, 1); u.chat_lines[i] = t end
+    u.tp_row = new("HorizontalBox", S.tree, "TeleportRow"); vadd(u.friends_box, u.tp_row, 6)
+    u.tp_name = text("", 18); hadd(u.tp_row, u.tp_name)
+    u.tp_accept = button("ACCEPT", 20); hadd(u.tp_row, u.tp_accept, 14)
+    u.tp_decline = button("DECLINE", 20); hadd(u.tp_row, u.tp_decline, 10)
 
     local helpers = {
         new = function(cls, _tree) return new(cls, S.tree, "B" .. cls) end,
@@ -289,6 +299,90 @@ local function build_content(page, qtree, qpage)
     place(page, u.backups_box, 372.0, 640.0, 575.0, 385.0)
     vis_hit(u.backups_box, false)
     u.show_backups = false
+    S.coop_list, S.coop = S.coop, nil
+end
+
+-- An icon at a fixed size with an empty, see-through button over it (a button's padding shrinks its content).
+local function icon_button(page, path, fallback, x, y, size, z)
+    local tex = StaticFindObject(path)
+    local b = new("Button", S.tree, "IconButton")
+    pcall(function() b:SetBackgroundColor(CLEAR) end)
+    tilt(b, TILT.piece)
+    if not util.valid(tex) then
+        local t = text(fallback, 26)
+        pcall(function() b:SetContent(t) end)
+        S.buttons[#S.buttons + 1] = { b = b, t = t }
+        place(page, b, x, y)
+        return b, nil
+    end
+    local img = image_from(tex, S.tree, "Icon")
+    pcall(function() img:SetColorAndOpacity(INK) end)
+    pcall(function() img:SetRenderTransformPivot({ X = 0.5, Y = 0.5 }) end)
+    tilt(img, TILT.piece)
+    place(page, img, x, y, size, size, z)
+    place(page, b, x, y, size, size, z + 1)
+    S.buttons[#S.buttons + 1] = { b = b, t = img }
+    return b, img
+end
+
+-- The gear at the bottom of the CO-OP page swaps the page for the settings; X swaps back.
+local function build_settings(page)
+    local u = S.ui
+    -- bottom right corner of the pink FRIENDS folder
+    u.gear, u.gear_img = icon_button(page, GEAR_TEX, "SETTINGS", 827.0, 932.0, 96.0, 6)
+    u.set_box = new("VerticalBox", S.tree, "Settings")
+    tilt(u.set_box, TILT.list)
+    place(page, u.set_box, 420.0, 230.0, 580.0, 760.0, 6)
+    u.set_title = text("SETTINGS", 58, DARK_RED); vadd(u.set_box, u.set_title)
+    u.set_sub = text("", 16, GREY, 560); vadd(u.set_box, u.set_sub, 4)
+    u.set_rows = {}
+    for i = 1, SETTING_ROWS do
+        local row = new("HorizontalBox", S.tree, "SettingRow"); vadd(u.set_box, row, i == 1 and 26 or 18)
+        local label = text("", 26)
+        local b, bt = button("OFF", 26, DARK_RED)
+        hadd(row, label); hadd(row, b, 24)
+        local hint = text("", 16, GREY, 560); vadd(u.set_box, hint, 2)
+        u.set_rows[i] = { row = row, label = label, btn = b, btn_t = bt, hint = hint }
+    end
+    u.set_close, u.set_close_img = icon_button(page, CLOSE_TEX, "X", 930.0, 215.0, 72.0, 7)
+    vis_hit(u.set_box, false); vis_hit(u.set_close, false); vis(u.set_close_img, false)
+    u.settings_mode = false
+end
+
+local function set_mode(on)
+    local u = S.ui
+    if (u.settings_mode == true) == on then return end
+    u.settings_mode = on
+    if on then
+        S.coop_vis = {}
+        for i, w in ipairs(S.coop_list) do
+            pcall(function() S.coop_vis[i] = w:GetVisibility() end)
+            pcall(function() w:SetVisibility(1) end)
+        end
+    else
+        for i, w in ipairs(S.coop_list) do
+            local v = S.coop_vis and S.coop_vis[i]
+            if v ~= nil then pcall(function() w:SetVisibility(v) end) end
+        end
+    end
+    vis_hit(u.gear, not on); vis(u.gear_img, not on)
+    vis_hit(u.set_box, on); vis_hit(u.set_close, on); vis(u.set_close_img, on)
+end
+
+local function refresh_settings(m)
+    local u = S.ui
+    set(u.set_sub, m.settings_editable
+        and "Your settings. While a friend is in your world, their game follows them too."
+        or "The host's settings - only the host can change them.")
+    for i, r in ipairs(u.set_rows) do
+        local o = (m.settings or {})[i]
+        vis_hit(r.row, o ~= nil); vis(r.hint, o ~= nil)
+        if o then
+            set(r.label, o.label .. ":")
+            set(r.btn_t, o.on and "ON" or "OFF")
+            set(r.hint, o.hint)
+        end
+    end
 end
 
 local function inject(jui)
@@ -358,6 +452,8 @@ local function inject(jui)
     pcall(function() pis:SetHorizontalAlignment(0); pis:SetVerticalAlignment(0) end)
     step("content")
     build_content(page, qtree, jui.Journal_QuestsUI)
+    step("settings")
+    build_settings(page)
     vis_hit(page, false)
 
     step("tab")
@@ -421,6 +517,7 @@ local function show(on)
     S.shown = on
     vis_hit(S.page, on)
     if on then
+        set_mode(false)
         pcall(function() S.page_slot:SetZOrder(1) end)
         ctx.refresh_now = true
     end
@@ -452,6 +549,7 @@ end
 local function refresh()
     local m, u = ctx.model(), S.ui
     S.model = m
+    if u.settings_mode then refresh_settings(m); return end
     set(u.headline, m.headline or "")
     set(u.detail, m.detail or "")
     set(u.me, m.me or "")
@@ -481,6 +579,8 @@ local function refresh()
     vis_hit(u.update, m.update ~= nil)
     if m.update then set(u.update_t, "UPDATE TO " .. m.update) end
     vis_hit(u.chat_row, m.show_chat)
+    vis_hit(u.tp_row, m.tp ~= nil)
+    if m.tp then set(u.tp_name, m.tp.who .. (m.tp.kind == "goto" and " wants to teleport to you" or " wants to bring you to them")) end
     for i, t in ipairs(u.chat_lines) do
         local c = (m.chat or {})[i]
         vis(t, m.show_chat and c ~= nil)
@@ -524,6 +624,17 @@ function journal_tab.tick(dt)
     if not S.shown then return end
     for _, x in ipairs(S.buttons) do hover(x.b, x.t) end
     local u, a = S.ui, ctx.act
+    refresh_in = refresh_in - dt
+    if u.settings_mode then
+        if clicked(u.set_close) then set_mode(false); ctx.refresh_now = true end
+        local opts = (S.model and S.model.settings) or {}
+        for i, r in ipairs(u.set_rows) do
+            if opts[i] and clicked(r.btn) then a.setting(opts[i].key); ctx.refresh_now = true end
+        end
+        if refresh_in <= 0 or ctx.refresh_now then refresh_in, ctx.refresh_now = 0.5, false; refresh() end
+        return
+    end
+    if clicked(u.gear) then set_mode(true); refresh(); return end
     if clicked(u.copy) then a.copy() end
     if clicked(u.host) then a.host() end
     if clicked(u.join_local) then a.join_local() end
@@ -561,6 +672,8 @@ function journal_tab.tick(dt)
         a.set_password(pw)
         ctx.refresh_now = true
     end
+    if mdl.tp and clicked(u.tp_accept) then a.tp_accept(); ctx.refresh_now = true
+    elseif mdl.tp and clicked(u.tp_decline) then a.tp_decline(); ctx.refresh_now = true end
     if clicked(u.chat_send) then
         local txt = ""
         pcall(function() txt = u.chat_input:GetText():ToString() end)
@@ -572,7 +685,6 @@ function journal_tab.tick(dt)
         pcall(function() txt = u.input:GetText():ToString() end)
         a.join_code(txt)
     end
-    refresh_in = refresh_in - dt
     if refresh_in <= 0 or ctx.refresh_now then refresh_in, ctx.refresh_now = 0.5, false; refresh() end
 end
 
@@ -590,6 +702,10 @@ end
 
 function journal_tab.dev_section(backups)
     if S and S.ui then S.ui.show_backups = backups == true; ctx.refresh_now = true end
+end
+
+function journal_tab.dev_settings(on)
+    if S and S.ui and S.ui.set_box then set_mode(on == true); ctx.refresh_now = true end
 end
 
 function journal_tab.configure(c) ctx = c end

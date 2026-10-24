@@ -71,8 +71,38 @@ local function due(name)
     return true
 end
 
+-- The bridge keeps mirror_index_<peer>.txt: a counter per blob, bumped after each write. Read at most
+-- once per frame, it lets get_blob skip opening blob files that didn't change. Without it (older
+-- bridge) every blob is polled on its timer as before.
+local index = { gen = {}, seen = {}, stale = {}, run = nil, at = -1, ok = false }
+local function read_index()
+    local t = os.clock()
+    if t - index.at < 0.004 then return index.ok end
+    index.at = t
+    local f = io.open(blob_path("index", peer), "rb")
+    if not f then index.ok = false; return false end
+    local s = f:read("*a")
+    f:close()
+    if not s then return index.ok end
+    if s:find("\r", 1, true) then s = s:gsub("\r\n", "\n") end
+    if s:sub(-4) ~= "END\n" then return index.ok end
+    local run = s:match("^v1 (%d+)\n")
+    if not run then index.ok = false; return false end
+    if run ~= index.run then index.run, index.seen, index.stale = run, {}, {} end
+    local gen = index.gen
+    for k in pairs(gen) do gen[k] = nil end
+    for n, g in s:gmatch("\n(%S+) (%d+)") do gen[n] = g end
+    index.ok = true
+    return true
+end
+
 function link.get_blob(name)
-    if not due(name) then return nil end
+    local indexed = read_index()
+    local g = indexed and index.gen[name]
+    if indexed then
+        if g == nil or g == index.seen[name] then return nil end
+        if SLOW[name] and not due(name) then return nil end
+    elseif not due(name) then return nil end
     local f = io.open(blob_path(name, peer), "rb")
     if not f then return nil end
     local s = f:read("*a")
@@ -80,12 +110,22 @@ function link.get_blob(name)
     if not s then return nil end
     if s:find("\r", 1, true) then s = s:gsub("\r\n", "\n") end
     local body = s:match("^(.*)\nEND\n$")
-    if not body or body == blob_seen[name] then return nil end
+    -- unchanged text under a new counter = the bridge's write isn't on disk yet: look again next frame,
+    -- for up to 0.25 s (after that it really is the same text again)
+    if not body or body == blob_seen[name] then
+        if g then
+            local t0 = index.stale[name]
+            if not t0 then index.stale[name] = os.clock()
+            elseif os.clock() - t0 > 0.25 then index.seen[name], index.stale[name] = g, nil end
+        end
+        return nil
+    end
+    if g then index.seen[name], index.stale[name] = g, nil end
     blob_seen[name] = body
     return body
 end
 
-function link.reset_blob(name) blob_seen[name] = nil; next_read[name] = nil end
+function link.reset_blob(name) blob_seen[name] = nil; next_read[name] = nil; index.seen[name] = nil; index.stale[name] = nil end
 
 function link.close()
     if me then os.remove(path(me)) end

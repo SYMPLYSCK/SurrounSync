@@ -5,6 +5,7 @@ local util = require("mirror.util")
 local game = require("mirror.game")
 local ghost = require("mirror.ghost")
 local events = require("mirror.events")
+local audio = require("mirror.audio")
 
 local throwables = {}
 
@@ -31,6 +32,7 @@ local FX = {
 }
 local SEND_EVERY = 1 / 15
 local FIRE_TIME = 10.0
+local OWN_REACH = 250
 
 local cfg
 local channel = events.new("throws", 32, 4)
@@ -62,7 +64,14 @@ local function on_begin(a)
     pcall(function() parent = a:GetAttachParentActor() end)
     pcall(function() wo = a.WeaponOwner end)
     pcall(function() inst = a:GetInstigator() end)
-    if not (util.same(owner, p) or util.same(parent, p) or util.same(owner2, p) or util.same(wo, p) or util.same(inst, p)) then
+    local ours = util.same(owner, p) or util.same(parent, p) or util.same(owner2, p) or util.same(wo, p) or util.same(inst, p)
+    -- The hotbar throw (BP_PlayerCharacter) spawns the throwable at Hand_R with no owner or instigator at all.
+    if not ours and not util.valid(owner) and not util.valid(parent) and not util.valid(wo) and not util.valid(inst) then
+        local l, pl = loc_of(a), nil
+        pcall(function() pl = p:K2_GetActorLocation() end)
+        ours = l ~= nil and pl ~= nil and util.dist(l, pl) <= OWN_REACH
+    end
+    if not ours then
         if diag_left > 0 then
             diag_left = diag_left - 1
             log.info(string.format("throwables: a %s began - not ours? owner %s, attached to %s", short_of(a),
@@ -146,7 +155,7 @@ local function go_off(cls, loc)
         local s = 1.0 + math.random() * 0.25
         local fx, cue, burn = find("explosion"), find("boom_cue"), find("burn")
         if fx then pcall(function() gs:SpawnEmitterAtLocation(ctx, fx, loc, rot, { X = s, Y = s, Z = s }, true, 0, true) end) end
-        if cue then pcall(function() gs:PlaySoundAtLocation(ctx, cue, loc, zero, 1.0, 1.0, 0.0, nil, nil, nil, nil) end) end
+        if cue then pcall(function() gs:PlaySoundAtLocation(ctx, cue, loc, zero, 1.0, 1.0, 0.0, audio.attenuation_for(cue), nil, nil, nil) end) end
         if burn then pcall(function() gs:SpawnDecalAtLocation(ctx, burn, { X = 400, Y = 800, Z = 800 }, loc, down, 30.0) end) end
         noise(loc, 7500)
     elseif kind == "fire" then
@@ -154,7 +163,7 @@ local function go_off(cls, loc)
         local f = { ["until"] = now + FIRE_TIME }
         if fx then pcall(function() f.emitter = gs:SpawnEmitterAtLocation(ctx, fx, loc, rot, { X = 1, Y = 1, Z = 1 }, true, 0, true) end) end
         if cue then
-            pcall(function() f.sound = gs:SpawnSoundAtLocation(ctx, cue, loc, zero, 1.0, 1.0, 0.0, nil, nil, true) end)
+            pcall(function() f.sound = gs:SpawnSoundAtLocation(ctx, cue, loc, zero, 1.0, 1.0, 0.0, audio.attenuation_for(cue), nil, true) end)
         end
         if burn then pcall(function() gs:SpawnDecalAtLocation(ctx, burn, { X = 400, Y = 1000, Z = 1000 }, loc, down, 30.0) end) end
         fires[#fires + 1] = f
@@ -163,7 +172,7 @@ local function go_off(cls, loc)
         local s = 0.1 + math.random() * 0.1
         local fx, cue = find("explosion"), find("firecracker")
         if fx then pcall(function() gs:SpawnEmitterAtLocation(ctx, fx, loc, rot, { X = s, Y = s, Z = s }, true, 0, true) end) end
-        if cue then pcall(function() gs:PlaySoundAtLocation(ctx, cue, loc, zero, 1.0, 1.0, 0.0, nil, nil, nil, nil) end) end
+        if cue then pcall(function() gs:PlaySoundAtLocation(ctx, cue, loc, zero, 1.0, 1.0, 0.0, audio.attenuation_for(cue), nil, nil, nil) end) end
         noise(loc, 15000)
     end
     log.info("throwables: the other player's " .. cls .. " went off")
@@ -266,6 +275,8 @@ function throwables.status()
     return string.format("throwables: thrown %d, mine now %d | the other player's flying %d, fires %d", counter, m, c, #fires)
 end
 
-function throwables.init(c) cfg = c end
+-- Respawn/reload: the old world's objects are freed - drop them without touching them.
+local function forget_world() mine, copies, made, fires = {}, {}, {}, {} end
+function throwables.init(c) cfg = c; game.on_world_reset(forget_world) end
 
 return throwables

@@ -1,6 +1,7 @@
 -- Shared helpers: hooks, object checks, vectors, error handling.
 
 local log = require("mirror.log")
+local crumb = require("mirror.crumb")
 
 local util = {}
 
@@ -153,8 +154,22 @@ function util.hook(path, pre, post, force)
     end
     slot = { pre = pre, post = post }
     if key then hook_slots[key] = slot end
-    local tramp_pre = function(...) if slot.pre then return slot.pre(...) end end
-    local tramp_post = post and function(...) if slot.post then return slot.post(...) end end or nil
+    local short = path:match("([^%./]+:[^:]+)$") or path   -- Class_C:Function fits the 72-char crash step
+    local in_pre, in_post, after = "hook " .. short, "hook post " .. short, "game (after hook " .. short .. ")"
+    local tramp_pre = function(...)
+        if not slot.pre then return end
+        crumb.at(in_pre)
+        local r = slot.pre(...)
+        crumb.at(after)
+        return r
+    end
+    local tramp_post = post and function(...)
+        if not slot.post then return end
+        crumb.at(in_post)
+        local r = slot.post(...)
+        crumb.at(after)
+        return r
+    end or nil
     local ok, err = pcall(function()
         if tramp_post then RegisterHook(path, tramp_pre, tramp_post) else RegisterHook(path, tramp_pre) end
     end)
@@ -163,6 +178,7 @@ function util.hook(path, pre, post, force)
 end
 
 local hooked_fn = {}
+local hooked_obj = {}   -- hk -> the UFunction we hooked
 local next_check = {}
 local backoff = {}
 local RECHECK, LOOKUPS_PER_FRAME, MAX_BACKOFF = 15.0, 1, 60
@@ -176,6 +192,14 @@ function util.ensure_hook(path, pre, post)
     if next_check[hk] and t < next_check[hk] then return hooked_fn[hk] ~= nil end
     if lookup_frame ~= frame_no then lookup_frame, lookups = frame_no, 0 end
     if lookups >= LOOKUPS_PER_FRAME and next_check[hk] then return hooked_fn[hk] ~= nil end
+    -- StaticFindObject costs ~1.7 ms (a miss ~15 ms, measured in-game): while the function we hooked
+    -- is still the live object of that name the hook stands - only a gone/replaced one needs a lookup
+    local held = hooked_obj[hk]
+    if held and util.valid(held) and util.addr(held) == hooked_fn[hk] then
+        local same = false
+        pcall(function() same = held:GetFName():ToString() == path:match("([^:]+)$") end)
+        if same then next_check[hk] = t + RECHECK; return true end
+    end
     lookups = lookups + 1
     lookup_count[path] = (lookup_count[path] or 0) + 1
     local fn = StaticFindObject(path)
@@ -187,9 +211,112 @@ function util.ensure_hook(path, pre, post)
     backoff[hk] = nil
     next_check[hk] = t + RECHECK
     local a = util.addr(fn)
-    if hooked_fn[hk] == a then return true end
-    if util.hook(path, pre, post, true) then hooked_fn[hk] = a; return true end
+    if hooked_fn[hk] == a then hooked_obj[hk] = fn; return true end
+    if util.hook(path, pre, post, true) then hooked_fn[hk], hooked_obj[hk] = a, fn; return true end
     return false
+end
+
+-- Live lists of a class's objects. FindAllOf walks every object in the game (30-40 ms, a visible
+-- hitch, worse in a big world): each class is walked once per world, then a ReceiveBeginPlay hook
+-- adds new ones - BeginPlay also runs for level actors that stream in. `hooks` names the class(es)
+-- whose BeginPlay to hook (the class itself or a parent - a parent's runs for its children too).
+-- While that class isn't loaded nothing of it can exist, so nothing is walked; once it loads, the hook
+-- goes in and one walk picks up what came before. Classes without a BeginPlay are re-walked every
+-- TRACK_NO_HOOK s. At most one walk per frame, and re-walks at most one per TRACK_GAP s overall.
+local TRACK_HOOKED, TRACK_UNHOOKED, TRACK_NO_HOOK, TRACK_GAP = 1800.0, 60.0, 300.0, 5.0
+local tracked, track_hooks = {}, {}
+local track_frame, track_rewalk_at = -1, -100
+local function track_add(t, o)
+    local a = util.addr(o)
+    if a and not t.set[a] then t.set[a] = util.class_name(o) or true; t.list[#t.list + 1] = o end
+end
+local function on_begin(self)
+    local o
+    pcall(function() o = self:get() end)
+    if not util.valid(o) then return end
+    local t = tracked[util.class_name(o) or ""]
+    if t then track_add(t, o) end
+end
+-- Hooked, whether the first class is loaded at all, and a count of (re)hooks.
+local function track_hooked(paths, clock)
+    local on, loaded, gen = false, false, 0
+    for i, p in ipairs(paths) do
+        local h = track_hooks[p]
+        if not h then h = { check = 0, on = false, loaded = false }; track_hooks[p] = h end
+        if clock >= h.check then
+            h.check = clock + (h.on and 15.0 or 2.0)
+            local fn = StaticFindObject(p .. ":ReceiveBeginPlay")
+            local a = util.valid(fn) and util.addr(fn) or nil
+            h.loaded = a ~= nil or util.valid(StaticFindObject(p))
+            if not a then h.on, h.addr = false, nil
+            elseif a ~= h.addr then
+                h.on = util.hook(p .. ":ReceiveBeginPlay", on_begin, nil, true) == true
+                h.addr = h.on and a or nil
+                if h.on then h.gen = (h.gen or 0) + 1 end
+            end
+        end
+        on, gen = on or h.on, gen + (h.gen or 0)
+        if i == 1 then loaded = h.loaded end
+    end
+    return on, loaded, gen
+end
+function util.instances(cls, hooks)
+    local t = tracked[cls]
+    if not t then
+        t = { list = {}, set = {}, due = 0, walked = false, pruned = 0,
+              hooks = type(hooks) == "string" and { hooks } or hooks or {} }
+        tracked[cls] = t
+    end
+    local clock = os.clock()
+    local loaded, gen = true, 0
+    if #t.hooks > 0 then t.hooked, loaded, gen = track_hooked(t.hooks, clock) end
+    if t.hooked and gen ~= t.walked_gen then t.due = 0 end   -- a hook just went in: catch what came before it
+    if clock >= t.due and #t.hooks > 0 and not t.hooked and not loaded then
+        t.list, t.set, t.walked, t.due = {}, {}, true, clock + 2.0
+    elseif clock >= t.due and track_frame ~= frame_no and (not t.walked or clock - track_rewalk_at >= TRACK_GAP) then
+        track_frame = frame_no
+        if t.walked then track_rewalk_at = clock end
+        local found = {}
+        pcall(function() found = FindAllOf(cls) or {} end)
+        t.list, t.set = {}, {}
+        for _, o in ipairs(found) do
+            local cdo = false
+            pcall(function() cdo = o:GetFullName():find("Default__", 1, true) ~= nil end)
+            if not cdo then track_add(t, o) end
+        end
+        if not t.logged then
+            t.logged = true
+            log.info(string.format("instances: %s - %d here, %s", cls, #t.list,
+                #t.hooks > 0 and "new ones via BeginPlay" or "re-walked every " .. TRACK_NO_HOOK .. " s"))
+        end
+        t.walked, t.walked_gen = true, gen
+        t.due = clock + (t.hooked and TRACK_HOOKED or #t.hooks > 0 and TRACK_UNHOOKED or TRACK_NO_HOOK)
+        t.pruned = clock
+    elseif clock - t.pruned >= 1.0 then
+        t.pruned = clock
+        -- A freed object's address can come back as a different object: keep only the same class.
+        local list, set = {}, {}
+        for _, o in ipairs(t.list) do
+            local a = util.addr(o)
+            local c = a and t.set[a]
+            if c and not set[a] and (c == true or util.class_name(o) == c) then set[a] = c; list[#list + 1] = o end
+        end
+        t.list, t.set = list, set
+    end
+    return t.list, t.walked
+end
+-- World reset: the old objects are freed - drop them untouched; every class is walked again.
+function util.instances_reset()
+    for _, t in pairs(tracked) do t.list, t.set, t.due, t.walked = {}, {}, 0, false end
+end
+function util.instances_status()
+    local n, hooked, walked = 0, 0, 0
+    for _, t in pairs(tracked) do
+        n = n + 1
+        if t.hooked then hooked = hooked + 1 end
+        if t.walked then walked = walked + 1 end
+    end
+    return string.format("%d classes tracked, %d by BeginPlay, %d walked", n, hooked, walked)
 end
 
 function util.lookup_top(n)

@@ -1,9 +1,7 @@
-# Builds dist/SurrounSyncSetup.exe: the setup with UE4SS, the mod, the bridge and (optionally) PDS packed in.
-#   .\tools\build-release.ps1 [-NoPds]
+# Builds dist/SurrounSyncSetup.exe: the setup with UE4SS, the mod and the bridge packed in.
+#   .\tools\build-release.ps1
 param(
-    [string]$Game = 'C:\Program Files (x86)\Steam\steamapps\common\SurrounDead',
-    [string]$Pds = (Join-Path $env:USERPROFILE 'Desktop\PDS-(Precedural damage system)\mod\PDS'),
-    [switch]$NoPds
+    [string]$Game = 'C:\Program Files (x86)\Steam\steamapps\common\SurrounDead'
 )
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path $PSScriptRoot -Parent
@@ -32,13 +30,6 @@ Copy-Item (Join-Path $Repo 'mod\SurrounSync') (Join-Path $Ue 'Mods') -Recurse
 Get-ChildItem (Join-Path $Ue 'Mods\SurrounSync') -Recurse -Include '*.bak*', '*.log', 'dlls' | Remove-Item -Recurse -Force
 # always a fresh bridge, built straight into the package (a running game locks the one in mod\SurrounSync\bridge)
 & (Join-Path $PSScriptRoot 'build-bridge.ps1') -Out (Join-Path $Ue 'Mods\SurrounSync\bridge')
-if (-not $NoPds -and (Test-Path $Pds)) {
-    Copy-Item $Pds (Join-Path $Ue 'Mods') -Recurse
-    Get-ChildItem (Join-Path $Ue 'Mods\PDS') -Recurse -Include '*.bak*', '*.log' | Remove-Item -Force
-    $pak = Join-Path $Game 'SurrounDead\Content\Paks\~mods\BLOODSHOT_DRYING_BRAINS_TESTING_2_P.pak'
-    if (Test-Path $pak) { New-Item -ItemType Directory -Force (Join-Path $P 'paks') | Out-Null; Copy-Item $pak (Join-Path $P 'paks') }
-    Write-Host "PDS included"
-} else { Write-Host "PDS not included" }
 $Manifest = Join-Path (Split-Path (Split-Path $Game -Parent) -Parent) 'appmanifest_1645820.acf'
 $GameBuild = ''
 if (Test-Path $Manifest) { $m = Select-String -Path $Manifest -Pattern '"buildid"\s+"(\d+)"'; if ($m) { $GameBuild = $m.Matches[0].Groups[1].Value } }
@@ -60,7 +51,7 @@ $Out = Join-Path $Dist 'SurrounSyncSetup.exe'
     "/win32icon:$(Join-Path $Repo 'installer\SurrounSync.ico')" "/resource:$Zip,payload.zip" "/resource:$(Join-Path $Repo 'installer\SurrounSync.png'),logo.png" `
     /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.IO.Compression.dll `
     /r:System.IO.Compression.FileSystem.dll /r:Microsoft.VisualBasic.dll `
-    (Join-Path $Repo 'installer\Setup.cs') (Join-Path $Repo 'bridge\Common.cs') $ReportTarget
+    (Join-Path $Repo 'installer\Setup.cs') (Join-Path $Repo 'bridge\Common.cs') (Join-Path $Repo 'bridge\Diagnose.cs') $ReportTarget
 if ($LASTEXITCODE -ne 0) { throw "csc failed (setup)" }
 Remove-Item $Stage -Recurse -Force
 $hash = (Get-FileHash $Out -Algorithm SHA256).Hash

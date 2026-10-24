@@ -16,6 +16,9 @@ local SHELLS = {
     "/Game/UI/Widgets/Notification/NotificationParentWidget.NotificationParentWidget_C",
 }
 local FAR = 40000
+-- speaking icon next to the ping while the other player talks (plain characters: the game font has no emoji)
+local SPEAK = { "<)  ", "<)) ", "<)))", "<)) " }
+local speak_frame = 0
 
 local cfg
 local made_for = nil
@@ -77,9 +80,15 @@ function nametag.tick(dt)
         end
     end
     check_in = check_in - dt
-    if not tag or check_in > 0 then return end
-    check_in = 0.5
+    if not tag then return end
+    local _, talking = require("mirror.voice").talking(dt)
+    if check_in > 0 then return end
+    check_in = talking and 0.15 or 0.5   -- faster while the speaking icon animates
     local label, color = netq.tag(link.peer_name())
+    if talking then
+        speak_frame = speak_frame % #SPEAK + 1
+        label = label .. "  " .. SPEAK[speak_frame]
+    end
     if label ~= tag.name then tag.name = label; pcall(function() tag.text:SetText(FText(label)) end) end
     if color ~= tag.color then
         tag.color = color
@@ -93,6 +102,7 @@ function nametag.tick(dt)
     end
 end
 
-function nametag.init(c) cfg = c end
+-- Respawn/reload: the old world's objects are freed - drop them without touching them.
+function nametag.init(c) cfg = c; game.on_world_reset(function() made_for, tag = nil, nil end) end
 
 return nametag

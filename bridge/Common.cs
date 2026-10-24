@@ -244,9 +244,13 @@ namespace SurrounSyncShared
 
     public static class Report
     {
-        public static string Create(string win64, out string error) { return Create(win64, out error, false); }
+        public static string Create(string win64, out string error) { return Create(win64, out error, false, null); }
+        public static string Create(string win64, out string error, bool lite) { return Create(win64, out error, lite, null); }
 
-        public static string Create(string win64, out string error, bool lite)
+        public static string OutDir;   // tests: where report zips go instead of the desktop
+
+        // message = what the player typed into the bug report box (kept as message.txt in the zip and shown with the post)
+        public static string Create(string win64, out string error, bool lite, string message)
         {
             error = null;
             try
@@ -256,7 +260,7 @@ namespace SurrounSyncShared
                     string g = Game.Find();
                     win64 = g != null ? Game.Win64(g) : null;
                 }
-                string desk = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+                string desk = OutDir ?? Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
                 if (string.IsNullOrEmpty(desk) || !Directory.Exists(desk)) desk = Release.AppDir;
                 Directory.CreateDirectory(desk);
                 string zip = lite ? Path.Combine(Path.GetTempPath(), "SurrounSync-report-small.zip")
@@ -266,10 +270,13 @@ namespace SurrounSyncShared
                 using (var fs = new FileStream(zip, FileMode.Create))
                 using (var z = new ZipArchive(fs, ZipArchiveMode.Create))
                 {
-                    Add(z, "report.txt", Encoding.UTF8.GetBytes(Summary(win64, local)));
+                    message = string.IsNullOrEmpty(message) || message.Trim() == "" ? null : Diagnose.Scrub(message.Trim());
+                    Add(z, "report.txt", Encoding.UTF8.GetBytes(Diagnose.Scrub(Summary(win64, local, message))));
+                    if (message != null)
+                        Add(z, "message.txt", Encoding.UTF8.GetBytes(message));
                     if (win64 != null)
                     {
-                        foreach (var n in new[] { "mirror_log.txt", "mirror_log.1.txt", "mirror_log.2.txt", "mirror_settings.txt", "mirror_role.txt" })
+                        foreach (var n in new[] { "mirror_log.txt", "mirror_log.1.txt", "mirror_log.2.txt", "mirror_step.txt", "mirror_step.1.txt", "mirror_settings.txt", "mirror_role.txt" })
                             if (!(lite && n == "mirror_log.2.txt")) AddFile(z, Path.Combine(win64, n), "game/" + n);
                         AddFile(z, Path.Combine(win64, "ue4ss", "UE4SS.log"), "game/UE4SS.log");
                         AddFile(z, Path.Combine(win64, "ue4ss", "Mods", "mods.txt"), "game/mods.txt");
@@ -383,12 +390,16 @@ namespace SurrounSyncShared
             catch { return null; }
         }
 
-        static string Summary(string win64, string local)
+        static string Summary(string win64, string local, string message)
         {
             var sb = new StringBuilder();
             sb.AppendLine("SurrounSync bug report - " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
             sb.AppendLine("Send this zip to the SurrounSync developer along with what you were doing when it went wrong.");
             sb.AppendLine();
+            try { sb.Append(Diagnose.Text(Diagnose.Run(win64, local), message)); }
+            catch (Exception e) { sb.AppendLine("(diagnosis failed: " + e.Message + ")"); }
+            sb.AppendLine();
+            sb.AppendLine("==================== SYSTEM DETAILS ====================");
             var tri = Classify(win64);
             sb.AppendLine("Severity: " + tri.Level);
             foreach (var r in tri.Reasons) sb.AppendLine("  - " + r);
@@ -477,7 +488,22 @@ namespace SurrounSyncShared
                     if (en.Success) sb.AppendLine("  engine at crash: " + en.Groups[1].Value.Trim());
                     var cs = Regex.Match(xml, @"<CallStack>([^<\s]*)");
                     if (cs.Success) sb.AppendLine("  crashed in: " + cs.Groups[1].Value.Trim() +
-                        (cs.Groups[1].Value.StartsWith("UE4SS") ? " (a script mod's call - SurrounSync, PDS or another UE4SS mod)" : " (the game itself)"));
+                        (cs.Groups[1].Value.StartsWith("UE4SS") ? " (a script mod's call - SurrounSync or another UE4SS mod)" : " (the game itself)"));
+                }
+                catch { }
+                try
+                {
+                    // mirror_step*.txt = the mod step running when that run ended; use the run that ended at the crash
+                    DateTime at = Directory.GetLastWriteTime(crash);
+                    foreach (var n in new[] { "mirror_step.txt", "mirror_step.1.txt" })
+                    {
+                        string p = Path.Combine(win64, n);
+                        if (!File.Exists(p)) continue;
+                        double gap = (at - File.GetLastWriteTime(p)).TotalSeconds;
+                        if (gap < -5 || gap > 600) continue;
+                        sb.AppendLine("  SurrounSync step at the crash: " + File.ReadAllText(p).Trim() + " (" + n + ")");
+                        break;
+                    }
                 }
                 catch { }
             }
@@ -542,6 +568,10 @@ namespace SurrounSyncShared
                 if (!File.Exists(path)) return;
                 byte[] d = ReadShared(path);
                 if (tail > 0 && d.Length > tail) { var t = new byte[tail]; Array.Copy(d, d.Length - tail, t, 0, tail); d = t; }
+                // text files are scrubbed of credentials, tokens and the Windows user name on the way into the zip
+                string ext = Path.GetExtension(path).ToLowerInvariant();
+                if (ext == ".txt" || ext == ".log" || ext == ".ini" || ext == ".xml" || ext == ".runtime-xml")
+                    d = Encoding.UTF8.GetBytes(Diagnose.Scrub(Encoding.UTF8.GetString(d)));
                 Add(z, name, d);
             }
             catch { }
@@ -558,38 +588,35 @@ namespace SurrounSyncShared
             string file = zip;
             try
             {
-                if (new FileInfo(zip).Length > MaxUpload)
-                {
-                    string e2;
-                    file = Create(win64, out e2, true);
-                    if (file == null) { error = "couldn't make a smaller copy: " + e2; return false; }
-                    if (new FileInfo(file).Length > MaxUpload) { error = "the report is too big to send"; return false; }
-                }
-                string note = "";
+                string message = "";
                 try
                 {
-                    using (var a = ZipFile.OpenRead(file))
+                    using (var a = ZipFile.OpenRead(zip))
                     {
-                        var e = a.GetEntry("report.txt");
-                        if (e != null) using (var r = new StreamReader(e.Open())) note = r.ReadToEnd();
+                        var e = a.GetEntry("message.txt");
+                        if (e != null) using (var r = new StreamReader(e.Open())) message = r.ReadToEnd().Trim();
                     }
                 }
                 catch { }
+                if (new FileInfo(zip).Length > MaxUpload)
+                {
+                    string e2;
+                    file = Create(win64, out e2, true, message);
+                    if (file == null) { error = "couldn't make a smaller copy: " + e2; return false; }
+                    if (new FileInfo(file).Length > MaxUpload) { error = "the report is too big to send"; return false; }
+                }
+                string local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SurrounDead");
+                var dg = Diagnose.Run(win64, local);
                 var tri = Classify(win64);
-                string icon = tri.Level == "CRITICAL" ? "🔴" : tri.Level == "ERROR" ? "🟠"
-                    : tri.Level == "MINOR" ? "🟡" : "🟢";
-                string head = "";
-                foreach (var line in note.Split('\n'))
-                    if (line.StartsWith("SurrounSync:") || line.StartsWith("Game:") || line.StartsWith("From:")) head += line.Trim() + "\n";
-                var why = new StringBuilder();
-                foreach (var r in tri.Reasons) why.Append("• ").Append(r.Replace('`', '\'')).Append('\n');
-                if (note.Length > 2500) note = note.Substring(0, 2500) + "...";
-                string desc = why.ToString() + "\n" + head + "```\n" + note.Replace('`', '\'') + "\n```";
+                string level = Diagnose.Rank(tri.Level) > Diagnose.Rank(dg.Level) ? tri.Level : dg.Level;
+                if (Duplicate(dg.Fingerprint, message, out error)) return false;
+                string icon = level == "CRITICAL" ? "🔴" : level == "ERROR" ? "🟠" : level == "MINOR" ? "🟡" : "🟢";
+                string desc = Diagnose.Scrub(Post(dg, message));
                 string who = Reporter();
-                string json = "{\"content\":" + JsonString(icon + " **" + tri.Level + "** bug report" + (who != "" ? " from " + who : ""))
-                    + ",\"embeds\":[{\"title\":" + JsonString(icon + " " + tri.Level + (tri.Reasons.Count > 0 ? " - " + Trunc(tri.Reasons[0], 200) : ""))
-                    + ",\"description\":" + JsonString(Trunc(desc, 4000)) + ",\"color\":" + tri.Color + "}]}";
-                string uploadName = "SurrounSync-" + tri.Level + "-" + Path.GetFileName(zip).Replace("SurrounSync-report-", "");
+                string json = "{\"content\":" + JsonString(icon + " **" + level + "** bug report" + (who != "" ? " from " + who : ""))
+                    + ",\"embeds\":[{\"title\":" + JsonString(Trunc(icon + " " + dg.Top.Title, 250))
+                    + ",\"description\":" + JsonString(Trunc(desc, 4000)) + ",\"color\":" + Diagnose.ColorOf(level) + "}]}";
+                string uploadName = "SurrounSync-" + level + "-" + Path.GetFileName(zip).Replace("SurrounSync-report-", "");
                 ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
                 string b = "----SurrounSync" + DateTime.Now.Ticks.ToString("x");
                 var req = (HttpWebRequest)WebRequest.Create(ReportTarget.Webhook);
@@ -614,6 +641,7 @@ namespace SurrounSyncShared
                     int code = (int)resp.StatusCode;
                     if (code < 200 || code >= 300) { error = "the report server answered " + code; return false; }
                 }
+                Remember(dg.Fingerprint);
                 return true;
             }
             catch (WebException we)
@@ -627,6 +655,61 @@ namespace SurrounSyncShared
         }
 
         static string Trunc(string s, int n) { return s.Length > n ? s.Substring(0, n - 3) + "..." : s; }
+
+        // The Discord post: the player summary, the findings with how sure each is, then the versions.
+        public static string Post(Diagnosis d, string message)
+        {
+            var t = d.Top;
+            var sb = new StringBuilder();
+            if (!string.IsNullOrEmpty(message)) sb.Append("**Message:** ").Append(Trunc(message.Replace('`', '\''), 1200)).Append("\n\n");
+            sb.Append("**What happened:** ").Append(t.What).Append('\n');
+            if (t.Affects != "") sb.Append("**Affects:** ").Append(t.Affects).Append('\n');
+            if (t.Cause != "") sb.Append("**Why (").Append(t.Confidence).Append("):** ").Append(Trunc(t.Cause, 500)).Append('\n');
+            if (t.PlayerTry != "") sb.Append("**Player can try:** ").Append(t.PlayerTry).Append('\n');
+            if (t.DevLook != "") sb.Append("**Look at:** ").Append(Trunc(t.DevLook, 300)).Append('\n');
+            foreach (var e in t.Evidence) sb.Append("> ").Append(Trunc(e.Replace('`', '\''), 300)).Append('\n');
+            if (d.Findings.Count > 1)
+            {
+                sb.Append("\n**Also found:**\n");
+                for (int i = 1; i < d.Findings.Count && i < 8; i++)
+                {
+                    var f = d.Findings[i];
+                    sb.Append("• [").Append(f.Severity).Append(", ").Append(f.Confidence).Append("] ").Append(f.Title)
+                      .Append(f.Count > 1 ? " (" + f.Count + "x)" : "").Append('\n');
+                }
+            }
+            sb.Append('\n');
+            foreach (var c in d.Context) if (!c.StartsWith("Last sync status")) sb.Append(Trunc(c, 300)).Append('\n');
+            return sb.ToString();
+        }
+
+        // The same problem sent again within 15 minutes with nothing new from the player isn't sent twice.
+        static string LastFile() { return Path.Combine(Release.AppDir, "last_report.txt"); }
+        public static bool Duplicate(string fingerprint, string message, out string error)
+        {
+            error = null;
+            if (!string.IsNullOrEmpty(message)) return false;
+            try
+            {
+                var parts = File.ReadAllText(LastFile()).Split('\n');
+                long ticks;
+                if (parts.Length >= 2 && parts[1].Trim() == fingerprint && long.TryParse(parts[0].Trim(), out ticks))
+                {
+                    double min = (DateTime.UtcNow - new DateTime(ticks, DateTimeKind.Utc)).TotalMinutes;
+                    if (min >= 0 && min < 15)
+                    {
+                        error = "the same report was already sent " + (int)min + " min ago - add a message to send it again";
+                        return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+        public static void Remember(string fingerprint)
+        {
+            try { Directory.CreateDirectory(Release.AppDir); File.WriteAllText(LastFile(), DateTime.UtcNow.Ticks + "\n" + fingerprint); } catch { }
+        }
 
         static string JsonString(string s)
         {

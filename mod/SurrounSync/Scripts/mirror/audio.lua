@@ -2,6 +2,7 @@
 
 local log = require("mirror.log")
 local util = require("mirror.util")
+local crumb = require("mirror.crumb")
 local game = require("mirror.game")
 local ghost = require("mirror.ghost")
 local events = require("mirror.events")
@@ -14,6 +15,7 @@ local SKIP = { "Footstep", "footstep", "Sprint", "Grass_Cue", "Dirt_Cue", "Concr
                "Water_Cue", "Death", "Hit", "Impact", "Flesh", "Bite", "explosion", "Explosion", "CarLand",
                "VehicleCollision", "door", "Door", "UI_" }
 local MAX_PER_S = 25
+local NEAR_CM = 400
 
 local cfg, role, session, zombies, fire
 local channel = events.new("audio", 64, 3)
@@ -28,11 +30,75 @@ local function drop(r) why[r] = (why[r] or 0) + 1 end
 
 local function shared() return role == "host" or (session and session.in_world()) end
 
+-- Sounds are long-lived assets: their paths are cached by address.
+local paths, paths_n = {}, 0
 local function path_of(o)
     if not util.valid(o) then return nil end
-    local p
+    local a = util.addr(o)
+    local p = a and paths[a]
+    if p then return p end
     pcall(function() p = o:GetFullName():match("^%S+ (.+)$") end)
+    if p and a then
+        if paths_n > 1024 then paths, paths_n = {}, 0 end
+        paths[a], paths_n = p, paths_n + 1
+    end
     return p
+end
+
+-- Sounds the player's own actions make (reload, bolt, insert, tools) are often 2D cues - no attenuation, since
+-- only the player hears them. Replayed for the other player they'd sound right next to them at any distance:
+-- give such cues one of the game's own attenuations.
+local ATT = "/Game/Audio/Attenuation/"
+local ATT_LOUD = { "GunshotsRifle", "GunshotsPistol", "GunshotsShotgun" }
+local ATT_NEAR = { "DoorOpeningClosing", "FootSteps", "BulletImpact" }
+local att_of, att_obj, att_warned = {}, {}, false
+local function att_asset(list)
+    for _, n in ipairs(list) do
+        local a = att_obj[n]
+        if not util.valid(a) then a = StaticFindObject(ATT .. n .. "." .. n); att_obj[n] = util.valid(a) and a or nil end
+        if att_obj[n] then return att_obj[n] end
+    end
+    return nil
+end
+function audio.attenuation_for(snd, path)
+    if not util.valid(snd) then return nil end
+    local key = path or path_of(snd) or tostring(util.addr(snd))
+    local a = att_of[key]
+    if a == nil then
+        local own = false
+        pcall(function() own = util.valid(snd.AttenuationSettings) or snd.bOverrideAttenuation == true end)
+        if own then a = false
+        else
+            local n = (key:match("[^%./]+$") or key):lower()
+            local handling = false
+            for _, w in ipairs({ "insert", "reload", "chamber", "bolt", "draw", "empty", "mag", "equip" }) do
+                if n:find(w, 1, true) then handling = true; break end
+            end
+            local loud = not handling and (n:find("shot", 1, true) or n:find("fire", 1, true) or n:find("boom", 1, true)
+                or n:find("explo", 1, true) or n:find("firecracker", 1, true))
+            a = att_asset(loud and ATT_LOUD or ATT_NEAR)
+            -- Not loaded yet: don't remember the miss, ask again next time.
+            if not a and not att_warned then att_warned = true; log.warn("audio: no attenuation asset loaded yet - 2D sounds stay 2D for now") end
+        end
+        if a ~= nil then att_of[key] = a end
+    end
+    return a or nil
+end
+
+-- Sounds this game played itself, to drop a replay of the same sound at the same spot (both games played it).
+local recent = {}
+local RECENT_S, RECENT_CM = 1.5, 300
+local function remember(path, l)
+    local t = os.clock()
+    while #recent > 0 and t - recent[1].t > RECENT_S do table.remove(recent, 1) end
+    if #recent < 96 then recent[#recent + 1] = { path = path, l = l, t = t } end
+end
+local function played_here(path, l)
+    local t = os.clock()
+    for _, r in ipairs(recent) do
+        if r.path == path and t - r.t <= RECENT_S and util.dist(r.l, l) <= RECENT_CM then return true end
+    end
+    return false
 end
 
 local function skipped(name)
@@ -64,6 +130,8 @@ local function on_sound(kind, ctx, snd, l, vol, pitch)
     local name = ""
     pcall(function() name = snd:GetFName():ToString() end)
     if skipped(name) then drop("skip"); return end
+    local path0 = path_of(snd)
+    if path0 and l then remember(path0, l) end
     local a, owner = chain(ctx)
     if not util.valid(a) or ghost.is(a) or ghost.is(owner) then return end
     if zombies.is_copy(a) or zombies.is_copy(owner) then return end
@@ -79,7 +147,15 @@ local function on_sound(kind, ctx, snd, l, vol, pitch)
         end
     end
     local p = game.player()
-    if util.same(owner, p) or (util.same(a, p) and not util.same(ctx, p)) then
+    local mine = util.same(owner, p) or (util.same(a, p) and not util.same(ctx, p))
+    -- One-shot sounds of things the player uses (containers, tools, cars, builds) come from those actors.
+    -- (Not with the player as the context: that's how this mod replays the other player's sounds.)
+    if not mine and kind == "at" and not util.same(ctx, p) and not zombies.family_of(a) and not zombies.family_of(owner) then
+        local pl
+        pcall(function() pl = p:K2_GetActorLocation() end)
+        mine = pl ~= nil and util.dist(pl, l) <= NEAR_CM
+    end
+    if mine then
         queue[#queue + 1] = { path = path, l = l, vol = vol, pitch = pitch, at = os.clock() }
     end
 end
@@ -95,6 +171,7 @@ local function hook_all()
         if not hooked[fn] then
             hooked[fn] = true
             local ok = pcall(function()
+                local step, after = "hook audio " .. fn, "game (after hook audio " .. fn .. ")"
                 RegisterHook(GS .. fn, function(self, a, b, c, d, e, f, g, h, i)
                     local ctx, snd, l, vol, pitch
                     if kind == "attached" then
@@ -106,7 +183,9 @@ local function hook_all()
                         pcall(function() l = vec_of(c:get()) end)
                         pcall(function() vol, pitch = e:get(), f:get() end)
                     end
+                    crumb.at(step)
                     util.safe(on_sound, "audio.sound", kind, ctx, snd, l, tonumber(vol), tonumber(pitch))
+                    crumb.at(after)
                 end)
             end)
             log.info("audio: hook " .. fn .. (ok and " on" or " FAILED"))
@@ -130,6 +209,7 @@ local function play(payload)
     local s = sound(path)
     if not s then return end
     local l = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
+    if played_here(path, l) then drop("dupe"); return end
     if copy ~= "" then
         local c = zombies.copy(tonumber(copy))
         if c and util.valid(c.z) then pcall(function() l = vec_of(c.z.Mesh:K2_GetComponentLocation()) or l end) end
@@ -137,7 +217,8 @@ local function play(payload)
     local gs = util.cdo("/Script/Engine.Default__GameplayStatics")
     playing = true
     pcall(function()
-        gs:PlaySoundAtLocation(game.player(), s, l, { Pitch = 0, Yaw = 0, Roll = 0 }, tonumber(vol) or 1, tonumber(pitch) or 1, 0.0, nil, nil, nil, nil)
+        gs:PlaySoundAtLocation(game.player(), s, l, { Pitch = 0, Yaw = 0, Roll = 0 }, tonumber(vol) or 1, tonumber(pitch) or 1, 0.0,
+            audio.attenuation_for(s, path), nil, nil, nil)
     end)
     playing = false
     stats.played = stats.played + 1
@@ -163,6 +244,7 @@ end
 
 function audio.init(c, r, s, z, f)
     cfg, role, session, zombies, fire = c, r, s, z, f
+    game.on_world_reset(function() paths, paths_n, att_of, att_obj, recent, queue, cache = {}, 0, {}, {}, {}, {}, {} end)
     if cfg.audio_sync == false then role = "off" end
     log.info("audio: " .. (role == "off" and "off" or "AI and tool sounds are shared"))
 end

@@ -14,6 +14,7 @@ local LOOT_CLASSES = { MASTER,
     "/Game/AI/Humans/Bandits/BP_MasterBandit.BP_MasterBandit_C",
     "/Game/AI/Humans/CoyoteSoldiers/BP_MasterCoyoteSoldier.BP_MasterCoyoteSoldier_C",
     "/Game/AI/Humans/Scavengers/BP_MasterScavenger.BP_MasterScavenger_C",
+    "/Game/AI/Humans/Trader/BP_MasterTrader.BP_MasterTrader_C",
     "/Game/AI/Animals/Deer/BP_AnimalDeer.BP_AnimalDeer_C",
     "/Game/AI/Animals/Wolf/BP_AnimalWolf.BP_AnimalWolf_C",
     "/Game/AI/Animals/Bear/BP_AnimalBear.BP_AnimalBear_C",
@@ -26,6 +27,7 @@ local cfg, role, zombies, session
 local channel = events.new("zloot", 128, 60)
 local first_seen = {}
 local sent = {}
+local dead_seen, dead_sent = {}, {}
 local SEND_AFTER = 0.6
 local lists = {}
 local gate_since = {}
@@ -59,16 +61,28 @@ local function corpse(id)
         return util.valid(z) and z or nil
     end
     local c = zombies.copy(id)
-    return c and util.valid(c.z) and c.dead_at and c.z or nil
+    -- a living trader's stock is shared too (buying = taking from it)
+    return c and util.valid(c.z) and (c.dead_at or c.trader) and c.z or nil
 end
 
+-- Rolling a body's loot (InitializeJigComponent) costs ~10-30 ms: a guest joining or a horde arriving
+-- made 40 at once = a 0.3-1.3 s freeze. Each scan now stops after SCAN_BUDGET s of that work and runs
+-- again next frame until the backlog is gone (40 bodies ~ 1 s, inside the guest's GATE_WAIT).
+local SCAN_BUDGET = 0.004
+local backlog = false
 local function host_scan()
     local t = zombies.now()
-    if not (ghost.exists() or (session and session.guest_in_world())) then first_seen, sent = {}, {}; return end
+    local t0, did = os.clock(), false
+    backlog = false
+    if not (ghost.exists() or (session and session.guest_in_world())) then
+        first_seen, sent, dead_seen, dead_sent = {}, {}, {}, {}
+        return
+    end
     for id, z in pairs(zombies.host_zombies()) do
-        util.pause()
+        if did and os.clock() - t0 > SCAN_BUDGET then backlog = true; break end
         if not first_seen[id] then first_seen[id] = t end
         if not sent[id] and t - first_seen[id] >= SEND_AFTER and util.valid(z) then
+            did = true
             local comp = comp_of(z)
             if comp then
                 jig.generate(comp)
@@ -78,9 +92,24 @@ local function host_scan()
                 stats.sent = stats.sent + 1
             end
         end
+        -- death can change what a body holds (a trader's stock empties and money is added; the game may
+        -- roll death loot): send what the body holds once that's done, so the guest's corpse matches
+        if sent[id] and not dead_sent[id] and is_dead(z) then
+            dead_seen[id] = dead_seen[id] or t
+            local comp = t - dead_seen[id] >= 1.0 and comp_of(z)
+            if comp then
+                did = true
+                dead_sent[id] = true
+                local list = jig.contents_of(comp)
+                channel:send("L " .. id .. " " .. jig.encode(list))
+                log.debug(string.format("corpses: zombie %d died holding %d item(s) - sent to the guest", id, #list))
+            end
+        end
     end
     for id in pairs(first_seen) do
-        if not zombies.host_zombies()[id] then first_seen[id], sent[id] = nil, nil end
+        if not zombies.host_zombies()[id] then
+            first_seen[id], sent[id], dead_seen[id], dead_sent[id] = nil, nil, nil, nil
+        end
     end
 end
 
@@ -108,10 +137,19 @@ end
 local function guest_check()
     local t = zombies.now()
     for id, c in pairs(zombies.copies()) do
-        if c.dead_at and not checked[id] and lists[id] and t - c.dead_at > 1.0 and util.valid(c.z) then
-            checked[id] = true
+        if c.trader == nil then c.trader = zombies.is_trader(c.z) end
+        local since = c.dead_at or (c.trader and c.born)
+        -- a trader checked alive is checked again once dead (its own death empties it and adds money);
+        -- a corpse is checked 1 s after death and again at 4 s, after anything the game adds on death here
+        local st = checked[id]
+        local due, wait = not st, 1.0
+        if st == "alive" and c.dead_at then due = true elseif st == "first" then due, wait = true, 4.0 end
+        if since and due and lists[id] and t - since > wait and util.valid(c.z) then
+            checked[id] = (not c.dead_at and "alive") or (st == "first" and true) or "first"
             local comp = comp_of(c.z)
             if comp then
+                -- a trader's stock is made on its first init: make it now so applying the host's list doesn't add it twice
+                if c.trader and not c.dead_at then jig.generate(comp) end
                 applying = true
                 local set, added, removed, missing = jig.apply_contents(comp, lists[id].items)
                 applying = false
@@ -198,8 +236,9 @@ local item_added_fn = function(self, ItemUID)
         for _, it in ipairs(jig.contents_of(comp)) do
             if it.uid == uid and it.da then
                 local inside = jig.subtree(comp, uid)
-                channel:send(string.format("A %d %s %s %d %.3f %.3f", id, uid, it.da, it.count, it.dx, it.dy)
-                    .. ((inside and #inside > 1) and (" " .. jig.encode(inside)) or ""))
+                channel:send(string.format("A %d %s %s %d %.3f %.3f %d:%d:%d", id, uid, it.da, it.count, it.dx, it.dy,
+                    it.cell or -1, it.rot and 1 or 0, it.slot or -1)
+                    .. (jig.worth_sending(inside) and (" " .. jig.encode(inside)) or ""))
                 log.info(string.format("corpses: put %s x%d into zombie %d's corpse - telling the other game",
                     it.da:match("[^%.]+$") or it.da, it.count, id))
                 return
@@ -207,14 +246,14 @@ local item_added_fn = function(self, ItemUID)
         end
     end, "corpses.item_added")
 end
-local function apply_add(id, uid, da, count, dx, dy, inside)
+local function apply_add(id, uid, da, count, dx, dy, inside, place)
     if added_once[uid] then return end
     added_once[uid] = true
     local z = corpse(id)
     local comp = z and comp_of(z)
     if not comp then log.info("corpses: the other player put an item into zombie " .. id .. "'s corpse - no corpse here"); return end
     applying = true
-    local mine, err = jig.add_item(comp, da, count, dx, dy)
+    local mine, err = jig.add_item(comp, da, count, dx, dy, nil, place)
     if mine and inside ~= "" then pcall(jig.fill, comp, mine, jig.decode(inside)) end
     applying = false
     if mine then added_once[mine] = true end
@@ -224,6 +263,7 @@ end
 
 function corpses.tick(dt)
     if role == "off" then return end
+    util.safe(jig.flush_ui, "jig.ui")
     hook_in = hook_in - dt
     if hook_in <= 0 then
         hook_in = 1.0
@@ -237,7 +277,7 @@ function corpses.tick(dt)
     util.safe(flush_takes, "corpses.takes")
     scan_in = scan_in - dt
     if scan_in <= 0 then
-        scan_in = 0.25
+        scan_in = backlog and 0 or 0.25
         if role == "host" then util.job("corpses.scan", util.safe, host_scan, "corpses.scan") else util.safe(guest_check, "corpses.check") end
     end
     channel:pump(function(p)
@@ -246,14 +286,20 @@ function corpses.tick(dt)
         if k == "A" then traded() end
         if k == "L" and role ~= "host" then
             local id, rest = p:match("^L (%d+) ?(.*)$")
-            if id then lists[tonumber(id)] = { items = jig.decode(rest), at = zombies.now() } end
+            if id then
+                id = tonumber(id)
+                lists[id], checked[id] = { items = jig.decode(rest), at = zombies.now() }, nil
+            end
         elseif k == "T" then
             local id, da, left = p:match("^T (%d+) (%S+) (%-?%d+)$")
             if id then util.safe(apply_take, "corpses.take", tonumber(id), da, tonumber(left) or 0) end
         elseif k == "A" then
-            local id, uid, da, n, dx, dy, inside = p:match("^A (%d+) (%S+) (%S+) (%-?%d+) (%S+) (%S+) ?(%S*)$")
+            local id, uid, da, n, dx, dy, cell, rot, slot, inside =
+                p:match("^A (%d+) (%S+) (%S+) (%-?%d+) (%S+) (%S+) (%-?%d+):(%d):(%-?%d+) ?(%S*)$")
             if id then
-                util.safe(apply_add, "corpses.add", tonumber(id), uid, da, tonumber(n) or 1, tonumber(dx) or 0, tonumber(dy) or 0, inside)
+                local place = { cell = tonumber(cell) >= 0 and tonumber(cell) or nil, rot = rot == "1",
+                                slot = tonumber(slot) >= 0 and tonumber(slot) or nil }
+                util.safe(apply_add, "corpses.add", tonumber(id), uid, da, tonumber(n) or 1, tonumber(dx) or 0, tonumber(dy) or 0, inside, place)
             end
         end
     end)

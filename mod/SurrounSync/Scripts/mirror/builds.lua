@@ -4,13 +4,21 @@ local log = require("mirror.log")
 local util = require("mirror.util")
 local game = require("mirror.game")
 local events = require("mirror.events")
-local link = require("mirror.link")
 local bedtags = require("mirror.bedtags")
 
 local builds = {}
 
 local BC = "/Game/Blueprints/Components/BuildingComponent.BuildingComponent_C"
 local BM = "/Game/Blueprints/BuildingSystem/Actors/Buildable_MASTER.Buildable_MASTER_C"
+-- The auto turret's pick-up (OnInteractBuildable) drops its item and destroys itself without Svr_Spawn/MC_Destroy.
+local TURRET = "/Game/Blueprints/BuildingSystem/Actors/Turret/Buildable_Turret.Buildable_Turret_C"
+-- A land mine goes off by itself (Event_Explode: effects, radial damage, K2_DestroyActor) - none of the hooks
+-- above see it. Its place is read at BeginPlay: once destroyed it reads 0,0,0.
+local MINE = "/Game/Blueprints/BuildingSystem/Actors/Traps/Buildable_LandMine.Buildable_LandMine_C"
+-- A horde beacon K2_DestroyActor's itself right after its final-wave SpawnRewards (no MC_Destroy).
+local BEACON = "/Game/Blueprints/HordeSystem/Beacon/Buildable_HordeBeacon.Buildable_HordeBeacon_C"
+local BOOM_FX = "/Game/PolygonFiles/PolygonMilitary/FX/FX_Explosion_New.FX_Explosion_New"
+local BOOM_CUE = "/Game/Audio/WARFARE_SOUNDS/Explosion_Fire_Gas/Cues/explosion_large_06_Cue.explosion_large_06_Cue"
 
 local cfg, role, session
 local channel = events.new("builds", 64, 10)
@@ -104,7 +112,7 @@ local function on_spawn_build(self, SpawnTransform)
         r.Pitch, r.Yaw, r.Roll, s.X or 1, s.Y or 1, s.Z or 1))
     stats.placed = stats.placed + 1
     log.info("builds: placed " .. (da:match("[^%.]+$") or da) .. " - telling the other game")
-    util.safe(function() bedtags.placed(da, { X = l.X, Y = l.Y, Z = l.Z }, "self") end, "builds.bedtag")
+    util.safe(function() bedtags.placed(da, { X = l.X, Y = l.Y, Z = l.Z }) end, "builds.bedtag")
 end
 
 local known_ids = {}
@@ -128,6 +136,41 @@ local function on_gone(self, why)
 end
 
 local function find(id, near) return util.find_by_id(id, near) end
+
+local mine_fn = function(self) util.safe(function() remember_id(self:get()) end, "builds.mine") end
+local function on_explode(self)
+    if applying or not shared() then return end
+    local addr = util.addr(self:get()) or 0
+    local id = known_ids[addr]
+    known_ids[addr] = nil
+    if not id then log.info("builds: a land mine went off - its place unknown, not sent"); return end
+    channel:send("X " .. id)
+    stats.removed = stats.removed + 1
+    log.info("builds: land mine " .. id .. " went off - telling the other game")
+end
+local explode_fn = function(self) util.safe(on_explode, "builds.explode", self) end
+
+-- The other game's mine went off: show it here and remove ours, without its damage (that happened there).
+local function exploded(payload)
+    local id = payload:match("^X (%S+)$")
+    local b = id and find(id, 100)
+    if not b then log.info("builds: land mine " .. tostring(id) .. " went off there - not here (gone off here too?)"); return end
+    local l
+    pcall(function() l = util.vec(b:K2_GetActorLocation()) end)
+    known_ids[util.addr(b) or 0] = nil
+    applying = true
+    pcall(function() b:K2_DestroyActor() end)
+    applying = false
+    local gs = util.cdo("/Script/Engine.Default__GameplayStatics")
+    if l and gs then
+        local fx, cue = StaticFindObject(BOOM_FX), StaticFindObject(BOOM_CUE)
+        local rot = { Pitch = 0, Yaw = math.random() * 360, Roll = 0 }
+        if util.valid(fx) then pcall(function() gs:SpawnEmitterAtLocation(game.player(), fx, l, rot, { X = 1, Y = 1, Z = 1 }, true, 0, true) end) end
+        if util.valid(cue) then pcall(function() gs:PlaySoundAtLocation(game.player(), cue, l, rot, 1.0, 1.0, 0.0, nil, nil, nil, nil) end) end
+    end
+    stats.applied_removes = stats.applied_removes + 1
+    log.info("builds: the other player's land mine " .. id .. " went off - shown here")
+end
 
 local function place(payload)
     local da, x, y, z, pi, ya, ro, sx, sy, sz =
@@ -161,7 +204,7 @@ local function place(payload)
     end
     stats.made = stats.made + 1
     log.info("builds: built the other player's " .. (da:match("[^%.]+$") or da))
-    util.safe(function() bedtags.placed(da, loc, link.peer_name()) end, "builds.bedtag")
+    util.safe(function() bedtags.placed(da, loc) end, "builds.bedtag")
 end
 
 local function move(payload)
@@ -199,6 +242,7 @@ local spawn_fn = function(self, SpawnTransform)
 end
 local pickup_fn = function(self) util.safe(on_gone, "builds.pickup", self, "picked up") end
 local destroy_fn = function(self) util.safe(on_gone, "builds.destroy", self, "destroyed") end
+local horde_done_fn = function(self) util.safe(on_gone, "builds.horde_done", self, "finished its horde") end
 
 function builds.tick(dt)
     if role == "off" then return end
@@ -230,6 +274,10 @@ function builds.tick(dt)
         end
         util.ensure_hook(BM .. ":Svr_Spawn", pickup_fn)
         util.ensure_hook(BM .. ":MC_Destroy", destroy_fn)
+        util.ensure_hook(TURRET .. ":OnInteractBuildable", pickup_fn)
+        util.ensure_hook(MINE .. ":ReceiveBeginPlay", mine_fn)
+        util.ensure_hook(MINE .. ":Event_Explode", explode_fn)
+        util.ensure_hook(BEACON .. ":SpawnRewards", horde_done_fn)
         util.ensure_hook(BM .. ":OnBeginInteract", interact_fn)
         util.ensure_hook(BM .. ":OnExecuteInteract", interact_fn)
         if not shared() then expect_gone = {} end
@@ -240,7 +288,9 @@ function builds.tick(dt)
         traded()
         if k == "P" then util.safe(place, "builds.place", p)
         elseif k == "M" then util.safe(move, "builds.move", p)
-        elseif k == "R" then util.safe(remove, "builds.remove", p) end
+        elseif k == "R" then util.safe(remove, "builds.remove", p)
+        elseif k == "X" then util.safe(exploded, "builds.exploded", p)
+        elseif k == "N" then util.safe(bedtags.apply, "builds.bedname", p) end
     end)
 end
 
@@ -250,10 +300,13 @@ function builds.status()
         stats.missing > 0 and (", not here " .. stats.missing) or "")
 end
 
+-- Respawn/reload: the old world's objects are freed - drop them without touching them.
+local function forget_world() last_moving, last_obj, last_moving_id = nil, nil, nil end
 function builds.init(c, r, s)
+    game.on_world_reset(forget_world)
     cfg, role, session = c, r, s
     if cfg.build_sync == false then role = "off" end
-    bedtags.init(s)
+    bedtags.init(s, function(p) channel:send(p) end, shared)
     log.info("builds: " .. (role == "off" and "off" or "builds are shared"))
 end
 

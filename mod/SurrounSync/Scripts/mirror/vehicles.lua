@@ -33,6 +33,7 @@ local resend = false
 local out_for = 0.0
 local wake_at = {}
 local riding = nil
+local entered_with = nil
 local ride_fix, ride_at = 0, -100.0
 local peer_rides = nil
 local LIST_EVERY = 5.0
@@ -73,18 +74,23 @@ local function is_car(a)
     return yes
 end
 
+-- False until every car type has been walked once in this world (one type per frame).
 local function scan()
-    cars = {}
+    local fresh, ready = {}, true
     for _, t in ipairs(TYPES) do
-        util.pause()
-        for _, v in ipairs(FindAllOf("Vehicle_" .. t .. "_C") or {}) do
-            if alive(v) and not v:GetFullName():find("Default__", 1, true) then
+        local list, walked = util.instances("Vehicle_" .. t .. "_C", MASTER)
+        if not walked then ready = false end
+        for _, v in ipairs(list) do
+            if alive(v) then
                 local n = name_of(v)
-                if n then cars[n] = v end
+                if n then fresh[n] = v end
             end
         end
     end
+    if not ready then return false end
+    cars = fresh
     scan_age = 0.0
+    return true
 end
 
 local unknown = {}
@@ -137,14 +143,82 @@ local function set_state(car, c, f, h)
             end
         end)
     end
-    if f and f >= 0 then pcall(function() car.FuelComponent.CurrentFuel = f end) end
+    -- Like the game's gas can: the fuel and the Empty flag together (Empty alone keeps a refuelled car dead).
+    if f and f >= 0 then
+        pcall(function() car.FuelComponent.CurrentFuel = f end)
+        pcall(function() car.FuelComponent.Empty = f <= 0 end)
+    end
     if h and h >= 0 then
         local before
         pcall(function() before = car.VehicleHealthComponent.CurrentHealth end)
-        pcall(function() car.VehicleHealthComponent.CurrentHealth = h end)
-        if h > 0 and (tonumber(before) or 0) <= 0 then
-            pcall(function() car:VehicleEngineFX(false) end)
-            pcall(function() car["EngineOn?"] = true end)
+        before = tonumber(before) or 0
+        if math.abs(before - h) > 0.05 then
+            pcall(function() car.VehicleHealthComponent.CurrentHealth = h end)
+            -- Like the repair kit / a wreck: engine back on above 0, off at 0; smoke and fire follow the health.
+            if h > 0 and before <= 0 then pcall(function() car["EngineOn?"] = true end)
+            elseif h <= 0 and before > 0 then pcall(function() car["EngineOn?"] = false end) end
+            pcall(function() car:VehicleEngineFX(true) end)
+        end
+    end
+end
+local function fuel_health(car)
+    local f, h
+    pcall(function() f = car.FuelComponent.CurrentFuel end)
+    pcall(function() h = car.VehicleHealthComponent.CurrentHealth end)
+    return tonumber(f), tonumber(h)
+end
+
+local known_state, told, applied_state = {}, {}, {}
+local STATE_NEAR, STATE_EVERY = 2500, 0.5
+local state_in, state_keys, state_idx = 0.0, {}, 0
+local function remember_state(n, car) known_state[n] = state_of(car) end
+local function watch_states(dt, busy)
+    state_in = state_in - dt
+    if state_in > 0 then return end
+    state_in = STATE_EVERY
+    local p = game.player()
+    local pl = p and (function() local l; pcall(function() l = p:K2_GetActorLocation() end); return l end)()
+    if not pl then return end
+    if state_idx >= #state_keys then
+        state_keys, state_idx = {}, 0
+        for n in pairs(cars) do state_keys[#state_keys + 1] = n end
+    end
+    local changed = false
+    for _ = 1, 12 do
+        state_idx = state_idx + 1
+        local mine = state_keys[state_idx]
+        if not mine then break end
+        local car = cars[mine]
+        if alive(car) and not busy(car) then
+            local l
+            pcall(function() l = car:K2_GetActorLocation() end)
+            if l and util.dist(l, pl) < STATE_NEAR then
+                local n = peer_name(car)
+                local st = state_of(car)
+                if n and known_state[n] and known_state[n] ~= st then told[n], changed = st, true end
+                if n then known_state[n] = st end
+            end
+        end
+    end
+    if changed then
+        local lines = {}
+        for n, st in pairs(told) do lines[#lines + 1] = n .. " " .. st end
+        table.sort(lines)
+        link.put_blob("carstate", table.concat(lines, "\n"))
+    end
+end
+local function apply_states(body, busy, named)
+    for line in body:gmatch("[^\n]+") do
+        local n, st = line:match("^(%S+) (.+)$")
+        if n and applied_state[n] ~= st then
+            applied_state[n] = st
+            local car = named(n)
+            if car and not busy(car) then
+                local c, f, h = st:match("^(%S+) (%S+) (%S+)$")
+                set_state(car, c, f, h)
+                remember_state(n, car)
+                log.info("vehicles: the other player changed " .. n .. " (colour/fuel/health " .. st .. ")")
+            end
         end
     end
 end
@@ -219,8 +293,7 @@ end
 local function stop_spawners()
     local n = 0
     for _, cls in ipairs(SPAWNERS) do
-        util.pause()
-        for _, s in ipairs(FindAllOf(cls) or {}) do
+        for _, s in ipairs(util.instances(cls, "/Game/Blueprints/Vehicles/Spawner/" .. cls:gsub("_C$", "") .. "." .. cls)) do
             pcall(function() if s["SpawnerUsed?"] ~= true then s["SpawnerUsed?"] = true; n = n + 1 end end)
         end
     end
@@ -242,7 +315,7 @@ local function host_list()
 end
 
 local function apply_list(body)
-    scan()
+    if not scan() then return false end
     local want = {}
     for line in body:gmatch("[^\n]+") do
         util.pause()
@@ -305,13 +378,23 @@ local function send_drive(dt)
             local l, r = transform(driving)
             local n = peer_name(driving)
             if l and n then
-                link.put_blob("drive", "P " .. n .. " " .. fmt(l, r) .. " " .. state_of(driving) .. string.format(" %.3f", now))
-                log.info("vehicles: parked " .. n)
+                local f, h = fuel_health(driving)
+                local used, lost = 0, 0
+                if entered_with and f and h then
+                    used = math.max(0, (entered_with.f or f) - f)
+                    lost = math.max(0, (entered_with.h or h) - h)
+                end
+                link.put_blob("drive", "P " .. n .. " " .. fmt(l, r) .. " " .. state_of(driving)
+                    .. string.format(" %.3f %.2f %.2f", now, used, lost))
+                log.info(string.format("vehicles: parked %s (used %.1f fuel, lost %.1f health)", n, used, lost))
             end
             resend = true
         end
         driving = car
+        entered_with = nil
         if car then
+            local f, h = fuel_health(car)
+            entered_with = { f = f, h = h }
             for i = #wake_at, 1, -1 do if util.same(wake_at[i].car, car) then table.remove(wake_at, i) end end
             frozen[util.addr(car) or 0] = nil
 
@@ -339,8 +422,18 @@ function vehicles.drive_line()
     local eng, lit = false, false
     pcall(function() eng = driving["EngineOn?"] == true end)
     pcall(function() lit = driving["LightsOn?"] == true end)
-    return string.format("D %s %.0f %.0f %.0f %.1f %.1f %.1f %.0f %.0f %.0f %d %d %.3f", n, l.X, l.Y, l.Z, r.Pitch, r.Yaw, r.Roll,
+    local line = string.format("D %s %.0f %.0f %.0f %.1f %.1f %.1f %.0f %.0f %.0f %d %d %.3f", n, l.X, l.Y, l.Z, r.Pitch, r.Yaw, r.Roll,
         v.X, v.Y, v.Z, eng and 1 or 0, lit and 1 or 0, now)
+    local towed
+    pcall(function()
+        if driving["TowingVehicle?"] == true then towed = driving.PhysicsConstraintComp:GetOwner() end
+    end)
+    if alive(towed) and not util.same(towed, driving) then
+        local tl, tr = transform(towed)
+        local tn = peer_name(towed)
+        if tl and tn then line = line .. string.format(" T %s %.0f %.0f %.0f %.1f %.1f %.1f", tn, tl.X, tl.Y, tl.Z, tr.Pitch, tr.Yaw, tr.Roll) end
+    end
+    return line
 end
 
 seat_point = function(car, passenger)
@@ -404,11 +497,13 @@ local function release_peer_car(final_l, final_r)
         if final_l then place_hard(c, final_l, final_r) end
         if util.same(riding, c) then
             pcall(function() c.Mesh:SetPhysicsLinearVelocity({ X = 0, Y = 0, Z = 0 }, false, FName("None")) end)
+            pcall(function() c.HitBoxCollision:SetGenerateOverlapEvents(true) end)
         else
             follow_mode(c, false)
         end
         car_effects(c, false, false)
     end
+    if peer.tow and alive(peer.tow.car) then follow_mode(peer.tow.car, false) end
     unseat_ghost()
     peer = nil
 end
@@ -424,7 +519,18 @@ local function apply_drive(body)
         if nums[10] then parked[n] = nums[10] end
         if driving and util.same(car_named(n), driving) then return end
         local pc = car_named(n)
-        if pc then set_state(pc, nums[7], nums[8], nums[9]) end
+        if pc then
+            local f, h = nums[8], nums[9]
+            -- Newer games send what the drive used: apply that to this world's numbers, never the
+            -- driver's copy of them (a copy that was out of date would empty a refuelled car here).
+            if nums[11] and nums[12] then
+                local lf, lh = fuel_health(pc)
+                if lf then f = math.max(0, lf - nums[11]) end
+                if lh then h = math.max(0, lh - nums[12]) end
+            end
+            set_state(pc, nums[7], f, h)
+            remember_state(n, pc)
+        end
         if peer and peer.name == n then release_peer_car(l, r) else
             local c = car_named(n)
             if c then place_hard(c, l, r) end
@@ -472,8 +578,28 @@ local function apply_drive(body)
     local ts = nums[12] or now
     local q = peer.samples or {}
     peer.samples = q
+    local tn, tx, ty, tz, tp, tyw, tro = rest:match(" T (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+)")
+    local tow
+    if tn then
+        local tc = (peer.tow and peer.tow.name == tn) and peer.tow.car or car_named(tn)
+        if tc and not util.same(tc, peer.car) then
+            if not (peer.tow and util.same(peer.tow.car, tc)) then
+                if peer.tow and alive(peer.tow.car) then follow_mode(peer.tow.car, false) end
+                follow_mode(tc, true)
+                frozen[util.addr(tc) or 0] = nil
+                peer.tow = { car = tc, name = tn }
+                log.info("vehicles: the other player tows " .. tn)
+            end
+            tow = { loc = { X = tonumber(tx), Y = tonumber(ty), Z = tonumber(tz) },
+                    rot = { Pitch = tonumber(tp), Yaw = tonumber(tyw), Roll = tonumber(tro) } }
+        end
+    elseif peer.tow then
+        if alive(peer.tow.car) then follow_mode(peer.tow.car, false) end
+        log.info("vehicles: the other player unhooked " .. peer.tow.name)
+        peer.tow = nil
+    end
     if not q[#q] or ts > q[#q].t then
-        q[#q + 1] = { t = ts, loc = l, rot = r, vel = peer.to.vel }
+        q[#q + 1] = { t = ts, loc = l, rot = r, vel = peer.to.vel, tow = tow }
         stats.samples = (stats.samples or 0) + 1
         if #q > 40 then table.remove(q, 1) end
         local offs = peer.offs or {}
@@ -526,20 +652,36 @@ local function follow(dt)
     for i = #q, 1, -1 do
         if q[i].t <= t then a, b = q[i], q[i + 1]; break end
     end
-    local l, r, v
+    local l, r, v, tl, tr
     if a and b then
         local f = (t - a.t) / math.max(b.t - a.t, 0.001)
         l = { X = lerp(a.loc.X, b.loc.X, f), Y = lerp(a.loc.Y, b.loc.Y, f), Z = lerp(a.loc.Z, b.loc.Z, f) }
         r = { Pitch = lerp_deg(a.rot.Pitch, b.rot.Pitch, f), Yaw = lerp_deg(a.rot.Yaw, b.rot.Yaw, f), Roll = lerp_deg(a.rot.Roll, b.rot.Roll, f) }
         v = { X = lerp(a.vel.X, b.vel.X, f), Y = lerp(a.vel.Y, b.vel.Y, f), Z = lerp(a.vel.Z, b.vel.Z, f) }
+        if a.tow and b.tow then
+            tl = { X = lerp(a.tow.loc.X, b.tow.loc.X, f), Y = lerp(a.tow.loc.Y, b.tow.loc.Y, f), Z = lerp(a.tow.loc.Z, b.tow.loc.Z, f) }
+            tr = { Pitch = lerp_deg(a.tow.rot.Pitch, b.tow.rot.Pitch, f), Yaw = lerp_deg(a.tow.rot.Yaw, b.tow.rot.Yaw, f), Roll = lerp_deg(a.tow.rot.Roll, b.tow.rot.Roll, f) }
+        elseif (b or a).tow then tl, tr = (b or a).tow.loc, (b or a).tow.rot end
     else
         local s0 = a or q[1]
         if not s0 then return end
         local ahead = math.max(0, math.min(t - s0.t, 0.3))
         l = { X = s0.loc.X + s0.vel.X * ahead, Y = s0.loc.Y + s0.vel.Y * ahead, Z = s0.loc.Z + s0.vel.Z * ahead }
         r, v = s0.rot, s0.vel
+        if s0.tow then
+            tl = { X = s0.tow.loc.X + s0.vel.X * ahead, Y = s0.tow.loc.Y + s0.vel.Y * ahead, Z = s0.tow.loc.Z + s0.vel.Z * ahead }
+            tr = s0.tow.rot
+        end
     end
     local car = peer.car
+    -- The car's HitBox runs over AI for the LOCAL player (causer GetPlayerCharacter): only the driver's
+    -- game may hit with it, or both games kill the zombie and both pay the XP. Getting in as a
+    -- passenger turns it back on, so re-check every second.
+    if not peer.hitbox_at or now - peer.hitbox_at > 1.0 then
+        peer.hitbox_at = now
+        pcall(function() car.HitBoxCollision:SetGenerateOverlapEvents(false) end)
+        if peer.tow and alive(peer.tow.car) then pcall(function() peer.tow.car.HitBoxCollision:SetGenerateOverlapEvents(false) end) end
+    end
     if riding then
         pcall(function() car.VehicleMovementComponent:SetThrottleInput(0) end)
         pcall(function() car.VehicleMovementComponent:SetBrakeInput(0) end)
@@ -555,6 +697,13 @@ local function follow(dt)
     end
     pcall(function() car.Mesh:SetPhysicsLinearVelocity(v, false, FName("None")) end)
     pcall(function() car.Mesh:SetPhysicsAngularVelocityInDegrees({ X = 0, Y = 0, Z = 0 }, false, FName("None")) end)
+    local tc = peer.tow and peer.tow.car
+    if tl and tl.X and alive(tc) then
+        local tok, tmoved = pcall(function() return tc:K2_TeleportTo(tl, tr) end)
+        if not (tok and tmoved ~= false) then place_hard(tc, tl, tr) end
+        pcall(function() tc.Mesh:SetPhysicsLinearVelocity(v, false, FName("None")) end)
+        pcall(function() tc.Mesh:SetPhysicsAngularVelocityInDegrees({ X = 0, Y = 0, Z = 0 }, false, FName("None")) end)
+    end
 end
 
 -- A sample of the car the other player drives, from their pose packets.
@@ -571,15 +720,24 @@ function vehicles.tick(dt)
     if inside ~= in_world then
         in_world, entered_at = inside, now
         list_sent, host_cars, pass = nil, nil, 0
+        -- A fresh start (or a restart after a crash) isn't riding along: say so, or the other game
+        -- keeps seating us from the last ride it heard about.
+        if inside then riding = nil; link.put_blob("ride", "R -") end
         if not inside then
             release_peer_car(); peer_rides = nil; unseat_ghost()
             alias, rev, driving, retired, frozen, unknown, wake_at, pending = {}, {}, nil, {}, {}, {}, {}, {}
             made_for_drive, parked = {}, {}
+            known_state, told, applied_state = {}, {}, {}
         end
     end
     if not in_world then return end
     if role == "host" then
-        if session and session.guest_in_world and session.guest_in_world() then
+        local guest_here = session and session.guest_in_world and session.guest_in_world()
+        if not guest_here and (peer or peer_rides) then
+            release_peer_car(); peer_rides = nil; unseat_ghost()
+            log.info("vehicles: the other player left - their car and seat let go")
+        end
+        if guest_here then
             car_hook_in = car_hook_in - dt
             if car_hook_in <= 0 then car_hook_in = 2.0; util.ensure_hook(MASTER .. ":ReceiveBeginPlay", on_car_begin) end
             if new_car and list_sent ~= nil and now - list_at >= 2.0 then
@@ -590,7 +748,7 @@ function vehicles.tick(dt)
             if (list_sent == nil or (resend and now - list_at >= LIST_EVERY)) and not util.job_running("vehicles.hostlist") then
                 resend, list_at = false, now
                 util.job("vehicles.hostlist", function()
-                    scan()
+                    if not scan() then resend = true; return end
                     local body = host_list()
                     if body ~= list_sent then list_sent = body; link.put_blob("cars", body) end
                 end)
@@ -607,7 +765,8 @@ function vehicles.tick(dt)
             local b = host_cars
             util.job("vehicles.list", function()
                 util.safe(stop_spawners, "vehicles.spawners")
-                util.safe(apply_list, "vehicles.list", b)
+                local ok, done = util.safe(apply_list, "vehicles.list", b)
+                if ok and done == false then pass, applied_at = pass - 1, -100.0 end
             end)
         end
     end
@@ -626,6 +785,12 @@ function vehicles.tick(dt)
     local d = link.get_blob("drive")
     if d then util.safe(apply_drive, "vehicles.drive", d) end
     util.safe(follow, "vehicles.follow", dt)
+    local function busy(c)
+        return util.same(c, driving) or (peer and (util.same(c, peer.car) or (peer.tow and util.same(c, peer.tow.car)))) or false
+    end
+    if ghost.get() then util.safe(watch_states, "vehicles.states", dt, busy) end
+    local cs = link.get_blob("carstate")
+    if cs then util.safe(apply_states, "vehicles.carstate", cs, busy, car_named) end
     if ghost_collide_at and now >= ghost_collide_at then
         ghost_collide_at = nil
         local g0 = ghost.get()
@@ -642,13 +807,33 @@ function vehicles.tick(dt)
     end
 end
 
+-- Why a player can't be teleported right now (nil = not in or towing a car).
+function vehicles.busy()
+    if driving then return "you are in a vehicle - get out first" end
+    if riding then return "you are riding in a vehicle - get out first" end
+    if peer then return "the other player is driving - wait until they park" end
+    if peer_rides then return "the other player is riding in your car" end
+    return nil
+end
+
 function vehicles.status()
     return string.format("vehicles: car updates received %d | driving %s | the other player's car %s | cars moved %d, added %d, removed %d, spawners stopped %d",
         stats.samples or 0, driving and tostring(peer_name(driving)) or "-", peer and peer.name or "-", stats.moved, stats.added, stats.removed, stats.spawners)
 end
 
+-- The old world's cars are gone (respawn/reload): drop them, keep what the other game told us.
+local function forget_world()
+    cars, alias, rev, retired, frozen, unknown, wake_at, pending = {}, {}, {}, {}, {}, {}, {}, {}
+    made_for_drive, parked, known_state = {}, {}, {}
+    driving, riding, entered_with, peer, master_cls = nil, nil, nil, nil, nil
+    seated, seated_as, ghost_collide_at = false, nil, nil
+    scan_age, list_sent, pass, entered_at, applied_at = math.huge, nil, 0, now, -100.0
+    state_keys, state_idx = {}, 0
+end
+
 function vehicles.init(c, r, s)
     cfg, role, session = c, r, s
+    game.on_world_reset(forget_world)
 end
 
 return vehicles

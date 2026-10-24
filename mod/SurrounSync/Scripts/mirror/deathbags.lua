@@ -366,7 +366,10 @@ function deathbags.status()
         stats.took, stats.taken)
 end
 
+-- Respawn/reload: the old world's objects are freed - drop them without touching them.
+local function forget_world() watch = nil end
 function deathbags.init(c, r, s, same_world)
+    game.on_world_reset(forget_world)
     cfg, role, session = c, r, s
     together = same_world or together
     if cfg.death_bag_sync ~= true then role = "off" end

@@ -35,7 +35,7 @@ Main modules:
 ```powershell
 .\tools\build-bridge.ps1      # mod\SurrounSync\bridge\SurrounSyncBridge.exe
 .\tools\dev-link.ps1          # link the mod folder into your game install (once)
-.\tools\build-release.ps1     # dist\SurrounSyncSetup.exe, with UE4SS, the mod and PDS inside (-NoPds without)
+.\tools\build-release.ps1     # dist\SurrounSyncSetup.exe, with UE4SS and the mod inside
 ```
 
 No Visual Studio needed; the scripts use the `csc.exe` that ships with Windows (C# 5). The bridge can't be rebuilt

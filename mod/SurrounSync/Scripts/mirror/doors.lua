@@ -21,9 +21,8 @@ local KINDS = {
 }
 
 local POLL = 0.25
--- FindAllOf walks every object in the game (~30 ms on slow PCs): level doors are scanned once,
--- only player-built ones again, one class at a time.
-local RESCAN = 6.0
+-- One class at a time; util.instances keeps the lists without walking every object in the game.
+local RESCAN = 2.0
 local EXPECT = 5.0
 
 local cfg, role, session
@@ -45,27 +44,30 @@ local function key(obj, cls)
     return string.format("%s@%d,%d,%d", cls, math.floor(l.X / 10 + 0.5), math.floor(l.Y / 10 + 0.5), math.floor(l.Z / 10 + 0.5))
 end
 
-local CLASSES, BUILT = {}, {}
-for cls in pairs(KINDS) do
-    CLASSES[#CLASSES + 1] = cls
-    if cls:find("^Buildable_") then BUILT[#BUILT + 1] = cls end
-end
+local CLASSES = {}
+for cls in pairs(KINDS) do CLASSES[#CLASSES + 1] = cls end
 table.sort(CLASSES)
-table.sort(BUILT)
+-- Whose ReceiveBeginPlay tells util.instances about new ones (the Master/Lab doors have none).
+local function bp(dir, cls) local n = cls:gsub("_C$", ""); return dir .. n .. "." .. cls end
+local HOOKS = {
+    BP_LockedDoor_C = bp("/Game/Blueprints/Other/Doors/", "BP_LockedDoor_C"),
+    BP_WarehouseDoors_C = bp("/Game/Blueprints/Other/Doors/", "BP_WarehouseDoors_C"),
+}
+for cls in pairs(KINDS) do
+    if cls:find("^Buildable_") then HOOKS[cls] = bp("/Game/Blueprints/BuildingSystem/Actors/Doors/", cls) end
+end
 local scan_idx = 0
 local warm = 0
 
 local function rescan_class(cls)
+    local objs, walked = util.instances(cls, HOOKS[cls])
     for id, d in pairs(list) do if d.cls == cls then list[id] = nil end end
     local kind = KINDS[cls]
-    pcall(function()
-        for _, o in ipairs(FindAllOf(cls) or {}) do
-            if util.valid(o) and not o:GetFullName():find("Default__", 1, true) then
-                local ok, id = pcall(key, o, cls)
-                if ok then list[id] = { obj = o, kind = kind, cls = cls } end
-            end
-        end
-    end)
+    for _, o in ipairs(objs) do
+        local ok, id = pcall(key, o, cls)
+        if ok then list[id] = { obj = o, kind = kind, cls = cls } end
+    end
+    return walked
 end
 
 local function rescan()
@@ -182,15 +184,14 @@ function doors.tick(dt)
     if not active then return end
 
     if warm > 0 then
-        rescan_class(CLASSES[warm])
-        warm = warm - 1
+        if rescan_class(CLASSES[warm]) then warm = warm - 1 end
         return
     end
     scan_in = scan_in - dt
     if scan_in <= 0 then
         scan_in = RESCAN
-        scan_idx = scan_idx % #BUILT + 1
-        rescan_class(BUILT[scan_idx])
+        scan_idx = scan_idx % #CLASSES + 1
+        rescan_class(CLASSES[scan_idx])
         for id, e in pairs(pending) do
             if apply(id, e) then pending[id] = nil end
         end
