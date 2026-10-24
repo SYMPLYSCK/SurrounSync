@@ -27,6 +27,7 @@ local lights = require("mirror.lights")
 local tactical = require("mirror.tactical")
 local throwables = require("mirror.throwables")
 local vehicles = require("mirror.vehicles")
+local harvest = require("mirror.harvest")
 local corpses = require("mirror.corpses")
 local deathbags = require("mirror.deathbags")
 local nametag = require("mirror.nametag")
@@ -34,8 +35,11 @@ local netq = require("mirror.netq")
 local clockmap = require("mirror.clockmap")
 local posepack = require("mirror.posepack")
 local chat = require("mirror.chat")
+local teleport = require("mirror.teleport")
+local names = require("mirror.names")
 local compat = require("mirror.compat")
 local voice = require("mirror.voice")
+local pvp = require("mirror.pvp")
 local perf = require("mirror.perf")
 local devtest = require("mirror.devtest")
 
@@ -100,6 +104,11 @@ local function flags(player)
     pcall(function() if player.bIsCrouched then f = f + 1 end end)
     pcall(function() if player.CharacterMovement:IsFalling() then f = f + 2 end end)
     pcall(function() if player.StaminaComponent.CurrentlySprinting == true then f = f + 4 end end)
+    pcall(function()
+        local sw = player.SwimmingComponent
+        if sw["IsSwimming?"] == true then f = f + 8 end
+        if sw["UnderWater?"] == true then f = f + 16 end
+    end)
     return f
 end
 
@@ -111,7 +120,11 @@ local function move_fields(player)
         local sc = player.StaminaComponent
         if sc.MaxStamina > 0 then stam = sc.CurrentStamina * 100 / sc.MaxStamina end
     end)
-    return string.format(" %.0f %.0f %.0f %.3f", walk, crouch, stam, now)
+    -- leaning (BP_PlayerCharacter Lean + LeanLeft?/LeanRight?, read by its AnimBP): "<lean>,<1 left|2 right|0>"
+    local lean, side = 0.0, 0
+    pcall(function() lean = tonumber(player.Lean) or 0.0 end)
+    pcall(function() if player["LeanLeft?"] == true then side = 1 elseif player["LeanRight?"] == true then side = 2 end end)
+    return string.format(" %.0f %.0f %.0f %.3f %.2f,%d", walk, crouch, stam, now, lean, side)
 end
 
 local pose_clock = clockmap.new(0.05, 0.25, 0.15)
@@ -130,7 +143,7 @@ end
 
 local function parse(payload)
     local x, y, z, yaw, vx, vy, vz, c, rest = payload:match(
-        "^(%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%d)(.*)$")
+        "^(%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%d+)(.*)$")
     if not c then return nil end
     local pose = {
         loc = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) },
@@ -138,11 +151,13 @@ local function parse(payload)
         vel = { X = tonumber(vx), Y = tonumber(vy), Z = tonumber(vz) },
         crouch = (tonumber(c) or 0) % 2 == 1,
         falling = math.floor((tonumber(c) or 0) / 2) % 2 == 1,
-        sprint = (tonumber(c) or 0) >= 4,
+        sprint = math.floor((tonumber(c) or 0) / 4) % 2 == 1,
+        swim = math.floor((tonumber(c) or 0) / 8) % 2 == 1,
+        underwater = math.floor((tonumber(c) or 0) / 16) % 2 == 1,
     }
     local combat, ads, hip, melee, pitch, lx, ly, lz, hy, hr, vy, mv =
         rest:match("^ (%-?%d+) (%d) (%d) (%d) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+)(.*)$")
-    local walk, crouch_speed, stam, sent = (mv or ""):match("^ (%S+) (%S+) (%S+) (%S+)$")
+    local walk, crouch_speed, stam, sent, lean = (mv or ""):match("^ (%S+) (%S+) (%S+) (%S+) ?(%S*)$")
     if walk then
         pose.move = { walk = tonumber(walk), crouch = tonumber(crouch_speed), stamina = tonumber(stam) }
         pose.sent = tonumber(sent)
@@ -153,6 +168,8 @@ local function parse(payload)
                      lhand = { X = tonumber(lx) or 0, Y = tonumber(ly) or 0, Z = tonumber(lz) or 0 },
                      head = { Yaw = tonumber(hy) or 0, Roll = tonumber(hr) or 0 },
                      view_yaw = tonumber(vy) }
+        local lv, ls = (lean or ""):match("^(%-?[%d%.]+),(%d)$")
+        if lv then pose.aim.lean, pose.aim.lean_side = tonumber(lv), tonumber(ls) end
     end
     return pose
 end
@@ -173,7 +190,7 @@ local function status()
         role, rx_count / cfg.phase1.status_interval, age,
         ghost.exists() and ghost.kind() or "none",
         ((gl and pl) and string.format(" %.0f m from you", util.dist(gl, pl) / 100) or "")
-        .. " | zombies: " .. zombies.status() .. " | " .. fire.status() .. " | " .. drops.status() .. " | " .. world.status() .. " | " .. doors.status() .. " | " .. infest.status() .. " | " .. power.status() .. " | " .. audio.status() .. " | " .. loot.status() .. " | " .. builds.status() .. " | " .. corpses.status() .. " | " .. deathbags.status() .. " | " .. tactical.status() .. " | " .. throwables.status() .. " | " .. vehicles.status()))
+        .. " | zombies: " .. zombies.status() .. " | " .. fire.status() .. " | " .. drops.status() .. " | " .. world.status() .. " | " .. doors.status() .. " | " .. infest.status() .. " | " .. power.status() .. " | " .. audio.status() .. " | " .. loot.status() .. " | " .. builds.status() .. " | " .. corpses.status() .. " | " .. deathbags.status() .. " | " .. tactical.status() .. " | " .. throwables.status() .. " | " .. vehicles.status() .. " | " .. harvest.status() .. " | " .. pvp.status() .. " | " .. require("mirror.itemclean").status()))
     rx_count = 0
 end
 
@@ -433,8 +450,11 @@ local function on_tick(dt)
     perf.run("builds", builds.tick, dt)
     perf.run("netq", util.safe, netq.tick, "netq.tick", dt, first_rx and (now - last_rx) or math.huge)
     perf.run("chat", util.safe, chat.tick, "chat.tick")
+    perf.run("teleport", util.safe, teleport.tick, "teleport.tick", dt)
+    perf.run("names", util.safe, names.tick, "names.tick", dt)
     perf.run("compat", util.safe, compat.tick, "compat.tick")
     perf.run("voice", util.safe, voice.tick, "voice.tick", dt)
+    perf.run("pvp", util.safe, pvp.tick, "pvp.tick", dt)
     perf.run("corpses", corpses.tick, dt)
     perf.run("deathbags", deathbags.tick, dt)
     perf.run("nametag", util.safe, nametag.tick, "nametag.tick", dt)
@@ -442,6 +462,7 @@ local function on_tick(dt)
     perf.run("tactical", util.safe, tactical.tick, "tactical.tick", dt)
     perf.run("throwables", util.safe, throwables.tick, "throwables.tick", dt)
     perf.run("vehicles", util.safe, vehicles.tick, "vehicles.tick", dt)
+    perf.run("harvest", util.safe, harvest.tick, "harvest.tick", dt)
     notify.tick(dt)
     util.safe(devtest.tick, "devtest.tick", dt)
 
@@ -509,6 +530,7 @@ function phase1.init(c, r, peer_id)
     end)
     invdiag.init(cfg)
     anim.init(cfg)
+    names.init()
     zombies.init(cfg, role, session)
     fire.init(cfg, role)
     drops.init(cfg, role, session)
@@ -520,9 +542,11 @@ function phase1.init(c, r, peer_id)
     loot.init(cfg, role, session)
     builds.init(cfg, role, session)
     corpses.init(cfg, role, zombies, session)
+    game.on_world_reset(function() ghost.forget(); look.forget() end)
     tactical.init(cfg)
     throwables.init(cfg)
     vehicles.init(cfg, role, session)
+    harvest.init(cfg, role, same_world)
     deathbags.init(cfg, role, session, same_world)
     zombies.set_guest_center(function()
         local gl = ghost.location()
@@ -532,6 +556,7 @@ function phase1.init(c, r, peer_id)
     end)
     nametag.init(cfg)
     voice.init(same_world)
+    pvp.init(role, same_world)
     devtest.init(role, zombies, loot)
     game.on_ready(function()
         save_guard.install()

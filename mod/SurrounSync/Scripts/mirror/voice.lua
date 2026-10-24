@@ -54,6 +54,20 @@ function voice.label()
     return (on and "VOICE: ON" or "VOICE: OFF"), ("VOL " .. VOLUMES[vol_i] .. "%")
 end
 
+-- Who is talking right now: the bridge writes mirror_voice_state.txt ("me 0|1 peer 0|1") only when it changes.
+local state_me, state_peer, state_in = false, false, 0.0
+function voice.talking(dt)
+    state_in = state_in - (dt or 0)
+    if state_in <= 0 then
+        state_in = 0.2
+        local f = io.open(link.dir() .. "\\mirror_voice_state.txt", "rb")
+        local s = f and f:read("*a") or ""
+        if f then f:close() end
+        state_me, state_peer = s:find("me 1", 1, true) ~= nil, s:find("peer 1", 1, true) ~= nil
+    end
+    return state_me, state_peer
+end
+
 function voice.init(same_world_fn) same_world = same_world_fn or same_world end
 
 return voice

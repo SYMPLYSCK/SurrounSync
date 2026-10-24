@@ -58,12 +58,29 @@ function game.on_new_player(fn)
     if site then new_player_slot[site] = #new_player_handlers end
 end
 
+-- A respawn or load tears the old world down: everything cached from it is freed memory now.
+-- Reset handlers drop those references without touching them (no IsValid, no calls).
+local reset_handlers, reset_slot = {}, {}
+function game.on_world_reset(fn)
+    local site = util.callsite(2)
+    local i = site and reset_slot[site]
+    if i then reset_handlers[i] = fn; return end
+    reset_handlers[#reset_handlers + 1] = fn
+    if site then reset_slot[site] = #reset_handlers end
+end
+
 local function adopt(pawn, pc)
-    local old = player
+    local old, old_world = player, world
     player, controller, world = pawn, pc, nil
     pcall(function() world = player:GetWorld() end)
+    -- A new pawn in the same, still-live world (the old pawn still exists) is not a world reset.
+    if old and util.valid(old) and old_world and util.same(old_world, world) then old = nil end
     util.recheck_hooks()
     log.info((old and "new real player (respawn/reload): " or "real player is ") .. player:GetFullName())
+    if old then
+        util.instances_reset()
+        for _, fn in ipairs(reset_handlers) do util.safe(fn, "game.on_world_reset") end
+    end
     for _, fn in ipairs(new_player_handlers) do util.safe(fn, "game.on_new_player") end
 end
 

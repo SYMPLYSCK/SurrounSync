@@ -12,7 +12,7 @@ local tactical = {}
 local DIR = "/Game/Inventory/Items/LocalAttachments/Tactical/"
 local NAMES = { "BP_SmallTacticalLaserSightLocalAttachment", "BP_TacticalLaserLightComboLocalAttachment",
                 "BP_SmallTacticalLightLocalAttachment", "BP_TacticalLightLocalAttachment" }
-local SCAN_EVERY = 30.0
+local SCAN_EVERY = 4.0
 
 local cfg
 local mine = {}
@@ -44,10 +44,18 @@ local function remember(a)
     if is_ours(a) then mine[util.addr(a) or 0] = a end
 end
 
+-- Each class has only some of the lights (the laser sight has no SpotLight, the
+-- flashlights no PointLight); reading through a missing one gives a placeholder, not a number.
+local function intensity(a, name)
+    local comp, v
+    pcall(function() comp = a[name] end)
+    if not util.valid(comp) then return 0 end
+    pcall(function() v = comp.Intensity end)
+    return type(v) == "number" and v or 0
+end
+
 local function read_line(a)
-    local spot, point, mesh, short = 0, 0, nil, nil
-    pcall(function() spot = a.SpotLight.Intensity or 0 end)
-    pcall(function() point = a.PointLight.Intensity or 0 end)
+    local spot, point, mesh, short = intensity(a, "SpotLight"), intensity(a, "PointLight"), nil, nil
     if spot <= 0 and point <= 0 then return nil end
     pcall(function() mesh = path_of(a.StaticMesh.StaticMesh) end)
     short = (util.class_name(a) or ""):gsub("_C$", "")
@@ -67,7 +75,7 @@ local function send(dt)
     if scan_in <= 0 then
         scan_in = SCAN_EVERY / #NAMES
         scan_idx = scan_idx % #NAMES + 1
-        for _, a in ipairs(FindAllOf(NAMES[scan_idx] .. "_C") or {}) do remember(a) end
+        for _, a in ipairs(util.instances(NAMES[scan_idx] .. "_C", class_path(NAMES[scan_idx]))) do remember(a) end
     end
     poll_in = poll_in - dt
     if poll_in > 0 then return end
@@ -174,9 +182,13 @@ function tactical.tick(dt)
         hook_in = 1.0
         for _, n in ipairs(NAMES) do util.ensure_hook(class_path(n) .. ":Jig_SetAttachmentActiveState", switched_fn) end
     end
-    util.safe(send, "tactical.send", dt)
     local g = ghost.get()
-    if not g then if next(copies) then clear() end; return end
+    if not g then
+        if next(copies) then clear() end
+        sent, scan_in = nil, 0.0
+        return
+    end
+    util.safe(send, "tactical.send", dt)
     if applied_gen ~= ghost.generation() then clear() end
     local got = link.get_blob("tactical")
     if got then peer_blob = got end
@@ -197,8 +209,11 @@ function tactical.status()
 end
 
 local registered = false
+-- Respawn/reload: the old world's objects are freed - drop them without touching them.
+local function forget_world() mine, copies, made, sent, applied, applied_gen = {}, {}, {}, nil, nil, nil end
 function tactical.init(c)
     cfg = c
+    game.on_world_reset(forget_world)
     if not registered then registered = true; ghost.on_destroy(clear) end
 end
 

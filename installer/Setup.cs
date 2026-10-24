@@ -148,7 +148,27 @@ namespace SurrounSyncSetup
             catch { return false; }
         }
 
-        public bool Install(string game, bool withPds)
+        // PDS and its pak, only when an older setup installed them ("ours" in the record); a PDS the player
+        // installed themselves is left alone.
+        void RemoveOldPds(string game, string mods, Dictionary<string, string> rec)
+        {
+            string v;
+            if (rec.TryGetValue("pds", out v) && v == "ours")
+            {
+                string pds = Path.Combine(mods, "PDS");
+                if (!IsLink(pds) && Directory.Exists(pds)) { DeleteDir(pds); DisableMod(mods, "PDS"); Log("Removed PDS (no longer part of SurrounSync's setup)."); }
+            }
+            rec.Remove("pds");
+            if (rec.TryGetValue("paks", out v))
+                foreach (var n in v.Split('|'))
+                {
+                    string f = Path.Combine(game, "SurrounDead", "Content", "Paks", "~mods", n);
+                    try { if (File.Exists(f)) { File.Delete(f); Log("Removed " + n + "."); } } catch { }
+                }
+            rec.Remove("paks");
+        }
+
+        public bool Install(string game)
         {
             if (!Game.IsGame(game)) { Log("SurrounDead wasn't found in " + game + "."); return false; }
             if (Game.Running(game)) { Log("SurrounDead is running - close the game, then try again."); return false; }
@@ -182,7 +202,7 @@ namespace SurrounSyncSetup
                 }
                 else
                 {
-                    Extract(z, "game/", w64, e => !N(e).StartsWith(ModPath) && !N(e).StartsWith("game/ue4ss/Mods/PDS/"));
+                    Extract(z, "game/", w64, e => !N(e).StartsWith(ModPath));
                     rec["ue4ss"] = "ours";
                     Log("Installed UE4SS.");
                 }
@@ -199,6 +219,9 @@ namespace SurrounSyncSetup
                 {
                     if (Directory.Exists(target)) DeleteDir(target);
                     Extract(z, ModPath, target, null);
+                    // bug reports compare this with the game's build (game update after this release?)
+                    try { string mb = PayloadText("made_for_build.txt"); if (!string.IsNullOrEmpty(mb)) File.WriteAllText(Path.Combine(target, "made_for_build.txt"), mb.Trim()); }
+                    catch { }
                     Log("Installed SurrounSync " + (ThisVersion() ?? "") + ".");
                 }
                 EnableMod(mods, "SurrounSync");
@@ -211,48 +234,9 @@ namespace SurrounSyncSetup
                 }
                 Progress(55);
 
-                if (withPds && PayloadHas("game/ue4ss/Mods/PDS/"))
-                {
-                    string pds = Path.Combine(mods, "PDS");
-                    if (IsLink(pds)) Log("Mods\\PDS is a developer link - left as it is.");
-                    else
-                    {
-                        bool had = Directory.Exists(pds);
-                        if (had) DeleteDir(pds);
-                        Extract(z, "game/ue4ss/Mods/PDS/", pds, null);
-                        if (!had || rec.ContainsKey("pds")) rec["pds"] = "ours";
-                        Log("Installed PDS (blood and gore).");
-                    }
-                    EnableMod(mods, "PDS");
-                    var paks = new List<string>();
-                    string pakDir = Path.Combine(game, "SurrounDead", "Content", "Paks", "~mods");
-                    // A cooked pak only loads into the game build it was made for (or a newer one with the same engine):
-                    // anything else crashes the game with "package may be corrupt".
-                    string madeFor = PayloadText("made_for_build.txt"), have = Game.BuildId(game);
-                    long mf, hv;
-                    bool pakFits = Game.EngineOk(w64) &&
-                        !(long.TryParse(madeFor, out mf) && long.TryParse(have, out hv) && hv < mf);
-                    if (!pakFits)
-                    {
-                        string ours;
-                        if (rec.TryGetValue("paks", out ours))
-                            foreach (var n in ours.Split('|'))
-                                try { string f = Path.Combine(pakDir, n); if (File.Exists(f)) File.Delete(f); } catch { }
-                        rec.Remove("paks");
-                        Log("Skipped the blood pak: it is made for game build " + madeFor + " (Unreal " + Game.Engine +
-                            "), this game is build " + have + " (Unreal " + (Game.EngineOf(w64) ?? "?") + ").");
-                    }
-                    foreach (var e in z.Entries)
-                        if (pakFits && N(e).StartsWith("paks/") && N(e).EndsWith(".pak"))
-                        {
-                            Directory.CreateDirectory(pakDir);
-                            string to = Path.Combine(pakDir, e.Name);
-                            e.ExtractToFile(to, true);
-                            paks.Add(e.Name);
-                            Log("Installed " + e.Name + ".");
-                        }
-                    if (paks.Count > 0) rec["paks"] = string.Join("|", paks.ToArray());
-                }
+                // Older setups could install PDS (blood and gore) and its pak; this setup no longer ships them.
+                // Take away only what an older setup put there (a pak made for an older game build can crash a newer game).
+                RemoveOldPds(game, mods, rec);
                 Progress(70);
 
                 Unblock(target); Unblock(ue); Unblock(Path.Combine(w64, "dwmapi.dll"));
@@ -348,17 +332,7 @@ namespace SurrounSyncSetup
                     else if (Directory.Exists(target)) { DeleteDir(target); Log("Removed SurrounSync."); }
                     DisableMod(mods, "SurrounSync");
                     string v;
-                    if (rec.TryGetValue("pds", out v) && v == "ours")
-                    {
-                        string pds = Path.Combine(mods, "PDS");
-                        if (!IsLink(pds) && Directory.Exists(pds)) { DeleteDir(pds); DisableMod(mods, "PDS"); Log("Removed PDS."); }
-                    }
-                    if (rec.TryGetValue("paks", out v))
-                        foreach (var n in v.Split('|'))
-                        {
-                            string f = Path.Combine(game, "SurrounDead", "Content", "Paks", "~mods", n);
-                            if (File.Exists(f)) { File.Delete(f); Log("Removed " + n + "."); }
-                        }
+                    RemoveOldPds(game, mods, rec);
                     if (rec.TryGetValue("ue4ss", out v) && v == "ours")
                     {
                         var others = OtherMods(mods);
@@ -390,7 +364,7 @@ namespace SurrounSyncSetup
             foreach (var d in Directory.GetDirectories(mods))
             {
                 string n = Path.GetFileName(d);
-                if (n == "SurrounSync" || n == "PDS" || n == "shared") continue;
+                if (n == "SurrounSync" || n == "shared") continue;
                 list.Add(n);
             }
             return list;
@@ -648,7 +622,7 @@ namespace SurrounSyncSetup
                     foreach (var d in Directory.GetDirectories(mods))
                     {
                         string n = Path.GetFileName(d);
-                        if (n == "SurrounSync" || n == "PDS" || n == "shared" || !File.Exists(Path.Combine(d, "enabled.txt"))) continue;
+                        if (n == "SurrounSync" || n == "shared" || !File.Exists(Path.Combine(d, "enabled.txt"))) continue;
                         if (Regex.IsMatch(txt, "^\\s*" + Regex.Escape(n) + "\\s*:", RegexOptions.Multiline)) continue;
                         self.Add(n);
                     }
@@ -777,12 +751,51 @@ namespace SurrounSyncSetup
         public static readonly Color Amber = Color.FromArgb(232, 178, 72);
     }
 
+    // Asks what went wrong before a bug report is made. Message is null when the player cancels.
+    class ReportDialog : Form
+    {
+        public string Message;
+        readonly TextBox box;
+
+        public ReportDialog()
+        {
+            Text = "SurrounSync bug report";
+            FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(520, 330);
+            BackColor = UI.Bg; ForeColor = UI.Text; Font = new Font("Segoe UI", 9.5f);
+            Controls.Add(new Label { Text = "ANYTHING ELSE TO ADD?", Left = 20, Top = 16, Width = 480, Height = 22, ForeColor = UI.Text,
+                                     Font = new Font("Segoe UI Semibold", 11f), BackColor = Color.Transparent });
+            Controls.Add(new Label { Text = "What happened, and what were you doing just before? (optional - logs are attached either way)",
+                                     Left = 20, Top = 42, Width = 480, Height = 36, ForeColor = UI.Dim, BackColor = Color.Transparent });
+            box = new TextBox { Left = 20, Top = 82, Width = 480, Height = 170, Multiline = true, AcceptsReturn = true,
+                                ScrollBars = ScrollBars.Vertical, MaxLength = 1500, BackColor = UI.Panel, ForeColor = UI.Text,
+                                BorderStyle = BorderStyle.FixedSingle, Font = new Font("Segoe UI", 10f) };
+            Controls.Add(box);
+            var send = new Flat("SEND", UI.Green, UI.GreenHover) { Left = 280, Top = 270, Width = 108, Fore = Color.FromArgb(14, 20, 15) };
+            send.Font = new Font("Segoe UI Black", 10.5f);
+            send.Click += delegate { Message = box.Text.Trim(); DialogResult = DialogResult.OK; Close(); };
+            var cancel = new Flat("Cancel", UI.Grey, UI.GreyHover) { Left = 396, Top = 270, Width = 104 };
+            cancel.Click += delegate { Message = null; DialogResult = DialogResult.Cancel; Close(); };
+            Controls.AddRange(new Control[] { send, cancel });
+            CancelButton = cancel;
+            Shown += delegate { box.Focus(); };
+        }
+
+        public static string Ask(IWin32Window owner)
+        {
+            using (var d = new ReportDialog())
+                return d.ShowDialog(owner) == DialogResult.OK ? (d.Message ?? "") : null;
+        }
+    }
+
     class SetupForm : Form
     {
+        public const string Discord = "https://discord.gg/ghd92vCpe2";
+        string reportMessage;
         readonly string mode; readonly bool waitGame;
         readonly string thisVersion = Installer.ThisVersion();
         TextBox gameBox; Label status, latestLabel; Flat primary, uninstall, check, report, browse; Bar bar; RichTextBox log;
-        CheckBox pdsBox;
         string latest; Release.Info latestInfo;
         static readonly Image logo = LoadLogo();
         static Image LoadLogo()
@@ -819,11 +832,11 @@ namespace SurrounSyncSetup
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
             using (var b = new LinearGradientBrush(new Rectangle(0, 0, ClientSize.Width, 118), Color.FromArgb(30, 40, 33), UI.Bg, 90f))
                 g.FillRectangle(b, 0, 0, ClientSize.Width, 118);
-            if (logo != null) { g.InterpolationMode = InterpolationMode.HighQualityBicubic; g.DrawImage(logo, 28, 24, 64, 64); }
+            if (logo != null) { g.InterpolationMode = InterpolationMode.HighQualityBicubic; g.DrawImage(logo, 18, 15, 88, 88); }
             using (var f = new Font("Segoe UI Black", 26f))
-                TextRenderer.DrawText(g, "SURROUNSYNC", f, new Point(104, 22), UI.Text);
+                TextRenderer.DrawText(g, "SURROUNSYNC", f, new Point(118, 22), UI.Text);
             using (var f = new Font("Segoe UI", 10.5f))
-                TextRenderer.DrawText(g, "Co-op for SurrounDead  ·  setup " + (thisVersion ?? "?"), f, new Point(108, 70), UI.Dim);
+                TextRenderer.DrawText(g, "Co-op for SurrounDead  ·  setup " + (thisVersion ?? "?"), f, new Point(122, 70), UI.Dim);
             using (var p = new Pen(Color.FromArgb(70, UI.Green), 2f) { DashStyle = DashStyle.Dash })
                 g.DrawLine(p, 0, 117, ClientSize.Width, 117);
             base.OnPaint(e);
@@ -852,11 +865,6 @@ namespace SurrounSyncSetup
             Controls.Add(browse);
             status = L("", 28, 200, 704, UI.Text, 10.5f);
             latestLabel = L("", 28, 226, 704, UI.Dim, 9f);
-            pdsBox = new CheckBox { Text = "Also install PDS (blood and gore - both players need it to see each other's blood)", Left = 28, Top = 254,
-                                    Width = 704, Checked = true, ForeColor = UI.Dim, BackColor = Color.Transparent, Font = new Font("Segoe UI", 9f) };
-            pdsBox.Visible = Installer.PayloadHas("game/ue4ss/Mods/PDS/");
-            if (File.Exists(Installer.RecordFile) && !Installer.ReadRecord().ContainsKey("pds")) pdsBox.Checked = false;
-            Controls.Add(pdsBox);
 
             primary = new Flat("INSTALL", UI.Green, UI.GreenHover) { Left = 28, Top = 288, Width = 236, Fore = Color.FromArgb(14, 20, 15) };
             primary.Font = new Font("Segoe UI Black", 11.5f);
@@ -870,7 +878,7 @@ namespace SurrounSyncSetup
             check = new Flat("Check", UI.Grey, UI.GreyHover) { Left = 400, Top = 288, Width = 104 };
             check.Click += delegate { Run("check"); };
             report = new Flat("Bug report", UI.Grey, UI.GreyHover) { Left = 516, Top = 288, Width = 120 };
-            report.Click += delegate { Run("report"); };
+            report.Click += delegate { AskAndReport(); };
             var logs = new Flat("Logs", UI.Grey, UI.GreyHover) { Left = 648, Top = 288, Width = 84 };
             logs.Click += delegate
             {
@@ -879,6 +887,11 @@ namespace SurrounSyncSetup
                 try { Process.Start("explorer.exe", "\"" + dir + "\""); } catch { }
             };
             Controls.AddRange(new Control[] { primary, uninstall, check, report, logs });
+
+            var discord = new Flat("Join our Discord", Color.FromArgb(88, 101, 242), Color.FromArgb(110, 122, 250))
+                          { Left = 560, Top = 38, Width = 172, Height = 38 };
+            discord.Click += delegate { try { Process.Start(Discord); } catch { Say("Discord: " + Discord, UI.Text); } };
+            Controls.Add(discord);
 
             bar = new Bar { Left = 28, Top = 344, Width = 704 };
             Controls.Add(bar);
@@ -957,7 +970,7 @@ namespace SurrounSyncSetup
                 if (MessageBox.Show(this, "Remove SurrounSync from SurrounDead? Your saves and their backups stay.", "SurrounSync",
                     MessageBoxButtons.OKCancel, MessageBoxIcon.Question) == DialogResult.OK) Run("uninstall");
             }
-            else if (mode == "report") Run("report");
+            else if (mode == "report") AskAndReport();
             else if (mode == "update") Say("Checking for an update…", UI.Text);
         }
         void Auto2()
@@ -979,18 +992,26 @@ namespace SurrounSyncSetup
             log.ScrollToCaret();
         }
 
+        void AskAndReport()
+        {
+            if (busy) return;
+            string msg = ReportDialog.Ask(this);
+            if (msg == null) { Say("Bug report cancelled.", UI.Dim); return; }
+            reportMessage = msg;
+            Run("report");
+        }
+
         void Run(string what)
         {
             if (busy) return;
             string g = gameBox.Text.Trim();
             if ((what == "install" || what == "update" || what == "repair") && !Installer.CanWrite(Game.Win64(g)))
             {
-                if (Program.Elevate("--install --game \"" + g + "\"" + (pdsBox.Checked ? "" : " --no-pds"))) { Close(); return; }
+                if (Program.Elevate("--install --game \"" + g + "\"")) { Close(); return; }
                 Say("No permission to write into the game folder, and administrator rights weren't given.", UI.Red);
                 return;
             }
             busy = true; Refresh2(); bar.Value = 0;
-            bool pds = pdsBox.Checked;
             var inst = new Installer();
             inst.Log = s => Say(s, s.StartsWith("WARNING") ? UI.Red : UI.Text);
             inst.Progress = p => BeginInvoke((Action)delegate { bar.Value = p; });
@@ -1000,7 +1021,7 @@ namespace SurrounSyncSetup
                 try
                 {
                     if (what == "uninstall") ok = inst.Uninstall(Game.IsGame(g) ? g : null);
-                    else if (what == "report") ok = MakeReport(g, inst.Log);
+                    else if (what == "report") ok = MakeReport(g, inst.Log, reportMessage);
                     else if (what == "check") ok = Doctor.Print(Doctor.Check(g), Say);
                     else if (what == "download") ok = DownloadAndRun(g, inst.Log, inst.Progress);
                     else
@@ -1011,8 +1032,9 @@ namespace SurrounSyncSetup
                             while (Game.Running(g)) Thread.Sleep(1000);
                             Thread.Sleep(2000);
                         }
-                        ok = inst.Install(g, pds);
+                        ok = inst.Install(g);
                         if (ok) Doctor.Print(Doctor.Check(g), Say);
+                        if (ok) Say("Questions, help or a co-op partner: join the SurrounSync Discord - " + Discord, UI.Green);
                     }
                 }
                 catch (Exception e) { inst.Log("WARNING: " + e.Message); }
@@ -1035,15 +1057,17 @@ namespace SurrounSyncSetup
             string err;
             if (!Release.Download(latestInfo.SetupUrl, tmp, progress, out err)) { say("WARNING: download failed: " + err); return false; }
             say("Starting the new setup…");
-            Process.Start(new ProcessStartInfo(tmp, "--install --game \"" + g + "\"" + (waitGame ? " --wait-game" : "") + (pdsBox.Checked ? "" : " --no-pds"))
+            Process.Start(new ProcessStartInfo(tmp, "--install --game \"" + g + "\"" + (waitGame ? " --wait-game" : ""))
             { UseShellExecute = true });
             return true;
         }
 
-        public static bool MakeReport(string g, Action<string> say)
+        public static bool MakeReport(string g, Action<string> say) { return MakeReport(g, say, null); }
+
+        public static bool MakeReport(string g, Action<string> say, string message)
         {
             string err;
-            string zip = Report.Create(Game.IsGame(g) ? Game.Win64(g) : null, out err);
+            string zip = Report.Create(Game.IsGame(g) ? Game.Win64(g) : null, out err, false, message);
             if (zip == null) { say("WARNING: couldn't save the bug report: " + err); return false; }
             say("Bug report saved: " + zip);
             if (Report.CanSend)
@@ -1052,7 +1076,8 @@ namespace SurrounSyncSetup
                 string serr;
                 if (Report.Send(zip, Game.IsGame(g) ? Game.Win64(g) : null, out serr))
                 {
-                    say("Sent - the developer has it. Tell them what you were doing when it went wrong.");
+                    say(string.IsNullOrEmpty(message) ? "Sent - the developer has it. Tell them what you were doing when it went wrong."
+                                                      : "Sent with your message - the developer has it.");
                     return true;
                 }
                 say("WARNING: couldn't send it (" + serr + ").");
@@ -1068,7 +1093,7 @@ namespace SurrounSyncSetup
         [STAThread]
         static int Main(string[] args)
         {
-            string mode = "", game = null; bool quiet = false, wait = false, pds = true;
+            string mode = "", game = null; bool quiet = false, wait = false;
             for (int i = 0; i < args.Length; i++)
             {
                 string a = args[i].ToLowerInvariant();
@@ -1076,17 +1101,17 @@ namespace SurrounSyncSetup
                 else if (a == "--game" && i + 1 < args.Length) game = args[++i];
                 else if (a == "--quiet") quiet = true;
                 else if (a == "--wait-game") wait = true;
-                else if (a == "--no-pds") pds = false;
+                else if (a == "--no-pds") { }  // older setups/updaters still pass it
                 else if (a == "--version") { Console.WriteLine(Installer.ThisVersion() ?? "?"); return 0; }
             }
-            if (quiet) return Quiet(mode, game, wait, pds);
+            if (quiet) return Quiet(mode, game, wait);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new SetupForm(mode, wait, game));
             return 0;
         }
 
-        static int Quiet(string mode, string game, bool wait, bool pds)
+        static int Quiet(string mode, string game, bool wait)
         {
             Directory.CreateDirectory(Release.AppDir);
             var logFile = Path.Combine(Release.AppDir, "setup.log");
@@ -1101,7 +1126,7 @@ namespace SurrounSyncSetup
                 if (mode == "check") return Doctor.Print(Doctor.Check(game ?? ""), (t, c) => inst.Log(t)) ? 0 : 1;
                 if (game == null) { inst.Log("SurrounDead wasn't found - pass --game <folder>."); return 2; }
                 if (wait) while (Game.Running(game)) Thread.Sleep(1000);
-                if (!inst.Install(game, pds)) return 1;
+                if (!inst.Install(game)) return 1;
                 Doctor.Print(Doctor.Check(game), (t, c) => inst.Log(t));
                 return 0;
             }

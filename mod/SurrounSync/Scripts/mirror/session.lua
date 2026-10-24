@@ -119,10 +119,45 @@ end
 local function lib() return util.cdo(EMS) end
 
 local function pose_str(p) return string.format("%.1f %.1f %.1f %.1f", p.loc.X, p.loc.Y, p.loc.Z, p.yaw) end
+-- A home far below the map is the void (the player was falling when it was taken): sending
+-- anyone there drops them until the game deletes the body.
+local VOID_Z = -200000
+local function sane_pose(p)
+    return p ~= nil and p.loc ~= nil and tonumber(p.loc.Z) ~= nil and p.loc.Z > VOID_Z
+end
+
 local function parse_pose(str)
     local x, y, z, yaw = (str or ""):match("^(%S+) (%S+) (%S+) (%S+)$")
     if not yaw then return nil end
-    return { loc = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }, yaw = tonumber(yaw) }
+    local p = { loc = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }, yaw = tonumber(yaw) }
+    if not sane_pose(p) then log.warn("session: ignoring a saved home spot below the map (" .. str .. ")"); return nil end
+    return p
+end
+
+-- Where I last stood on solid ground in my own world: the home spot when I join mid-fall or mid-load.
+local last_ground, ground_in = nil, 0.0
+local function track_ground(dt)
+    ground_in = ground_in - dt
+    if ground_in > 0 then return end
+    ground_in = 2.0
+    local p = game.player()
+    if not util.valid(p) then return end
+    local on, pose = false, nil
+    pcall(function() on = p.CharacterMovement:IsMovingOnGround() == true end)
+    pcall(function() pose = { loc = util.vec(p:K2_GetActorLocation()), yaw = p:K2_GetActorRotation().Yaw } end)
+    if on and sane_pose(pose) then last_ground = pose end
+end
+
+local function home_now()
+    local p, pose, on = game.player(), nil, false
+    pcall(function() pose = { loc = util.vec(p:K2_GetActorLocation()), yaw = p:K2_GetActorRotation().Yaw } end)
+    pcall(function() on = p.CharacterMovement:IsMovingOnGround() == true end)
+    if on and sane_pose(pose) then return pose end
+    if last_ground then
+        log.warn("session: not standing on solid ground at join - home is where I last stood instead")
+        return last_ground
+    end
+    return sane_pose(pose) and pose or nil
 end
 
 local function to_str(v)
@@ -713,11 +748,7 @@ local function guest_tick(dt)
         elseif state == "idle" then
             notify.show("Joining " .. link.peer_name() .. "'s world...", "info")
             log.info("session: joining - saving my own world first")
-            home = nil
-            pcall(function()
-                local p = game.player()
-                home = { loc = util.vec(p:K2_GetActorLocation()), yaw = p:K2_GetActorRotation().Yaw }
-            end)
+            home = home_now()
             home_bed = beds.read()
             if cfg.diagnostics then util.safe(invdiag.snapshot, "invdiag", "before join") end
             carry.join = carried()
@@ -860,7 +891,7 @@ local function guest_tick(dt)
                     if r then
                         leave_try = nil
                         beds.set(beds.home_key(t.own), nil)
-                        local pose = parse_pose(t.home) or home
+                        local pose = parse_pose(t.home) or (sane_pose(home) and home or nil)
                         if r == "kept" then
                             notify.show("Your own save changed during co-op, so it was not overwritten. Your co-op character is kept in "
                                 .. "Backups (handbook J, CO-OP tab). Quit and restart the game to continue in your own world.", "bad")
@@ -1103,6 +1134,7 @@ local function checkpoint_tick(dt)
 end
 
 function session.tick(dt)
+    if state == "idle" then util.safe(track_ground, "session.ground", dt) end
     flush_notes()
     checkpoint_tick(dt)
     if role == "host" then host_tick(dt) else guest_tick(dt) end

@@ -40,6 +40,7 @@ local alias = {}
 local rev = {}
 local added_once = {}
 local put_sent = {}
+local add_q, moved, move_q = {}, {}, {}
 local JIG_COMP = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
 local GENERATE = JIG_COMP .. ":InitializeJigComponent"
 local REQUEST = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:SERVER_RequestData"
@@ -58,6 +59,9 @@ local opened_at = {}
 local pushed = {}
 local push_q = {}
 local host_list = {}
+-- Guest: the host's ack in its last list per container, and a re-check 1 s after taking a list over
+-- (a player saw an item kept by the take-over gone until the next host push, 8 s later)
+local host_ack, recheck = {}, {}
 local opened = {}
 local asked = {}
 local synced = {}
@@ -83,12 +87,13 @@ local function release(id, uid)
     if next(h) == nil then held[id] = nil end
 end
 
-local function list_add(id, uid, da, count, dx, dy, inside)
+local function list_add(id, uid, da, count, dx, dy, inside, place)
     local list = host_list[id]
     if not list or synced[id] then return end
     for _, w in ipairs(list) do if w.uid == uid then return end end
     local at = #list + 1
-    list[at] = { uid = uid, da = da, count = tonumber(count) or 1, dx = tonumber(dx) or 0, dy = tonumber(dy) or 0 }
+    list[at] = { uid = uid, da = da, count = tonumber(count) or 1, dx = tonumber(dx) or 0, dy = tonumber(dy) or 0,
+                 cell = place.cell, rot = place.rot, slot = place.slot }
     local sub = (inside and inside ~= "") and jig.decode(inside) or {}
     for i = 2, #sub do
         local w = sub[i]
@@ -201,7 +206,7 @@ local function apply(payload)
     local take = have - (tonumber(left) or 0)
     if take <= 0 then return end
     applying = true
-    local ok, err = pcall(function() comp:HandleLocalRequestConsumeItem(guid(uid), take, comp, "", false) end)
+    local ok, err = jig.take(comp, uid, take, have)
     applying = false
     stats.applied = stats.applied + 1
     log.info(string.format("loot: the other player took %d from %s - removed here%s", take, id,
@@ -233,64 +238,31 @@ local function on_added(self, ItemUID, ItemInfo)
     put_sent[uid] = now
     local ok, id = pcall(id_of, actor)
     if not ok then return end
-    local inside = jig.subtree(comp, uid)
-    channel:send(string.format("A %s %s %s %d %.3f %.3f %d", id, uid, da, count or 1, dur and dur.X or 0, dur and dur.Y or 0, next_seq(id))
-        .. ((inside and #inside > 1) and (" " .. jig.encode(inside)) or ""))
-    mark_dirty(id, comp)
-    stats.put = stats.put + 1
-    log.info(string.format("loot: put %s x%d into %s - telling the other game", da:match("[^%.]+$") or da, count or 1, id))
+    -- Sent next frame: moving an item inside the container fires this "added" event too - the move hook
+    -- (on_moved, same frame) cancels it, so a rearrange never adds a copy on the other side.
+    add_q[#add_q + 1] = { uid = uid, id = id, comp = comp, da = da, count = count, dur = dur }
 end
 
-local function apply_add(payload)
-    if not shared() then return end
-    local id, uid, da, count, dx, dy, s, inside = payload:match("^A (%S+) (%S+) (%S+) (%-?%d+) (%S+) (%S+) (%d+) ?(%S*)$")
-    if not id then return end
-    local actor = find(id)
-    local comp = actor and comp_of(actor)
-    if added_once[uid] then if comp then acked(id, s, comp) end return end
-    if not comp then
-        stats.missing = stats.missing + 1
-        log.info("loot: the other player put something into " .. id .. " - not here")
-        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
-        return
+local function flush_adds()
+    local q = add_q
+    add_q = {}
+    for _, e in ipairs(q) do
+        if moved[e.uid] then
+            put_sent[e.uid] = nil
+        elseif util.valid(e.comp) then
+            local id, uid, da, count, dur = e.id, e.uid, e.da, e.count, e.dur
+            local inside = jig.subtree(e.comp, uid)
+            local me = inside and inside[1] or {}
+            -- where it sits in the grid (cell:rotated:container) so the other game puts it in the same spot
+            channel:send(string.format("A %s %s %s %d %.3f %.3f %d %d:%d:%d", id, uid, da, count or 1, dur and dur.X or 0, dur and dur.Y or 0, next_seq(id),
+                me.cell or -1, me.rot and 1 or 0, me.slot or -1)
+                .. (jig.worth_sending(inside) and (" " .. jig.encode(inside)) or ""))
+            mark_dirty(id, e.comp)
+            stats.put = stats.put + 1
+            log.info(string.format("loot: put %s x%d into %s - telling the other game", da:match("[^%.]+$") or da, count or 1, id))
+        end
     end
-    if count_of(comp, uid) > 0 or (alias[uid] and count_of(comp, alias[uid]) > 0) then added_once[uid] = true; acked(id, s, comp); return end
-    local asset = StaticFindObject(da)
-    if not util.valid(asset) then
-        log.info("loot: the other player put " .. (da:match("[^%.]+$") or da) .. " into " .. id .. " - not loaded here")
-        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
-        return
-    end
-    local slots = 0
-    pcall(function() slots = comp.MainJigContainers:GetArrayNum() end)
-    if role ~= "host" then list_add(id, uid, da, count, dx, dy, inside) end
-    if role ~= "host" and slots == 0 then
-        added_once[uid] = true
-        log.info(string.format("loot: the other player put %s into %s - not opened here yet, it'll be there when opened",
-            da:match("[^%.]+$") or da, id))
-        return
-    end
-    applying = true
-    local mine, err = jig.add_item(comp, da, tonumber(count) or 1, tonumber(dx) or 0, tonumber(dy) or 0)
-    applying = false
-    if not mine then
-        log.warn("loot: couldn't add the other player's " .. (da:match("[^%.]+$") or da) .. " to " .. id .. ": " .. tostring(err))
-        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
-        return
-    end
-    acked(id, s, comp)
-    added_once[uid] = true
-    alias[uid], rev[mine] = mine, uid
-    stats.added = stats.added + 1
-    local n, miss = 0, 0
-    if inside ~= "" then
-        applying = true
-        local ok, a, m = pcall(jig.fill, comp, mine, jig.decode(inside))
-        applying = false
-        if ok then n, miss = a, m else log.warn("loot: couldn't fill the other player's item: " .. tostring(a)) end
-    end
-    log.info(string.format("loot: the other player put %s x%s into %s - added here%s", da:match("[^%.]+$") or da, count, id,
-        (n + miss > 0) and string.format(" (holding %d, %d missing)", n, miss) or ""))
+    moved = {}
 end
 
 local main_cls, main_miss = {}, {}
@@ -324,6 +296,116 @@ local function is_main(actor)
     return r
 end
 
+local function player_jig()
+    local c
+    pcall(function() c = game.player().BP_JigMultiplayer end)
+    return util.valid(c) and c or nil
+end
+local function local_uid(theirs) return alias[theirs] or theirs end
+
+-- Rearranging inside a shared container: send the whole layout (uids as the other game knows them).
+local function on_moved(self, ItemUID)
+    if applying or not shared() then return end
+    local comp = util.obj(self)
+    if not comp then return end
+    local owner
+    pcall(function() owner = comp:GetOwner() end)
+    if not (util.valid(owner) and is_main(owner)) then return end
+    local uid
+    pcall(function() uid = uid_str(ItemUID:get()) end)
+    if not uid then return end
+    moved[uid] = true
+    local ok, id = pcall(id_of, owner)
+    if ok and id then move_q[id] = comp end
+end
+
+local function flush_moves()
+    for id, comp in pairs(move_q) do
+        if util.valid(comp) then
+            local list = jig.contents_of(comp)
+            for _, h in ipairs(list) do h.uid = rev[h.uid] or h.uid end
+            channel:send(string.format("M %s %d %s", id, next_seq(id), jig.encode(list, true)))
+            mark_dirty(id, comp)
+            stats.moved = (stats.moved or 0) + 1
+            log.info("loot: rearranged " .. id .. " - telling the other game")
+        end
+    end
+    move_q = {}
+end
+
+local function apply_move(payload)
+    if not shared() then return end
+    local id, s, rest = payload:match("^M (%S+) (%d+) (.*)$")
+    if not id then return end
+    local actor = find(id)
+    local comp = actor and comp_of(actor)
+    if not comp then return end
+    local n = 0
+    pcall(function() n = comp.MainJigContainers:GetArrayNum() end)
+    if n == 0 then acked(id, s, comp); return end
+    applying = true
+    local ok, mv, failed = pcall(jig.apply_layout, comp, jig.decode(rest), local_uid, player_jig())
+    applying = false
+    acked(id, s, comp)
+    if not ok then log.warn("loot: couldn't rearrange " .. id .. ": " .. tostring(mv)); return end
+    log.info(string.format("loot: the other player rearranged %s - %d moved here%s", id, mv,
+        failed > 0 and (", " .. failed .. " couldn't move") or ""))
+end
+
+local function apply_add(payload)
+    if not shared() then return end
+    local id, uid, da, count, dx, dy, s, cell, rot, slot, inside =
+        payload:match("^A (%S+) (%S+) (%S+) (%-?%d+) (%S+) (%S+) (%d+) (%-?%d+):(%d):(%-?%d+) ?(%S*)$")
+    if not id then return end
+    local place = { cell = tonumber(cell) >= 0 and tonumber(cell) or nil, rot = rot == "1", slot = tonumber(slot) >= 0 and tonumber(slot) or nil }
+    local actor = find(id)
+    local comp = actor and comp_of(actor)
+    if added_once[uid] then if comp then acked(id, s, comp) end return end
+    if not comp then
+        stats.missing = stats.missing + 1
+        log.info("loot: the other player put something into " .. id .. " - not here")
+        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
+        return
+    end
+    if count_of(comp, uid) > 0 or (alias[uid] and count_of(comp, alias[uid]) > 0) then added_once[uid] = true; acked(id, s, comp); return end
+    local asset = StaticFindObject(da)
+    if not util.valid(asset) then
+        log.info("loot: the other player put " .. (da:match("[^%.]+$") or da) .. " into " .. id .. " - not loaded here")
+        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
+        return
+    end
+    local slots = 0
+    pcall(function() slots = comp.MainJigContainers:GetArrayNum() end)
+    if role ~= "host" then list_add(id, uid, da, count, dx, dy, inside, place) end
+    if role ~= "host" and slots == 0 then
+        added_once[uid] = true
+        log.info(string.format("loot: the other player put %s into %s - not opened here yet, it'll be there when opened",
+            da:match("[^%.]+$") or da, id))
+        return
+    end
+    applying = true
+    local mine, err = jig.add_item(comp, da, tonumber(count) or 1, tonumber(dx) or 0, tonumber(dy) or 0, nil, place)
+    applying = false
+    if not mine then
+        log.warn("loot: couldn't add the other player's " .. (da:match("[^%.]+$") or da) .. " to " .. id .. ": " .. tostring(err))
+        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
+        return
+    end
+    acked(id, s, comp)
+    added_once[uid] = true
+    alias[uid], rev[mine] = mine, uid
+    stats.added = stats.added + 1
+    local n, miss = 0, 0
+    if inside ~= "" then
+        applying = true
+        local ok, a, m = pcall(jig.fill, comp, mine, jig.decode(inside))
+        applying = false
+        if ok then n, miss = a, m else log.warn("loot: couldn't fill the other player's item: " .. tostring(a)) end
+    end
+    log.info(string.format("loot: the other player put %s x%s into %s - added here%s", da:match("[^%.]+$") or da, count, id,
+        (n + miss > 0) and string.format(" (holding %d, %d missing)", n, miss) or ""))
+end
+
 local function sync_from_host(id)
     local comp, list = opened[id], host_list[id]
     if not (comp and list) or not util.valid(comp) then return end
@@ -337,6 +419,10 @@ local function sync_from_host(id)
     for _, p in ipairs(pairs_) do
         if p.want.uid then alias[p.want.uid], rev[p.uid] = p.uid, p.want.uid end
     end
+    applying = true
+    local lok, mv = pcall(jig.apply_layout, comp, list, local_uid, player_jig())
+    applying = false
+    if lok and mv > 0 then log.info(string.format("loot: %s rearranged to the host's layout (%d moved)", id, mv)) end
     stats.synced = (stats.synced or 0) + 1
     if not first then
         if added + removed > 0 then
@@ -352,6 +438,7 @@ local function sync_from_host(id)
         if util.valid(owner) then pcall(function() game.player():RequestServerData(comp, {}) end) end
         require("mirror.notify").show("This container was just updated to match the host - close it and open it again.", "info")
     end
+    recheck[id] = now + 1.0
     log.info(string.format("loot: %s now holds the host's items (%d: %d kept, %d added, %d removed%s)", id, #list, set, added,
         removed, missing > 0 and (", " .. missing .. " missing - opened before the host's list came, or not loaded here") or ""))
 end
@@ -399,19 +486,35 @@ end
 local LIST_EVERY, SCAN_EVERY, AHEAD_M, AHEAD_STEP = 120.0, 2.0, 35, 0.15
 local ahead, ahead_scan_in, ahead_step_in = {}, 0.0, 0.0
 local known, list_in = {}, 0.0
+-- The container list is rebuilt LIST_SLICE components per frame (it was one 120-160 ms frame every
+-- LIST_EVERY s); the old list stays in use until the new one is done. Components come from a
+-- tracked list (one walk per world, new ones via BeginPlay) instead of a FindAllOf each time.
+local JIG = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
+local LIST_SLICE = 150
+local build
 local function list_containers()
-    known, main_by_class = {}, {}
-    local g = ghost.get()
-    for _, comp in ipairs(FindAllOf("BP_JigComponent_C") or {}) do
+    local comps, walked = util.instances("BP_JigComponent_C", JIG)
+    if not walked then list_in = 1.0; return end
+    main_by_class = {}
+    build = { comps = comps, i = 1, out = {} }
+end
+local function list_step()
+    local g, me = ghost.get(), game.player()
+    local comps, out = build.comps, build.out
+    local last = math.min(#comps, build.i + LIST_SLICE - 1)
+    for i = build.i, last do
+        local comp = comps[i]
         local owner
-        pcall(function() owner = comp:GetOwner() end)
-        if util.valid(owner) and not util.same(owner, g) and not util.same(owner, game.player()) and is_main(owner) then
+        if util.valid(comp) then pcall(function() owner = comp:GetOwner() end) end
+        if util.valid(owner) and not util.same(owner, g) and not util.same(owner, me) and is_main(owner) then
             local ok, id = pcall(id_of, owner)
             local l
             pcall(function() l = util.vec(owner:K2_GetActorLocation()) end)
-            if ok and l then known[#known + 1] = { id = id, comp = comp, loc = l } end
+            if ok and l then out[#out + 1] = { id = id, comp = comp, loc = l } end
         end
     end
+    build.i = last + 1
+    if build.i > #comps then known, build = out, nil end
 end
 local function ahead_scan()
     ahead = {}
@@ -427,7 +530,8 @@ local function ahead_scan()
 end
 local function ahead_tick(dt)
     list_in = list_in - dt
-    if list_in <= 0 then list_in = LIST_EVERY; util.safe(list_containers, "loot.list") end
+    if build then util.safe(list_step, "loot.list")
+    elseif list_in <= 0 then list_in = LIST_EVERY; util.safe(list_containers, "loot.list") end
     ahead_scan_in = ahead_scan_in - dt
     if ahead_scan_in <= 0 then ahead_scan_in = SCAN_EVERY; util.safe(ahead_scan, "loot.ahead_scan") end
     ahead_step_in = ahead_step_in - dt
@@ -486,10 +590,33 @@ local main_added_fn = function(self, ToContainerUID, ItemUID, ToContainerName, I
     util.safe(on_added, "loot.added", self, ItemUID, ItemInfo)
 end
 local item_added_fn = function(self, ItemUID) util.safe(on_added, "loot.item_added", self, ItemUID, nil) end
+local move_fn = function(self, ItemUID) util.safe(on_moved, "loot.moved", self, ItemUID) end
+
+-- Once per world, a few seconds in: weapons made without their stats by older versions get them.
+local repair_in = 8.0
+local JIG_CLASS
+local function repair_player_stats()
+    local p = game.player()
+    if not util.valid(p) then repair_in = 5.0; return end
+    local comp
+    pcall(function() comp = p.BP_JigComponent end)
+    if not util.valid(comp) then
+        JIG_CLASS = util.valid(JIG_CLASS) and JIG_CLASS or StaticFindObject(JIG_COMP)
+        pcall(function() comp = p:GetComponentByClass(JIG_CLASS) end)
+    end
+    if not util.valid(comp) then log.info("loot: stat repair skipped - no inventory component"); return end
+    local n, names = jig.repair_stats(comp)
+    if n > 0 then log.info("loot: gave " .. n .. " item(s) their missing stats: " .. table.concat(names, ", ")) end
+end
 
 function loot.tick(dt)
+    if repair_in then
+        repair_in = repair_in - dt
+        if repair_in <= 0 then repair_in = nil; util.safe(repair_player_stats, "loot.repair_stats") end
+    end
     if role == "off" then return end
     now = now + dt
+    util.safe(jig.flush_ui, "jig.ui")
     hook_in = hook_in - dt
     if hook_in <= 0 then
         hook_in = 1.0
@@ -501,6 +628,7 @@ function loot.tick(dt)
             util.ensure_hook(c .. ":OnExecuteInteract", prefetch_fn)
         end
         util.ensure_hook(JIG_COMP .. ":HandleServerDropRequest", drop_fn)
+        util.ensure_hook(JIG_COMP .. ":HandleSameContainerMoveToIndex", move_fn)
         for _, c in ipairs(MAIN) do
             util.ensure_hook(c .. ":JigMP_OnItemRemoved", hook_fn)
             util.ensure_hook(c .. ":JigMP_OnItemAdded", item_added_fn)
@@ -508,15 +636,25 @@ function loot.tick(dt)
             util.ensure_hook(c .. ":JigMP_OnMainContainerItemAdded", main_added_fn)
         end
         if not shared() then
-            alias, rev, added_once, put_sent = {}, {}, {}, {}
+            alias, rev, added_once, put_sent, add_q, moved, move_q = {}, {}, {}, {}, {}, {}, {}
             pushed, push_q, host_list, opened, asked, synced, apply_q = {}, {}, {}, {}, {}, {}, {}
             pending, held, ack, main_by_class = {}, {}, {}, {}
+            host_ack, recheck = {}, {}
         end
     end
+    util.safe(flush_moves, "loot.moves")
+    util.safe(flush_adds, "loot.adds")
     if role == "host" then
         util.safe(flush_pushes, "loot.push")
         if ghost.get() then util.safe(ahead_tick, "loot.ahead", dt) end
     else
+        -- only while the host's list already has all of this player's takes/puts (never undoes one)
+        for id, at in pairs(recheck) do
+            if now >= at then
+                recheck[id] = nil
+                if (pending[id] or 0) <= (host_ack[id] or 0) then util.safe(sync_from_host, "loot.recheck", id) end
+            end
+        end
         for id, at in pairs(apply_q) do
             if now >= at then apply_q[id] = nil; util.safe(sync_from_host, "loot.sync", id) end
         end
@@ -525,7 +663,7 @@ function loot.tick(dt)
         if role == "host" or not shared() then return end
         local id, a, rest = p:match("^C (%S+) (%d+) ?(.*)$")
         if not id then return end
-        host_list[id] = jig.decode(rest)
+        host_list[id], host_ack[id] = jig.decode(rest), tonumber(a)
         if (pending[id] or 0) <= tonumber(a) then util.safe(sync_from_host, "loot.sync", id) end
     end
     cchan:pump(take_contents)
@@ -533,6 +671,7 @@ function loot.tick(dt)
         local k = p:sub(1, 2)
         if is_trade(p) then traded() end
         if k == "A " then util.safe(apply_add, "loot.apply_add", p)
+        elseif k == "M " then util.safe(apply_move, "loot.apply_move", p)
         elseif k == "C " then take_contents(p)
         elseif k == "R " then
             if role ~= "host" and shared() then
@@ -565,7 +704,10 @@ function loot.status()
         stats.fixed or 0, stats.rejected or 0, stats.missing > 0 and (", container not found " .. stats.missing) or "")
 end
 
+-- Respawn/reload: the old world's objects are freed - drop them without touching them.
+local function forget_world() main_cls, main_by_class, known, build = {}, {}, {}, nil; repair_in = 8.0 end
 function loot.init(c, r, s)
+    game.on_world_reset(forget_world)
     cfg, role, session = c, r, s
     if cfg.loot_sync == false then role = "off" end
     log.info("loot: " .. (role == "off" and "off" or "container contents are shared (taken + put in)"))

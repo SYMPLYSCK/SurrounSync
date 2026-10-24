@@ -44,16 +44,18 @@ local function key_of(o, cls)
     return string.format("%s@%d,%d,%d", cls, math.floor(l.X / 10 + 0.5), math.floor(l.Y / 10 + 0.5), math.floor(l.Z / 10 + 0.5)), util.vec(l)
 end
 
--- One class per call: FindAllOf walks every object in the game.
+-- One class per call (util.instances keeps the lists without walking every object in the game).
 local scan_idx = 0
 local function rescan_class(cls)
+    local objs, walked = util.instances(cls, "/Game/Infestation/BP_Infestation.BP_Infestation_C")
+    if not walked then return false end
     for k, n in pairs(nests) do
         if n.cls == cls then nests[k] = nil; by_addr[n.addr] = nil end
     end
     pcall(function()
-        for _, o in ipairs(FindAllOf(cls) or {}) do
+        for _, o in ipairs(objs) do
             local a = util.addr(o)
-            if a and not by_addr[a] and not o:GetFullName():find("Default__", 1, true) then
+            if a and not by_addr[a] then
                 local ok, k, l = pcall(key_of, o, cls)
                 if ok then
                     local n = { obj = o, key = k, loc = l, addr = a, cls = cls }
@@ -62,6 +64,7 @@ local function rescan_class(cls)
             end
         end
     end)
+    return true
 end
 local function rescan_step()
     scan_idx = scan_idx % #CLASSES + 1
@@ -310,8 +313,7 @@ function infest.tick(dt)
     if role == "host" then util.ensure_hook(SAI .. ":SetBB_LockOnTarget", on_lock_target) end
 
     if warm > 0 then
-        rescan_class(CLASSES[warm])
-        warm = warm - 1
+        if rescan_class(CLASSES[warm]) then warm = warm - 1 end
         if warm == 0 then
             local c = 0
             for _ in pairs(nests) do c = c + 1 end
@@ -351,7 +353,10 @@ function infest.status()
         stats.sent, stats.applied, stats.blocked, stats.destroyed, stats.retargeted, stats.missing)
 end
 
+-- Respawn/reload: the old world's objects are freed - drop them without touching them.
+local function forget_world() nests, by_addr, scan_in = {}, {}, 0.0 end
 function infest.init(c, r, s, shared)
+    game.on_world_reset(forget_world)
     cfg, role, session = c, r, s
     same_world = shared or same_world
     if cfg.infest_sync == false then role = "off" end

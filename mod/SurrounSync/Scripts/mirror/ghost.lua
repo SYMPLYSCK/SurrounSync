@@ -11,6 +11,7 @@ local actor = nil
 local addr = nil
 local crouched = false
 local move_speed, move_crouch, move_sprint = nil, nil, nil
+local water_off, swim_shown = nil, nil
 local generation = 0
 local view = nil
 local combat_state = nil
@@ -25,6 +26,12 @@ function ghost.get()
     if actor and util.valid(actor) then return actor end
     actor, addr = nil, nil
     return nil
+end
+
+-- The world it stood in is gone: forget it without touching it.
+function ghost.forget()
+    actor, addr, view, kind = nil, nil, nil, nil
+    generation = generation + 1
 end
 
 function ghost.exists() return ghost.get() ~= nil end
@@ -140,6 +147,21 @@ local function make_cosmetic(g)
         cfg.ghost.target_tag, tag, idx, ghost.invoker_index()))
 end
 
+-- Back to the non-PvP mesh setup for this ghost's kind (pvp.lua makes the mesh hittable).
+function ghost.restore_mesh()
+    local g = ghost.get()
+    if not g then return end
+    if kind == "guest" then
+        util.safe(function() g.Mesh:SetCollisionEnabled(NO_COLLISION) end, "ghost.collision")
+    else
+        util.safe(function()
+            g.Mesh:SetCollisionEnabled(QUERY_ONLY)
+            g.Mesh:SetCollisionResponseToAllChannels(ECR_IGNORE)
+            g.Mesh:SetCollisionResponseToChannel(ECC_VISIBILITY, ECR_BLOCK)
+        end, "ghost.mesh")
+    end
+end
+
 function ghost.spawn(world, loc, yaw, k)
     if ghost.exists() then return ghost.get() end
     local cls = load_class()
@@ -154,6 +176,7 @@ function ghost.spawn(world, loc, yaw, k)
     generation = generation + 1
     crouched = false
     move_speed, move_crouch, move_sprint = nil, nil, nil
+    water_off, swim_shown = nil, nil
     combat_state = nil
     we_registered_invoker = false
     kind = k or "host"
@@ -253,6 +276,29 @@ function ghost.apply(pose, moving)
     end
     if cfg.ghost.mirror_aim and pose.aim then ghost.apply_aim(g, pose.aim) end
     ghost.apply_move(g, pose)
+    ghost.apply_swim(g, pose)
+end
+
+-- The ghost's own SwimmingComponent (WaterDetection, every 10 ms) writes bWaterVolume onto its physics volume -
+-- outside water volumes that's the world's DefaultPhysicsVolume, shared with the local player, who then swims
+-- (floats) on land while the ghost is in water. Stop it and show the peer's swimming from the pose instead
+-- (AnimBP_PlayerCharacter reads SwimmingComponent IsSwimming? / UnderWater?).
+function ghost.apply_swim(g, pose)
+    local a = util.addr(g)
+    if water_off ~= a then
+        local ok = pcall(function()
+            util.cdo("/Script/Engine.Default__KismetSystemLibrary"):K2_ClearTimer(g.SwimmingComponent, "WaterDetection")
+        end)
+        if ok then water_off = a; log.info("ghost: its own water detection is off") end
+    end
+    local want = (pose.swim and 1 or 0) + (pose.underwater and 2 or 0)
+    if want == swim_shown then return end
+    swim_shown = want
+    pcall(function()
+        local sw = g.SwimmingComponent
+        sw["IsSwimming?"] = pose.swim == true
+        sw["UnderWater?"] = pose.underwater == true
+    end)
 end
 
 function ghost.apply_move(g, pose)
@@ -283,6 +329,13 @@ function ghost.apply_aim(g, aim)
     pcall(function() g["HipFire?"] = aim.hip end)
     pcall(function() g["InMeleeStance?"] = aim.melee end)
     if aim.lhand then pcall(function() g.LeftHandLoc = aim.lhand end) end
+    if aim.lean then
+        pcall(function()
+            g.Lean = aim.lean
+            g["LeanLeft?"] = aim.lean_side == 1
+            g["LeanRight?"] = aim.lean_side == 2
+        end)
+    end
     if view and util.valid(view) and aim.view_yaw then
         local r = { Pitch = aim.pitch, Yaw = aim.view_yaw, Roll = 0 }
         pcall(function() view:SetControlRotation(r) end)

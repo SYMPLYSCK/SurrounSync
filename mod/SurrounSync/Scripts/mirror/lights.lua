@@ -5,6 +5,7 @@ local util = require("mirror.util")
 local game = require("mirror.game")
 local ghost = require("mirror.ghost")
 local link = require("mirror.link")
+local audio = require("mirror.audio")
 
 local lights = {}
 
@@ -52,7 +53,8 @@ local function apply(g, state)
         local cue, gs = StaticFindObject(on and CUE_ON or CUE_OFF), util.cdo(GS)
         if util.valid(cue) and gs then
             pcall(function()
-                gs:PlaySoundAtLocation(g, cue, g:K2_GetActorLocation(), { Pitch = 0, Yaw = 0, Roll = 0 }, 1.0, 1.0, 0.0, nil, nil, nil, nil)
+                gs:PlaySoundAtLocation(g, cue, g:K2_GetActorLocation(), { Pitch = 0, Yaw = 0, Roll = 0 }, 1.0, 1.0, 0.0,
+                    audio.attenuation_for(cue), nil, nil, nil)
             end)
         end
         log.info("lights: the other player's flashlight " .. (on and "on" or "off"))

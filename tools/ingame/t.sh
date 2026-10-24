@@ -45,7 +45,8 @@ start_one() {
   if [ "$r" = host ]; then dir="$HW"; args=""; slot=QuickSave110649_26Jul2026; side=left
   else dir="$GW"; args="'-saveddirsuffix=Guest',"; slot=QuickSave111214_22Jul2026; side=right; fi
   for try in 1 2; do
-    mark $r; launch "$dir" "$args" $side
+    # the new game rewrites its log from line 1: start the wait there (a mark on the old, longer log never matched)
+    if [ "$r" = host ]; then : > "$HL"; else : > "$GL"; fi 2>/dev/null; eval "M_$r=0"; launch "$dir" "$args" $side
     waitnew $r "devtest: watching" 90 >/dev/null && cmd $r "continue $slot"
     waitnew $r "devtest: load " 60 >/dev/null
     if waitnew $r "real player is|new real player" 45 >/dev/null; then do_ $r god "devtest: god" 20; return 0; fi
@@ -69,7 +70,9 @@ setup() {
 # guest joins the host and is in its world
 # (the guest's home spot blocks saving - zombies: it moves 40 m first and drops in; god mode keeps it alive)
 join() {
-  do_ guest "tp 40 0" "devtest: tp" 10 >/dev/null; sleep 6
+  # absolute spot 40 m off the save's home: a relative "tp 40 0" stacked up after crash recovery
+  # (the guest comes back where it joined from) and dropped it under the map
+  do_ guest "tpto 165736 182791 1577" "devtest: tpto" 10 >/dev/null; sleep 6
   do_ guest clearz "clearz removed" 10 >/dev/null
   # (connector security: the host answers the join request - like clicking ACCEPT in the CO-OP tab)
   ( for i in $(seq 1 120); do

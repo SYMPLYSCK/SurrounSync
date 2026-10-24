@@ -32,7 +32,7 @@ function track:at(t, util, max_extrap)
         r.loc.X, r.loc.Y, r.loc.Z = n.loc.X + n.vel.X * e, n.loc.Y + n.vel.Y * e, n.loc.Z + n.vel.Z * e
         r.vel.X, r.vel.Y, r.vel.Z = n.vel.X, n.vel.Y, n.vel.Z
         r.yaw, r.crouch, r.falling, r.aim, r.t, r.stale = n.yaw, n.crouch, n.falling, n.aim, t, t - n.t
-        r.sprint, r.move = n.sprint, n.move
+        r.sprint, r.move, r.swim, r.underwater = n.sprint, n.move, n.swim, n.underwater
         return r
     end
     local i = hi
@@ -42,7 +42,7 @@ function track:at(t, util, max_extrap)
     r.loc.X, r.loc.Y, r.loc.Z = util.lerp(a.loc.X, b.loc.X, k), util.lerp(a.loc.Y, b.loc.Y, k), util.lerp(a.loc.Z, b.loc.Z, k)
     r.vel.X, r.vel.Y, r.vel.Z = util.lerp(a.vel.X, b.vel.X, k), util.lerp(a.vel.Y, b.vel.Y, k), util.lerp(a.vel.Z, b.vel.Z, k)
     r.yaw, r.crouch, r.falling, r.t, r.stale = util.lerp_angle(a.yaw, b.yaw, k), b.crouch, b.falling, t, 0
-    r.sprint, r.move = b.sprint, b.move
+    r.sprint, r.move, r.swim, r.underwater = b.sprint, b.move, b.swim, b.underwater
     if b.aim and a.aim then
         local ra, ba, aa = r.aim_s, b.aim, a.aim
         if not ra then ra = { head_s = {} }; r.aim_s = ra end

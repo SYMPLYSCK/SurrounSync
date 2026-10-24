@@ -28,6 +28,7 @@ local function describe(comp)
     local names = {}
     for _, h in ipairs(jig.contents_of(comp)) do
         names[#names + 1] = (h.da and h.da:match("([%w_]+)$") or "?") .. "x" .. h.count
+            .. (h.cell and ("@" .. h.cell .. (h.rot and "r" or "")) or "")
     end
     table.sort(names)
     return #names .. " items [" .. table.concat(names, ", ") .. "]"
@@ -189,6 +190,27 @@ local function run(cmd)
         end
         log.info("devtest: putin " .. item.da:match("([%w_]+)$") .. " -> " .. container_name(a) .. ": "
             .. (moved and "done" or ("FAILED " .. tostring(err))) .. " - now " .. describe(fb))
+    elseif cmd == "rearrange" or cmd == "rearrange r" then
+        -- like a player dragging the container's first item to another free cell (rotated with "r")
+        local a = nearest_container(6)
+        local pc, fb
+        pcall(function() pc = game.player().BP_JigMultiplayer end)
+        pcall(function() fb = a.BP_JigMultiplayer end)
+        local item = fb and jig.contents_of(fb)[1]
+        if not (item and util.valid(pc)) then log.info("devtest: rearrange - no item in a container within 6 m"); return end
+        local rot = cmd == "rearrange r"
+        local cont, cells = jig.container_arg(fb.MainJigContainers[1])
+        local done = false
+        for idx = cells - 1, 0, -1 do
+            if idx ~= item.cell then
+                pcall(function() pc:SERVER_SameContainer_MoveToIndex(fb, jig.guid(item.uid), cont[jig.REPUID], idx, rot, 0) end)
+                for _, h in ipairs(jig.contents_of(fb)) do
+                    if h.uid == item.uid and h.cell == idx then done = true end
+                end
+                if done then break end
+            end
+        end
+        log.info("devtest: rearrange " .. (done and "done" or "FAILED") .. " - now " .. describe(fb))
     elseif cmd == "dump" then
         local a = nearest_container(6)
         if a then
@@ -339,12 +361,20 @@ function devtest.watch(cfg)
             god = cmd == "god"
             local ok = pcall(function() game.player().MedicalComponent["CanTakeDamage?"] = not god end)
             log.info("devtest: " .. cmd .. " -> " .. tostring(ok))
+        elseif cmd:find("^tpto ") then
+            -- absolute spot (the test kit's join): a relative tp from a save that already moved drifts off the map
+            local x, y, z = (arg or ""):match("^(%S+)%s+(%S+)%s+(%S+)$")
+            if not (tonumber(x) and tonumber(y) and tonumber(z)) then log.info("devtest: tpto needs <x> <y> <z>"); return end
+            local p, to = game.player(), { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
+            local ok, err = pcall(function() p:K2_TeleportTo(to, p:K2_GetActorRotation()) end)
+            log.info(string.format("devtest: tpto -> (%.0f, %.0f, %.0f) %s", to.X, to.Y, to.Z, ok and "ok" or tostring(err)))
         elseif cmd:find("^tp ") then
             local dx, dy = (arg or ""):match("^(%S+)%s+(%S+)$")
             local p, l = game.player(), nil
             pcall(function() l = p:K2_GetActorLocation() end)
             if not (l and tonumber(dx) and tonumber(dy)) then log.info("devtest: tp needs <dx m> <dy m>"); return end
-            local to = { X = l.X + tonumber(dx) * 100, Y = l.Y + tonumber(dy) * 100, Z = l.Z + 3000 }
+            -- a short drop: from 30 m up the player fell through ground that hadn't loaded yet (and joined mid-fall)
+            local to = { X = l.X + tonumber(dx) * 100, Y = l.Y + tonumber(dy) * 100, Z = l.Z + 300 }
             local ok, err = pcall(function() p:K2_TeleportTo(to, p:K2_GetActorRotation()) end)
             log.info(string.format("devtest: tp -> (%.0f, %.0f, %.0f) %s", to.X, to.Y, to.Z, ok and "ok" or tostring(err)))
         elseif cmd == "gkill" then require("mirror.zombies").dev_guest_kill()
@@ -630,7 +660,7 @@ function devtest.watch(cfg)
         elseif cmd == "status" then
             log.info(string.format("devtest: state %s, where %s, playing %s, host_gone %s", tostring(session.state()),
                 tostring(session.where()), tostring(session.playing_slot()), tostring(session.host_gone())))
-        elseif cmd:find("^kill %d+$") or ({ open = 1, corpse = 1, dump = 1, dump2 = 1, move = 1, putin = 1, addtest = 1 })[cmd] then
+        elseif cmd:find("^kill %d+$") or ({ open = 1, corpse = 1, dump = 1, dump2 = 1, move = 1, putin = 1, addtest = 1, rearrange = 1, ["rearrange r"] = 1 })[cmd] then
             container_cmds(cmd)
         else log.info("devtest: unknown command") end
     end

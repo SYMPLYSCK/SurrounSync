@@ -180,6 +180,8 @@ local function model()
     m.show_voice = r ~= nil
     m.voice_label, m.voice_vol = require("mirror.voice").label()
     if l and l.voice == "talking" then m.voice_label = "VOICE: TALKING" end
+    m.settings = require("mirror.hostrules").rows()
+    m.settings_editable = require("mirror.hostrules").can_edit()
     if steam then
         m.me = l and ("Signed in as " .. (l.name or "?")) or
             "The Steam connection isn't running. Make sure Steam is running and your antivirus isn't blocking SurrounSyncBridge."
@@ -213,6 +215,7 @@ local function model()
     m.show_chat = r ~= nil
     m.password_on = r == "host" and l and l.password or false
     m.chat = require("mirror.chat").recent(3)
+    m.tp = require("mirror.teleport").pending()
     m.update = l and l.update or nil
     m.show_report = steam
     m.host_gone = r == "guest" and session.host_gone() ~= nil
@@ -235,13 +238,23 @@ local function update()
         notify.show("Updates need the Steam connection. Run SurrounSync Setup from the Start menu instead.", "bad")
     end
 end
-local function report()
-    if not link.bridge_cmd("report") then
+local function send_report(message)
+    message = tostring(message or ""):gsub("\r", ""):gsub("[%z\1-\9\11-\31]", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    if #message > 1500 then message = message:sub(1, 1500) end
+    if not link.bridge_cmd(message ~= "" and ("report " .. message) or "report") then
         notify.show("Bug reports need the Steam connection. Run SurrounSync Setup -> BUG REPORT instead.", "bad")
         return
     end
     report_asked_at = os.clock()
     notify.show("Saving a bug report and sending it to the SurrounSync developer...", "info")
+end
+-- asks what went wrong first; SEND makes and sends the report with that message
+local function report()
+    if not require("mirror.names").ask({ title = "BUG REPORT - ANYTHING ELSE TO ADD?", multiline = true, ok = "SEND", clear = false,
+                                         hint = "What happened, and what were you doing just before? (optional)",
+                                         done = send_report }) then
+        send_report("")
+    end
 end
 local function watch_release()
     local l = link.lobby()
@@ -339,6 +352,7 @@ local function watch_requests()
 end
 
 local function tick(dt)
+    util.safe(require("mirror.hostrules").tick, "hostrules.tick")
     instance.tick(dt, function()
         notify.show("This game is already running from the same folder. Run a second game from a separate install.", "bad")
     end)
@@ -411,6 +425,8 @@ menu.dev_password = set_password
 
 function menu.init(c)
     cfg = c
+    require("mirror.hostrules").init(my_role)
+    require("mirror.itemclean").init(my_role)
     journal_tab.configure{
         model = model,
         act = {
@@ -433,11 +449,14 @@ function menu.init(c)
             end,
             voice = function() require("mirror.voice").toggle() end,
             voice_vol = function() require("mirror.voice").cycle_volume() end,
+            setting = function(key) require("mirror.hostrules").toggle(key) end,
             refresh = function()
                 if link.bridge_cmd("browse") then notify.show("Looking for public games...", "info") end
             end,
             set_password = set_password,
             chat_send = function(txt) return require("mirror.chat").send(txt) end,
+            tp_accept = function() require("mirror.teleport").accept() end,
+            tp_decline = function() require("mirror.teleport").decline() end,
             update = update,
             report = report,
             accept = function(id, name) answer("accept", id, name) end,

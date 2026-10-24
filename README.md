@@ -41,8 +41,8 @@ Both players need the same SurrounSync version.
 
 1. Close SurrounDead.
 2. Download **SurrounSyncSetup.exe** from the [latest release](https://github.com/SYMPLYSCK/SurrounSync/releases/latest) and run it.
-3. Click **INSTALL**. It finds the game on its own (or use *Browse*), installs UE4SS if you don't have it yet, the
-   mod, and optionally the PDS blood and gore mod.
+3. Click **INSTALL**. It finds the game on its own (or use *Browse*), installs UE4SS if you don't have it yet, and the
+   mod.
 
 When it's done, the setup checks your PC and tells you if anything is off, with what to do about it. You can run
 that check again any time with the **Check** button.
@@ -69,7 +69,7 @@ world can join someone else.
 | | |
 |---|---|
 | **Players** | movement, sprinting, crouching, clothes and gear, weapons, aiming, animations, flashlights and lasers, a name tag with connection quality |
-| **Combat** | shots, impacts, blood and gore (with PDS), grenades and projectiles, hits and kills, damage and medical effects (bleeding, infection, radiation) |
+| **Combat** | shots, impacts, blood and gore (with PDS, if both players installed it), grenades and projectiles, hits and kills, damage and medical effects (bleeding, infection, radiation) |
 | **AI** | zombies, bosses, bandits, soldiers, scavengers and animals: looks, movement, health, deaths, corpses. XP goes to whoever made the kill |
 | **Loot** | corpses, containers, storage and crates, dropped items, death bags. Guns keep their magazines and attachments |
 | **World** | time and weather, doors, building, generators and lights, cars (driving, passengers, fuel, damage) |
@@ -168,5 +168,4 @@ welcome. See [LICENSE](LICENSE).
 
 - [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS), the scripting runtime this is built on (MIT licence, included in
   the setup).
-- PDS (Procedural Damage System), the blood and gore mod the setup offers alongside it.
 - SurrounSync is an unofficial fan mod. It isn't affiliated with or endorsed by the developers of SurrounDead.

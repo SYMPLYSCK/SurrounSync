@@ -1,6 +1,7 @@
 -- Measures how long each part of the mod takes per frame and logs slow spots.
 
 local log = require("mirror.log")
+local crumb = require("mirror.crumb")
 
 local perf = {}
 
@@ -9,10 +10,18 @@ local parts = {}
 local frame_sum, frame_max, frames, wall = 0.0, 0.0, 0, 0.0
 local frame_start = nil
 local enabled = true
+local gc_mode = "incremental"
+
+-- Lua 5.4 collector mode for the whole mod (main.lua calls this once at startup).
+function perf.set_gc(mode)
+    gc_mode = mode == "incremental" and "incremental" or "generational"
+    collectgarbage(gc_mode)
+end
 
 function perf.configure(cfg) enabled = not (cfg and cfg.perf_log == false) end
 
 function perf.run(name, fn, ...)
+    crumb.at(name)
     if not enabled then return fn(...) end
     local t, m = os.clock(), collectgarbage("count")
     fn(...)
@@ -31,6 +40,7 @@ function perf.frame_end(dt)
     if not (enabled and frame_start) then return end
     local d = os.clock() - frame_start
     frame_start = nil
+    crumb.at("game (mod tick done)")
     frame_sum, frames, wall = frame_sum + d, frames + 1, wall + (dt or 0)
     if d >= 0.1 then log.info(string.format("perf: slow frame %.0f ms", d * 1000)) end
     if d > frame_max then frame_max = d end
@@ -45,8 +55,8 @@ function perf.frame_end(dt)
     end
     local gc_on = collectgarbage("isrunning")
     if not gc_on then collectgarbage("restart") end
-    log.info(string.format("perf: mod %.2f ms/frame (worst frame %.0f ms), game %.0f fps, Lua memory %.0f KB%s | %s",
-        frame_sum / frames * 1000, frame_max * 1000, frames / wall, collectgarbage("count"),
+    log.info(string.format("perf: mod %.2f ms/frame (worst frame %.0f ms), game %.0f fps, Lua memory %.0f KB (%s GC)%s | %s",
+        frame_sum / frames * 1000, frame_max * 1000, frames / wall, collectgarbage("count"), gc_mode,
         gc_on and "" or " (GC WAS STOPPED - restarted)", table.concat(top, " | ")))
     parts, frame_sum, frame_max, frames, wall = {}, 0.0, 0.0, 0, 0.0
 end

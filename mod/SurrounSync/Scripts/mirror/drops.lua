@@ -5,6 +5,7 @@ local util = require("mirror.util")
 local game = require("mirror.game")
 local events = require("mirror.events")
 local jig = require("mirror.jig")
+local names = require("mirror.names")
 
 local drops = {}
 
@@ -45,6 +46,7 @@ local full_path, uid_str, guid = jig.full_path, jig.uid_str, jig.guid
 
 local ended = {}
 local PICKUP_COMP = "/Game/JigSInventory/Jigsaw/Pickup/BP_JigPickupComponent.BP_JigPickupComponent_C"
+local BEACON = "/Game/Blueprints/HordeSystem/Beacon/Buildable_HordeBeacon.Buildable_HordeBeacon_C"
 
 local function alive(a)
     if not util.valid(a) then return false end
@@ -123,7 +125,14 @@ local function shared() return role == "host" or (session and session.in_world()
 local function traded() if session and session.checkpoint and shared() then session.checkpoint("drops") end end
 channel.send = function(self, p) if p:find("^[DT] ") then traded() end return events.send(self, p) end
 
-local function send_drop(pickup)
+-- " <name>" when the item has a custom name (names.lua), else ""
+local function name_field(uid)
+    local n = uid and names.get(uid)
+    return n and (" " .. names.encode(n)) or ""
+end
+
+local function send_drop(pickup, own_uid)
+    if util.valid(pickup) then util.safe(require("mirror.itemclean").mark, "drops.clean_mark", pickup) end
     if not shared() or not util.valid(pickup) then return end
     if tracked_uid(pickup) then return end
     local comp = jig_of(pickup)
@@ -144,6 +153,8 @@ local function send_drop(pickup)
         vec = { X = v.X, Y = v.Y }
         weight, price = info[WEIGHT] or 0, info[PRICE] or 0
     end)
+    if own_uid and (not uid or uid == "0_0_0_0") then uid = own_uid end
+    if not da then da = item_of(pickup) end
     if not (da and uid) then log.warn("drops: couldn't read the dropped item's info"); return end
     if tracked[uid] and alive(tracked[uid]) then return end
     local l, r
@@ -152,14 +163,15 @@ local function send_drop(pickup)
     tracked[uid] = pickup
     channel:send(string.format("D %s %s %d %.3f %.3f %.1f %.1f %.1f %.1f %.1f %.1f %.0f %.0f %.4f %.2f", uid, da,
         count or 1, dur and dur.X or 0, dur and dur.Y or 0, l.X, l.Y, l.Z, r.Pitch, r.Yaw, r.Roll,
-        vec.X or 0, vec.Y or 0, weight, price))
+        vec.X or 0, vec.Y or 0, weight, price) .. name_field(uid))
     local inside, line, n = contents_of(comp), {}, 0
     for i, h in ipairs(inside) do
         local par = h.parent and line[h.parent]
         if h.da and (par or not h.parent) then
             n = n + 1
             line[i] = n
-            channel:send(string.format("I %s %s %d %.3f %.3f %d %d", uid, h.da, h.count, h.dx, h.dy, par or 0, h.slot or 0))
+            channel:send(string.format("I %s %s %d %.3f %.3f %d %d", uid, h.da, h.count, h.dx, h.dy, par or 0, h.slot or 0)
+                .. name_field(h.uid))
         end
     end
     stats.sent = stats.sent + 1
@@ -191,9 +203,47 @@ local function on_drop_request()
     end
 end
 
+-- The horde beacon's final-wave rewards (SpawnRewards) are plain pickups spawned with no owner, so no drop
+-- path sees them. Their components begin play inside SpawnRewards: pickups begun in the same frame as the
+-- SpawnRewards hook are the rewards. They're sent like drops a moment later (count set, info filled); world
+-- pickups can carry a zero UID, so a reward without one gets a made-up one.
+local begun, rewards = {}, {}
+local function on_pickup_begin(self)
+    local comp = util.obj(self)
+    if not comp then return end
+    local owner
+    pcall(function() owner = comp:GetOwner() end)
+    if util.valid(owner) then begun[#begun + 1] = { actor = owner, at = now } end
+end
+local function on_rewards()
+    if not shared() then return end
+    local n = 0
+    for _, b in ipairs(begun) do
+        if b.at == now then
+            n = n + 1
+            rewards[#rewards + 1] = { actor = b.actor, at = now + 0.5 }
+        end
+    end
+    begun = {}
+    log.info(string.format("drops: horde beacon rewards spawned here (%d) - sending them", n))
+end
+local function send_rewards()
+    local keep = {}
+    for _, r in ipairs(rewards) do
+        if now < r.at then keep[#keep + 1] = r
+        elseif on_ground(r.actor) then
+            send_drop(r.actor, string.format("%d_%d_%d_%d", math.random(1, 2147483646), math.random(1, 2147483646),
+                math.random(1, 2147483646), math.random(1, 2147483646)))
+        end
+    end
+    rewards = keep
+end
+
 local function make(payload)
     local uid, da, count, dx, dy, x, y, z, pi, ya, ro, vx, vy, wt, pr =
-        payload:match("^D (%S+) (%S+) (%-?%d+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+)$")
+        payload:match("^D (%S+) (%S+) (%-?%d+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+)")
+    local dname = payload:match("^D" .. string.rep(" %S+", 15) .. " (%S+)$")
+    if uid and dname then names.set(uid, names.decode(dname), true) end
     if not uid then return end
     if not shared() then return end
     if tracked[uid] and alive(tracked[uid]) then return end
@@ -263,10 +313,11 @@ end
 local function take_content(payload)
     local uid, da, count, dx, dy, rest = payload:match("^I (%S+) (%S+) (%-?%d+) (%S+) (%S+) ?(.*)$")
     if not uid then return end
-    local par, slot = (rest or ""):match("^(%d+) (%-?%d+)$")
+    local par, slot, nm = (rest or ""):match("^(%d+) (%-?%d+) ?(%S*)$")
     local list = contents[uid] or {}
     list[#list + 1] = { da = da, count = tonumber(count) or 1, dx = tonumber(dx) or 0, dy = tonumber(dy) or 0,
-                        parent = par ~= "0" and tonumber(par) or nil, slot = tonumber(slot) }
+                        parent = par ~= "0" and tonumber(par) or nil, slot = tonumber(slot),
+                        name = nm and nm ~= "" and names.decode(nm) or nil }
     contents[uid] = list
     local a = finished[uid]
     if a and alive(a) then
@@ -418,6 +469,8 @@ local filled_fn = function(self) util.safe(on_filled, "drops.filled", self) end
 local request_fn = function() util.safe(on_drop_request, "drops.request") end
 local add_pre_fn = function(self, ActorRef) util.safe(on_add_actor_pre, "drops.add_pre", ActorRef) end
 local add_post_fn = function() util.safe(on_add_actor_post, "drops.add_post") end
+local begin_fn = function(self) util.safe(on_pickup_begin, "drops.pickup_begin", self) end
+local rewards_fn = function() util.safe(on_rewards, "drops.rewards") end
 local end_play_fn = function(self)
     util.safe(function()
         local owner
@@ -451,6 +504,7 @@ function drops.tick(dt)
     if not (cfg and cfg.mirror_drops) then return end
     now = now + dt
     if #finish > 0 then util.safe(finish_copies, "drops.finish") end
+    if #rewards > 0 then util.safe(send_rewards, "drops.send_rewards") end
     if picking and now - picking.at > 0.2 then util.safe(on_add_actor_post, "drops.add_post_late") end
     check_in = check_in - dt
     if check_in <= 0 then
@@ -464,6 +518,9 @@ function drops.tick(dt)
         util.ensure_hook(PLAYER .. ":JigMP_OnPickupEquipped", equipped_fn)
         util.ensure_hook(JIG .. ":ServerFunc_HandleRequestAddActorToContainer", add_pre_fn, add_post_fn)
         util.ensure_hook(PICKUP_COMP .. ":ReceiveEndPlay", end_play_fn)
+        util.ensure_hook(PICKUP_COMP .. ":ReceiveBeginPlay", begin_fn)
+        util.ensure_hook(BEACON .. ":SpawnRewards", rewards_fn)
+        if #begun > 0 and begun[#begun].at < now then begun = {} end
         if not shared() then tracked, copies, alias, finish, ended, contents, finished = {}, {}, {}, {}, {}, {}, {} end
         for uid, a in pairs(tracked) do
             local here, why = on_ground(a)
@@ -491,7 +548,28 @@ function drops.status()
         world_stats.sent, world_stats.removed, world_stats.missing)
 end
 
+-- Respawn/reload: the old world's objects are freed - drop them without touching them.
+-- Item cleanup removes an old dropped item: the other game removes its copy too.
+function drops.cleanup_remove(actor)
+    if not alive(actor) then return false end
+    local uid = tracked_uid(actor)
+    local w = not uid and shared() and world_info(actor) or nil
+    if not pcall(function() actor:K2_DestroyActor() end) then return false end
+    if uid then
+        forget(uid)
+        channel:send("T " .. uid)
+    else
+        ended[util.addr(actor) or 0] = true
+        if w then channel:send(string.format("W %s %.1f %.1f %.1f %s", w.cls, w.loc.X, w.loc.Y, w.loc.Z, w.da)) end
+    end
+    return true
+end
+
+local function forget_world()
+    tracked, finish, finished, ended, filled, picking, begun, rewards = {}, {}, {}, {}, {}, nil, {}, {}
+end
 function drops.init(c, r, s)
+    game.on_world_reset(forget_world)
     cfg, role, session = c, r, s
     if cfg.mirror_drops then log.info("drops: mirroring dropped items") end
 end

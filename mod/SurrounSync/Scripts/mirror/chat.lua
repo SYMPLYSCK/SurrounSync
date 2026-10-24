@@ -30,6 +30,7 @@ end
 function chat.send(text)
     text = clean(text)
     if text == "" then return false, "empty" end
+    if text:sub(1, 1) == "/" then require("mirror.teleport").command(text); return true end
     local t = os.clock()
     if t - last_send < SEND_GAP then
         notify.show("Slow down a little - one message a second.", "info")

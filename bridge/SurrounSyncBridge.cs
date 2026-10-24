@@ -520,6 +520,8 @@ class Voice
     public double Volume = 1.0;
     public double Distance = 0;
     public bool Talking;
+    public long HeardAt = -100000;   // when the other player's last voice packet arrived (TickCount)
+    public bool PeerTalking { get { return Environment.TickCount - HeardAt < 400; } }
     uint rate = 24000;
     IntPtr wave = IntPtr.Zero;
     readonly List<IntPtr> queued = new List<IntPtr>();
@@ -684,6 +686,35 @@ class Bridge
     bool answered = false;
 
     static long Now() { return Environment.TickCount; }
+
+    // Watchdog: the loop is single-threaded, so one call that blocks (Steam, a file) froze the whole link
+    // (2026-10-24: guest bridge silent ~40 s; the mod's restart then quit because this one still held the
+    // mutex). Each loop step is named; stuck > STALL_EXIT ms -> log the step and exit so the restart works.
+    volatile string step = "start";
+    long beat = Environment.TickCount;
+    const int STALL_LOG = 4000, STALL_EXIT = 12000;
+    void Step(string s) { step = s; Interlocked.Exchange(ref beat, Environment.TickCount); }
+    void StartWatchdog()
+    {
+        var th = new Thread(() =>
+        {
+            bool logged = false;
+            while (true)
+            {
+                Thread.Sleep(500);
+                long stuck = Environment.TickCount - Interlocked.Read(ref beat);
+                if (stuck < STALL_LOG) { logged = false; continue; }
+                if (!logged) { logged = true; Log("loop stuck in " + step + " for " + stuck / 1000.0 + " s"); }
+                if (stuck >= STALL_EXIT)
+                {
+                    Log("loop stuck in " + step + " for " + stuck / 1000 + " s - exiting so the game can restart the bridge");
+                    Environment.Exit(4);
+                }
+            }
+        });
+        th.IsBackground = true;
+        th.Start();
+    }
     static long Unix() { return DateTimeOffset.UtcNow.ToUnixTimeSeconds(); }
 
     void Log(string m)
@@ -774,7 +805,14 @@ class Bridge
         bool created;
         using (var mutex = new Mutex(true, mutexName, out created))
         {
-            if (!created) { Log("another bridge for role " + role + " is running on " + dir + " - exiting"); return 0; }
+            // a stuck old bridge exits on its own watchdog within ~12 s: wait for it instead of quitting at once
+            if (!created)
+            {
+                Log("another bridge for role " + role + " is running on " + dir + " - waiting up to 20 s for it to go");
+                try { created = mutex.WaitOne(20000); } catch (AbandonedMutexException) { created = true; }
+                if (!created) { Log("the other bridge is still running - exiting"); return 0; }
+                Log("the old bridge is gone - taking over");
+            }
             net = testPort > 0 ? (INet)new TestNet(testPort) : new SteamNet();
             if (!net.Init(Log)) return 2;
             me = net.Me;
@@ -790,6 +828,7 @@ class Bridge
             }
             ClearPeerFiles();
             if (auto) StartUpdateCheck();
+            StartWatchdog();
             try { Loop(); }
             finally
             {
@@ -827,25 +866,26 @@ class Bridge
         while (true)
         {
             long t = Now();
+            Step("steam callbacks");
             net.Pump(OnSessionRequest, Log);
             if (auto && t - lastCmd > 250)
             {
-                lastCmd = t; ReadCommand(); ExpireRequests(t);
+                Step("command file"); lastCmd = t; ReadCommand(); ExpireRequests(t);
                 if (browsing && net.Servers != null) { browsing = false; Log("found " + net.Servers.Count + " public game(s)"); WriteLobby(); }
             }
-            if (auto && t - lastLobby > 2000) { lastLobby = t; WriteLobby(); }
+            if (auto && t - lastLobby > 2000) { Step("lobby file"); lastLobby = t; WriteLobby(); }
             if (role == "idle")
             {
-                Drain(0); Drain(1);
-                FlushWrites();
-                Thread.Sleep(20);
+                Step("idle receive"); Drain(0); Drain(1);
+                Step("idle writes"); FlushWrites();
+                Step("idle sleep"); Thread.Sleep(20);
                 if (GameGone(ref lastGameCheck, ref gameMissing)) { Log("game closed - exiting"); return; }
                 continue;
             }
-            if (peer == 0 && t - lastScan > 3000) { lastScan = t; Discover(); }
+            if (peer == 0 && t - lastScan > 3000) { Step("friend scan"); lastScan = t; Discover(); }
             if (peer != 0 && t - lastHello > 1000)
             {
-                lastHello = t;
+                Step("hello"); lastHello = t;
                 SendRaw('H', epoch + " " + Unix() + " " + role + " " + (!gameCheck || gameMissing == 0 ? "1" : "0"), false);
                 // Steam only knows the names of your friends ("[unknown]" for anyone else): we say ours
                 if (t - lastNameSent > 5000) { lastNameSent = t; SendRaw('N', net.MyName ?? "", false); }
@@ -858,18 +898,21 @@ class Bridge
             }
             if (peer != 0)
             {
-                if (t - lastPoseRead >= 10) { lastPoseRead = t; PumpPose(); }
-                if (t - lastBlobScan > 15) { lastBlobScan = t; PumpBlobs(); }
+                if (t - lastPoseRead >= 10) { Step("pose send"); lastPoseRead = t; PumpPose(); }
+                if (t - lastBlobScan > 15) { Step("blob send"); lastBlobScan = t; PumpBlobs(); }
             }
-            Ping(t);
-            Receive(0); Receive(1);
+            Step("ping"); Ping(t);
+            Step("receive"); Receive(0); Receive(1);
             if (voice.Available) Receive(2);
+            Step("voice");
             if (peer != 0) voice.Tick(pkt => { bool ok = net.Send(peer, pkt, false, 2); if (ok) { txPkts++; txBytes += pkt.Length; } return ok; });
             if (t - voiceCfgAt > 250) { voiceCfgAt = t; ReadVoiceSettings(); }
-            FlushWrites();
-            if (t - lastStatus > 2000) { lastStatus = t; WriteStatus(); }
+            WriteVoiceState();
+            Step("file writes"); FlushWrites();
+            if (t - lastStatus > 2000) { Step("status file"); lastStatus = t; WriteStatus(); }
+            Step("game check");
             if (GameGone(ref lastGameCheck, ref gameMissing)) { Log("game closed - exiting"); return; }
-            Thread.Sleep(4);
+            Step("sleep"); Thread.Sleep(4);
         }
     }
 
@@ -1111,7 +1154,7 @@ class Bridge
             WriteLobby();
         }
         else if (c == "update") StartUpdater();
-        else if (c == "report") StartReport();
+        else if (c == "report" || c.StartsWith("report ")) StartReport(c.Length > 7 ? c.Substring(7) : null);
         else if (c == "clearallow") { try { File.Delete(AllowFile()); } catch { } Log("always-allowed list cleared"); WriteLobby(); }
         else Log("unknown command '" + c + "'");
     }
@@ -1213,7 +1256,8 @@ class Bridge
         catch (Exception e) { Log("update: couldn't start the updater: " + e.Message); }
     }
 
-    void StartReport()
+    // message = what the player typed into the in-game bug report box (may be null)
+    void StartReport(string message)
     {
         if (reportLine == "reporting") return;
         reportLine = "reporting";
@@ -1221,7 +1265,7 @@ class Bridge
         var th = new Thread(() =>
         {
             string err;
-            string zip = SurrounSyncShared.Report.Create(Win64Dir(), out err);
+            string zip = SurrounSyncShared.Report.Create(Win64Dir(), out err, false, message);
             Log(zip != null ? "bug report saved: " + zip : "bug report failed: " + err);
             if (zip == null) { reportLine = "reporterror " + Clean(err); return; }
             string sent = "off";
@@ -1238,6 +1282,16 @@ class Bridge
         th.Start();
     }
     static string Get(Dictionary<string, string> d, string k, string def) { string v; return d.TryGetValue(k, out v) && v != "" ? v.Replace(' ', '_') : def; }
+
+    // "me 0|1 peer 0|1" - who is talking right now, for the speaking icon on the name tag. Written only on a change.
+    string voiceState = null;
+    void WriteVoiceState()
+    {
+        string st = "me " + (voice.Talking ? 1 : 0) + " peer " + (peer != 0 && voice.PeerTalking ? 1 : 0);
+        if (st == voiceState) return;
+        voiceState = st;
+        try { WriteAtomic(Path.Combine(dir, "mirror_voice_state.txt"), st); } catch { }
+    }
 
     void ReadVoiceSettings()
     {
@@ -1456,7 +1510,7 @@ class Bridge
         foreach (var path in files)
         {
             string file = Path.GetFileName(path);
-            if (file.StartsWith("mirror_link_")) continue;
+            if (file.StartsWith("mirror_link_") || file.StartsWith("mirror_index_")) continue;
             DateTime w;
             try { w = File.GetLastWriteTimeUtc(path); } catch { continue; }
             if (w < startedUtc) continue;
@@ -1594,7 +1648,7 @@ class Bridge
             rxPkts++; rxBytes += data.Length;
             if (!WithinLimits(data)) continue;
             lastRx = Now(); lastHeard = lastRx;
-            if (data[0] == (byte)'V') { voice.Play(data, 1); continue; }
+            if (data[0] == (byte)'V') { voice.HeardAt = Environment.TickCount; voice.Play(data, 1); continue; }
             if (data[0] == (byte)'Z' || data[0] == (byte)'F')
             {
                 try { if (data[0] == (byte)'Z') Handle('B', Inflate(data, 1, MAX_PART)); else TakeFragment(data); }
@@ -1624,8 +1678,24 @@ class Bridge
     {
         if (name.Length == 0 || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return;
         WriteAtomic(Path.Combine(dir, "mirror_" + name + "_" + other + ".txt"), body);
+        BumpIndex(name);
         rxBlobs++;
         if (loggedRx.Add(name)) Log("got " + name + " (" + body.Length + " chars)");
+    }
+
+    // One small file the game reads instead of opening every blob file each frame: a counter per blob name,
+    // bumped after the blob is written. The first token changes per bridge run so the game drops old counters.
+    readonly Dictionary<string, long> blobGen = new Dictionary<string, long>();
+    readonly string indexRun = DateTime.UtcNow.Ticks.ToString();
+    void BumpIndex(string name)
+    {
+        long g;
+        blobGen.TryGetValue(name, out g);
+        blobGen[name] = g + 1;
+        var sb = new StringBuilder("v1 ").Append(indexRun).Append('\n');
+        foreach (var kv in blobGen) sb.Append(kv.Key).Append(' ').Append(kv.Value).Append('\n');
+        sb.Append("END\n");
+        WriteAtomic(Path.Combine(dir, "mirror_index_" + other + ".txt"), sb.ToString());
     }
 
     // bridge-to-bridge round trip, without the games in between (what the network itself costs)
