@@ -424,17 +424,34 @@ function devtest.watch(cfg)
         elseif cmd == "buildplace" then
             local ok, err = pcall(function() game.player().BuildingComponent:SpawnBuild(build_at) end)
             log.info("devtest: buildplace -> " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
-        elseif cmd == "infest" then
-            local n = 0
-            for _, a in ipairs(FindAllOf("BP_Infestation_C") or {}) do
-                pcall(function()
-                    if a:GetFullName():find("Default__", 1, true) then return end
-                    local l = a:K2_GetActorLocation()
-                    local function b(f) local v = false; pcall(function() v = a[f] == true end); return v and "1" or "0" end
-                    log.info(string.format("devtest: infest %.0f %.0f prim=%s rand=%s dead=%s marker=%s", l.X / 100, l.Y / 100,
-                        b("PrimaryInfestation?"), b("RandomInfestation?"), b("IsDestroyed?"), b("ShowMarker?")))
-                    n = n + 1
-                end)
+        elseif cmd == "infest" or cmd:find("^nesthit ") then
+            -- infest: every nest with its health; nesthit <amount>: hit the nearest nest like a weapon does
+            local n, best, bd = 0, nil, math.huge
+            local pl = game.player():K2_GetActorLocation()
+            for _, cls in ipairs({ "BP_Infestation_C", "BP_Infestation_Ceiling_C", "BP_Infestation_Corner_C", "BP_Infestation_Floor_C",
+                                   "BP_Infestation_Wall_C", "BP_PrimaryInfestation_C" }) do
+                for _, a in ipairs(FindAllOf(cls) or {}) do
+                    pcall(function()
+                        if a:GetFullName():find("Default__", 1, true) then return end
+                        local l = a:K2_GetActorLocation()
+                        local d = math.sqrt((l.X - pl.X) ^ 2 + (l.Y - pl.Y) ^ 2 + (l.Z - pl.Z) ^ 2)
+                        if d < bd then best, bd = a, d end
+                        if cmd == "infest" then
+                            local function b(f) local v = false; pcall(function() v = a[f] == true end); return v and "1" or "0" end
+                            local dc = a.DamageComponent
+                            log.info(string.format("devtest: infest %s %.0f %.0f %.0f m prim=%s dead=%s hp=%.1f/%.1f max=%.1f", cls,
+                                l.X / 100, l.Y / 100, d / 100, b("PrimaryInfestation?"), b("IsDestroyed?"),
+                                dc.CurrentHealth, dc.StandardHealthValue, dc.MaxHealth))
+                        end
+                        n = n + 1
+                    end)
+                end
+            end
+            if cmd ~= "infest" and best then
+                local ok, err = pcall(function() best:Damage_Object(tonumber(arg) or 100, game.player(), nil) end)
+                local dc = best.DamageComponent
+                log.info(string.format("devtest: nesthit %.0f m -> %s hp=%.1f/%.1f max=%.1f dead=%s", bd / 100, tostring(ok and "" or err),
+                    dc.CurrentHealth, dc.StandardHealthValue, dc.MaxHealth, tostring(best["IsDestroyed?"])))
             end
             log.info("devtest: infest done " .. n)
         elseif cmd:find("^count ") then

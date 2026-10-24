@@ -39,6 +39,8 @@ end
 
 require("mirror.ghost").configure(cfg)
 require("mirror.game").init()
+-- nests saved with the old 1,000,000-health pin get their real health back, in single player too
+require("mirror.infest").watch()
 
 local menu = require("mirror.menu")
 if role == "auto" then

@@ -188,6 +188,8 @@ local function rot(s)
 end
 
 local gear = {}
+-- in_hand[i]: gear[i] belongs to a piece attached to a hand socket (the gun being held, not a holstered one)
+local in_hand = {}
 
 local function clear_gear(g)
     local left = 0
@@ -201,7 +203,7 @@ local function clear_gear(g)
         end
     end
     if left > 0 then log.warn(string.format("look: %d old gear component(s) not destroyed (hidden)", left)) end
-    gear = {}
+    gear, in_hand = {}, {}
 end
 
 local function add_comp(g, kind)
@@ -220,7 +222,7 @@ function look.apply(g, blob)
     clear_gear(g)
     pcall(function() g.Mesh:SetCastShadow(true) end)
     missing = {}
-    local parts, gear_n, nodes = 0, 0, {}
+    local parts, gear_n, nodes, root_sock = 0, 0, {}, {}
     for line in blob:gmatch("[^\n]+") do
         local f = {}
         for v in (line .. "\t"):gmatch("([^\t]*)\t") do f[#f + 1] = v end
@@ -238,6 +240,8 @@ function look.apply(g, blob)
             local c = add_comp(g, (f[6] ~= "-") and kind or "N")
             if c then
                 gear[#gear + 1] = c
+                root_sock[id] = (parent == 0) and socket or root_sock[parent] or ""
+                in_hand[#gear] = root_sock[id]:lower():find("hand", 1, true) ~= nil
                 pcall(function() c:SetCastShadow(true) end)
                 nodes[id] = c
                 local parent_comp = (parent == 0) and g.Mesh or nodes[parent]
@@ -271,9 +275,10 @@ function look.gear_summary(blob)
     return table.concat(out, ",")
 end
 
-function look.forget() gear = {} end
+function look.forget() gear, in_hand = {}, {} end
 
 function look.components() return gear end
+function look.in_hand(i) return in_hand[i] == true end
 
 function look.dump(g)
     if not util.valid(g) then return end

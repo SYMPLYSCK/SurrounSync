@@ -37,6 +37,11 @@ local alias = {}
 local finish = {}
 local contents = {}
 local finished = {}
+-- A loose magazine's pickup class has no container settings, so its copy here has no grid for the rounds
+-- (the game builds the mag's capacity container only when it goes into an inventory). unfilled[uid] = the
+-- item list the copy couldn't hold; when it's picked up here the list goes into the new inventory item.
+local unfilled = {}
+local refill = {}
 local ITEMS = "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"
 local now = 0.0
 local check_in = 0.0
@@ -80,10 +85,11 @@ end
 
 local world_stats = { sent = 0, removed = 0, missing = 0 }
 
+local resend, sent_list
 local function forget(uid)
     local a = tracked[uid]
     if a then ended[util.addr(a) or 0] = nil end
-    tracked[uid], copies[uid], seen[uid] = nil, nil, nil
+    tracked[uid], copies[uid], seen[uid], resend[uid], sent_list[uid] = nil, nil, nil, nil, nil
 end
 
 local function jig_of(actor)
@@ -119,6 +125,20 @@ local function apply_contents(comp, want, what)
     local set, added, removed, missing = jig.apply_contents(comp, want)
     log.info(string.format("drops: %s contents - %d set, %d added, %d extra removed, %d missing (of %d) - now [%s]", what,
         set, added, removed, missing, #want, describe(contents_of(comp))))
+    return set + added, missing
+end
+
+-- the copy of uid (actor) holds nothing of its list: keep the list for the pickup, show the round count on the ground
+local function note_unfilled(uid, actor, placed, missing)
+    if not (placed == 0 and missing > 0) then unfilled[uid] = nil; return end
+    local list = contents[uid]
+    if unfilled[uid] == list then return end
+    unfilled[uid] = list
+    local n = 0
+    for _, w in ipairs(list) do if not w.parent then n = n + (w.count or 1) end end
+    pcall(function() actor:GetComponentByClass(StaticFindObject(PICKUP_COMP)).RepCapacity = n end)
+    log.info(string.format("drops: the copy has no container for its %d item(s) (%d inside) - they go into it when it's picked up here",
+        #list, n))
 end
 
 local function shared() return role == "host" or (session and session.in_world()) end
@@ -179,9 +199,22 @@ local function send_drop(pickup, own_uid)
         #inside > 0 and (" (holding " .. describe(inside) .. ")") or ""))
 end
 
+-- Dropping takes the item out with RemoveGetInfo, which gives it (and all it holds) new UIDs: a custom name
+-- goes over to the new ones before the drop is sent.
+local function carry_name(item_uid, pickup)
+    local old, new, comp
+    pcall(function() local g = item_uid:get(); old = uid_str(g) end)
+    if not old or old == "0_0_0_0" or not util.valid(pickup) then return end
+    comp = jig_of(pickup)
+    pcall(function() new = uid_str(comp.PickupInfo[UID]) end)
+    if new and new ~= old then names.moved(old, new, comp) end
+end
+
 local function on_dropped(self, ItemUID, FromContainerUID, ActorRef)
     if not util.same(self:get(), game.player()) then return end
-    send_drop(util.obj(ActorRef))
+    local pickup = util.obj(ActorRef)
+    carry_name(ItemUID, pickup)
+    send_drop(pickup)
 end
 
 -- Drops from a container or of part of a stack never reach the player's OnItemDropped: the game tells the
@@ -195,11 +228,14 @@ local function on_filled(self)
     pcall(function() owner = comp:GetOwner() end)
     if util.valid(owner) then filled[#filled + 1] = { actor = owner, at = now } end
 end
-local function on_drop_request()
+local function on_drop_request(item_uid)
     local list = filled
     filled = {}
     for _, f in ipairs(list) do
-        if f.at == now then send_drop(f.actor) end
+        if f.at == now then
+            if item_uid then carry_name(item_uid, f.actor) end
+            send_drop(f.actor)
+        end
     end
 end
 
@@ -322,8 +358,54 @@ local function take_content(payload)
     local a = finished[uid]
     if a and alive(a) then
         local comp = jig_of(a)
-        if comp then apply_contents(comp, list, da:match("[^%.]+$") or da) end
+        if comp then note_unfilled(uid, a, apply_contents(comp, list, da:match("[^%.]+$") or da)) end
     end
+end
+
+-- An attachment put on (or taken off) a weapon lying on the ground is a comp-to-comp move into (out of) the
+-- pickup's own Jig component: nothing is dropped or picked up, so the other game's copy kept the old parts.
+-- After such a move the dropped item's whole contents go over again ("C <uid> <list>").
+resend, sent_list = {}, {}
+local applying = false
+local function on_comp_move(From, To)
+    if applying or not shared() then return end
+    for _, c in ipairs({ From, To }) do
+        local owner
+        pcall(function() owner = c:GetOwner() end)
+        local uid = tracked_uid(owner)
+        if uid then resend[uid] = now + 0.3 end
+    end
+end
+local function send_contents()
+    for uid, at in pairs(resend) do
+        if now >= at then
+            resend[uid] = nil
+            local a = tracked[uid]
+            local comp = alive(a) and jig_of(a)
+            if comp then
+                local inside = contents_of(comp)
+                local line = jig.encode(inside)
+                if line ~= sent_list[uid] then
+                    sent_list[uid] = line
+                    channel:send("C " .. uid .. " " .. line)
+                    log.info(string.format("drops: a dropped item's parts changed here - now [%s], sent", describe(inside)))
+                end
+            end
+        end
+    end
+end
+local function take_changed(payload)
+    local uid, line = payload:match("^C (%S+) ?(.*)$")
+    if not uid then return end
+    local list = jig.decode(line)
+    contents[uid], sent_list[uid] = list, line
+    local a = finished[uid] or tracked[uid]
+    local comp = alive(a) and jig_of(a)
+    if not comp then return end
+    applying = true
+    local ok, placed, missing = pcall(apply_contents, comp, list, "changed parts")
+    applying = false
+    if ok then note_unfilled(uid, a, placed, missing) end
 end
 
 local function remove_world(payload)
@@ -379,13 +461,51 @@ local function finish_copies()
             end) end
             if not ok then log.warn("drops: couldn't finish a container copy: " .. tostring(err)) end
             finished[f.uid] = f.actor
-            if comp then apply_contents(comp, contents[f.uid] or {}, "copy") end
+            if comp then note_unfilled(f.uid, f.actor, apply_contents(comp, contents[f.uid] or {}, "copy")) end
         end
     end
     finish = keep
 end
 
 local picking = nil
+
+-- A copy with unfilled contents was picked up here (uid = its drop uid, item = the new inventory item's uid if known).
+local function queue_refill(uid, item, before)
+    local list = uid and unfilled[uid]
+    if not list then return end
+    unfilled[uid] = nil
+    refill[#refill + 1] = { uid = uid, item = item, da = copies[uid] and copies[uid].da, list = list, before = before,
+                            at = now + 0.3 }
+end
+local function inventory() local c; pcall(function() c = game.player().BP_JigMultiplayer end); return util.valid(c) and c or nil end
+local function do_refill(r)
+    local pc = inventory()
+    if not pc then return end
+    local all, target = contents_of(pc), nil
+    local holds = {}
+    for _, h in ipairs(all) do if h.parent then holds[h.parent] = true end end
+    for i, h in ipairs(all) do
+        if h.da == r.da and not holds[i] then
+            if h.uid == r.item then target = h; break end
+            if not (r.before and r.before[h.uid]) then target = h end
+        end
+    end
+    if not target then log.warn("drops: picked-up copy not found in the inventory - its contents couldn't be put back"); return end
+    local fl = { { da = r.da } }
+    for _, w in ipairs(r.list) do
+        fl[#fl + 1] = { da = w.da, count = w.count, dx = w.dx, dy = w.dy, slot = w.slot, name = w.name,
+                        parent = w.parent and (w.parent + 1) or 1 }
+    end
+    local added, missing = jig.fill(pc, target.uid, fl)
+    log.info(string.format("drops: put the picked-up copy's contents into it - %d added, %d missing", added, missing))
+end
+local function run_refills()
+    local keep = {}
+    for _, r in ipairs(refill) do
+        if now < r.at then keep[#keep + 1] = r else util.safe(do_refill, "drops.refill", r) end
+    end
+    refill = keep
+end
 local function send_world(actor, cls, l, da)
     if not (cls and l and da) then return end
     channel:send(string.format("W %s %.1f %.1f %.1f %s", cls, l.X, l.Y, l.Z, da))
@@ -405,7 +525,13 @@ local function on_add_actor_pre(ActorRef)
     local actor
     pcall(function() actor = ActorRef:get() end)
     local uid = tracked_uid(actor)
-    if uid then picking = { uid = uid, at = now }
+    if uid then
+        picking = { uid = uid, at = now }
+        if unfilled[uid] then
+            picking.before = {}
+            local pc = inventory()
+            for _, h in ipairs(pc and contents_of(pc) or {}) do picking.before[h.uid] = true end
+        end
     elseif shared() then picking = { world = world_info(actor), at = now }
     else picking = nil end
 end
@@ -427,15 +553,16 @@ local function on_add_actor_post()
     end
     log.info("drops: a dropped item was picked up here (" .. (copies[uid] and "copy" or "own drop")
         .. ", removed by the game) - telling the other game")
+    queue_refill(uid, p.item, p.before)
     forget(uid)
     channel:send("T " .. uid)
 end
 
 local function on_picked(self, Info, ItemUID)
     if not util.same(self:get(), game.player()) then return end
-    if picking then picking.added = true; return end
     local u, da
     pcall(function() u = uid_str(ItemUID:get()) end)
+    if picking then picking.added = true; picking.item = u; return end
     pcall(function() da = full_path(Info:get()[ITEM_ID]) end)
     local key = u and (alias[u] or u)
     if not (key and copies[key]) and da then
@@ -457,6 +584,7 @@ local function on_picked(self, Info, ItemUID)
         stats.forced = stats.forced + 1
         log.warn("drops: picked up a copy that the game didn't remove - removed it (no duplicate)")
     end
+    queue_refill(key, u)
     forget(key)
     channel:send("T " .. key)
 end
@@ -466,11 +594,15 @@ local hook_fn = function(self, ItemUID, FromContainerUID, ActorRef)
 end
 local picked_fn = function(self, Info, ItemUID) util.safe(on_picked, "drops.picked", self, Info, ItemUID) end
 local filled_fn = function(self) util.safe(on_filled, "drops.filled", self) end
-local request_fn = function() util.safe(on_drop_request, "drops.request") end
+local request_fn = function(self, ItemUID) util.safe(on_drop_request, "drops.request", ItemUID) end
+local craft_drop_fn = function() util.safe(on_drop_request, "drops.request") end
 local add_pre_fn = function(self, ActorRef) util.safe(on_add_actor_pre, "drops.add_pre", ActorRef) end
 local add_post_fn = function() util.safe(on_add_actor_post, "drops.add_post") end
 local begin_fn = function(self) util.safe(on_pickup_begin, "drops.pickup_begin", self) end
 local rewards_fn = function() util.safe(on_rewards, "drops.rewards") end
+local comp_move_fn = function(self, From, To)
+    util.safe(function() on_comp_move(util.obj(From), util.obj(To)) end, "drops.comp_move")
+end
 local end_play_fn = function(self)
     util.safe(function()
         local owner
@@ -479,15 +611,17 @@ local end_play_fn = function(self)
         if a and tracked_uid(owner) then ended[a] = true end
     end, "drops.end_play")
 end
-local equipped_fn = function(self, ActorRef)
+local equipped_fn = function(self, ActorRef, ContainerName, ItemUID)
     util.safe(function()
         if not util.same(self:get(), game.player()) then return end
-        local actor
+        local actor, item
         pcall(function() actor = ActorRef:get() end)
         if not util.valid(actor) then return end
+        pcall(function() item = uid_str(ItemUID:get()) end)
         for uid, a in pairs(tracked) do
             if util.same(a, actor) then
                 log.info("drops: a dropped item was picked up here (equipped) - telling the other game")
+                queue_refill(uid, item)
                 forget(uid)
                 channel:send("T " .. uid)
                 return
@@ -505,6 +639,8 @@ function drops.tick(dt)
     now = now + dt
     if #finish > 0 then util.safe(finish_copies, "drops.finish") end
     if #rewards > 0 then util.safe(send_rewards, "drops.send_rewards") end
+    if #refill > 0 then run_refills() end
+    if next(resend) then util.safe(send_contents, "drops.send_contents") end
     if picking and now - picking.at > 0.2 then util.safe(on_add_actor_post, "drops.add_post_late") end
     check_in = check_in - dt
     if check_in <= 0 then
@@ -512,16 +648,20 @@ function drops.tick(dt)
         util.ensure_hook(PLAYER .. ":JigMP_OnItemDropped", hook_fn)
         util.ensure_hook(JIG .. ":SetPickupContainerData", filled_fn)
         util.ensure_hook(JIG .. ":HandleServerDropRequest", request_fn)
-        util.ensure_hook(JIG .. ":HandleServerFuncRequestCraftDrop", request_fn)
+        util.ensure_hook(JIG .. ":HandleServerFuncRequestCraftDrop", craft_drop_fn)
         if #filled > 0 and filled[#filled].at < now - 1 then filled = {} end
         util.ensure_hook(PLAYER .. ":JigMP_OnPickupAdded", picked_fn)
         util.ensure_hook(PLAYER .. ":JigMP_OnPickupEquipped", equipped_fn)
         util.ensure_hook(JIG .. ":ServerFunc_HandleRequestAddActorToContainer", add_pre_fn, add_post_fn)
         util.ensure_hook(PICKUP_COMP .. ":ReceiveEndPlay", end_play_fn)
+        util.ensure_hook(JIG .. ":Handle Comp to Comp Move", comp_move_fn)
         util.ensure_hook(PICKUP_COMP .. ":ReceiveBeginPlay", begin_fn)
         util.ensure_hook(BEACON .. ":SpawnRewards", rewards_fn)
         if #begun > 0 and begun[#begun].at < now then begun = {} end
-        if not shared() then tracked, copies, alias, finish, ended, contents, finished = {}, {}, {}, {}, {}, {}, {} end
+        if not shared() then
+            tracked, copies, alias, finish, ended, contents, finished, unfilled = {}, {}, {}, {}, {}, {}, {}, {}
+            resend, sent_list = {}, {}
+        end
         for uid, a in pairs(tracked) do
             local here, why = on_ground(a)
             if here then seen[uid] = true end
@@ -538,6 +678,7 @@ function drops.tick(dt)
         if k == "D" then util.safe(make, "drops.make", payload)
         elseif k == "W" then util.safe(remove_world, "drops.world", payload)
         elseif k == "I" then util.safe(take_content, "drops.content", payload)
+        elseif k == "C" then util.safe(take_changed, "drops.changed", payload)
         else util.safe(remove, "drops.remove", payload) end
     end)
 end
@@ -566,7 +707,8 @@ function drops.cleanup_remove(actor)
 end
 
 local function forget_world()
-    tracked, finish, finished, ended, filled, picking, begun, rewards = {}, {}, {}, {}, {}, nil, {}, {}
+    tracked, finish, finished, ended, filled, picking, begun, rewards, unfilled, refill = {}, {}, {}, {}, {}, nil, {}, {}, {}, {}
+    resend, sent_list = {}, {}
 end
 function drops.init(c, r, s)
     game.on_world_reset(forget_world)

@@ -133,8 +133,41 @@ local function state_of(car)
     pcall(function() h = car.VehicleHealthComponent.CurrentHealth end)
     return string.format("%d %.1f %.1f", tonumber(c) or -1, tonumber(f) or -1, tonumber(h) or -1)
 end
+-- The game's gas can / repair kit also refresh what a player standing at the car sees: the car's own fuel and
+-- repair widgets, and the HUD's Fuel/Health stats (Svr_UpdateFuel / Svr_UpdateEngine) - those are otherwise
+-- only filled in when someone starts looking at or enters the car. The HUD stats are one panel for whatever
+-- the player looks at, so they're refreshed only when this car is the one next to the player.
+local NEXT_TO = 600
+local function show_state(car, fuel_changed, health_changed)
+    if fuel_changed then
+        pcall(function()
+            local w = car.FuelWidget:GetUserWidgetObject()
+            w:UpdateFuel(car.FuelComponent.CurrentFuel, car.FuelComponent.MaxFuel)
+        end)
+    end
+    if health_changed then
+        pcall(function()
+            local w = car.RepairWidget:GetUserWidgetObject()
+            w:UpdateHealth(car.VehicleHealthComponent.CurrentHealth, car.VehicleHealthComponent.MaxHealth)
+        end)
+    end
+    local near = false
+    pcall(function()
+        local pl, cl = game.player():K2_GetActorLocation(), car:K2_GetActorLocation()
+        local d = util.dist(pl, cl)
+        if d > NEXT_TO then return end
+        near = true
+        for _, other in pairs(cars) do
+            if not util.same(other, car) and alive(other) and util.dist(pl, other:K2_GetActorLocation()) < d then near = false; return end
+        end
+    end)
+    if not near then return end
+    if fuel_changed then pcall(function() car:Svr_UpdateFuel(car.FuelComponent.CurrentFuel) end) end
+    if health_changed then pcall(function() car:Svr_UpdateEngine(car.VehicleHealthComponent.CurrentHealth) end) end
+end
 local function set_state(car, c, f, h)
     c, f, h = tonumber(c), tonumber(f), tonumber(h)
+    local fuel_changed, health_changed = false, false
     if c and c >= 0 then
         pcall(function()
             if car.VehicleColor ~= c then
@@ -145,6 +178,9 @@ local function set_state(car, c, f, h)
     end
     -- Like the game's gas can: the fuel and the Empty flag together (Empty alone keeps a refuelled car dead).
     if f and f >= 0 then
+        local before
+        pcall(function() before = car.FuelComponent.CurrentFuel end)
+        fuel_changed = math.abs((tonumber(before) or -1) - f) > 0.05
         pcall(function() car.FuelComponent.CurrentFuel = f end)
         pcall(function() car.FuelComponent.Empty = f <= 0 end)
     end
@@ -158,8 +194,10 @@ local function set_state(car, c, f, h)
             if h > 0 and before <= 0 then pcall(function() car["EngineOn?"] = true end)
             elseif h <= 0 and before > 0 then pcall(function() car["EngineOn?"] = false end) end
             pcall(function() car:VehicleEngineFX(true) end)
+            health_changed = true
         end
     end
+    if fuel_changed or health_changed then show_state(car, fuel_changed, health_changed) end
 end
 local function fuel_health(car)
     local f, h

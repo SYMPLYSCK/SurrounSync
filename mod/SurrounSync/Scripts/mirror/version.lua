@@ -1,6 +1,6 @@
 -- Mod version, and the protocol number both players must match.
 
 return {
-    VERSION = "0.11.0",
-    PROTOCOL = 47,
+    VERSION = "0.12.0",
+    PROTOCOL = 48,
 }

@@ -285,6 +285,15 @@ namespace SurrounSyncShared
                     try { foreach (var f in Directory.GetFiles(local, "mirror_bridge*.log")) AddFile(z, f, "connector/" + Path.GetFileName(f)); }
                     catch { }
                     AddFile(z, Path.Combine(local, "Saved", "Logs", "SurrounDead.log"), "game/SurrounDead.log");
+                    // a restarted game renames the last run's log (the one that crashed) to SurrounDead-backup-<date>.log
+                    try
+                    {
+                        string prev = null; DateTime at = DateTime.MinValue;
+                        foreach (var f in Directory.GetFiles(Path.Combine(local, "Saved", "Logs"), "SurrounDead-backup-*.log"))
+                        { var t = File.GetLastWriteTime(f); if (t > at) { at = t; prev = f; } }
+                        if (prev != null && new FileInfo(prev).Length < 8 * 1024 * 1024) AddFile(z, prev, "game/SurrounDead-previous.log");
+                    }
+                    catch { }
                     string crash = NewestCrash(local);
                     if (crash != null)
                         foreach (var f in Directory.GetFiles(crash))

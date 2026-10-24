@@ -241,6 +241,10 @@ end
 local function send_report(message)
     message = tostring(message or ""):gsub("\r", ""):gsub("[%z\1-\9\11-\31]", " "):gsub("^%s+", ""):gsub("%s+$", "")
     if #message > 1500 then message = message:sub(1, 1500) end
+    if report_asked_at then
+        notify.show("A bug report is already being sent - you'll see here when it's done.", "info")
+        return
+    end
     if not link.bridge_cmd(message ~= "" and ("report " .. message) or "report") then
         notify.show("Bug reports need the Steam connection. Run SurrounSync Setup -> BUG REPORT instead.", "bad")
         return
@@ -353,6 +357,9 @@ end
 
 local function tick(dt)
     util.safe(require("mirror.hostrules").tick, "hostrules.tick")
+    -- the rename / bug report box runs in single player too (it used to tick only in a co-op session,
+    -- so SEND in a solo game did nothing)
+    util.safe(require("mirror.names").tick, "names.tick", dt)
     instance.tick(dt, function()
         notify.show("This game is already running from the same folder. Run a second game from a separate install.", "bad")
     end)
@@ -427,6 +434,7 @@ function menu.init(c)
     cfg = c
     require("mirror.hostrules").init(my_role)
     require("mirror.itemclean").init(my_role)
+    require("mirror.names").init()
     journal_tab.configure{
         model = model,
         act = {

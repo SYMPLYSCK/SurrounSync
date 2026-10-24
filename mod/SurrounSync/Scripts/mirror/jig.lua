@@ -150,7 +150,12 @@ function jig.contents_of(comp)
                     local d = it[INFO][DURABILITY]
                     out[#out + 1] = { uid = jig.uid_str(it[UID]), da = jig.full_path(it[INFO][ITEM_ID]),
                                       count = it[INFO][COUNT] or 1, dx = d.X or 0, dy = d.Y or 0, el = el }
-                    pcall(function() out[#out].cell, out[#out].rot = it[SLOT_INDEX], it[ROTATED] == true end)
+                    pcall(function()
+                        local h = out[#out]
+                        h.cell, h.rot = it[SLOT_INDEX], it[ROTATED] == true
+                        local m = it["ContainerMotherID_38_33D59C5047C31FF0367835AAF5ABE05D"]
+                        h.mother = string.format("%d_%d_%d_%d", m.A, m.B, m.C, m.D)
+                    end)
                     in_of[#out], slot_of[#out] = holder, slot
                 end)
             end)
@@ -160,7 +165,7 @@ function jig.contents_of(comp)
     for i, h in ipairs(out) do index[h.uid] = i end
     for i, h in ipairs(out) do
         local p = in_of[i] and index[in_of[i]]
-        h.slot = slot_of[i]
+        h.slot, h.holder = slot_of[i], in_of[i]
         if p and p ~= i then h.parent = p end
     end
     return out

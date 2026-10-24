@@ -18,7 +18,7 @@ end
 local function read_lines(path)
     local t = {}
     local f = io.open(path, "r")
-    if f then for l in f:lines() do l = l:gsub("%s+$", ""); if l ~= "" then t[l] = true end end; f:close() end
+    if f then for line in f:lines() do local l = line:gsub("%s+$", ""); if l ~= "" then t[l] = true end end; f:close() end
     return t
 end
 
@@ -47,7 +47,10 @@ function loader.tick(dt, busy)
     if t < next_at then return end
     next_at = t + INTERVAL
     local p = table.remove(queue, 1)
-    if StaticFindObject(p) then return end
+    -- a miss gives a non-nil wrapper around NULL, not nil: only a valid object counts as loaded
+    local have = false
+    pcall(function() have = StaticFindObject(p):IsValid() end)
+    if have then return end
     local f = io.open(guard, "w")
     if f then f:write(p, "\n"); f:close() end
     local t0 = os.clock()
@@ -62,7 +65,8 @@ end
 
 function loader.configure(c)
     cfg = c
-    on = c and c.asset_loader ~= false
+    -- off unless asked for: a real LoadAsset from Lua hung the guest on its first join (2026-10-24, bridgetest)
+    on = c and c.asset_loader == true
     if not on then return end
     guard = saved_dir() .. "\\mirror_loading.txt"
     banned_file = saved_dir() .. "\\mirror_load_banned.txt"

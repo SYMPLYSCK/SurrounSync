@@ -134,13 +134,19 @@ local function play_impact(payload)
     impact_stats.played = impact_stats.played + 1
 end
 
+-- The held gun's muzzle: holstered guns are visible and have a Muzzle socket too (after a weapon switch the old
+-- gun came first and the tracers/flashes started at it) - a piece hanging from a hand socket wins.
 local function ghost_muzzle()
-    for _, c in ipairs(look.components()) do
+    local any
+    for i, c in ipairs(look.components()) do
         local ok = false
         pcall(function() ok = util.valid(c) and c:DoesSocketExist(FName("Muzzle")) and c:IsVisible() end)
-        if ok then return c end
+        if ok then
+            if look.in_hand(i) then return c end
+            any = any or c
+        end
     end
-    return nil
+    return any
 end
 
 local function play(payload)
