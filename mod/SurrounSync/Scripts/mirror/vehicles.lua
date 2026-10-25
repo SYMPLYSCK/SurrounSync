@@ -39,6 +39,9 @@ local entered_with = nil
 local ride_fix, ride_at, ride_seat = 0, -100.0, nil
 local seated_seat = 0
 local peer_rides = nil
+-- seats: first come keeps its seat. seats.peer = the seat this copy's player announced ("R car seat");
+-- seats.name = the car the local player rides in (host's name; main copy)
+local seats = { peer = nil, name = nil }
 local LIST_EVERY = 5.0
 local list_at, applied_at = -100.0, -100.0
 local PASSES = { 3, 10, 18 }
@@ -100,11 +103,21 @@ local unknown = {}
 local function car_named(name)
     local c = alias[name] or cars[name]
     if alive(c) then return c end
+    -- a mate copy has no cars list: the host's name -> our car map lives in the main copy
+    -- (a car the host spawned has another name here - the bots never sat down on the guest)
+    if mate then
+        local main = P().main("mirror.vehicles")
+        if main ~= vehicles and main.car_named then
+            c = main.car_named(name)
+            if alive(c) then return c end
+        end
+    end
     if (unknown[name] or 0) > now then return nil end
     if scan_age > 5 then scan(); c = alias[name] or cars[name] end
     if not alive(c) then unknown[name] = now + 30; return nil end
     return c
 end
+vehicles.car_named = car_named
 local function peer_name(car)
     local n = name_of(car)
     return n and (rev[n] or n) or nil
@@ -401,27 +414,29 @@ local function send_drive(dt)
     if car and (mine_drives or vehicles.other_drives(car)) then
         local nm = (mine_drives and peer and peer.name) or peer_name(car)
         if not util.same(riding, car) then
-            riding, ride_fix, ride_seat = car, 2, nil
+            riding, ride_fix, ride_seat, seats.name = car, 2, nil, nm
             -- got in together with someone who drives it (lower slot): no longer the driver, no "parked"
             if util.same(driving, car) then driving, entered_with, out_for = nil, nil, 0.0 end
-            link.put_blob("ride", "R " .. tostring(nm))
             if mine_drives then
                 log.info("vehicles: riding along in " .. tostring(nm))
                 notify.show("Riding along - your friend is driving.", "info")
             end
         end
-        if mine_drives then
-            local s = seat_of(nm, P().my_slot())
-            if s ~= ride_seat then ride_seat, ride_fix = s, 2 end
-            if ride_fix > 0 and now - ride_at > 0.4 then
-                ride_fix, ride_at = ride_fix - 1, now
-                local pt = seat_point(car, s)
-                if pt then pcall(function() p:K2_SetActorLocation(pt, false, {}, true) end) end
-            end
+        -- the first free seat, kept while riding (only a lower slot that claimed it at the same time moves us)
+        local s = seat_of(nm, P().my_slot())
+        if s ~= ride_seat then
+            ride_seat, ride_fix = s, 2
+            link.put_blob("ride", "R " .. tostring(nm) .. " " .. s)
+            log.info("vehicles: riding in " .. tostring(nm) .. ", seat " .. s)
+        end
+        if ride_fix > 0 and now - ride_at > 0.4 then
+            ride_fix, ride_at = ride_fix - 1, now
+            local pt = seat_point(car, s)
+            if pt then pcall(function() p:K2_SetActorLocation(pt, false, {}, true) end) end
         end
         return
     elseif riding then
-        riding = nil
+        riding, ride_seat, seats.name = nil, nil, nil
         link.put_blob("ride", "R -")
         log.info("vehicles: got out (passenger)")
     end
@@ -523,17 +538,33 @@ function vehicles.rides_in() return peer_rides end
 
 -- Passenger seat (1-3) of the player in `slot` riding car n: the riders in slot order, the same on every game.
 seat_of = function(n, slot)
-    local set, order = {}, {}
-    local function add(s) if s and not set[s] then set[s] = true; order[#order + 1] = s end end
-    if riding and peer_name(riding) == n then add(P().my_slot()) end
+    local list, seen = {}, {}
+    local function add(s, seat)
+        if s and not seen[s] then seen[s] = true; list[#list + 1] = { s = s, seat = tonumber(seat) } end
+    end
+    -- (the local player counts in every copy - a mate copy has no riding of its own: bot in the guest's lap)
+    local main = P().main("mirror.vehicles")
+    local mn, ms = main.my_ride()
+    if mn == n then add(P().my_slot(), ms) end
     P().each("mirror.vehicles", function(m)
-        if m.rides_in and m.rides_in() == n then add(m.player_slot()) end
+        if m.rides_in and m.rides_in() == n then add(m.player_slot(), m.peer_seat and m.peer_seat()) end
     end)
     add(slot)
-    table.sort(order)
-    for i, s in ipairs(order) do if s == slot then return math.min(i, 3) end end
-    return 1
+    table.sort(list, function(a, b) return a.s < b.s end)
+    local taken, got = {}, {}
+    for _, e in ipairs(list) do
+        if e.seat and e.seat >= 1 and e.seat <= 3 and not taken[e.seat] then taken[e.seat], got[e.s] = true, e.seat end
+    end
+    for _, e in ipairs(list) do
+        if not got[e.s] then
+            for k = 1, 3 do if not taken[k] then taken[k], got[e.s] = true, k; break end end
+            got[e.s] = got[e.s] or 3
+        end
+    end
+    return got[slot] or 1
 end
+function vehicles.my_ride() return seats.name, ride_seat end
+function vehicles.peer_seat() return seats.peer end
 
 local function seat_ghost(car, seat)
     local g = ghost.get()
@@ -719,15 +750,21 @@ local function apply_drive(body)
 end
 
 apply_ride = function(body)
-    local n = body:match("^R (%S+)$")
+    local n, seat = body:match("^R (%S+)%s*(%d*)$")
     if not n then return end
+    seats.peer = tonumber(seat)
     if n == "-" then
+        seats.peer = nil
         if peer_rides then peer_rides = nil; unseat_ghost() end
         log.info("vehicles: the other player got out")
         return
     end
     local c = car_named(n)
-    if not c then return end
+    -- (the blob comes once: a mate copy keeps the ride and seats them when the car turns up)
+    if not c then
+        if mate and peer_rides ~= n then peer_rides = n; log.info("vehicles: the other player rides in " .. n .. " - not here yet") end
+        return
+    end
     if peer and peer.name == n then
         -- they were driving it and now ride along (someone with a lower slot got in): the driver's copy
         -- follows the car from now on - let go of it without parking it
@@ -822,7 +859,7 @@ function vehicles.tick(dt)
         list_sent, host_cars, pass = nil, nil, 0
         -- A fresh start (or a restart after a crash) isn't riding along: say so, or the other game
         -- keeps seating us from the last ride it heard about.
-        if inside then riding = nil; link.put_blob("ride", "R -") end
+        if inside then riding, ride_seat, seats.name = nil, nil, nil; link.put_blob("ride", "R -") end
         if not inside then
             release_peer_car(); peer_rides = nil; unseat_ghost()
             alias, rev, driving, retired, frozen, unknown, wake_at, pending = {}, {}, nil, {}, {}, {}, {}, {}
@@ -889,7 +926,7 @@ function vehicles.tick(dt)
         util.safe(follow, "vehicles.follow", dt)
         local g = ghost.get()
         if g and seated and peer_rides and not peer then
-            -- someone else got in or out: riders keep their slot order
+            -- someone else got in or out: riders keep their seats, newcomers take free ones
             local c, want = car_named(peer_rides), seat_of(peer_rides, vehicles.player_slot())
             if c and want ~= seated_seat then seat_ghost(c, want) end
         end
@@ -916,7 +953,7 @@ function vehicles.tick(dt)
     end
     local g = ghost.get()
     if g and seated and peer_rides and not peer then
-        -- someone else got in or out: riders keep their slot order
+        -- someone else got in or out: riders keep their seats, newcomers take free ones
         local c, want = car_named(peer_rides), seat_of(peer_rides, vehicles.player_slot())
         if c and want ~= seated_seat then seat_ghost(c, want) end
     end

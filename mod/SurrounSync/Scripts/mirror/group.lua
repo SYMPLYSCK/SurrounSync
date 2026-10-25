@@ -86,6 +86,8 @@ function group.init(c, s)
     zombies.init(cfg, lead and "host" or "guest", s, { secondary = true })
     zombies.set_gate(false)
     if lead then zombies.set_guest_center(function() return require("mirror.ghost").location() end) end
+    -- the bodies of that AI carry the same loot for both of us (the leader's game rolls it, like the host's)
+    require("mirror.corpses").init(cfg, lead and "host" or "guest", zombies, s)
     on, want, want_e, acked, their, their_e = false, "m", 0, -1, "m", 0
 end
 

@@ -17,7 +17,7 @@ local INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
 local ITEM_ID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"
 local UID = "UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"
 local SKIP_CLASS = { Container_DeadPlayerLoot_C = true }
-local AGE = 20 * 60
+local AGE = nil           -- (dev override in s; else the ITEM CLEANUP host rule's minutes)
 local SCAN_EVERY = 30.0
 local NEAR = 500
 local MAX_PER_SCAN = 25
@@ -95,7 +95,7 @@ local function scan()
                         math.floor(l.X / 50), math.floor(l.Y / 50), math.floor(l.Z / 50))
                     keep[key] = first[key] or clock
                     seen = seen + 1
-                    if clock - keep[key] >= AGE and removed < MAX_PER_SCAN and not near_player(l) then
+                    if clock - keep[key] >= (AGE or (tonumber(hostrules.my_value("itemclean")) or 20) * 60) and removed < MAX_PER_SCAN and not near_player(l) then
                         if drops.cleanup_remove(a) then
                             removed = removed + 1
                             keep[key] = nil
@@ -123,7 +123,7 @@ local function tick(dt)
 end
 
 -- Dev tests: shorter age and scan interval (seconds).
-function itemclean.dev_age(age, every) AGE, SCAN_EVERY, scan_in = age or AGE, every or SCAN_EVERY, 0 end
+function itemclean.dev_age(age, every) AGE, SCAN_EVERY, scan_in = age, every or SCAN_EVERY, 0 end
 
 function itemclean.status()
     return string.format("item cleanup %s: watching %d, removed %d", active() and "on" or "off", stats.watching, stats.removed)

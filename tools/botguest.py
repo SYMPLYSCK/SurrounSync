@@ -65,6 +65,7 @@ class Bot:
                                       "--test-id", str(bid), "--dir", self.dir, "--no-game-check"],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.seq, self.tags, self.heard, self.said = 0, ["guest"], {}, set()
+        self.ride = None   # host's name of the car this bot rides in (see CMD)
         self.t0 = time.time()
 
     def log(self, m):
@@ -95,14 +96,16 @@ class Bot:
         for tag in self.tags:
             if tag not in self.said or int(time.time()) % 5 == 0:
                 self.blobs(tag, look)
+                write(os.path.join(self.dir, "mirror_ride_%s.txt" % tag), "R %s\nEND\n" % (self.ride or "-"))
                 self.said.add(tag)
         f = self.host_sample()
         if not f or len(f) < 5:
             return
         a = self.phase + (time.time() - self.t0) * 0.3
-        f[0] = "%.1f" % (float(f[0]) + math.cos(a) * self.radius)
-        f[1] = "%.1f" % (float(f[1]) + math.sin(a) * self.radius)
-        f[3] = "%.1f" % ((math.degrees(a) + 90) % 360)
+        if not self.ride:   # riding: stay on the host (the driver) - the ghost sits in its seat anyway
+            f[0] = "%.1f" % (float(f[0]) + math.cos(a) * self.radius)
+            f[1] = "%.1f" % (float(f[1]) + math.sin(a) * self.radius)
+            f[3] = "%.1f" % ((math.degrees(a) + 90) % 360)
         f[-1 if "," not in f[-1] else -2] = "%.3f" % (time.time() - self.t0)
         self.seq += 1
         sample = " ".join(f)
@@ -116,6 +119,26 @@ class Bot:
             if got and inn not in self.heard:
                 self.heard[inn] = True
                 self.log("hearing %s: %s" % (inn, got[:80].replace("\t", " | ")))
+
+
+# Commands while running (one per write): "ride <host's car name>" puts every bot in that car as a rider,
+# "ride -" gets them out.
+CMD = os.path.join(SD, "mirror_bots_cmd.txt")
+
+
+def commands(bots):
+    s = (read(CMD) or "").strip()
+    if not s:
+        return
+    write(CMD, "")
+    m = re.match(r"^ride (\S+)$", s)
+    if not m:
+        print("bots: unknown command %r" % s, flush=True)
+        return
+    for b in bots:
+        b.ride = None if m.group(1) == "-" else m.group(1)
+        b.said = set()   # resend the blobs (with the ride) now
+        b.log("riding in %s" % b.ride if b.ride else "out of the car")
 
 
 def accept_requests(done, host_dir):
@@ -153,6 +176,7 @@ def main():
         while time.time() < end and all(b.proc.poll() is None for b in bots):
             if not a.no_accept:
                 accept_requests(accepted, a.host_dir)
+            commands(bots)
             for b in bots:
                 b.step()
             time.sleep(0.1)

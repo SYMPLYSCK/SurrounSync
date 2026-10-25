@@ -239,7 +239,8 @@ local function close_popup()
 end
 
 -- The rename box. o = { title, text, hint, font, cursor (true outside menus: give the mouse to the box), done(name),
--- multiline (raw text, Enter makes a new line), ok = button label (default SAVE), clear = label or false (no button) }
+-- multiline (raw text, Enter makes a new line), ok = button label (default SAVE), clear = label or false (no button),
+-- message (text instead of an input box), cancel = false (no CANCEL: it stays until the ok button) }
 local function open_box(o)
     close_popup()
     local wbl, pc, shell = util.cdo(WBL), game.controller(), StaticFindObject(SHELL)
@@ -264,7 +265,8 @@ local function open_box(o)
     pcall(function() border:SetContent(vb) end)
     local font = o.font
     vb:AddChildToVerticalBox(label(tree, o.title, font, 20))
-    local box = new(o.multiline and "MultiLineEditableTextBox" or "EditableTextBox", tree)
+    local box = o.message and label(tree, o.message, font, 16)
+        or new(o.multiline and "MultiLineEditableTextBox" or "EditableTextBox", tree)
     -- black text on the light box, typing or not (the default focused/unfocused colours are a pale grey),
     -- like the handbook's own input boxes; set before the box is first drawn
     local ink = { SpecifiedColor = BLACK, ColorUseRule = 0 }
@@ -274,6 +276,7 @@ local function open_box(o)
     pcall(function() box:SetForegroundColor(BLACK) end)
     pcall(function() box:SetText(FText(o.text or "")) end)
     pcall(function() box:SetHintText(FText(o.hint or "")) end)
+    if o.message then pcall(function() box:SetAutoWrapText(true) end); pcall(function() box.WrapTextAt = 560 end) end
     pcall(function() box.MinimumDesiredWidth = o.multiline and 520 or 320 end)
     local bs
     pcall(function() bs = vb:AddChildToVerticalBox(box) end)
@@ -291,17 +294,18 @@ local function open_box(o)
     end
     local save = btn(o.ok or "SAVE")
     local clear = o.clear ~= false and btn(o.clear or "CLEAR NAME") or nil
-    popup = { w = w, box = box, done = o.done, cursor = o.cursor, raw = o.multiline == true,
-              save = save, clear = clear, cancel = btn("CANCEL") }
+    popup = { w = w, box = box, done = o.done, cursor = o.cursor, raw = o.multiline == true or o.message ~= nil,
+              save = save, clear = clear, cancel = o.cancel ~= false and btn("CANCEL") or nil }
     pcall(function() w:AddToViewport(50) end)
     if o.cursor then
         pcall(function() wbl:SetInputMode_UIOnlyEx(pc, box, 0, false) end)
         pcall(function() pc.bShowMouseCursor = true end)
     end
-    pcall(function() box:SetKeyboardFocus() end)
+    if not o.message then pcall(function() box:SetKeyboardFocus() end) end
     return true
 end
 names.ask = open_box
+function names.asking() return popup ~= nil end
 
 local function open_popup(uid, font)
     if not open_box({ title = "NAME THIS BACKPACK", text = names.get(uid), hint = "e.g. Med kit bag", font = font,
@@ -519,7 +523,7 @@ function names.tick(dt)
     if popup then
         if clicked(popup.save) then commit(nil)
         elseif popup and popup.clear and clicked(popup.clear) then commit("")
-        elseif popup and clicked(popup.cancel) then close_popup() end
+        elseif popup and popup.cancel and clicked(popup.cancel) then close_popup() end
     end
 end
 

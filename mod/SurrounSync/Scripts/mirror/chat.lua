@@ -57,7 +57,7 @@ function chat.tick()
         local who = link.peer_name()
         add(who, text, false)
         log.info("chat: " .. who .. ": " .. text)
-        notify.show(who .. ": " .. text, "info")
+        if require("mirror.mysettings").on("chat") then notify.show(who .. ": " .. text, "info", nil, true) end
     end)
 end
 

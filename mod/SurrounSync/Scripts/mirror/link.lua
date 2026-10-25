@@ -265,6 +265,8 @@ function link.lobby()
         elseif k == "request" then
             local id, name = rest:match("^(%d+) ?(.*)$")
             if id then l.requests[#l.requests + 1] = { id = id, name = (name ~= "" and name ~= "[unknown]") and name or "Someone" } end
+        elseif k == "reqfriend" then
+            for _, q in ipairs(l.requests) do if q.id == rest then q.friend = true end end
         elseif k == "kicked" then
             local id, name = rest:match("^(%d+) ?(.*)$")
             if id then l.kicked = { id = id, name = name ~= "" and name or id } end

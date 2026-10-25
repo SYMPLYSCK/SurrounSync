@@ -82,6 +82,8 @@ static class Steam
     [DllImport(DLL)] public static extern IntPtr SteamAPI_ISteamFriends_GetFriendRichPresence(IntPtr self, ulong id, byte[] key);
     [DllImport(DLL)] public static extern IntPtr SteamAPI_ISteamFriends_GetFriendPersonaName(IntPtr self, ulong id);
     [DllImport(DLL)] public static extern IntPtr SteamAPI_ISteamFriends_GetPersonaName(IntPtr self);
+    [DllImport(DLL)] [return: MarshalAs(UnmanagedType.I1)]
+    public static extern bool SteamAPI_ISteamFriends_HasFriend(IntPtr self, ulong id, int flags);
 
     [StructLayout(LayoutKind.Sequential, Pack = 8)]
     public struct CallbackMsg { public int User; public int Callback; public IntPtr Param; public int ParamSize; }
@@ -109,7 +111,10 @@ interface INet
     void Accept(ulong id);
     void Close(ulong id);
     string NameOf(ulong id);
+    bool IsFriend(ulong id);
     string Route(ulong id);
+    // bumps each time the connection to id is made again (what went out on the old one may be lost)
+    int ConnGen(ulong id);
     void SetPresence(string role);
     List<KeyValuePair<ulong, string>> FriendsWithPresence(string role);
     int FriendCount();
@@ -199,6 +204,7 @@ class SteamNet : INet
     public string NameOf(ulong id) { return Steam.S(Steam.SteamAPI_ISteamFriends_GetFriendPersonaName(friends, id)); }
 
     // how the session runs: through a Steam relay or direct, and how much is still waiting to go out
+    public int ConnGen(ulong id) { return 0; }
     public string Route(ulong id)
     {
         Steam.P2PSessionState s;
@@ -297,6 +303,7 @@ class SteamNet : INet
     }
     public void SetPresence(string role) { Steam.SteamAPI_ISteamFriends_SetRichPresence(friends, Steam.Z("surrounsync"), Steam.Z(role)); }
     public int FriendCount() { return Steam.SteamAPI_ISteamFriends_GetFriendCount(friends, FRIEND_IMMEDIATE); }
+    public bool IsFriend(ulong id) { return Steam.SteamAPI_ISteamFriends_HasFriend(friends, id, FRIEND_IMMEDIATE); }
 
     public List<KeyValuePair<ulong, string>> FriendsWithPresence(string role)
     {
@@ -349,6 +356,9 @@ class TestNet : INet
         public volatile bool dead;
     }
     readonly Dictionary<ulong, Conn> conns = new Dictionary<ulong, Conn>();   // host: by guest id; guest: 1001 = the host
+    readonly Dictionary<ulong, int> connGens = new Dictionary<ulong, int>();
+    public int ConnGen(ulong id) { lock (qlock) { int g; connGens.TryGetValue(id, out g); return g; } }
+    void BumpConn(ulong id) { int g; connGens.TryGetValue(id, out g); connGens[id] = g + 1; }
     readonly List<Conn> unnamed = new List<Conn>();                          // host: accepted, id frame not read yet
 
     public TestNet(int port, ulong guestId)
@@ -464,7 +474,7 @@ class TestNet : INet
                                 unnamed.Remove(c);
                                 Conn old;
                                 if (conns.TryGetValue(from, out old) && old != c) DropConn(old);
-                                c.id = from; conns[from] = c;
+                                c.id = from; conns[from] = c; BumpConn(from);
                                 pendingRequests.Enqueue(from);
                             }
                         }
@@ -545,7 +555,7 @@ class TestNet : INet
                         tc.EndConnect(connectAr);
                         var c = new Conn { client = tc, stream = tc.GetStream(), id = 1001UL };
                         lock (c.outq) c.outq.Enqueue(Frame(BitConverter.GetBytes(guestId), 9));
-                        lock (qlock) conns[1001UL] = c;
+                        lock (qlock) { conns[1001UL] = c; BumpConn(1001UL); }
                         log("testnet: connected from " + tc.Client.LocalEndPoint + " in " + (t - connectStarted) + " ms as " + guestId);
                         StartWriter(c);
                         StartReader(c, 1001UL);
@@ -612,6 +622,7 @@ class TestNet : INet
             if (conns.TryGetValue(id, out c)) { DropConn(c); conns.Remove(id); }
         }
     }
+    public bool IsFriend(ulong id) { return Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_STRANGERS") != "1"; }
     // (SURROUNSYNC_TEST_STRANGERS=1: answer like Steam does for someone who isn't your friend)
     public string NameOf(ulong id)
     {
@@ -798,6 +809,7 @@ class PeerLink
     public long lastRx, lastHeard, lastHello, lastNameSent, pingAt, quietAt;
     public double rtt = -1;
     public readonly Dictionary<string, string> sent = new Dictionary<string, string>();
+    public int connGen;                  // net.ConnGen when the blobs in sent went out
     public readonly Dictionary<string, DateTime> seenWrite = new Dictionary<string, DateTime>();
     public readonly HashSet<string> loggedTx = new HashSet<string>(), loggedRx = new HashSet<string>();
     public string lastPose = null;
@@ -934,6 +946,41 @@ class Bridge
         return st == "on" ? 0 : 1;
     }
 
+    // public listing end to end on real Steam: a LISTED lobby (a few seconds), then the worldwide browse must find it
+    int ListSmoke()
+    {
+        logPath = Path.Combine(Path.GetTempPath(), "mirror_list_smoke.log");
+        var sn = new SteamNet();
+        if (!sn.Init(Log)) { Console.WriteLine("SMOKE: Steam init failed"); return 2; }
+        var d = new Dictionary<string, string>();
+        d["surrounsync"] = "1"; d["name"] = "listing test - ignore"; d["proto"] = "0"; d["locked"] = "1"; d["players"] = "1/4"; d["host"] = sn.Me.ToString();
+        sn.SetPublic(true, true, d);
+        long t0 = Environment.TickCount;
+        while (sn.PublicState == "creating" && Environment.TickCount - t0 < 30000) { sn.Pump(id => false, m => { }); Thread.Sleep(50); }
+        Console.WriteLine("SMOKE: lobby " + sn.PublicState);
+        int found = -1; bool mine = false;
+        if (sn.PublicState == "on")
+        {
+            Thread.Sleep(1500);
+            sn.RequestServers();
+            t0 = Environment.TickCount;
+            while (sn.Servers == null && Environment.TickCount - t0 < 30000) { sn.Pump(id => false, m => { }); Thread.Sleep(50); }
+            if (sn.Servers != null)
+            {
+                found = sn.Servers.Count;
+                foreach (var s in sn.Servers)
+                {
+                    Console.WriteLine("SMOKE: listed " + s["name"] + " proto " + s["proto"] + " players " + s["players"] + " locked " + s["locked"] + " host " + s["host"]);
+                    if (s["host"] == sn.Me.ToString() && s["name"] == "listing test - ignore") mine = true;
+                }
+            }
+        }
+        sn.SetPublic(false, false, null);
+        sn.Shutdown();
+        Console.WriteLine("SMOKE: public games found " + found + ", our own lobby listed with its data: " + mine);
+        return mine ? 0 : 1;
+    }
+
     int VoiceSmoke()
     {
         logPath = Path.Combine(Path.GetTempPath(), "mirror_voice_smoke.log");
@@ -979,6 +1026,7 @@ class Bridge
             else if (args[i] == "--test-id" && i + 1 < args.Length) ulong.TryParse(args[++i], out testId);
             else if (args[i] == "--lobby-smoke") return LobbySmoke();
             else if (args[i] == "--voice-smoke") return VoiceSmoke();
+            else if (args[i] == "--list-smoke") return ListSmoke();
         }
         auto = role == "auto";
         if (auto) role = "idle";
@@ -1415,7 +1463,12 @@ class Bridge
         if (role == "host") sb.Append("slots ").Append(maxGuests).Append('\n');
         if (mySlot >= 0) sb.Append("myslot ").Append(mySlot).Append('\n');
         foreach (var h in hosting) sb.Append("host ").Append(h.Key).Append(' ').Append(Clean(h.Value)).Append('\n');
-        foreach (var r in requests) sb.Append("request ").Append(r.Key).Append(' ').Append(Clean(r.Value.Key)).Append('\n');
+        foreach (var r in requests)
+        {
+            sb.Append("request ").Append(r.Key).Append(' ').Append(Clean(r.Value.Key)).Append('\n');
+            // (the host's "auto-accept friends" setting)
+            if (net.IsFriend(r.Key)) sb.Append("reqfriend ").Append(r.Key).Append('\n');
+        }
         if (kickedLine != null && Now() - kickedAt < 30000) sb.Append(kickedLine).Append('\n');
         sb.Append("allowed ").Append(AllowList().Count).Append('\n');
         if (passKey != null) sb.Append("password on\n");
@@ -1941,7 +1994,18 @@ class Bridge
         string[] files;
         try { files = Directory.GetFiles(dir, "mirror_*.txt"); } catch { return; }
         var byTag = new Dictionary<string, PeerLink>();
-        foreach (var l in links) if (CanPump(l)) byTag[l.outTag] = l;
+        foreach (var l in links)
+        {
+            // the connection was made again (one-PC test link dropped during a load): blobs sent on the old
+            // one may never have arrived - the host kept the guest "in its own world" and showed no ghost
+            int g = l.mate ? 0 : net.ConnGen(l.id);
+            if (g != l.connGen)
+            {
+                if (l.connGen != 0 && l.sent.Count > 0) Log("connection to " + l.name + " made again - sending everything again");
+                l.connGen = g; l.sent.Clear();
+            }
+            if (CanPump(l)) byTag[l.outTag] = l;
+        }
         if (byTag.Count == 0) return;
         foreach (var path in files)
         {

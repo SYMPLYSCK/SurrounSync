@@ -47,6 +47,20 @@ local function actors()
     return sky, weather
 end
 
+-- Blood moon: each game rolls its own at sunset (BP_EventManager BloodMoonChance), so one player had a red sky
+-- and red-eyed zombies the other didn't. The host's is shared: the guest doesn't roll while joined.
+local EM = "/Game/Blueprints/Events/BP_EventManager.BP_EventManager_C"
+local events_mgr
+local moon = false
+local moon_fn = function(self, on) pcall(function() moon = on:get() == true end) end
+local em_next = 0.0
+local function event_manager()
+    if not util.valid(events_mgr) and now >= em_next then
+        events_mgr, em_next = live("BP_EventManager_C"), now + 20
+    end
+    return util.valid(events_mgr) and events_mgr or nil
+end
+
 local function current_weather(w)
     local p, name, label
     pcall(function() p = w.Weather end)
@@ -146,6 +160,11 @@ local function host_tick()
     if type(tod) ~= "number" then return end
     -- The guest changed the weather on their side (debug menu): it becomes the shared weather.
     local req = peer_live() and link.get_blob("sky_req") or nil
+    -- GUEST WEATHER (host rule) off: the host's weather stays, the guest's sync puts it back for them
+    if req and not require("mirror.hostrules").mine("weather") then
+        log.info("world: the guest changed the weather - ignored (GUEST WEATHER is off)")
+        req = nil
+    end
     local rn, rl, rv, ra = (req or ""):match("^([^|]*)|([^|]*)|([^|]*)|(%d)$")
     if rn and w then
         local preset = ra == "1" and rn ~= "" and find_preset(rn, rl) or nil
@@ -166,8 +185,15 @@ local function host_tick()
         if util.valid(p) then vals, asset = values_str(values_of(p)), is_asset(p) and 1 or 0 end
         local g = global_state(w)
         if g then live_vals = values_str(values_of(g)) end
+        -- (evidence for "the host's weather changed, the guest's didn't": every clear change of what the host sees)
+        local lv = g and values_of(g) or nil
+        if lv and (not world.host_logged or differ_live(world.host_logged, lv)) then
+            world.host_logged = lv
+            log.info("world: my weather is now " .. tostring(label or name) .. " (live " .. live_vals .. ") - sent to the guest")
+        end
     end
-    link.put_blob("sky", string.format("%.2f|%s|%s|%s|%d|%s", tod, name or "", label or "", vals, asset, live_vals))
+    util.ensure_hook(EM .. ":SetBloodMoon", moon_fn)
+    link.put_blob("sky", string.format("%.2f|%s|%s|%s|%d|%s|m%d", tod, name or "", label or "", vals, asset, live_vals, moon and 1 or 0))
 end
 
 -- Guest-side game settings changed while joined (restored on leaving):
@@ -193,6 +219,7 @@ local function restore_guest_settings()
     local s, w = sky, weather
     if util.valid(w) and saved.random ~= nil then pcall(function() w["Random Weather Variation"] = saved.random end) end
     if util.valid(s) and saved.animate ~= nil then pcall(function() s["Animate Time of Day"] = saved.animate end) end
+    if util.valid(events_mgr) and saved.moon_chance ~= nil then pcall(function() events_mgr.BloodMoonChance = saved.moon_chance end) end
     saved, host_tod_prev, host_still = nil, nil, 0
 end
 world.restore = restore_guest_settings
@@ -200,13 +227,25 @@ world.restore = restore_guest_settings
 local function guest_tick()
     local msg = peer_live() and link.get_blob("sky") or nil
     if msg then
+        local rest, m = msg:match("^(.*)|m([01])$")
+        if rest then msg = rest end
         local t, n, l, v, a, g = msg:match("^([^|]+)|([^|]*)|([^|]*)|([^|]*)|(%d)|?([^|]*)$")
         if not t then t, n, l = msg:match("^([^|]+)|([^|]*)|(.*)$") end
-        if t then host = { tod = tonumber(t), name = n, label = l, vals = parse_values(v), asset = a ~= "0", live = parse_values(g) } end
+        if t then host = { tod = tonumber(t), name = n, label = l, vals = parse_values(v), asset = a ~= "0", live = parse_values(g), moon = m and m == "1" } end
     end
     if not host or not session.in_world() then matched, mine_set = nil, nil; restore_guest_settings(); return end
     local s, w = actors()
     hold_guest_settings(s, w)
+    util.ensure_hook(EM .. ":SetBloodMoon", moon_fn)
+    local em = (saved.moon_chance == nil or (host.moon ~= nil and host.moon ~= moon)) and event_manager()
+    if em and saved.moon_chance == nil then
+        pcall(function() saved.moon_chance = em.BloodMoonChance; em.BloodMoonChance = 0 end)
+    end
+    if em and host.moon ~= nil and host.moon ~= moon then
+        local ok, err = pcall(function() em:SetBloodMoon(host.moon) end)
+        if ok then moon = host.moon end
+        log.info("world: blood moon " .. (host.moon and "rises" or "ends") .. " - the host's" .. (ok and "" or (" FAILED: " .. tostring(err))))
+    end
 
     -- the host's clock standing still (paused time / a time-freeze mod): stop ours too, run it again when theirs does
     -- (an unchanged blob isn't delivered again: "still" = no new clock value for 5 s while the link is up)
@@ -323,6 +362,6 @@ function world.init(c, r, s, connected)
 end
 
 -- the old world's sky/weather actors are freed with it
-function world.forget() sky, weather = nil, nil end
+function world.forget() sky, weather, events_mgr, moon, em_next = nil, nil, nil, false, 0 end
 
 return world

@@ -663,7 +663,7 @@ local function on_world_ready()
     if role == "host" and hosted_slot and world_slot and world_slot ~= "" and world_slot ~= hosted_slot then
         log.warn("session: host loaded save " .. world_slot .. " while hosting " .. hosted_slot .. " - ending the session")
         hosted_slot = nil
-        if on_host_world_change then on_host_world_change() end
+        if on_host_world_change then on_host_world_change("save") end
     end
 end
 local function firewall_tick()
@@ -1143,7 +1143,18 @@ local function install_firewall()
     game.on_new_player(function() util.safe(on_world_ready, "session.world_ready") end)
     -- (the game instance class isn't loaded yet when the mod starts: hooked once it is, and again after loads)
     local hook_in = 0.0
-    local on_load = function() on_any_load() end
+    local on_load = function(_, LevelName)
+        on_any_load()
+        -- the pause menu's MAIN MENU loads level "MainMenu": a host leaving its save stops hosting
+        -- (only another save's load did; at the menu the lobby stayed open and friends could still "join")
+        local lv
+        pcall(function() lv = LevelName:get():ToString() end)
+        if lv == "MainMenu" and role == "host" and on_host_world_change then
+            log.info("session: host went to the main menu - ending the session")
+            hosted_slot = nil
+            util.safe(on_host_world_change, "session.host_left", "menu")
+        end
+    end
     game.on_tick(function(dt)
         hook_in = hook_in - (dt or 0)
         if hook_in <= 0 then

@@ -372,6 +372,7 @@ def group_split_leader_and_follower_agree():
         package.loaded["mirror.zombies"] = Z
         package.loaded["mirror.ghost"] = { location = function() return nil end }
         package.loaded["mirror.phase1"] = { set_ghost_kind = function(k) KIND = k end }
+        package.loaded["mirror.corpses"] = { init = function(c, r, z) CORPSES = { role = r, z = z } end }
         package.loaded["mirror.peers"] = { my_slot = function() return my_slot end, slot_of = function() return peer_slot end,
                                            main = function() return Z end }
         group = require("mirror.group")
@@ -380,6 +381,8 @@ def group_split_leader_and_follower_agree():
     A, B = lua(), lua()
     A.execute(G, 2, 3)      # leader: slot 2, its copy for slot 3
     B.execute(G, 3, 2)      # follower: slot 3, its copy for slot 2
+    check(A.eval("CORPSES.role") == "host" and B.eval("CORPSES.role") == "guest" and A.eval("CORPSES.z == Z"),
+          "the pair's corpse loot: the leader's copy rolls it (host role), the follower's shows it, on the pair's zombies")
 
     def run(n=3):
         for _ in range(n):
@@ -438,6 +441,7 @@ def vehicles_seat_four_players_by_slot():
                 my_slot = function() return MY end,
                 slot_of = function(out) return PS end,
                 each = function(name, fn) fn(require(name)); for _, m in ipairs(OTHERS) do fn(m) end end,
+                main = function(name) return MAIN or require(name) end,
             }
             -- driver seat at (0, 100, 0) of a car at the origin facing +X: passenger (0, -100), rear seats 95 behind
             A = obj({ VehicleColor = 0, Colors = {}, Mesh = { SetMaterial = function() end, SetPhysicsLinearVelocity = function() end,
@@ -475,6 +479,28 @@ def vehicles_seat_four_players_by_slot():
     L.execute('OTHERS = {}; vehicles.tick(0.1); vehicles.tick(0.1)')
     at = L.eval('GHOST_AT')
     check(abs(at.X) < 1e-6 and abs(at.Y + 100) < 1e-6, "the other rider gets out: it moves up to the front passenger seat")
+
+    # the guest's own screen, a bot's copy: the local player (slot 1) sits in the front passenger seat - the bot
+    # (slot 2) used to be put there too (the copy didn't count the local rider: bot in the guest's lap)
+    L = setup("guest", 1, 2)
+    L.execute('MAIN = { my_ride = function() return "Vehicle_Van_C_1", 1 end }; blobs_in.ride = "R Vehicle_Van_C_1"; vehicles.tick(0.1)')
+    at = L.eval('GHOST_AT')
+    check(at is not None and abs(at.X + 95) < 1e-6 and abs(at.Y - 100) < 1e-6, "a rider never gets the local player's seat")
+    # first come keeps its seat: a rider that announced the rear-left seat stays there when the front one empties
+    L = setup("guest", 2, 3)
+    L.execute('OTHERS = { { rides_in = function() return "Vehicle_Van_C_1" end, player_slot = function() return 1 end, '
+              'peer_seat = function() return 1 end } }; blobs_in.ride = "R Vehicle_Van_C_1 3"; vehicles.tick(0.1)')
+    at = L.eval('GHOST_AT')
+    check(at is not None and abs(at.X + 95) < 1e-6 and abs(at.Y + 100) < 1e-6, "an announced seat is used (seat 3, behind the passenger)")
+    L.execute('OTHERS = {}; vehicles.tick(0.1); vehicles.tick(0.1)')
+    at = L.eval('GHOST_AT')
+    check(abs(at.X + 95) < 1e-6 and abs(at.Y + 100) < 1e-6, "and kept when the front passenger gets out")
+    # two claim the same seat: the lower slot keeps it, the other takes the next free one
+    L = setup("guest", 2, 3)
+    L.execute('OTHERS = { { rides_in = function() return "Vehicle_Van_C_1" end, player_slot = function() return 1 end, '
+              'peer_seat = function() return 1 end } }; blobs_in.ride = "R Vehicle_Van_C_1 1"; vehicles.tick(0.1)')
+    at = L.eval('GHOST_AT')
+    check(at is not None and abs(at.X + 95) < 1e-6 and abs(at.Y - 100) < 1e-6, "a contested seat goes to the lower slot, the other moves to a free one")
 
     # both get into the same car: the lower slot drives
     L = setup("guest", 1, 0)
@@ -595,7 +621,7 @@ def harvest_uses_up_nodes_once():
         G.execute("ROCK.MaxHits = ROCK.MaxHits - 1; HOOKS.HitHarvestableObject(param(ROCK), param({}), param(1))")
         G.execute("harvest.tick(0.1)")
         carry(G, H)
-    check(H.eval("ROCK.MaxHits") == 2 and not H.eval("ROCK.destroyed"), "the other player's hits wear the node down")
+    check(H.eval("ROCK.MaxHits") == 1 and not H.eval("ROCK.destroyed"), "the other player's hits wear the node down to their hits left")
     G.execute("ROCK.MaxHits = 0; HOOKS.HitHarvestableObject(param(ROCK), param({}), param(1)); harvest.tick(0.1)")
     carry(G, H)
     check(H.eval("ROCK.destroyed"), "the last hit in one game removes the node in the other")
@@ -612,6 +638,66 @@ def harvest_uses_up_nodes_once():
     # a late joiner (fresh guest world) removes the nodes the host already used up
     G.execute('RESET(); ROCK.destroyed = false; SCRAP["Salvaged?"] = false; blobs_in.harvested = ' + repr(blob) + '; harvest.tick(0.1)')
     check(G.eval("ROCK.destroyed") and G.eval('SCRAP["Salvaged?"]') is True, "a late joiner gets the used-up nodes removed")
+
+    # Rocks are foliage until their first hit, which (in the hitting game only) spawns the node actor at the
+    # instance and removes the instance. The other game had no actor -> every hit was "not found".
+    for L in (H, G):
+        L.execute(r"""
+            CPATH = "/Game/Levels/L.L:PersistentLevel.InstancedFoliageActor_0.FoliageInstancedStaticMeshComponent_3"
+            REMOVED = {}
+            INST = { [4] = { X = 900, Y = 0, Z = 0 }, [5] = { X = 2000, Y = 0, Z = 0 }, [9] = { X = 2004, Y = 0, Z = 0 } }
+            FOL = obj({ GetFullName = function() return "FoliageInstancedStaticMeshComponent " .. CPATH end })
+            FOL.GetInstancesOverlappingSphere = function(self, at, r)
+                local out = {}
+                for i, l in pairs(INST) do if math.abs(l.X - at.X) < r + 50 then out[#out + 1] = param(i) end end
+                return out
+            end
+            FOL.GetInstanceTransform = function(self, i, t) t.Translation = INST[i]; t.Scale3D = { X = 1, Y = 1, Z = 1 } end
+            FOL.RemoveInstance = function(self, i) REMOVED[#REMOVED + 1] = i; INST[i] = nil end
+            StaticFindObject = function(p) if p == CPATH then return FOL end end
+            function convert(x, hits)
+                local n = obj({ MaxHits = hits, destroyed = false, GetClass = function() return cls("BP_HarvestableObject_Rocks_C") end,
+                                K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end })
+                n.K2_DestroyActor = function() n.destroyed = true end
+                for i, l in pairs(INST) do if l.X == x then INST[i] = nil end end
+                local fa = FindAllOf
+                FindAllOf = function(c) local t = fa(c); if c == "BP_HarvestableObject_Rocks_C" then t[#t + 1] = n end; return t end
+                HOOKS.SetMaxHits(param(n))
+                HOOKS.HitFoliageRock(param({}), param({}), param({}), param(FOL), param(0), param(1))
+                return n
+            end
+        """)
+    H.execute("NEW = convert(2000, 7)")
+    H.execute("harvest.tick(0.1)"); carry(H, G)
+    for _ in range(3):
+        H.execute("NEW.MaxHits = NEW.MaxHits - 1; HOOKS.HitHarvestableObject(param(NEW), param({}), param(1)); harvest.tick(0.1)")
+        carry(H, G)
+    check(G.eval("#REMOVED") == 0, "hits on a node that is still foliage here leave the foliage standing")
+    G.execute("GNEW = convert(2000, 8); harvest.tick(0.1)")
+    check(G.eval("GNEW.MaxHits") == 4, "its first hit here converts it with the hits the host has left (%s)" % G.eval("GNEW.MaxHits"))
+    H.execute("NEW.MaxHits = 0; HOOKS.HitHarvestableObject(param(NEW), param({}), param(1)); harvest.tick(0.1)")
+    carry(H, G)
+    check(G.eval("GNEW.destroyed"), "used up in the host's game: the converted node goes here too")
+    # a node the guest never touched: used up on the host -> the guest's foliage instance (not its neighbour) goes
+    H.execute("N2 = convert(900, 7); harvest.tick(0.1)"); carry(H, G)
+    H.execute("N2.MaxHits = 0; HOOKS.HitHarvestableObject(param(N2), param({}), param(1)); harvest.tick(0.1)")
+    carry(H, G)
+    check(list(G.eval("REMOVED").values()) == [4], "used up there, still foliage here: that foliage instance is removed (%s)"
+          % list(G.eval("REMOVED").values()))
+    blob = H.eval("blobs_out.harvested") or ""
+    check(("Rocks_C@90,0,0 " + "/Game/Levels/L.L:PersistentLevel.InstancedFoliageActor_0.FoliageInstancedStaticMeshComponent_3") in blob,
+          "the used-up list names the foliage component for late joiners")
+    G.execute('RESET(); REMOVED = {}; INST[4] = { X = 900, Y = 0, Z = 0 }; blobs_in.harvested = ' + repr(blob) + '; harvest.tick(0.1)')
+    check(list(G.eval("REMOVED").values()) == [4], "a late joiner's foliage instance of a used-up node is removed")
+    # the "F" (which foliage component) was lost - e.g. sent while the link reconnected: found by searching
+    G.execute('REMOVED = {}; INST[7] = { X = 3000, Y = 0, Z = 0 }; INST[8] = { X = 3100, Y = 0, Z = 0 }'
+              '; FindAllOf_was = FindAllOf; FindAllOf = function(c) if c == "FoliageInstancedStaticMeshComponent" then return { FOL } end; return FindAllOf_was(c) end')
+    H.execute("N3 = convert(3000, 7); harvest.tick(0.1)")
+    H.execute("N3.MaxHits = 0; HOOKS.HitHarvestableObject(param(N3), param({}), param(1)); harvest.tick(0.1)")
+    G.execute('StaticFindObject = function() return nil end')   # the named component can't be used
+    carry(H, G)
+    got = list(G.eval("REMOVED").values())
+    check(7 in got and 8 not in got, "without the component name the right foliage instance is still removed (%s)" % got)
 
 
 def zombie_copies_take_the_hosts_look():
@@ -676,6 +762,76 @@ def zombie_copies_take_the_hosts_look():
     check(L.eval('#C.called') == 1, "the archetype is not applied twice")
     L.execute('zombies._look.sync(1, COPY, E, { arch = 4, bones = 7, eyes = 0 })')
     check(L.eval('C.Mesh.mat == MAT'), "eyes the host's doesn't show are turned off")
+    # Blood moon: a copy made after it rose (no red eyes of its own) takes the host zombie's red eyes, once.
+    L.execute('MOONS = {}; M = zombie(); M.Event_BloodMoon = function(self, on) MOONS[#MOONS + 1] = on; '
+              'zombies._look.moon_hook({ get = function() return self end }, { get = function() return on end }) end; '
+              'MCOPY = { z = M, fam = "zombie" }; zombies._look.sync(3, MCOPY, E, { arch = 0, bones = 0, eyes = 2 }); '
+              'zombies._look.sync(3, MCOPY, E, { arch = 0, bones = 0, eyes = 2 })')
+    check(L.eval('#MOONS') == 1 and L.eval('MOONS[1]') is True, "a host zombie's blood moon eyes reach a later copy, once")
+    L.execute('zombies._look.sync(3, MCOPY, E, { arch = 0, bones = 0, eyes = 1 })')
+    check(L.eval('#MOONS') == 2 and L.eval('MOONS[2]') is False, "and end on it when the host's end")
+    L.execute('zombies._look.sync(3, MCOPY, E, { arch = 0, bones = 0, eyes = 1 }); '
+              'P = zombie(); P.Event_BloodMoon = M.Event_BloodMoon; zombies._look.sync(4, { z = P, fam = "zombie" }, E, { arch = 0, bones = 0, eyes = 1 })')
+    check(L.eval('#MOONS') == 2, "no blood moon call on copies that never had one")
+
+
+def zombie_archetype_effects_reach_copies():
+    print("zombie_archetype_effects_reach_copies")
+    def side(role):
+        L = lua()
+        L.execute(FAKES + r"""
+            NOW = 0; os.clock = function() return NOW end
+            SENT, INBOX = {}, {}
+            package.loaded["mirror.events"] = evmock { new = function(name)
+                return { send = function(self, p) SENT[#SENT + 1] = p end,
+                         pump = function(self, fn) local q = INBOX; INBOX = {}; for _, p in ipairs(q) do fn(p) end end } end }
+            PLAYER = obj({})
+            package.loaded["mirror.game"] = { player = function() return PLAYER end }
+            util = require("mirror.util")
+            HOOKS = {}
+            util.ensure_hook = function(p, fn) HOOKS[p:match(":(.+)$")] = fn; return true end
+            LOADED = {}
+            StaticFindObject = function(p) return LOADED[p] end
+            CALLS = {}
+            local function rec(name) return function(self, ...) CALLS[#CALLS + 1] = { name, ... }; return obj({}) end end
+            CDO = { SpawnSystemAttached = rec("spit"), SpawnEmitterAttached = rec("mist"), SpawnEmitterAtLocation = rec("emitter"),
+                    PlaySoundAtLocation = rec("sound"), SpawnDecalAtLocation = rec("decal") }
+            util.cdo = function() return CDO end
+            zfx = require("mirror.zfx")
+            for k, p in pairs(zfx.A) do LOADED[p] = obj({ name = k }) end
+            function zombie(x) return obj({ Mesh = { K2_GetComponentLocation = function() return { X = x, Y = 0, Z = 0 } end },
+                                            K2_GetRootComponent = function() return obj({}) end, SD_AIComponent = {} }) end
+            HOST_Z = zombie(500); ARCH = 2
+            COPIES = {}
+            ZOMBIES = { host_id_of = function(z) return 7 end, copy = function(id) return COPIES[id] end,
+                        _look = { arch_of = function() return ARCH end } }
+            zfx.init(ZOMBIES, ROLE_)
+        """.replace("ROLE_", '"%s"' % role))
+        return L
+    H, G = side("host"), side("guest")
+    # copy looks: acidic drool at the mouth, radiated mist, sprinter run - once each, no archetype call
+    G.execute('C3 = { z = zombie(0) }; zfx.looks(C3, 3); zfx.looks(C3, 3); C2 = { z = zombie(0) }; zfx.looks(C2, 2); '
+              'C1 = { z = zombie(0) }; zfx.looks(C1, 1)')
+    kinds = [G.eval('CALLS[%d][1]' % i) for i in range(1, G.eval('#CALLS') + 1)]
+    check(kinds == ["spit", "mist"], "an acidic copy drools and a radiated one gets the mist, once (%s)" % kinds)
+    check(G.eval('C3.z.BloodSpitFX ~= nil') and G.eval('C2.z.ZombieMist ~= nil'), "kept where the game keeps them")
+    check(G.eval('C1.z.SD_AIComponent.MovementBlendspace.name') == "run", "a sprinter copy runs like one")
+    # death blasts: the host's radiated zombie (not a headshot) and grenadier are sent; a headshot isn't
+    H.execute('zfx.tick(2.1); HOOKS.Event_SpecialDeath({ get = function() return HOST_Z end }, { get = function() return true end })')
+    check(H.eval('#SENT') == 0, "no radiated blast after a headshot")
+    H.execute('HOOKS.Event_SpecialDeath({ get = function() return HOST_Z end }, { get = function() return false end }); '
+              'ARCH = 0; HOOKS.Event_SpecialDeath({ get = function() return HOST_Z end }, { get = function() return false end }); '
+              'HOOKS.GrenadierDeath({ get = function() return HOST_Z end })')
+    sent = [H.eval('SENT[%d]' % i) for i in range(1, H.eval('#SENT') + 1)]
+    check(sent == ["R 7 500 0 0", "G 7 500 0 0"], "radiated and grenadier blasts are sent (%s)" % sent)
+    G.execute('CALLS = {}; COPIES[7] = { z = zombie(510) }; INBOX = { "G 7 500 0 0", "R 7 500 0 0" }; zfx.tick(0.1); NOW = 0.2; zfx.tick(0.1)')
+    kinds = [G.eval('CALLS[%d][1]' % i) for i in range(1, G.eval('#CALLS') + 1)]
+    check(kinds == ["emitter", "sound", "decal"], "the grenadier blast plays on the copy at once (%s)" % kinds)
+    check(G.eval('CALLS[1][4].X') == 510, "at the copy's own spot")
+    G.execute('NOW = 1.6; zfx.tick(0.1)')
+    check(G.eval('#CALLS') == 4 and G.eval('CALLS[4][1]') == "emitter", "the radiated blast follows after the game's delay")
+    G.execute('CALLS = {}; COPIES[7].arch_ran = true; INBOX = { "G 7 500 0 0" }; NOW = 3; zfx.tick(0.1); NOW = 4; zfx.tick(0.1)')
+    check(G.eval('#CALLS') == 0, "a copy that ran the archetype itself blasts on its own - not twice")
 
 
 def nests_keep_real_health():
@@ -1148,8 +1304,7 @@ def loot_skips_containers_gone_since_listed():
     check(L.eval("#READ") == 1 and L.eval("READ[1]") == "live", "and only that one's contents are read and sent")
 
 
-def loot_asks_the_host_again_on_every_reopen():
-    print("loot_asks_the_host_again_on_every_reopen")
+def loot_guest(near=False):
     L = lua()
     L.execute(FAKES + r"""
         package.loaded["mirror.crumb"] = { at = function() end }
@@ -1165,7 +1320,7 @@ def loot_asks_the_host_again_on_every_reopen():
             generate = function() end, contents_of = function() return {} end, flush_ui = function() end,
             encode = function() return "" end, decode = function(s) return { s } end, is_empty = function() return false end,
             uid_str = function(x) return x end, full_path = function(x) return x end, guid = function(x) return x end,
-            apply_contents = function(c, list) APPLIED = APPLIED + 1; return 1, (list[1] == "two" and 1 or 0), 0, 0, {} end,
+            apply_contents = function(c, list) APPLIED = APPLIED + 1; LAST = list[1]; return 1, (list[1] == "two" and 1 or 0), 0, 0, {} end,
             apply_layout = function() return 0, 0 end,
         }
         util = require("mirror.util")
@@ -1189,6 +1344,14 @@ def loot_asks_the_host_again_on_every_reopen():
         REQ = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:SERVER_RequestData"
         function open() HOOKS[REQ](nil, { get = function() return COMP end }) end
         function qs() local n = 0; for _, p in ipairs(SENT) do if p:sub(1, 2) == "Q " then n = n + 1 end end; return n end
+    """)
+    return L
+
+
+def loot_asks_the_host_again_on_every_reopen():
+    print("loot_asks_the_host_again_on_every_reopen")
+    L = loot_guest()
+    L.execute(r"""
         open()
         ID = SENT[1] and SENT[1]:match("^Q (%S+)$")
         INBOX.lootc = { "C " .. tostring(ID) .. " 0 one" }
@@ -1204,6 +1367,30 @@ def loot_asks_the_host_again_on_every_reopen():
     check(L.eval("REFRESHED") == 1, "and redraws it when the host's copy changed meanwhile (%d)" % L.eval("REFRESHED"))
     L.execute("open(); loot.tick(0.1)")
     check(L.eval("qs()") == 2, "an open right after (the redraw itself) doesn't ask again")
+
+
+def loot_open_shows_the_hosts_items_at_once():
+    print("loot_open_shows_the_hosts_items_at_once")
+    L = loot_guest()
+    L.execute(r"""
+        ME.K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end
+        for i = 1, 12 do loot.tick(0.1) end
+        NEAR_QS = qs()
+        ID = SENT[1] and SENT[1]:match("^Q (%S+)$")
+        INBOX.lootc = { "C " .. tostring(ID) .. " 0 one" }
+        loot.tick(0.1)
+        A0 = APPLIED
+        INIT = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:InitializeJigComponent"
+        HOOKS[INIT]({ get = function() return COMP end })
+        A1 = APPLIED
+        LISTED = LAST
+        open(); loot.tick(0.1)
+    """)
+    check(L.eval("NEAR_QS") == 1, "standing next to a container asks the host about it before any open (%d)" % L.eval("NEAR_QS"))
+    check(L.eval("A0") == 0 and L.eval("A1") == 1 and L.eval("LISTED") == "one", "the open itself takes the host's items, inside the open (before the UI reads them)")
+    check(L.eval("REFRESHED") == 0 and L.eval("qs()") == 1, "no redraw afterwards and no second ask")
+    L.execute("for i = 1, 25 do loot.tick(0.1) end")
+    check(L.eval("qs()") == 2, "while the player stays near, it is asked again every 2 s (%d)" % L.eval("qs()"))
 
 
 def bags_are_never_consumed_and_twin_grids_are_counted():
@@ -1898,6 +2085,25 @@ def random_and_debug_weather_is_shared():
     pass_blobs(H2, G2)
     G2.execute('world.tick(2.1)')
     check(G2.eval('GWS.Rain') == 6 and G2.eval('GWS.Snow') == 3, "the host's live weather changing reaches the guest")
+    # Blood moon: each game rolled its own at sunset; the host's is shared and the guest doesn't roll while joined.
+    H3, G3 = side("host"), side("guest")
+    for L in (H3, G3):
+        L.execute('HOOKS = {}; util.ensure_hook = function(p, fn) HOOKS[p:match(":(.+)$")] = fn; return true end; '
+                  'SETS = {}; EM = obj({ GetFullName = function() return "BP_EventManager_C /Game/L.L:P.EM" end, BloodMoonChance = 25 }); '
+                  'EM.SetBloodMoon = function(self, on) SETS[#SETS + 1] = on; HOOKS.SetBloodMoon(nil, { get = function() return on end }) end; '
+                  'local fa = FindAllOf; FindAllOf = function(c) if c == "BP_EventManager_C" then return { EM } end return fa(c) end')
+    H3.execute('world.tick(2.1)'); pass_blobs(H3, G3)
+    G3.execute('world.tick(2.1)')
+    check(G3.eval('EM.BloodMoonChance') == 0 and H3.eval('EM.BloodMoonChance') == 25 and G3.eval('#SETS') == 0,
+          "the guest's own blood moon roll is off while joined; nothing set while both have none")
+    H3.execute('EM:SetBloodMoon(true); world.tick(2.1)'); pass_blobs(H3, G3)
+    G3.execute('world.tick(2.1); world.tick(2.1)')
+    check(G3.eval('#SETS') == 1 and G3.eval('SETS[1]') is True, "the host's blood moon rises on the guest, once")
+    H3.execute('EM:SetBloodMoon(false); world.tick(2.1)'); pass_blobs(H3, G3)
+    G3.execute('world.tick(2.1)')
+    check(G3.eval('#SETS') == 2 and G3.eval('SETS[2]') is False, "and ends there when the host's ends")
+    G3.execute('world.init({}, "off", { in_world = function() return true end }, function() return true end)')
+    check(G3.eval('EM.BloodMoonChance') == 25, "leaving gives the guest its own blood moon chance back")
 
 
 def trader_stock_is_the_hosts():
@@ -1969,6 +2175,157 @@ def trader_stock_is_the_hosts():
     for _ in range(5):
         G.execute("tick()")
     check(G.eval("#APPLIED") == 2 and G.eval("APPLIED[2]") == 1, "the dead trader's body holds the host's loot")
+
+
+CORPSE_FAKES = FAKES + r"""
+    ROLE, GID = ...
+    package.loaded["mirror.link"].peer_age = function() return 0 end
+    T, DEAD = 0, false
+    AMMO, GUN = "/Game/Items/Ammo.Ammo", "/Game/Items/Gun.Gun"
+    MASTER = "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C"
+    util = require("mirror.util")
+    HOOKS = {}
+    util.ensure_hook = function(path, fn) HOOKS[path] = HOOKS[path] or {}; HOOKS[path][fn] = true; return true end
+    function fire_removed(z, da)
+        for fn in pairs(HOOKS[MASTER .. ":JigMP_OnMainContainerItemRemoved"] or {}) do
+            fn({ get = function() return z end }, nil, nil, nil, { get = function() return {
+                ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { ItemID_28_01CA27D84AF7D1014D9E2E83894C1848 = da } } end })
+        end
+    end
+    package.loaded["mirror.ghost"] = { exists = function() return true end }
+    SH, ALL = {}, {}
+    package.loaded["mirror.peers"] = {
+        shared = function(n, init) SH[n] = SH[n] or init or {}; return SH[n] end,
+        role = function() return ROLE end, main = function(n) return require(n) end,
+        relay = function(name, self_mod, fn)
+            if ROLE ~= "host" or RELAYING then return end
+            RELAYING = true
+            for _, m in ipairs(ALL) do if m ~= self_mod then fn(m) end end
+            RELAYING = false
+        end }
+    TR = obj({ BP_JigMultiplayer = obj({}) })
+    UIDS = 0
+    function count(da) local n = 0 for _, w in ipairs(STOCK) do if w.da == da then n = n + w.count end end return n end
+    TAKEN, APPLIED = {}, 0
+    package.loaded["mirror.jig"] = {
+        generate = function() end,
+        contents_of = function() return STOCK end,
+        encode = function(l) local o = {} for _, w in ipairs(l) do o[#o + 1] = w.da .. "=" .. w.count end return table.concat(o, ";") end,
+        decode = function(s) local o = {} for da, n in s:gmatch("([^=;]+)=(%d+)") do o[#o + 1] = { da = da, count = tonumber(n) } end return o end,
+        apply_contents = function(comp, items)
+            APPLIED = APPLIED + 1
+            STOCK = {}
+            for _, w in ipairs(items) do UIDS = UIDS + 1; STOCK[#STOCK + 1] = { uid = "g" .. UIDS, da = w.da, count = w.count } end
+            return #items, 0, 0, 0
+        end,
+        set_starting = function() return 0, 0 end,
+        count_of_item = function(comp, da) return count(da) end,
+        reduce_item = function(comp, da, left)
+            local take, n = count(da) - left, 0
+            for _, w in ipairs(STOCK) do
+                if take > 0 and w.da == da then local k = math.min(take, w.count); w.count = w.count - k; take = take - k; n = n + k end
+            end
+            if n > 0 then TAKEN[#TAKEN + 1] = da .. ">" .. left; fire_removed(TR, da) end
+            return n
+        end,
+        full_path = function(x) return x end, uid_str = function(x) return x end,
+        subtree = function() return nil end, worth_sending = function() return false end,
+    }
+    SESSION = { in_world = function() return true end, guest_in_world = function() return true end }
+    function zfake(id)
+        local copy = { z = TR, born = 0 }
+        return {
+            now = function() return T end, host_zombies = function() return { [id] = TR } end,
+            copies = function() return { [id] = copy } end, copy = function(i) return i == id and copy or nil end,
+            is_trader = function() return false end, dead_of = function() return DEAD end,
+            host_id_of = function(z) return z == TR and id or nil end, copy_id_of = function(z) return z == TR and id or nil end,
+            set_copy_hooks = function() end, _copy = copy,
+        }
+    end
+    -- another player's copy of corpses (and its own events/link), like peers.lua loads it
+    function load_copy(zf)
+        local out, inn, loaded = {}, {}, {}
+        local lk = { put_blob = function(n, b) out[n] = b end, get_blob = function(n) local b = inn[n]; inn[n] = nil; return b end,
+                     peer_age = function() return 0 end }
+        local function ireq(name)
+            if name == "mirror.link" then return lk end
+            if name == "mirror.events" or name == "mirror.corpses" then
+                if not loaded[name] then
+                    local path = package.searchpath(name, package.path)
+                    loaded[name] = assert(loadfile(path, "t", setmetatable({ require = ireq }, { __index = _G })))(name)
+                end
+                return loaded[name]
+            end
+            return require(name)
+        end
+        local m = ireq("mirror.corpses")
+        m.init({}, ROLE, zf, SESSION)
+        return m, out, inn
+    end
+"""
+
+
+def corpse_loot_reaches_every_player():
+    print("corpse_loot_reaches_every_player")
+    H = lua()
+    H.execute(CORPSE_FAKES + r"""
+        STOCK = { { uid = "h1", da = AMMO, count = 3 }, { uid = "h2", da = GUN, count = 1 } }
+        main = require("mirror.corpses")
+        main.init({}, ROLE, zfake(7), SESSION)
+        c2, out2, in2 = load_copy(zfake(3))
+        ALL = { main, c2 }
+        function tick() T = T + 0.3; main.tick(0.3); c2.tick(0.3) end
+    """, "host")
+    guests = []
+    for gid in (7, 3):
+        G = lua()
+        G.execute(CORPSE_FAKES + r"""
+            STOCK = { { uid = "x1", da = AMMO, count = 5 } }
+            ZF = zfake(GID)
+            corpses = require("mirror.corpses")
+            corpses.init({}, "guest", ZF, SESSION)
+            function tick() T = T + 0.3; if DEAD then ZF._copy.dead_at = ZF._copy.dead_at or T end; corpses.tick(0.3) end
+        """, "guest", gid)
+        guests.append(G)
+    G1, G2 = guests
+
+    def carry(src_out, dst_in):
+        for k in list(src_out.keys()):
+            dst_in[k] = src_out[k]
+
+    def step(n=1):
+        for _ in range(n):
+            H.execute("tick()")
+            carry(H.eval("blobs_out"), G1.eval("blobs_in")); carry(H.eval("out2"), G2.eval("blobs_in"))
+            G1.execute("tick()"); G2.execute("tick()")
+            carry(G1.eval("blobs_out"), H.eval("blobs_in")); carry(G2.eval("blobs_out"), H.eval("in2"))
+
+    step(4)
+    H.execute("DEAD = true"); G1.execute("DEAD = true"); G2.execute("DEAD = true")
+    step(6)
+    check(G1.eval("count(AMMO)") == 3 and G2.eval("count(AMMO)") == 3 and G2.eval("count(GUN)") == 1,
+          "both guests' corpses hold the host's loot (each under its own zombie id)")
+    # guest 1 loots 2 ammo: the host takes them, guest 2's corpse loses them too, nothing comes back to guest 1
+    G1.execute("STOCK[1].count = 1; fire_removed(TR, AMMO)")
+    step(2)
+    check(H.eval("count(AMMO)") == 1, "the host's body loses what guest 1 took (%d)" % H.eval("count(AMMO)"))
+    check(G2.eval("count(AMMO)") == 1, "guest 2's corpse loses it too (%d)" % G2.eval("count(AMMO)"))
+    check(G1.eval("#TAKEN") == 0, "no echo back to guest 1")
+    # the 4 s re-check of the death list must not bring the looted ammo back
+    step(16)
+    check(G1.eval("count(AMMO)") == 1 and G2.eval("count(AMMO)") == 1,
+          "re-applying the host's list after a take brings nothing back (g1 %d, g2 %d)" % (G1.eval("count(AMMO)"), G2.eval("count(AMMO)")))
+    # the host loots the last one: hooks fire in both host copies, each guest hears it once
+    H.execute("STOCK[1].count = 0; fire_removed(TR, AMMO)")
+    step(2)
+    check(G1.eval("count(AMMO)") == 0 and G2.eval("count(AMMO)") == 0, "the host's own take reaches both guests")
+    check(G2.eval("#TAKEN") == 2, "guest 2 applied each take once (%d)" % G2.eval("#TAKEN"))
+    # guest 2 takes the gun
+    G2.execute("STOCK[2].count = 0; fire_removed(TR, GUN)")
+    step(3)
+    check(H.eval("count(GUN)") == 0 and G1.eval("count(GUN)") == 0, "guest 2's take reaches the host and guest 1")
+    step(16)
+    check(G2.eval("count(GUN)") == 0 and G1.eval("count(GUN)") == 0, "and stays taken")
 
 
 def link_reads_only_blobs_the_index_says_changed():
@@ -2668,7 +3025,49 @@ def chat_and_voice_reach_every_player():
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
-for t in (group_split_host_decides_follow_and_ignores_followers, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
+def settings_pages_cycle_save_and_follow_the_host():
+    print("settings_pages_cycle_save_and_follow_the_host")
+    d = tempfile.mkdtemp()
+    try:
+        L = lua()
+        L.execute('''
+            local d = ...
+            ROLE = "host"; BLOBS = {}; SEEN = {}
+            package.loaded["mirror.notify"] = { show = function() end }
+            package.loaded["mirror.peers"] = { each = function(_, fn) fn(package.loaded["mirror.link"], nil) end }
+            package.loaded["mirror.link"] = { dir = function() return d end,
+                put_blob = function(n, s) BLOBS[n] = s end,
+                get_blob = function(n) local b = BLOBS[n]; if b ~= SEEN[n] then SEEN[n] = b; return b end end }
+            hr = require("mirror.hostrules"); ms = require("mirror.mysettings")
+            hr.init(function() return ROLE end); ms.init(function() return ROLE end)
+        ''', d.replace("\\", "/"))
+        check(L.eval('hr.my_value("itemclean")') == "off" and L.eval('hr.my_value("players")') == "4", "host rules start at their defaults")
+        seq = []
+        for _ in range(4):
+            L.execute('hr.toggle("itemclean")'); seq.append(L.eval('hr.my_value("itemclean")'))
+        check(seq == ["10", "20", "40", "off"], "ITEM CLEANUP cycles OFF -> 10 -> 20 -> 40 -> OFF (%s)" % seq)
+        L.execute('hr.toggle("joins"); hr.toggle("pvp"); hr.tick()')
+        check("joins friends" in (L.eval('BLOBS.rules') or "") and "pvp on" in L.eval('BLOBS.rules'), "the rules blob carries every value")
+        L.execute('ROLE = "guest"; package.loaded["mirror.hostrules"] = nil; hr2 = require("mirror.hostrules"); hr2.init(function() return ROLE end)')
+        check(L.eval('hr2.value("joins")') == "friends" and L.eval('hr2.get("pvp")') is True,
+              "a guest follows the host's blob (and the file kept the host's values)")
+        check(L.eval('hr2.can_edit()') is False, "a guest can't edit the host rules")
+        L.execute('ms.toggle("messages")')
+        check(L.eval('ms.value("messages")') == "important", "CO-OP MESSAGES cycles ALL -> IMPORTANT")
+        L.execute('ms.toggle("perf"); ms.toggle("perf"); ms.tick()')
+        check(L.eval('BLOBS.gperf') == "low", "a guest sends its GUEST PERFORMANCE to the host (%s)" % L.eval('BLOBS.gperf'))
+        L.execute('package.loaded["mirror.mysettings"] = nil; ms2 = require("mirror.mysettings")')
+        check(L.eval('ms2.value("messages")') == "important" and L.eval('ms2.value("perf")') == "low", "my settings are saved on this PC")
+        check(abs(L.eval('ms2.PERF_SHARE.low') * 15000 - 6000) < 1, "LOW = 60 m zombie copy range")
+        with open(os.path.join(d, "mirror_host_settings.txt"), "w") as f:
+            f.write("pvp on\nitemclean on\nloadsplit off\n")
+        L.execute('ROLE = "host"; package.loaded["mirror.hostrules"] = nil; hr3 = require("mirror.hostrules"); hr3.init(function() return ROLE end)')
+        check(L.eval('hr3.my_value("itemclean")') == "20" and L.eval('hr3.my_value("teleport")') == "on",
+              "an old on/off settings file still loads (cleanup on = 20 min, new rules at defaults)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+for t in (settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, tactical_reads_only_lights_the_class_has,
           vehicles_keep_this_worlds_fuel, harvest_uses_up_nodes_once, zombie_copies_take_the_hosts_look,
           copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
@@ -2676,7 +3075,7 @@ for t in (group_split_host_decides_follow_and_ignores_followers, group_split_lea
           throws_and_mines_reach_the_other_game, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, loose_magazine_picked_up_without_hooks_still_gets_its_rounds, ground_weapon_attachments_reach_the_other_game, ghost_gun_in_hand_is_known, missing_zombie_looks_get_loaded,
           random_and_debug_weather_is_shared,
           trader_stock_is_the_hosts, instances_walk_once_then_follow_beginplay,
-          link_reads_only_blobs_the_index_says_changed, host_settled_corpses_cost_almost_nothing,
+          link_reads_only_blobs_the_index_says_changed, corpse_loot_reaches_every_player, host_settled_corpses_cost_almost_nothing,
           standing_hooks_skip_the_lookup, hook_lookups_share_one_budget, find_remembers_misses, container_items_keep_their_cell_and_rotation, loot_skips_containers_gone_since_listed, bags_are_never_consumed_and_twin_grids_are_counted,
           load_split_switches_only_when_both_agree, load_split_hands_the_ai_to_the_guest):
     try:

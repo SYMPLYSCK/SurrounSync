@@ -42,11 +42,16 @@ function notify.ping(times)
     return true
 end
 
-function notify.show(text, kind, key)
+-- (always = shown whatever CO-OP MESSAGES says: chat lines have their own setting)
+function notify.show(text, kind, key, always)
     kind = COLORS[kind] and kind or "info"
     text = tostring(text):gsub("^%l", string.upper)
     if kind == "bad" then log.warn("notify: " .. text) else log.info("notify: " .. text) end
     if not enabled or broken then return end
+    if not always then
+        local level = require("mirror.mysettings").value("messages")
+        if level == "off" or (level == "important" and kind == "info") then return end
+    end
     if last_shown[text] and clock - last_shown[text] < REPEAT_S then return end
     for _, m in ipairs(queue) do
         if m.text == text then return end

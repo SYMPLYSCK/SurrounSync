@@ -22,7 +22,10 @@ local LIST_WIDTH = 560.0
 local GEAR_TEX = "/Game/UI/Textures/over_250_survival_flat_icons/gear.gear"
 local CLOSE_TEX = "/Game/UI/Textures/CrossX.CrossX"
 local INK = { R = 0.12, G = 0.08, B = 0.06, A = 1.0 }
-local SETTING_ROWS = 6
+local SETTING_ROWS = 7
+-- The game fades the handbook in/out over 0.5 s (JournalUI "Fade", after a 0.25 s double-tap wait for
+-- the clock); playing that fade 8x faster makes J feel ~0.45 s quicker.
+local FADE_SPEED = 8.0
 
 local ctx = nil
 local S = nil
@@ -247,6 +250,16 @@ local function build_content(page, qtree, qpage)
         u.reqs[i] = { row = rr, name = name, accept = ba, allow = bl, decline = bd }
     end
     u.clear_allowed, u.clear_allowed_t = button("", 18); vadd(u.friends_box, u.clear_allowed, 4)
+    -- the host's guests, each with KICK (pressed twice: the first press asks "SURE?")
+    u.guests_title = text("PLAYERS IN YOUR WORLD", 26, DARK_RED); vadd(u.friends_box, u.guests_title, 6)
+    u.guests = {}
+    for i = 1, 3 do
+        local gr = new("HorizontalBox", S.tree, "Guest"); vadd(u.friends_box, gr, 2)
+        local name = text("", 22)
+        local b, bt = button("KICK", 20)
+        hadd(gr, name); hadd(gr, b, 14)
+        u.guests[i] = { row = gr, name = name, btn = b, btn_t = bt }
+    end
     local gt = new("HorizontalBox", S.tree, "GamesTitle"); vadd(u.friends_box, gt, 10)
     hadd(gt, text("GAMES TO JOIN", 26, DARK_RED))
     u.refresh = button("REFRESH", 18); hadd(gt, u.refresh, 18)
@@ -336,10 +349,15 @@ local function build_settings(page)
     tilt(u.set_box, TILT.list)
     place(page, u.set_box, 420.0, 230.0, 580.0, 760.0, 6)
     u.set_title = text("SETTINGS", 58, DARK_RED); vadd(u.set_box, u.set_title)
+    -- two pages: the host's rules for the shared world, and this PC's own settings
+    local tabs = new("HorizontalBox", S.tree, "SettingTabs"); vadd(u.set_box, tabs, 2)
+    u.set_tab_host, u.set_tab_host_t = button("HOST RULES", 28, DARK_RED); hadd(tabs, u.set_tab_host)
+    u.set_tab_mine, u.set_tab_mine_t = button("MY SETTINGS", 28, GREY); hadd(tabs, u.set_tab_mine, 30)
+    u.set_tab = "host"
     u.set_sub = text("", 16, GREY, 560); vadd(u.set_box, u.set_sub, 4)
     u.set_rows = {}
     for i = 1, SETTING_ROWS do
-        local row = new("HorizontalBox", S.tree, "SettingRow"); vadd(u.set_box, row, i == 1 and 26 or 18)
+        local row = new("HorizontalBox", S.tree, "SettingRow"); vadd(u.set_box, row, i == 1 and 16 or 12)
         local label = text("", 26)
         local b, bt = button("OFF", 26, DARK_RED)
         hadd(row, label); hadd(row, b, 24)
@@ -371,17 +389,26 @@ local function set_mode(on)
     vis_hit(u.set_box, on); vis_hit(u.set_close, on); vis(u.set_close_img, on)
 end
 
+local function settings_list(m)
+    if S.ui.set_tab == "mine" then return m.my_settings or {} end
+    return m.settings or {}
+end
+
 local function refresh_settings(m)
     local u = S.ui
-    set(u.set_sub, m.settings_editable
-        and "Your settings. While a friend is in your world, their game follows them too."
-        or "The host's settings - only the host can change them.")
+    local host = u.set_tab ~= "mine"
+    style_text(u.set_tab_host_t, 28, host and DARK_RED or GREY)
+    style_text(u.set_tab_mine_t, 28, host and GREY or DARK_RED)
+    set(u.set_sub, not host and "Only for your own game - saved on this PC."
+        or m.settings_editable and "Your rules. Friends in your world play by them too."
+        or "The host's rules - only the host can change them.")
+    local list = settings_list(m)
     for i, r in ipairs(u.set_rows) do
-        local o = (m.settings or {})[i]
+        local o = list[i]
         vis_hit(r.row, o ~= nil); vis(r.hint, o ~= nil)
         if o then
             set(r.label, o.label .. ":")
-            set(r.btn_t, o.on and "ON" or "OFF")
+            set(r.btn_t, o.text or "OFF")
             set(r.hint, o.hint)
         end
     end
@@ -595,6 +622,17 @@ local function refresh()
         vis_hit(q.row, r ~= nil)
         if r then set(q.name, r.name) end
     end
+    local guests = m.guests or {}
+    vis(u.guests_title, #guests > 0)
+    for i, g in ipairs(u.guests) do
+        local p = guests[i]
+        vis_hit(g.row, p ~= nil)
+        if p then
+            set(g.name, p.name)
+            if g.armed and (g.armed.id ~= p.id or clock > g.armed.at + 4) then g.armed = nil end
+            set(g.btn_t, g.armed and "SURE?" or "KICK")
+        end
+    end
     vis_hit(u.clear_allowed, (m.allowed or 0) > 0)
     if (m.allowed or 0) > 0 then set(u.clear_allowed_t, "CLEAR ALWAYS-ALLOWED (" .. m.allowed .. ")") end
     set(u.none, #m.hosts > 0 and "" or (m.steam and "No friends are hosting right now. Your friend chooses HOST A GAME here, or sends you their code."
@@ -612,6 +650,10 @@ function journal_tab.tick(dt)
     clock = clock + dt
     if not ensure() then return end
     local open = is_open()
+    if open ~= S.was_open then
+        S.was_open = open
+        pcall(function() S.jui:SetPlaybackSpeed(S.jui.Fade, FADE_SPEED) end)
+    end
     if not open then
         if S.shown then show(false) end
         if S.want_show and clock > S.want_show then S.want_show = nil end
@@ -629,9 +671,11 @@ function journal_tab.tick(dt)
     refresh_in = refresh_in - dt
     if u.settings_mode then
         if clicked(u.set_close) then set_mode(false); ctx.refresh_now = true end
-        local opts = (S.model and S.model.settings) or {}
+        if clicked(u.set_tab_host) then u.set_tab = "host"; ctx.refresh_now = true end
+        if clicked(u.set_tab_mine) then u.set_tab = "mine"; ctx.refresh_now = true end
+        local opts = S.model and settings_list(S.model) or {}
         for i, r in ipairs(u.set_rows) do
-            if opts[i] and clicked(r.btn) then a.setting(opts[i].key); ctx.refresh_now = true end
+            if opts[i] and clicked(r.btn) then a.setting(opts[i].key, u.set_tab); ctx.refresh_now = true end
         end
         if refresh_in <= 0 or ctx.refresh_now then refresh_in, ctx.refresh_now = 0.5, false; refresh() end
         return
@@ -668,6 +712,14 @@ function journal_tab.tick(dt)
         end
     end
     if (mdl.allowed or 0) > 0 and clicked(u.clear_allowed) then a.clear_allowed(); ctx.refresh_now = true end
+    for i, g in ipairs(u.guests) do
+        local p = (mdl.guests or {})[i]
+        if p and clicked(g.btn) then
+            if g.armed and g.armed.id == p.id then g.armed = nil; a.kick(p.id, p.name)
+            else g.armed = { id = p.id, at = clock } end
+            ctx.refresh_now = true
+        end
+    end
     if clicked(u.pw_set) then
         local pw = ""
         pcall(function() pw = u.pw_input:GetText():ToString() end)
@@ -706,8 +758,12 @@ function journal_tab.dev_section(backups)
     if S and S.ui then S.ui.show_backups = backups == true; ctx.refresh_now = true end
 end
 
-function journal_tab.dev_settings(on)
-    if S and S.ui and S.ui.set_box then set_mode(on == true); ctx.refresh_now = true end
+function journal_tab.dev_settings(on, tab)
+    if S and S.ui and S.ui.set_box then
+        set_mode(on == true)
+        if tab then S.ui.set_tab = tab end
+        ctx.refresh_now = true
+    end
 end
 
 function journal_tab.configure(c) ctx = c end

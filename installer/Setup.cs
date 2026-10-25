@@ -1054,7 +1054,8 @@ namespace SurrounSyncSetup
             string g = gameBox.Text.Trim();
             if ((what == "install" || what == "update" || what == "repair") && !Installer.CanWrite(Game.Win64(g)))
             {
-                if (Program.Elevate("--install --game \"" + g + "\"")) { Close(); return; }
+                // (the in-game UPDATE button: keep waiting for the game to close, or the install hits its locked files)
+                if (Program.Elevate("--install --game \"" + g + "\"" + (waitGame ? " --wait-game" : ""))) { Close(); return; }
                 Say("No permission to write into the game folder, and administrator rights weren't given.", UI.Red);
                 return;
             }

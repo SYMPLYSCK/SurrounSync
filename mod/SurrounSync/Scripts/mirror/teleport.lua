@@ -9,6 +9,7 @@ local ghost = require("mirror.ghost")
 local events = require("mirror.events")
 local link = require("mirror.link")
 local notify = require("mirror.notify")
+local hostrules = require("mirror.hostrules")
 
 local teleport = {}
 
@@ -220,6 +221,7 @@ function teleport.command(text)
         say("Commands: /goto <player>, /bring <player>, /accept, /deny")
         return true
     end
+    if not hostrules.get("teleport") then say("The host turned teleports off for this world.", "warn"); return true end
     if not ghost.get() then say("The other player isn't in your world right now.", "warn"); return true end
     if not name_matches(arg or "") then
         say(string.format("No player called '%s' - the other player is %s.", arg, peer()), "warn")
@@ -261,7 +263,14 @@ function teleport.tick(dt)
         if msg == "Q G" or msg == "Q B" then
             pending = { kind = msg == "Q G" and "goto" or "bring", left = ASK_FOR }
             say(msg == "Q G" and (who .. " wants to teleport to you.") or (who .. " wants to bring you to them."))
-            say("Type /accept or /deny in the CO-OP chat, or answer in the handbook (J), CO-OP tab.")
+            if not hostrules.get("teleport") then
+                pending = nil
+                channel:send("N teleports are turned off in this world")
+            elseif require("mirror.mysettings").on("autotp") then
+                answer(true)
+            else
+                say("Type /accept or /deny in the CO-OP chat, or answer in the handbook (J), CO-OP tab.")
+            end
         elseif msg == "A" then
             if asked and asked.kind == "goto" then asked = nil; do_goto() end
         elseif msg == "D" then

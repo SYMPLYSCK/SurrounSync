@@ -46,6 +46,107 @@ local function comp_of(z)
 end
 
 local function shared() return role == "host" or (session and session.in_world()) end
+
+-- 4 players: the host has a copy of this module per guest (peers.lua), each with its own zombie ids.
+--  * Only the main copy turns the host's own takes/put-ins (hooks) into messages; it hands them to the other
+--    copies itself, so every guest hears each change exactly once whether or not the game's hooks fire per copy.
+--  * A guest's change is applied by that guest's copy and handed to the other copies the same way.
+--  * While any copy applies a change the hooks of all copies stay quiet (shared flag): no echo to the sender.
+local peers_mod
+local function peers() peers_mod = peers_mod or require("mirror.peers"); return peers_mod end
+local busy
+local function busy_t()
+    if not busy then local p = peers(); busy = p.shared and p.shared("corpses_applying", { on = false }) or { on = false } end
+    return busy
+end
+local function set_applying(v) applying = v; busy_t().on = v end
+local function hooks_here()
+    if applying or busy_t().on or not shared() then return false end
+    local p = peers()
+    return not (p.role and p.role() == "host" and p.main and p.main("mirror.corpses") ~= corpses)
+end
+local function relay(fn)
+    if role == "host" and peers().relay then peers().relay("mirror.corpses", corpses, fn) end
+end
+
+-- Guest: the host's list for a body follows every take and put-in, so applying it again (1 s / 4 s after
+-- death) never brings back a looted item or drops one put in. My own moves of the last few seconds are kept
+-- and replayed on a list that was already on its way when I made them.
+local own = {}
+local OWN_KEEP = 10.0
+local function total_of(items, da)
+    local n = 0
+    for _, it in ipairs(items) do if it.da == da then n = n + (it.count or 1) end end
+    return n
+end
+local function drop_items(items, gone)
+    local more = true
+    while more do
+        more = false
+        for i, it in ipairs(items) do
+            if not gone[i] and it.parent and gone[it.parent] then gone[i], more = true, true end
+        end
+    end
+    local map, out = {}, {}
+    for i, it in ipairs(items) do if not gone[i] then out[#out + 1] = it; map[i] = #out end end
+    for _, it in ipairs(out) do if it.parent then it.parent = map[it.parent] end end
+    return out
+end
+local function cap_list(l, da, left)
+    local extra = total_of(l.items, da) - left
+    if extra <= 0 then return end
+    local gone = {}
+    for i = #l.items, 1, -1 do
+        if extra <= 0 then break end
+        local it = l.items[i]
+        if it.da == da then
+            local n = math.min(extra, it.count or 1)
+            extra = extra - n
+            if n >= (it.count or 1) then gone[i] = true else it.count = it.count - n end
+        end
+    end
+    l.items = drop_items(l.items, gone)
+end
+local function grow_list(l, da, count, dx, dy, place, inside)
+    local base = #l.items
+    local sub = inside and inside ~= "" and jig.decode(inside) or nil
+    if sub and sub[1] and sub[1].da == da then
+        for i, it in ipairs(sub) do
+            if i == 1 then it.parent, it.slot, it.cell, it.rot = nil, place and place.slot, place and place.cell, place and place.rot
+            elseif it.parent then it.parent = it.parent + base end
+            l.items[#l.items + 1] = it
+        end
+    else
+        l.items[#l.items + 1] = { da = da, count = count, dx = dx, dy = dy,
+                                  slot = place and place.slot, cell = place and place.cell, rot = place and place.rot }
+    end
+end
+local function list_took(id, da, left, mine)
+    if role == "host" then return end
+    if lists[id] then cap_list(lists[id], da, left) end
+    if mine then own[id] = own[id] or {}; table.insert(own[id], { at = zombies.now(), da = da, left = left }) end
+end
+local function list_added(id, da, count, dx, dy, place, inside, have)
+    if role == "host" then return end
+    if lists[id] then grow_list(lists[id], da, count, dx, dy, place, inside) end
+    if have then
+        own[id] = own[id] or {}
+        table.insert(own[id], { at = zombies.now(), da = da, have = have, add = { count, dx, dy, place, inside } })
+    end
+end
+local function replay_own(id)
+    local l, mv = lists[id], own[id]
+    if not (l and mv) then return end
+    local t, keep = zombies.now(), {}
+    for _, m in ipairs(mv) do
+        if t - m.at <= OWN_KEEP then
+            keep[#keep + 1] = m
+            if m.left then cap_list(l, m.da, m.left)
+            elseif total_of(l.items, m.da) < m.have then grow_list(l, m.da, m.add[1], m.add[2], m.add[3], m.add[4], m.add[5]) end
+        end
+    end
+    own[id] = #keep > 0 and keep or nil
+end
 local function traded() if session and session.checkpoint and shared() then session.checkpoint("corpses") end end
 channel.send = function(self, p) if p:find("^A ") then traded() end return events.send(self, p) end
 
@@ -150,9 +251,10 @@ local function guest_check()
             if comp then
                 -- a trader's stock is made on its first init: make it now so applying the host's list doesn't add it twice
                 if c.trader and not c.dead_at then jig.generate(comp) end
-                applying = true
-                local set, added, removed, missing = jig.apply_contents(comp, lists[id].items)
-                applying = false
+                set_applying(true)
+                local ok, set, added, removed, missing = pcall(jig.apply_contents, comp, lists[id].items)
+                set_applying(false)
+                if not ok then error(set) end
                 stats.applied = stats.applied + 1
                 stats.missing = stats.missing + missing
                 log.info(string.format("corpses: zombie %d's corpse holds the host's loot (%d items: %d matched, %d added, %d removed%s)",
@@ -162,12 +264,12 @@ local function guest_check()
         end
     end
     for id, l in pairs(lists) do
-        if not zombies.copy(id) and t - l.at > 300 then lists[id], checked[id] = nil, nil end
+        if not zombies.copy(id) and t - l.at > 300 then lists[id], checked[id], own[id] = nil, nil, nil end
     end
 end
 
 local function on_removed(self, ItemRemovedInfo)
-    if applying or not shared() then return end
+    if not hooks_here() then return end
     local z = self:get()
     local id = role == "host" and zombies.host_id_of(z) or zombies.copy_id_of(z)
     if not id then return end
@@ -184,22 +286,37 @@ local function flush_takes()
             local left = jig.count_of_item(comp, tk.da)
             channel:send(string.format("T %d %s %d", tk.id, tk.da, left))
             stats.took = stats.took + 1
+            list_took(tk.id, tk.da, left, true)
+            relay(function(m) m.relay_take(tk.z, tk.da) end)
         end
     end
     takes = {}
 end
 
 local function apply_take(id, da, left)
+    list_took(id, da, left)
     local z = corpse(id)
     local comp = z and comp_of(z)
     if not comp then return end
-    applying = true
-    local n = jig.reduce_item(comp, da, left)
-    applying = false
+    set_applying(true)
+    local ok, n = pcall(jig.reduce_item, comp, da, left)
+    set_applying(false)
+    if not ok then error(n) end
+    relay(function(m) m.relay_take(z, da) end)
     if n > 0 then
         stats.taken = stats.taken + 1
         log.info(string.format("corpses: the other player took %d %s from zombie %d - taken here too", n, da:match("[^%.]+$") or da, id))
     end
+end
+
+-- Host, another guest's copy: a body changed (the host or a guest took from it) - tell my guest what's left.
+function corpses.relay_take(z, da)
+    if role ~= "host" or not shared() then return end
+    local id = zombies.host_id_of(z)
+    local comp = id and sent[id] and util.valid(z) and comp_of(z)
+    if not comp then return end
+    channel:send(string.format("T %d %s %d", id, da, jig.count_of_item(comp, da)))
+    stats.took = stats.took + 1
 end
 
 local removed_fn = function(self, FromContainerUID, ItemUID, ContainerName, ItemRemovedInfo)
@@ -208,7 +325,7 @@ end
 
 local item_removed_fn = function(self, ItemUID, FromUID, ToContainer, To)
     util.safe(function()
-        if applying or not shared() then return end
+        if not hooks_here() then return end
         local z = self:get()
         local id = role == "host" and zombies.host_id_of(z) or zombies.copy_id_of(z)
         if not id then return end
@@ -223,9 +340,21 @@ local item_removed_fn = function(self, ItemUID, FromUID, ToContainer, To)
 end
 
 local added_once = {}
+local function add_line(id, uid, it, inside_s)
+    return string.format("A %d %s %s %d %.3f %.3f %d:%d:%d", id, uid, it.da, it.count, it.dx, it.dy,
+        it.cell or -1, it.rot and 1 or 0, it.slot or -1) .. (inside_s ~= "" and (" " .. inside_s) or "")
+end
+local function item_of(comp, uid)
+    for _, it in ipairs(jig.contents_of(comp)) do
+        if it.uid == uid and it.da then
+            local inside = jig.subtree(comp, uid)
+            return it, jig.worth_sending(inside) and jig.encode(inside) or ""
+        end
+    end
+end
 local item_added_fn = function(self, ItemUID)
     util.safe(function()
-        if applying or not shared() then return end
+        if not hooks_here() then return end
         local z = self:get()
         local id = role == "host" and zombies.host_id_of(z) or zombies.copy_id_of(z)
         local comp = z and comp_of(z)
@@ -233,36 +362,52 @@ local item_added_fn = function(self, ItemUID)
         local uid
         pcall(function() uid = jig.uid_str(ItemUID:get()) end)
         if not uid or added_once[uid] then return end
-        for _, it in ipairs(jig.contents_of(comp)) do
-            if it.uid == uid and it.da then
-                local inside = jig.subtree(comp, uid)
-                channel:send(string.format("A %d %s %s %d %.3f %.3f %d:%d:%d", id, uid, it.da, it.count, it.dx, it.dy,
-                    it.cell or -1, it.rot and 1 or 0, it.slot or -1)
-                    .. (jig.worth_sending(inside) and (" " .. jig.encode(inside)) or ""))
-                log.info(string.format("corpses: put %s x%d into zombie %d's corpse - telling the other game",
-                    it.da:match("[^%.]+$") or it.da, it.count, id))
-                return
-            end
-        end
+        local it, inside_s = item_of(comp, uid)
+        if not it then return end
+        added_once[uid] = true
+        channel:send(add_line(id, uid, it, inside_s))
+        list_added(id, it.da, it.count, it.dx, it.dy, { slot = it.slot, cell = it.cell, rot = it.rot }, inside_s,
+            jig.count_of_item(comp, it.da))
+        relay(function(m) m.relay_add(z, uid) end)
+        log.info(string.format("corpses: put %s x%d into zombie %d's corpse - telling the other game",
+            it.da:match("[^%.]+$") or it.da, it.count, id))
     end, "corpses.item_added")
 end
+
+-- Host, another guest's copy: something was put into a body (by the host or a guest) - tell my guest.
+function corpses.relay_add(z, uid)
+    if role ~= "host" or not shared() or added_once[uid] then return end
+    local id = zombies.host_id_of(z)
+    local comp = id and sent[id] and util.valid(z) and comp_of(z)
+    if not comp then return end
+    local it, inside_s = item_of(comp, uid)
+    if not it then return end
+    added_once[uid] = true
+    channel:send(add_line(id, uid, it, inside_s))
+end
+
 local function apply_add(id, uid, da, count, dx, dy, inside, place)
     if added_once[uid] then return end
     added_once[uid] = true
+    list_added(id, da, count, dx, dy, place, inside)
     local z = corpse(id)
     local comp = z and comp_of(z)
     if not comp then log.info("corpses: the other player put an item into zombie " .. id .. "'s corpse - no corpse here"); return end
-    applying = true
-    local mine, err = jig.add_item(comp, da, count, dx, dy, nil, place)
-    if mine and inside ~= "" then pcall(jig.fill, comp, mine, jig.decode(inside)) end
-    applying = false
-    if mine then added_once[mine] = true end
+    set_applying(true)
+    local ok, mine, err = pcall(jig.add_item, comp, da, count, dx, dy, nil, place)
+    if ok and mine and inside ~= "" then pcall(jig.fill, comp, mine, jig.decode(inside)) end
+    set_applying(false)
+    if not ok then error(mine) end
+    if mine then
+        added_once[mine] = true
+        relay(function(m) m.relay_add(z, mine) end)
+    end
     log.info(string.format("corpses: the other player put %s x%d into zombie %d's corpse - %s", da:match("[^%.]+$") or da,
         count, id, mine and "added here" or ("couldn't add: " .. tostring(err))))
 end
 
 function corpses.tick(dt)
-    if role == "off" then return end
+    if role == "off" or not role then return end
     util.safe(jig.flush_ui, "jig.ui")
     hook_in = hook_in - dt
     if hook_in <= 0 then
@@ -289,6 +434,7 @@ function corpses.tick(dt)
             if id then
                 id = tonumber(id)
                 lists[id], checked[id] = { items = jig.decode(rest), at = zombies.now() }, nil
+                replay_own(id)
             end
         elseif k == "T" then
             local id, da, left = p:match("^T (%d+) (%S+) (%-?%d+)$")

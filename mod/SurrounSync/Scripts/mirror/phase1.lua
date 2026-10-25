@@ -492,6 +492,7 @@ local function on_tick(dt)
         perf.run("vehicles", util.safe, vehicles.tick, "vehicles.tick", dt)
         perf.run("group", util.safe, group.tick, "group.tick", dt)
         perf.run("zombies", zombies.tick, dt)
+        perf.run("corpses", corpses.tick, dt)
         status_in = status_in - dt
         if status_in <= 0 then status_in = cfg.phase1.status_interval; status() end
         return

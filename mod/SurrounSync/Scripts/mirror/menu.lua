@@ -197,7 +197,16 @@ local function model()
     m.show_voice = r ~= nil
     m.voice_label, m.voice_vol = require("mirror.voice").label()
     if l and l.voice == "talking" then m.voice_label = "VOICE: TALKING" end
+    -- the host's KICK buttons: every guest the bridge knows
+    m.guests = {}
+    if r == "host" and l then
+        for _, p in ipairs(l.players or {}) do
+            if p.slot ~= 0 then m.guests[#m.guests + 1] = { id = p.id, name = p.name } end
+        end
+        if #m.guests == 0 and l.peer then m.guests[1] = { id = l.peer.id, name = l.peer.name } end
+    end
     m.settings = require("mirror.hostrules").rows()
+    m.my_settings = require("mirror.mysettings").rows()
     m.settings_editable = require("mirror.hostrules").can_edit()
     if steam then
         m.me = l and ("Signed in as " .. (l.name or "?")) or
@@ -246,7 +255,8 @@ local function join_code(txt)
     else notify.show("That code doesn't look right. Use the number shown in your friend's co-op menu.", "bad") end
 end
 
-local update_told = false
+-- the update prompt: stays (and comes back after a load) until ACCEPT; shown a few s into the world
+local upd = { accepted = false, player_since = nil }
 local report_asked_at, report_seen = nil, nil
 local errors_told, errors_told_at = 0, -1000
 local function update()
@@ -280,9 +290,17 @@ local function report()
 end
 local function watch_release()
     local l = link.lobby()
-    if l and l.update and not update_told and util.valid(game.player()) then
-        update_told = true
-        notify.show("SurrounSync " .. l.update .. " is out. Open the handbook (J) -> CO-OP -> UPDATE.", "info")
+    local in_game = util.valid(game.player())
+    upd.player_since = in_game and (upd.player_since or os.clock()) or nil
+    if l and l.update and not upd.accepted and upd.player_since and os.clock() - upd.player_since > 5 then
+        local names = require("mirror.names")
+        if not names.asking() then
+            names.ask({ title = "SURROUNSYNC " .. l.update .. " IS OUT",
+                        message = "A new SurrounSync version is ready. ACCEPT opens the updater - it installs the update "
+                            .. "as soon as you close the game. Both players need the same version to play together.",
+                        ok = "ACCEPT", clear = false, cancel = false, cursor = true,
+                        done = function() upd.accepted = true; update() end })
+        end
     end
     local r = l and (l.report or l.report_error)
     if r and r ~= report_seen then
@@ -324,6 +342,14 @@ local function answer(cmd, id, name)
     local t = accepted_ids(); t[tostring(id)] = cmd ~= "decline" or nil; set_accepted(t)
 end
 local seen_requests, last_kick, last_joinerror = {}, nil, nil
+local slots_sent_at = nil
+local kicked_by_me = {}       -- ids the host removed with KICK (the bridge also kicks players who flood it)
+local function kick(id, name)
+    if not link.bridge_cmd("kick " .. id) then notify.show("Couldn't reach the Steam connection.", "bad"); return end
+    kicked_by_me[tostring(id)] = true
+    local t = accepted_ids(); t[tostring(id)] = nil; set_accepted(t)
+    log.info("menu: kicked " .. tostring(name) .. " (" .. tostring(id) .. ")")
+end
 local JOIN_ERRORS = {
     needpass = "This host needs a password. Type it in the PASSWORD box (CO-OP tab) and join again.",
     badpass = "Wrong password. Check it with the host and join again.",
@@ -339,9 +365,19 @@ local function watch_requests()
         if l.joinerror and JOIN_ERRORS[l.joinerror] then
             notify.show(JOIN_ERRORS[l.joinerror], "bad", "join_wait")
             pending_join, wait_since = false, nil
+            -- removed by the host: straight home with everything (no "wait for the host?" choice)
+            if l.joinerror == "kicked" and my_role() == "guest" then session.go_home_now() end
         end
     end
+    -- MAX PLAYERS (host rule): the bridge forgets it when it restarts, so keep it in line with the lobby file
+    local want_slots = (tonumber(require("mirror.hostrules").my_value("players")) or 4) - 1
+    if l and l.slots and l.slots ~= want_slots and os.clock() - (slots_sent_at or -100) > 3 then
+        slots_sent_at = os.clock()
+        link.bridge_cmd("slots " .. want_slots)
+        log.info("menu: max players " .. (want_slots + 1))
+    end
     if not (l and my_role() == "host") then return end
+    local joins = require("mirror.hostrules").my_value("joins")
     local now_ids = {}
     for _, q in ipairs(l.requests or {}) do
         now_ids[q.id] = true
@@ -353,11 +389,16 @@ local function watch_requests()
         elseif not request_nag[q.id] then
             request_seen_at[q.id] = request_seen_at[q.id] or os.clock()
             if name or os.clock() - request_seen_at[q.id] > 2 then
-                log.info("menu: join request from " .. (name or "?") .. " (" .. q.id .. ")")
-                notify.show((name or "Someone") .. " wants to join your world - open the handbook (J), CO-OP tab, to ACCEPT or DECLINE.",
-                    "good", "join_req_" .. q.id)
-                notify.ping(2)
+                log.info("menu: join request from " .. (name or "?") .. " (" .. q.id .. ")" .. (q.friend and " (friend)" or ""))
                 request_nag[q.id] = os.clock()
+                if joins == "all" or (joins == "friends" and q.friend) then
+                    log.info("menu: let in without asking (JOIN REQUESTS: " .. joins .. ")")
+                    answer("accept", q.id, name or "Someone")
+                else
+                    notify.show((name or "Someone") .. " wants to join your world - open the handbook (J), CO-OP tab, to ACCEPT or DECLINE.",
+                        "good", "join_req_" .. q.id)
+                    if require("mirror.mysettings").on("joinsound") then notify.ping(2) end
+                end
             end
         elseif os.clock() - request_nag[q.id] > 30 then
             request_nag[q.id] = os.clock()
@@ -370,13 +411,18 @@ local function watch_requests()
     local k = l.kicked and l.kicked.id
     if k and k ~= last_kick then
         local t = accepted_ids(); t[tostring(k)] = nil; set_accepted(t)
-        notify.show(l.kicked.name .. " was disconnected (sent too much data). They can't rejoin until you host again.", "bad")
+        if kicked_by_me[tostring(k)] then
+            notify.show(l.kicked.name .. " was removed from your world. They can't rejoin until you host again.", "info")
+        else
+            notify.show(l.kicked.name .. " was disconnected (sent too much data). They can't rejoin until you host again.", "bad")
+        end
     end
     last_kick = k
 end
 
 local function tick(dt)
     util.safe(require("mirror.hostrules").tick, "hostrules.tick")
+    util.safe(require("mirror.mysettings").tick, "mysettings.tick")
     -- the rename / bug report box runs in single player too (it used to tick only in a co-op session,
     -- so SEND in a solo game did nothing)
     util.safe(require("mirror.names").tick, "names.tick", dt)
@@ -452,13 +498,26 @@ menu.dev_password = set_password
 
 function menu.init(c)
     -- the guest's things must not land in another save of mine: send it home and stop
-    session.on_host_world_change(function()
-        if my_role() ~= "host" or stopping then return end
+    session.on_host_world_change(function(how)
+        if my_role() ~= "host" then return end
+        if how == "menu" then
+            -- no player ticks at the main menu (stopping_tick would wait until the next world): stop right
+            -- here - the goodbye blob goes out before the bridge reads its stop command (15 vs 250 ms)
+            if not stopping then p1().say_bye() end
+            stopping = nil
+            p1().stop()
+            session.forget_hosted()
+            log.info("menu: left the save while hosting - hosting stopped")
+            notify.show("You left your save, so you stopped hosting and your friend went home.", "info")
+            return
+        end
+        if stopping then return end
         stopping = { t = 0.0, why = "You loaded another save, so the co-op session ended and your friend went home." }
         p1().say_bye()
     end)
     cfg = c
     require("mirror.hostrules").init(my_role)
+    require("mirror.mysettings").init(my_role)
     require("mirror.itemclean").init(my_role)
     require("mirror.names").init()
     journal_tab.configure{
@@ -483,7 +542,9 @@ function menu.init(c)
             end,
             voice = function() require("mirror.voice").toggle() end,
             voice_vol = function() require("mirror.voice").cycle_volume() end,
-            setting = function(key) require("mirror.hostrules").toggle(key) end,
+            setting = function(key, tab)
+                if tab == "mine" then require("mirror.mysettings").toggle(key) else require("mirror.hostrules").toggle(key) end
+            end,
             refresh = function()
                 if link.bridge_cmd("browse") then notify.show("Looking for public games...", "info") end
             end,
@@ -493,6 +554,7 @@ function menu.init(c)
             tp_decline = function() require("mirror.teleport").decline() end,
             update = update,
             report = report,
+            kick = kick,
             accept = function(id, name) answer("accept", id, name) end,
             allow = function(id, name) answer("allow", id, name) end,
             decline = function(id, name) answer("decline", id, name) end,

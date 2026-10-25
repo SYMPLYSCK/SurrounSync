@@ -18,6 +18,12 @@ local KINDS = {
     Buildable_WoodenGate_C     = { flag = "IsClosed", closed_when = true, toggle = "Event_OpenDoor", dot = true },
     Buildable_BunkerDoor_C     = { flag = "IsClosed", closed_when = true, toggle = "Event_OpenDoor", dot = true },
     Buildable_BarricadedMetalDoor_C = { flag = "IsClosed", closed_when = true, toggle = "Event_OpenDoor", dot = true },
+    -- Bunker entrances: the keycard scanner calls CallInteractOnObject on its doors (Open? flips when the
+    -- door has finished moving). The scanner itself: only whether its keycard was used (the use eats it).
+    BP_DoubleBunkerDoor_C          = { flag = "Open?", closed_when = false, toggle = "CallInteractOnObject" },
+    BP_LargeBunkerEntrance_C       = { flag = "Open?", closed_when = false, toggle = "CallInteractOnObject" },
+    BP_LargeBunkerEntrance_Small_C = { flag = "Open?", closed_when = false, toggle = "CallInteractOnObject" },
+    BP_BunkerScanner_C             = { lock = "KeycardRequired?" },
 }
 
 local POLL = 0.25
@@ -64,7 +70,10 @@ local function rescan_class(cls)
     for id, d in pairs(list) do if d.cls == cls then list[id] = nil end end
     local kind = KINDS[cls]
     for _, o in ipairs(objs) do
-        local ok, id = pcall(key, o, cls)
+        -- exact class only: a subclass listed under its parent too (BP_LargeBunkerEntrance_Small) would
+        -- get each remote toggle twice - open and straight back shut
+        local ok, id = false, nil
+        if util.class_name(o) == cls then ok, id = pcall(key, o, cls) end
         if ok then list[id] = { obj = o, kind = kind, cls = cls } end
     end
     return walked

@@ -236,7 +236,8 @@ function audio.tick(dt)
         elseif math.abs((fire.last_shot or -100) - q.at) > 0.3 then send(q.path, q.l, q.vol, q.pitch) end
     end
     queue = keep
-    channel:pump(function(p) if shared() then util.safe(play, "audio.play", p) end end)
+    local hear = require("mirror.mysettings").on("sounds")
+    channel:pump(function(p) if hear and shared() then util.safe(play, "audio.play", p) end end)
 end
 
 function audio.status()

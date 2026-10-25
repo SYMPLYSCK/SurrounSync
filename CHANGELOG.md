@@ -2,6 +2,47 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 0.13.0 (2026-10-25)
+
+Hey everyone! Big one this time: you can finally play with more than one friend.
+
+**👥 New: 4-player co-op**
+The host plus up to three friends can now play in one world. Everyone sees everyone, cars seat four (first in, first seated), and voice, chat, teleports and loot work for all players. If two of you wander far from the host, Load Splitting (still experimental) lets the friend closest to the group run the zombies around you.
+
+**⚙️ New: a proper settings page**
+CO-OP tab → ⚙️ now has two tabs:
+- **HOST RULES** (the host's rules for everyone): PvP, item cleanup (off / 10 / 20 / 40 min), load splitting, max players (2-4), join requests (ask me / let friends in / let everyone in), teleports on or off, and whether guests can change the weather.
+- **MY SETTINGS** (only your game): name tags, co-op messages (all / important / off), chat pop-ups, shared sounds, the join alert sound, auto-accept teleports, and guest performance (how far out zombies are copied to you: 150 / 100 / 60 m. Lower helps slower PCs).
+
+**🦶 New: kick players**
+When you host, the CO-OP tab lists the players in your world with a KICK button (press it twice to confirm). They go home with everything they carry and can't come back until you host again.
+
+**✨ Also new**
+- Settlement (raider) camps are the same for everyone.
+- Zombie looks match better: acidic and radiated zombies show their effects for both players, and the blood moon is shared.
+- Rocks and trees you use up disappear for the other players too.
+- Bunker doors and keycard scanners open for everyone.
+- The handbook (J) opens and closes faster.
+- When an update is out, the game asks you once you're in the world (and again after loading until you accept).
+
+**🔧 Fixes**
+- The host's base could end up in a guest's own save after playing together. Fixed.
+- Dropped magazines keep their ammo, and attachments on weapons lying on the ground show for everyone.
+- Weather and car fuel / damage / paint stay in sync while you play.
+- The host sometimes couldn't see a guest after they joined (their "I'm here" got lost on a connection hiccup). Fixed.
+- Loot always shows the host's items. No more wrong items flashing for a moment when you open a container.
+- Zombie loot is the same for every player, also with four.
+- Going back to the main menu as host now ends hosting properly.
+- A crash when hovering certain items, plus a batch of other crash fixes from your bug reports.
+- The connection program no longer stalls when your disk or antivirus is slow.
+
+**⚠️ Known issues**
+- A backpack inside another backpack can still show up twice or go missing after a trip through a storage box. Drop it and pick it back up to fix it.
+- Items a guest takes from a container while the host is paused or disconnected can end up duplicated.
+- Weather can occasionally differ between players. If you see it, please send a bug report right then. That helps me find it.
+
+Thanks again for all the bug reports and for testing with friends. Have fun, and watch each other's backs. 🧡
+
 ## 0.12.0 (2026-10-24)
 
 Hey everyone! This one took a while. I spent most of it chasing bugs you reported, plus one experiment I've wanted to try for a long time.

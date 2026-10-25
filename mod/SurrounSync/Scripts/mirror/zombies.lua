@@ -350,7 +350,7 @@ local arch_seen, arch_seen_n = {}, 0
 -- .ready[i] = when this game itself last ran archetype i (its mesh/effects are loaded then); .calling = our
 -- own call is running. Calling an Archetype_ function from Lua loads what it needs synchronously when it
 -- isn't loaded yet - a guest froze in "z.look.arch" right after its first copies (report 20261024-203718).
-local arch_hooks = { ready = {}, calling = false }
+local arch_hooks = { ready = {}, calling = false, moon = { seen = {}, n = 0 } }
 local ARCH_READY_S = 120
 for i, a in ipairs(ARCH) do
     arch_hooks[i] = function(self)
@@ -363,8 +363,18 @@ for i, a in ipairs(ARCH) do
         arch_seen[n] = i
     end
 end
+-- Blood moon: zombies alive when it rises get red eyes (+ speed); later ones don't. moon_seen[name] = had it.
+arch_hooks.moon.hook = function(self, start)
+    local n, on
+    pcall(function() n = util.fname(self:get()); on = start:get() == true end)
+    if not n then return end
+    if arch_hooks.moon.n > 4000 then arch_hooks.moon.seen, arch_hooks.moon.n = {}, 0 end
+    if arch_hooks.moon.seen[n] == nil then arch_hooks.moon.n = arch_hooks.moon.n + 1 end
+    arch_hooks.moon.seen[n] = on
+end
 local function hook_archetypes()
     for i, a in ipairs(ARCH) do util.ensure_hook(MZ .. ":Archetype_" .. a, arch_hooks[i]) end
+    util.ensure_hook(MZ .. ":Event_BloodMoon", arch_hooks.moon.hook)
 end
 local function bone_fname(i)
     local f = bone_fnames[i]
@@ -531,7 +541,7 @@ local function host_tick(dt)
         return i
     end
     local alive = {}
-    local radius = cfg.zombies.radius
+    local radius = cfg.zombies.radius * zombies.perf_share()
     local nearest = math.huge
     for _, z in ipairs(zombies_cached(now)) do
         local skip_until = far_until[z]
@@ -577,7 +587,10 @@ local function host_tick(dt)
                     st = { at = now, cls = path_of(z:GetClass()), mesh = path_of(mesh), mat = path_of(mat), dead_at = st and st.dead_at }
                     st.fam = family_of(z)
                     if st.fam ~= "zombie" then st.look = look_of(z, st.fam)
-                    else st.arch, st.bones, st.eyes = arch_of(z, a), bones_of(z), eyes_of(z) end
+                    else
+                        st.arch, st.bones, st.eyes = arch_of(z, a), bones_of(z), eyes_of(z)
+                        if st.eyes == 1 and arch_hooks.moon.seen[a] then st.eyes = 2 end
+                    end
                     statics[id] = st
                 end) end
                 local yaw, v, mont, mpos, dead = 0, { X = 0, Y = 0, Z = 0 }, nil, 0, false
@@ -1041,8 +1054,11 @@ local function sync_look(id, c, e)
             arch_hooks.calling = true
             perf.run("z.look.arch", function() ok, err = pcall(function() local f = z["Archetype_" .. ARCH[x.arch]]; f(z) end) end)
             arch_hooks.calling = false
-            if not ok then log.warn("zombies: copy " .. id .. " archetype " .. ARCH[x.arch] .. ": " .. tostring(err)) end
+            if not ok then log.warn("zombies: copy " .. id .. " archetype " .. ARCH[x.arch] .. ": " .. tostring(err))
+            else c.arch_ran = true end
         elseif mine ~= x.arch then
+            -- not run here: the archetype's looks only (zfx.lua)
+            util.safe(zombies.fx.looks, "zombies.fx_looks", c, x.arch)
             arch_mismatch = arch_mismatch + 1
             if arch_mismatch <= 5 then log.info("zombies: copy " .. id .. " is a " .. ARCH[x.arch] .. " on the host - not loaded here, the copy keeps its own look") end
         end
@@ -1067,8 +1083,13 @@ local function sync_look(id, c, e)
         end
     end) end
     c.bones_done = true
+    local had = arch_hooks.moon.seen[util.fname(z) or ""]
+    local red = x.eyes == 2
+    if red ~= (had == true) and (red or had ~= nil) then
+        perf.run("z.look.moon", function() pcall(function() z:Event_BloodMoon(red) end) end)
+    end
     local glow = eyes_of(z)
-    if x.eyes == 1 and glow == 0 then
+    if x.eyes >= 1 and glow == 0 then
         local off = false
         pcall(function()
             off = util.cdo("/Script/Engine.Default__KismetSystemLibrary"):GetConsoleVariableBoolValue("Game.DisableZombieEyes") == true
@@ -1081,7 +1102,7 @@ local function sync_look(id, c, e)
 end
 
 -- For tools/test-sync.py.
-zombies._look = { arch_hooks = arch_hooks, arch_of = function(z, n) return arch_of(z, n) end, bones_of = function(z) return bones_of(z) end,
+zombies._look = { arch_hooks = arch_hooks, moon_hook = arch_hooks.moon.hook, arch_of = function(z, n) return arch_of(z, n) end, bones_of = function(z) return bones_of(z) end,
                   sync = function(id, c, e, x) xlooks[id] = x; sync_look(id, c, e) end }
 zombies._host = { tick = function(c, dt) cfg = cfg or c; now = now + dt; host_tick(dt) end }
 zombies._test = { setup = function(c, r) cfg, role = c, r end, sweep = function(dt) now = now + (dt or 0); suppress_natives() end }
@@ -1613,6 +1634,8 @@ function rad.take_back(amount)
     log.info(string.format("zombies: took back %.2f radiation from a copy", back))
 end
 zombies._rad = rad
+-- archetype looks + death blasts on copies (a field: this file is at Lua's 200-locals limit)
+zombies.fx = require("mirror.zfx")
 
 function zombies.tick(dt)
     if not (cfg and cfg.zombies.enabled) or not gate then return end
@@ -1623,6 +1646,7 @@ function zombies.tick(dt)
     util.safe(xp.tick, "zombies.xp")
     util.safe(watch_begin, "zombies.watch_begin", dt)
     if role == "host" then perf.run("z.host", host_tick, dt) else guest_tick(dt) end
+    util.safe(zombies.fx.tick, "zombies.fx", dt)
 end
 
 local function in_reach(id, x, y, z)
@@ -1854,6 +1878,7 @@ end
 function zombies.init(c, r, s, opts)
     cfg, role, session = c, r, s
     secondary = opts and opts.secondary or false
+    zombies.fx.init(zombies, r)
     game.on_world_reset(forget_world)
     util.safe(watch_new_zombies, "zombies.watch")
     game.keybind("F12", { ModifierKey.CONTROL }, function() want_steamtest = true end)
@@ -2076,6 +2101,14 @@ function zombies.init(c, r, s, opts)
         end
     end
     log.info("zombies: " .. role .. " side ready")
+end
+
+-- GUEST PERFORMANCE (the guest's own setting, sent as a blob): the share of the copy range it wants.
+-- (a module field, not a local: this file is at Lua's local-variable limit)
+function zombies.perf_share()
+    local b = link.get_blob("gperf")
+    if b then zombies.gperf = b end
+    return require("mirror.mysettings").PERF_SHARE[zombies.gperf or "full"] or 1.0
 end
 
 return zombies

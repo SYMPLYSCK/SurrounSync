@@ -94,8 +94,10 @@ function nametag.tick(dt)
         tag.color = color
         pcall(function() tag.text:SetColorAndOpacity({ SpecifiedColor = color, ColorUseRule = 0 }) end)
     end
-    local far = false
-    pcall(function() far = util.dist(util.vec(g:K2_GetActorLocation()), util.vec(game.player():K2_GetActorLocation())) > FAR end)
+    local far = not require("mirror.mysettings").on("nametags")
+    if not far then
+        pcall(function() far = util.dist(util.vec(g:K2_GetActorLocation()), util.vec(game.player():K2_GetActorLocation())) > FAR end)
+    end
     if far == tag.shown then
         tag.shown = not far
         pcall(function() tag.comp:SetVisibility(not far, false) end)

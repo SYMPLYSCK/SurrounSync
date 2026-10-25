@@ -426,7 +426,8 @@ local function apply_add(payload)
         (n + miss > 0) and string.format(" (holding %d, %d missing)", n, miss) or ""))
 end
 
-local function sync_from_host(id)
+-- quiet = applied inside the open itself (same frame, before the UI shows it): no redraw needed
+local function sync_from_host(id, quiet)
     local comp, list = opened[id], host_list[id]
     if not (comp and list) then return end
     if not still(id, comp) then opened[id] = nil; return end
@@ -450,7 +451,7 @@ local function sync_from_host(id)
         reopened[id] = nil
         if added + removed > 0 then
             -- still open on screen after a reopen: redraw it with the host's items
-            if again and now - (opened_at[id] or -100) < 5.0 then
+            if again and not quiet and now - (opened_at[id] or -100) < 5.0 then
                 pcall(function() game.player():RequestServerData(comp, {}) end)
             end
             stats.fixed = (stats.fixed or 0) + 1
@@ -459,7 +460,7 @@ local function sync_from_host(id)
         end
         return
     end
-    if added + removed > 0 and now - (opened_at[id] or -100) < 5.0 then
+    if added + removed > 0 and not quiet and now - (opened_at[id] or -100) < 5.0 then
         -- open on screen: redraw it with the host's items (no message - it should just look right)
         local owner
         pcall(function() owner = comp:GetOwner() end)
@@ -482,6 +483,10 @@ local function on_generated(comp, via)
     if not main then return end
     local ok, id = pcall(id_of, owner)
     if not ok then return end
+    -- A fresh host list (asked while the player came near): take it over right here, inside the open, so the
+    -- container never shows this game's copy first. "init" runs before the UI reads it; "request" just after, same frame.
+    local fresh = role ~= "host" and host_list[id] and now - (list_at[id] or -100) < FRESH
+        and (pending[id] or 0) <= (host_ack[id] or 0)
     if role == "host" then
         -- Every generation, not just the first: some containers (shops) roll new stock after a while.
         pushed[id] = true
@@ -492,9 +497,11 @@ local function on_generated(comp, via)
         if now - (opened_at[id] or -100) < 2.0 then return end
         opened[id], opened_at[id] = comp, now
         reopened[id] = true
-        -- asked when the player began interacting (prefetch): that answer is fresh - use it now
-        if host_list[id] and now - (list_at[id] or -100) < FRESH then apply_q[id] = now
+        if fresh then reopened[id] = via ~= "init" or nil; sync_from_host(id, via == "init")
         else asked_at[id] = now; channel:send("Q " .. id) end
+    elseif fresh then
+        opened[id], opened_at[id] = comp, now
+        sync_from_host(id, via == "init")
     else
         opened[id], opened_at[id] = comp, now
         if not host_list[id] and not jig.is_empty(comp) then
@@ -570,10 +577,29 @@ local function ahead_scan()
     end
     table.sort(ahead, function(a, b) return a.d > b.d end)
 end
-local function ahead_tick(dt)
+local function list_tick(dt)
     list_in = list_in - dt
     if build then util.safe(list_step, "loot.list")
-    elseif list_in <= 0 then list_in = LIST_EVERY; util.safe(list_containers, "loot.list") end
+    elseif list_in <= 0 then list_in = role == "host" and LIST_EVERY or 15.0; util.safe(list_containers, "loot.list") end
+end
+-- Guest: containers within NEAR_M are asked about every 2 s, so their host list is already here (fresh)
+-- when one is opened - the open then shows the host's items at once instead of correcting itself a moment later.
+local NEAR_M, NEAR_EVERY, near_in = 3.0, 1.0, 0.0
+local function near_ask()
+    local l
+    pcall(function() l = util.vec(game.player():K2_GetActorLocation()) end)
+    if not l then return end
+    for _, k in ipairs(known) do
+        local id = k.id
+        if util.dist(l, k.loc) < NEAR_M * 100 and now - (asked_at[id] or -100) >= 2.0
+                and not (host_list[id] and now - (list_at[id] or -100) < 2.0) then
+            asked[id], asked_at[id] = true, now
+            channel:send("Q " .. id)
+        end
+    end
+end
+local function ahead_tick(dt)
+    list_tick(dt)
     ahead_scan_in = ahead_scan_in - dt
     if ahead_scan_in <= 0 then ahead_scan_in = SCAN_EVERY; util.safe(ahead_scan, "loot.ahead_scan") end
     ahead_step_in = ahead_step_in - dt
@@ -699,6 +725,10 @@ function loot.tick(dt)
         crumb.at("loot: ahead")
         if ghost.get() then util.safe(ahead_tick, "loot.ahead", dt) end
     else
+        crumb.at("loot: near")
+        list_tick(dt)
+        near_in = near_in - dt
+        if near_in <= 0 then near_in = NEAR_EVERY; util.safe(near_ask, "loot.near") end
         crumb.at("loot: sync")
         -- only while the host's list already has all of this player's takes/puts (never undoes one)
         for id, at in pairs(recheck) do

@@ -16,3 +16,6 @@ research/
 # bug report webhook (secret)
 tools/report-webhook.txt
 tools/testpkg/
+
+# written by the unit tests (names.lua keeps item names next to the game)
+mirror_item_names.txt
