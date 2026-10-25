@@ -29,15 +29,7 @@ local function path_of(obj)
     return p
 end
 
-local cache = {}
-local function find(p)
-    if not p or p == "-" then return nil end
-    local o = util.cached(cache, p)
-    if o then return o end
-    o = StaticFindObject(p)
-    if util.valid(o) then cache[p] = o; return o end
-    return nil
-end
+local find = util.find
 
 local function on_weapon_effects(self, EmitterTemplate)
     local w = self:get()
@@ -446,7 +438,7 @@ lasers_follow_aim = function(dt)
 end
 
 forget_world = function()
-    cache, laser_list, list_idx, driven, in_hand = {}, {}, 0, {}, {}
+    laser_list, list_idx, driven, in_hand = {}, 0, {}, {}
 end
 
 return fire

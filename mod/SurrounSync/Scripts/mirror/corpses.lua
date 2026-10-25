@@ -24,7 +24,7 @@ local INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
 local ITEM_ID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"
 
 local cfg, role, zombies, session
-local channel = events.new("zloot", 128, 60)
+local channel = events.reliable("zloot")
 local first_seen = {}
 local sent = {}
 local dead_seen, dead_sent = {}, {}

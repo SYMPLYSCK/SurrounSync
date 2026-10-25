@@ -10,6 +10,8 @@ local cfg
 local every = 1.0
 local wait = 0.0
 local kept = {}
+-- an ended zombie is forgotten untouched (its mesh setting doesn't matter any more)
+util.on_end(function(a) kept[a] = nil end)
 local ALWAYS_TICK_POSE_AND_REFRESH_BONES = 0
 
 function keepalive.configure(c) cfg = c end
@@ -48,5 +50,8 @@ function keepalive.tick(dt)
     wait = every
     pass()
 end
+
+-- old-world zombies are gone: drop them untouched (writing their Mesh would touch freed objects)
+function keepalive.forget() kept = {} end
 
 return keepalive

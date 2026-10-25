@@ -18,7 +18,8 @@ local function path(cls) local n = cls:gsub("_C$", ""); return DIR .. n .. "." .
 
 local cfg, role
 local same_world = function() return false end
-local channel = events.new("harvest", 32, 3)
+local channel = events.reliable("harvest")
+local peers = require("mirror.peers")
 local done = {}            -- key -> true: used up in this world (the host's list is sent to late joiners)
 local index = {}           -- cls -> { at, by_key }
 local applying = false
@@ -144,7 +145,12 @@ function harvest.tick(dt)
         local body = link.get_blob("harvested")
         if body then peer_body, list_due = body, true end
     end
-    channel:pump(function(p) if together then util.safe(apply, "harvest.apply", p) end end)
+    channel:pump(function(p)
+        if not together then return end
+        util.safe(apply, "harvest.apply", p)
+        -- host, more than two players: the other guests' copies note it (used-up list) and pass it on
+        peers.relay("mirror.harvest", harvest, function(m) m.relay_in(p) end)
+    end)
     if role == "host" and dirty then
         dirty = false
         local keys = {}
@@ -155,6 +161,13 @@ function harvest.tick(dt)
         list_due = false
         util.safe(apply_list, "harvest.list", peer_body)
     end
+end
+
+-- another guest's hit, already done to the host's node by that guest's copy: only note it and pass it on
+function harvest.relay_in(p)
+    local kind, key, _, gone = p:match("^(%a) (%S+)%s*(%d*)%s*(%d*)$")
+    if key and (kind == "S" or gone == "1") then mark_done(key) end
+    channel:send(p)
 end
 
 function harvest.status()

@@ -4,6 +4,9 @@ local log = require("mirror.log")
 local link = require("mirror.link")
 local notify = require("mirror.notify")
 local fs = require("mirror.fs")
+local util = require("mirror.util")
+local game = require("mirror.game")
+local jig = require("mirror.jig")
 
 local compat = {}
 
@@ -20,6 +23,29 @@ local KNOWN = {
 
 local mine = nil
 local sent, compared = false, nil
+local probe_addr, probe_at, probe_warned = nil, nil, false
+local JIG = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
+
+-- once per player, 10 s in (the inventory is filled by then): does this game build still have what item sync uses?
+local function probe_game()
+    local player = game.player()
+    local addr = util.valid(player) and util.addr(player) or nil
+    if not addr or addr == probe_addr then return end
+    probe_at = probe_at or (os.clock() + 10)
+    if os.clock() < probe_at then return end
+    probe_addr, probe_at = addr, nil
+    local cls, comp = util.find(JIG), nil
+    if cls then pcall(function() comp = player:GetComponentByClass(cls) end) end
+    if not util.valid(comp) then log.error("compat: the player has no inventory component - a game update changed it"); return end
+    local missing = jig.probe(comp)
+    if #missing == 0 then log.info("compat: inventory layout check passed"); return end
+    log.error("compat: this game build lacks what item sync uses: " .. table.concat(missing, ", ")
+        .. " - loot, drops and trades can fail until SurrounSync is updated for it")
+    if not probe_warned then
+        probe_warned = true
+        notify.show("A SurrounDead update changed the inventory. Item sync may not work until SurrounSync is updated.", "bad")
+    end
+end
 
 local function read_mods()
     local out = {}
@@ -72,6 +98,7 @@ local function compare(theirs)
 end
 
 function compat.tick()
+    probe_game()
     if not mine then mine = read_mods() end
     if not sent then
         sent = true

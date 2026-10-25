@@ -66,7 +66,9 @@ local function lying(a)
 end
 
 local function near_player(l)
-    for _, p in ipairs({ game.player(), ghost.get() }) do
+    local who = require("mirror.peers").ghost_list()
+    who[#who + 1] = game.player()
+    for _, p in ipairs(who) do
         local pl
         if p then pcall(function() pl = util.vec(p:K2_GetActorLocation()) end) end
         if pl and util.dist(pl, l) < NEAR then return true end

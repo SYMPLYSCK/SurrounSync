@@ -154,6 +154,14 @@ function names.encode(name) return (name:gsub("[%%,;| ]", function(c) return str
 function names.decode(s) return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)) end
 
 -- JSI_Slot:GetUniqueID just returns self.ItemUniqueID: read the property, no out-param call
+-- Every widget is checked before a call: a NULL wrapper (a tooltip torn down, a text or slot not built yet) is a native crash
+-- (crash report 2026-10-25: two runs died in the tooltip hook, AV reading 0x34, while the player hovered items)
+local function child(w, key)
+    local c
+    pcall(function() c = w[key] end)
+    return util.valid(c) and c or nil
+end
+
 local function uid_of(item)
     local ok, s = pcall(function()
         local g = item.ItemUniqueID
@@ -163,8 +171,11 @@ local function uid_of(item)
 end
 
 local function is_backpack(item)
-    local p
-    pcall(function() p = item.JigDataAsset:GetFullName() end)
+    -- (an item without a data asset holds a wrapper around NULL: GetFullName on it is a native crash pcall can't catch)
+    local da, p
+    pcall(function() da = item.JigDataAsset end)
+    if not util.valid(da) then return false end
+    pcall(function() p = da:GetFullName() end)
     return type(p) == "string" and p:find(BACKPACKS, 1, true) ~= nil
 end
 
@@ -332,16 +343,19 @@ local function menu_look(canvas)
     local w, pos, size, row, font
     pcall(function() w = canvas.JigContextMenuW end)
     if not util.valid(w) then return nil end
-    pcall(function() local p = w.Slot:GetPosition(); pos = { X = p.X, Y = p.Y } end)
+    local slot, list = child(w, "Slot"), child(w, "OptionsVB")
+    if slot then pcall(function() local p = slot:GetPosition(); pos = { X = p.X, Y = p.Y } end) end
     pcall(function() local d = w:GetDesiredSize(); size = { X = d.X, Y = d.Y } end)
-    pcall(function()
-        local c = w.OptionsVB:GetChildAt(0)
+    if list then pcall(function()
+        local c = list:GetChildAt(0)
+        if not util.valid(c) then return end
         local d = c:GetDesiredSize()
         row = d.Y > 4 and d.Y or nil
         local t = c:GetContent()
+        if not util.valid(t) then return end
         local f = t.Font
         font = { FontObject = f.FontObject, TypefaceFontName = f.TypefaceFontName, Size = f.Size }
-    end)
+    end) end
     if not (pos and size and size.X > 4 and size.Y > 4) then return nil end
     return { pos = pos, size = size, row = row or 34, font = font }
 end
@@ -438,12 +452,13 @@ local hovered = nil   -- { tip = the tooltip widget, uid }: my backpack under th
 -- the hint goes at the end of the small description text, not next to the name
 local HINT = "(F2: rename)"
 local function on_tooltip(self)
-    local item
-    pcall(function() item = self.ItemRef end)
-    if not util.valid(item) then return end
+    if not util.valid(self) then return end
+    local item = child(self, "ItemRef")
+    if not item then return end
     local uid = uid_of(item)
     local name = names.get(uid)
-    if name then pcall(function() self.NameText:SetText(FText(name)) end) end
+    local title = name and child(self, "NameText")
+    if title then pcall(function() title:SetText(FText(name)) end) end
     if uid and is_backpack(item) and mine(uid) then
         hovered = { tip = self, uid = uid }
         if count > 0 and os.clock() - noted_at > 2.0 then
@@ -453,10 +468,11 @@ local function on_tooltip(self)
             pcall(function() comp = p.BP_JigComponent end)
             names.note(comp)
         end
-        pcall(function()
-            local d = self.descr:GetText():ToString() or ""
-            if not d:find(HINT, 1, true) then self.descr:SetText(FText(d == "" and HINT or (d .. "\n" .. HINT))) end
-        end)
+        local descr = child(self, "descr")
+        if descr then pcall(function()
+            local d = descr:GetText():ToString() or ""
+            if not d:find(HINT, 1, true) then descr:SetText(FText(d == "" and HINT or (d .. "\n" .. HINT))) end
+        end) end
     end
 end
 local function rename_hovered()

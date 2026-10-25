@@ -134,8 +134,7 @@ local function apply_hit(payload)
     if not util.valid(p) then return end
     -- Damage_Headshot kills outright whatever the amount; the amount already carries the headshot bonus.
     if cls:find("Damage_Headshot", 1, true) then cls = cls:gsub("Damage_Headshot", "Damage_Body") end
-    local dtc = cls ~= "-" and StaticFindObject(cls) or nil
-    if not util.valid(dtc) then dtc = nil end
+    local dtc = util.find(cls)
     local ok, err = pcall(function() util.cdo(GS):ApplyDamage(p, math.min(amt, MAX_HIT), nil, g, dtc) end)
     stats.taken = stats.taken + 1
     if ok then log.info(string.format("pvp: the other player hit me for %.1f", amt))

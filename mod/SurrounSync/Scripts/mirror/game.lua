@@ -3,6 +3,7 @@
 local log = require("mirror.log")
 local util = require("mirror.util")
 local ghost = require("mirror.ghost")
+local peers = require("mirror.peers")
 local crumb = require("mirror.crumb")
 
 local game = {}
@@ -86,6 +87,7 @@ local function adopt(pawn, pc)
     -- A new pawn in the same, still-live world (the old pawn still exists) is not a world reset.
     if old and util.valid(old) and old_world and util.same(old_world, world) then old = nil end
     util.recheck_hooks()
+    util.find_reset()
     log.info((old and "new real player (respawn/reload): " or "real player is ") .. player:GetFullName())
     if old then
         util.instances_reset()
@@ -104,7 +106,7 @@ local function refresh_player(ctx)
     pc = FindFirstOf("BP_PlayerController_C")
     local pawn
     pcall(function() pawn = pc.Pawn end)
-    if util.valid(pawn) and not ghost.is(pawn) then adopt(pawn, pc); return true end
+    if util.valid(pawn) and not peers.is_ghost(pawn) then adopt(pawn, pc); return true end
     return false
 end
 
@@ -195,7 +197,7 @@ end
 
 local function on_tick(self, DeltaSeconds)
     local ctx = self:get()
-    if ghost.is(ctx) then return end
+    if peers.is_ghost(ctx) then return end
     if not refresh_player(ctx) then return end
     if not util.same(ctx, player) then return end
     local dt = real_dt(DeltaSeconds:get() or 0)

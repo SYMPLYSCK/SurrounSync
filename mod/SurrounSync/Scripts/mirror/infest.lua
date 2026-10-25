@@ -273,7 +273,7 @@ local function on_lock_target(self)
     if not (zl and gl and pl) then return end
     for _, n in pairs(nests) do
         if util.dist(zl, n.loc) < WAVE_RADIUS then
-            if util.dist(gl, n.loc) < util.dist(pl, n.loc) then
+            if require("mirror.peers").ghost_nearest(ghost, gl, pl, n.loc) then
                 retargeting = true
                 pcall(function() comp:SetBB_LockOnTarget(gl) end)
                 retargeting = false

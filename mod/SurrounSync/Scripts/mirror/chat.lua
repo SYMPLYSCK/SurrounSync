@@ -12,8 +12,10 @@ local SEND_GAP = 1.0
 local IN_BURST, IN_WINDOW = 5, 5.0
 
 local channel = events.new("chat", 16, 30)
-local history = {}
-local last_send = -100
+-- one history for every player's link (more than two players: peers.lua gives each link its own copy)
+local peers = require("mirror.peers")
+local history = peers.shared("chat_history")
+local sends = peers.shared("chat_send", { last = -100 })
 local incoming = {}
 
 local function clean(s)
@@ -32,12 +34,13 @@ function chat.send(text)
     if text == "" then return false, "empty" end
     if text:sub(1, 1) == "/" then require("mirror.teleport").command(text); return true end
     local t = os.clock()
-    if t - last_send < SEND_GAP then
+    if t - sends.last < SEND_GAP then
         notify.show("Slow down a little - one message a second.", "info")
         return false, "too fast"
     end
-    last_send = t
+    sends.last = t
     channel:send(text)
+    peers.each("mirror.chat", function(c, inst) if inst then c.relay(text) end end)
     add("You", text, true)
     log.info("chat: me: " .. text)
     return true
@@ -57,6 +60,9 @@ function chat.tick()
         notify.show(who .. ": " .. text, "info")
     end)
 end
+
+-- (the same line to this copy's player)
+function chat.relay(text) channel:send(text) end
 
 function chat.recent(n)
     local out = {}

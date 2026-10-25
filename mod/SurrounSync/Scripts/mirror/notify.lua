@@ -30,8 +30,8 @@ function notify.ping(times)
     local util, game = require("mirror.util"), require("mirror.game")
     local s
     for _, p in ipairs(PING_SOUNDS) do
-        local o = StaticFindObject(p)
-        if util.valid(o) then s = o; break end
+        local o = util.find(p)
+        if o then s = o; break end
     end
     local w = game.world()
     if not s or not w then return false end

@@ -14,10 +14,11 @@ function link.configure(c)
     base_dir = (c and c.link_dir) and (base .. "\\" .. c.link_dir) or base
 end
 
-function link.open(my_role)
+-- tags (more than two players): { out = "to2", inn = "from2" } - the file names of this one other player
+function link.open(my_role, tags)
     dir = base_dir or ((os.getenv("LOCALAPPDATA") or ".") .. "\\SurrounDead")
-    me = my_role
-    peer = (my_role == "host") and "guest" or "host"
+    me = tags and tags.out or my_role
+    peer = tags and tags.inn or ((my_role == "host") and "guest" or "host")
     last_seq = -1
     return path(me), path(peer)
 end

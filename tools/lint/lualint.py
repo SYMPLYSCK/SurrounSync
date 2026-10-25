@@ -7,7 +7,7 @@ Needs luaparser: pip install --target tools/lint/luapkg luaparser (or set LUAPAR
 import sys, os
 sys.path.insert(0, os.environ.get("LUAPARSER_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "luapkg")))
 from luaparser import ast, astnodes as N
-KNOWN = set("""print require load pcall error type tostring tonumber pairs ipairs table string math os io select setmetatable getmetatable next rawget rawset unpack collectgarbage coroutine debug _G
+KNOWN = set("""print require load pcall error type tostring tonumber pairs ipairs table string math os io select setmetatable getmetatable next rawget rawset unpack collectgarbage coroutine debug package _G
 FindAllOf FindFirstOf StaticFindObject StaticConstructObject LoadAsset RegisterHook RegisterKeyBind Key ModifierKey FName FText NotifyOnNewObject ExecuteInGameThread LoopAsync ExecuteWithDelay""".split())
 def visit(node, scopes, out, f):
     def declared(name): return any(name in s for s in scopes)

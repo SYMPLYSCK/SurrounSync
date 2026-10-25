@@ -82,6 +82,7 @@ local config = {
     diagnostics = false,
 
     world_sync = true,
+    camp_sync = true,          -- the guest gets the host's settlement camps (camps.lua)
     door_sync = true,
     power_sync = true,
     audio_sync = true,

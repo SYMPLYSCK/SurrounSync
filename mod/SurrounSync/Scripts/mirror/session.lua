@@ -10,6 +10,7 @@ local slotguard = require("mirror.slotguard")
 local V = require("mirror.version")
 local game = require("mirror.game")
 local link = require("mirror.link")
+local events = require("mirror.events")
 local ghost = require("mirror.ghost")
 local invdiag = require("mirror.invdiag")
 local notify = require("mirror.notify")
@@ -34,6 +35,8 @@ local WORLD_FILES  = { "Level.sav", "General.sav", "Difficulties.sav", "Slot.sav
 local later_notes = {}
 
 local state = "idle"
+-- host: the save the guest got at its join; another save loaded while hosting ends the session
+local hosted_slot, on_host_world_change = nil, nil
 local own_slot = nil
 local join_slot, join_stamp = nil, nil
 local nonce = nil
@@ -434,6 +437,7 @@ local function host_export(job)
     link.put_blob("hostbed", beds.read() or "0")
     link.put_blob("world", string.format("ready %s %s %d", job.nonce, slot, n))
     log.info(string.format("session: host exported %d world file(s) from %s for join %s", n, slot, job.nonce))
+    hosted_slot = slot
     return true
 end
 
@@ -449,6 +453,9 @@ local function host_tick(dt)
             log.info("session: join request " .. n .. " - saving")
             notify.show(link.peer_name() .. " is joining your world...", "info")
             host_job = { nonce = n, t = 0.0 }
+            -- trade/build messages from before this save are in the world the guest gets: they skip them
+            events.set_cut(os.time())
+            link.put_blob("joincut", n .. " " .. os.time())
             save_now()
         end
     end
@@ -583,7 +590,8 @@ local function firewall(why)
     end
 end
 require("mirror.save_guard").set_before_save(function()
-    util.safe(firewall, "session.firewall", "the game's save")
+    -- (the copy of another guest's link on the host only counts the save: the main one guards it)
+    if not (link.tags and link.tags()) then util.safe(firewall, "session.firewall", "the game's save") end
     session.on_any_save()
 end)
 
@@ -652,6 +660,11 @@ local function on_world_ready()
     level_loading, cleared_world = false, false
     world_slot = ems_current_name()
     log.info("session: this world is save " .. tostring(world_slot))
+    if role == "host" and hosted_slot and world_slot and world_slot ~= "" and world_slot ~= hosted_slot then
+        log.warn("session: host loaded save " .. world_slot .. " while hosting " .. hosted_slot .. " - ending the session")
+        hosted_slot = nil
+        if on_host_world_change then on_host_world_change() end
+    end
 end
 local function firewall_tick()
     if restore_name and not saving() then
@@ -878,6 +891,7 @@ local function guest_tick(dt)
                 end
                 nonce = tostring(os.time())
                 link.reset_blob("world")
+                link.reset_blob("joincut")
                 world_in, world_ready, world_shown, world_poll = {}, nil, 0, 0
                 link.put_blob("req", "join " .. nonce)
                 state, wait = "requested", 0.0
@@ -900,6 +914,9 @@ local function guest_tick(dt)
             world_shown = got
             log.info(string.format("session: receiving %s's world... %d/%d", link.peer_name(), got, #WORLD_FILES))
         end
+        local jc = link.get_blob("joincut")
+        local jn, js = (jc or ""):match("^(%S+) (%d+)$")
+        if jn == nonce then events.set_cut(link.same_clock() and tonumber(js) or (os.time() - link.peer_age(tonumber(js)) - 2)) end
         local w = link.get_blob("world")
         if w and w == "fail " .. nonce then
             log.error("session: host could not export its world")
@@ -1109,7 +1126,7 @@ end
 local function on_actor_loaded(self)
     if not tp then return end
     local p = self:get()
-    if ghost.is(p) then return end
+    if require("mirror.peers").is_ghost(p) then return end
     local target = tp_target()
     if not target then return end
     local rot = { Pitch = 0, Yaw = tp.goal == "home" and tp.home.yaw or 0, Roll = 0 }
@@ -1131,7 +1148,7 @@ local function install_firewall()
         hook_in = hook_in - (dt or 0)
         if hook_in <= 0 then
             hook_in = 2.0
-            util.ensure_hook("/Game/Blueprints/SD_GameInstance.SD_GameInstance_C:Event_LoadLevel", on_load)
+            util.ensure_hook("/Game/Blueprints/SD_GameInstance.SD_GameInstance_C:Event_LoadLevel", on_load, nil, true)
         end
         util.safe(firewall_tick, "session.firewall_tick")
     end)
@@ -1151,9 +1168,10 @@ function session.preinit(c)
 end
 
 function session.init(c, r, connected)
+    events.set_hold(session.joining)
     cfg, role = c, r
     started = true
-    install_firewall()
+    if not (link.tags and link.tags()) then install_firewall() end
     peer_connected = connected or peer_connected
     configure_store()
     if role == "guest" then
@@ -1175,6 +1193,8 @@ end
 local cp_clock, cp_due, cp_last, cp_first = 0.0, nil, -math.huge, nil
 local guest_in = function() return false end
 function session.set_guest_in(fn) guest_in = fn end
+function session.on_host_world_change(fn) on_host_world_change = fn end
+function session.forget_hosted() hosted_slot = nil end
 function session.guest_in_world() return role == "host" and guest_in() end
 -- Any save (the game's autosave, a manual one, ours) covers the trades made before it.
 function session.on_any_save() cp_due, cp_last = nil, cp_clock end
@@ -1221,6 +1241,10 @@ end
 function session.role() return started and role or nil end
 function session.request_toggle() want_toggle = true end
 function session.in_world() return state == "joined" and tp == nil end
+-- asked for / loading into the host's world: its trade messages wait unread until I'm in
+function session.joining()
+    return role == "guest" and (state == "requested" or (state == "joined" and tp ~= nil and tp.goal == "host"))
+end
 
 -- "arriving": loaded into the host's world and already next to the host, but the spot isn't confirmed yet
 -- (the game can still move the player for a few seconds). Enough to show both players to each other.

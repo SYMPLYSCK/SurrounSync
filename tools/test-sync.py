@@ -2,7 +2,7 @@
 
     pip install --target <dir> lupa, set PYTHONPATH=<dir>, then: python tools/test-sync.py
 """
-import os, random, shutil, sys
+import os, random, shutil, sys, tempfile
 
 try:
     from lupa import LuaRuntime
@@ -26,6 +26,7 @@ def lua():
     L = LuaRuntime(unpack_returned_tuples=True)
     L.execute('package.path = ... .. "/?.lua;" .. package.path', SCRIPTS.replace("\\", "/"))
     L.execute('package.loaded["mirror.log"] = setmetatable({}, { __index = function() return function() end end })')
+    L.execute('function evmock(t) t.reliable = t.reliable or t.new; return t end')
     return L
 
 
@@ -220,6 +221,11 @@ def instances_walk_once_then_follow_beginplay():
     L.execute('NEW = actor("Door_C"); HOOKS["/Game/D.Door_C:ReceiveBeginPlay"]({ get = function() return NEW end }); '
               'R3 = #util.instances("Door_C")')
     check(L.eval('R3') == 3 and L.eval('WALKS') == 2, "a new one arrives through BeginPlay, no walk")
+    L.execute('ENDED = nil; util.on_end(function(a) ENDED = a end); '
+              'HOOKS["/Script/Engine.Actor:ReceiveEndPlay"]({ get = function() return NEW end }); '
+              'R8 = #util.instances("Door_C"); NEW_A = NEW:GetAddress()')
+    check(L.eval('R8') == 2 and L.eval('ENDED') == L.eval('NEW_A'), "an ended one leaves the list at once (EndPlay)")
+    L.execute('HOOKS["/Game/D.Door_C:ReceiveBeginPlay"]({ get = function() return NEW end })')
     L.execute('for i = 1, 400 do frame(1.0); util.instances("Door_C", "/Game/D.Door_C"); util.instances("Lamp_C") end')
     check(L.eval('WALKS') == 3, "400 s later: the hooked class not re-walked, the one without a BeginPlay once")
     L.execute('W0 = WALKS; for i = 1, 50 do frame(1.0); R7 = select(2, util.instances("Bunker_C", "/Game/B.Bunker_C")) end')
@@ -231,6 +237,63 @@ def instances_walk_once_then_follow_beginplay():
               'local l, w = util.instances("Door_C"); R5, R6 = #l, w')
     check(L.eval('TOUCHED') == 0, "a world reset drops the old objects without touching them")
     check(L.eval('WALKS') == L.eval('W0') + 1 and L.eval('R5') == 2 and L.eval('R6'), "and walks the class again in the new world")
+
+
+def hook_lookups_share_one_budget():
+    print("hook_lookups_share_one_budget")
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        util = require("mirror.util")
+        HOOKED = {}
+        util.hook = function(p) HOOKED[#HOOKED + 1] = p; return true end
+        LOOKS = {}
+        LOADED = { ["/Game/A.A_C"] = true }
+        StaticFindObject = function(p)
+            LOOKS[#LOOKS + 1] = p
+            NOW = NOW + 0.0017   -- a hit ~1.7 ms, a miss ~15 ms
+            local c = p:match("^(.-):") or p
+            if not LOADED[c] then NOW = NOW + 0.013; return nil end
+            return obj({ GetFName = function() return { ToString = function() return p:match("([^:]+)$") end } end })
+        end
+        function frame() NOW = NOW + 0.016; util.new_frame() end
+        F = {}
+        for i = 1, 10 do F[i] = function() end end
+        function all()
+            for i = 1, 5 do util.ensure_hook("/Game/A.A_C:F" .. i, F[i]) end
+            for i = 6, 10 do util.ensure_hook("/Game/B.B_C:F" .. i, F[i]) end
+        end
+        frame(); all(); R1 = #LOOKS
+    """)
+    check(L.eval('R1') == 2, "first lookups are budgeted too (2 hits in one frame, not 10)")
+    L.execute('for i = 1, 20 do frame(); all() end; R2, R3 = #HOOKED, #LOOKS')
+    check(L.eval('R2') == 5, "the loaded class gets all its hooks over the next frames")
+    check(L.eval('R3') == 6, "the unloaded class costs one miss for all its functions")
+    L.execute('LOOKS = {}; util.ensure_hook("/Game/B.B_C:Urgent", function() end, nil, true); R4 = #LOOKS')
+    check(L.eval('R4') == 1, "an urgent hook skips the budget and the class miss")
+    L.execute('LOOKS = {}; LOADED["/Game/B.B_C"] = true; for i = 1, 400 do frame(); NOW = NOW + 0.25; all() end; R5 = #HOOKED')
+    check(L.eval('R5') == 10, "a class that loads later gets hooked")
+
+
+def find_remembers_misses():
+    print("find_remembers_misses")
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        util = require("mirror.util")
+        N = 0; HAVE = false
+        StaticFindObject = function(p) N = N + 1; if HAVE then return obj({ GetFName = function() return { ToString = function() return "X" end } end }) end return nil end
+        for i = 1, 10 do util.find("/Game/X.X") end
+        R1 = N
+        NOW = 2.5; util.find("/Game/X.X"); R2 = N
+        HAVE = true; NOW = 3; R3 = util.find("/Game/X.X") ~= nil
+        util.find_reset(); R4 = util.find("/Game/X.X") ~= nil; R5 = N
+        R6 = util.find("/Game/X.X") ~= nil and N == R5
+    """)
+    check(L.eval('R1') == 1, "ten asks for a missing path cost one lookup")
+    check(L.eval('R2') == 2, "asked again after 2 s")
+    check(not L.eval('R3'), "the next ask waits for the doubled backoff")
+    check(L.eval('R4') and L.eval('R6'), "a world reset forgets misses; a hit is cached")
 
 
 def tactical_reads_only_lights_the_class_has():
@@ -289,6 +352,141 @@ def tactical_reads_only_lights_the_class_has():
               'ATT.BP_TacticalLaserLightComboLocalAttachment_C[1].IsValid = function() return false end; '
               'for i = 1, 20 do tactical.tick(0.1) end')
     check("Combo" not in (L.eval('blobs_out.tactical') or ""), "a removed attachment stops being sent")
+
+
+def group_split_leader_and_follower_agree():
+    print("group_split_leader_and_follower_agree")
+    G = r'''
+        local my_slot, peer_slot = ...
+        OUT, IN, LOG = {}, {}, {}
+        SPLIT, INWORLD, KIND = false, true, nil
+        package.loaded["mirror.log"] = { info = function(m) LOG[#LOG + 1] = m end }
+        package.loaded["mirror.link"] = { put_blob = function(n, b) OUT[n] = b end,
+            get_blob = function(n) local b = IN[n]; IN[n] = nil; return b end,
+            tags = function() return { out = "to" .. peer_slot } end, peer_name = function() return "P" .. peer_slot end }
+        Z = { gate = nil, role = nil }
+        function Z.init(c, r, s, o) Z.role, Z.secondary = r, o and o.secondary end
+        function Z.set_gate(v) Z.gate = v end
+        function Z.set_guest_center() end
+        function Z.is_split() return SPLIT end
+        package.loaded["mirror.zombies"] = Z
+        package.loaded["mirror.ghost"] = { location = function() return nil end }
+        package.loaded["mirror.phase1"] = { set_ghost_kind = function(k) KIND = k end }
+        package.loaded["mirror.peers"] = { my_slot = function() return my_slot end, slot_of = function() return peer_slot end,
+                                           main = function() return Z end }
+        group = require("mirror.group")
+        group.init({}, { in_world = function() return INWORLD end })
+    '''
+    A, B = lua(), lua()
+    A.execute(G, 2, 3)      # leader: slot 2, its copy for slot 3
+    B.execute(G, 3, 2)      # follower: slot 3, its copy for slot 2
+
+    def run(n=3):
+        for _ in range(n):
+            A.execute('group.tick(0.3)'); B.execute('group.tick(0.3)')
+            for src, dst in ((A, B), (B, A)):
+                out = src.eval('OUT')
+                for k in list(out.keys()):
+                    dst.eval('IN')[k] = out[k]
+                src.execute('OUT = {}')
+
+    check(A.eval('Z.role') == "host" and B.eval('Z.role') == "guest" and A.eval('Z.secondary') and A.eval('Z.gate') is False,
+          "lower slot's copy sends (host role), the other shows (guest role); both off at first")
+    A.execute('SPLIT = true')
+    B.execute('group.follow(true, 7)')
+    run()
+    check(A.eval('Z.gate') is True and A.eval('KIND') == "host", "leader (split) takes the follower on: its AI goes for their ghost")
+    check(B.eval('Z.gate') is True and B.eval('group.follow_acked(7)'), "follower shows the leader's AI once confirmed")
+    A.execute('SPLIT = false')
+    run()
+    check(A.eval('Z.gate') is False and A.eval('KIND') == "guest" and B.eval('Z.gate') is False and not B.eval('group.follow_acked(7)'),
+          "leader merged: both sides stop")
+    A.execute('SPLIT = true'); B.execute('group.follow(true, 8)'); run()
+    B.execute('group.follow(false, 9)'); run()
+    check(A.eval('Z.gate') is False and B.eval('Z.gate') is False, "follower told to stop by the host: both sides stop")
+    A2 = lua(); A2.execute(G, 2, 3); A2.execute('SPLIT = false; IN.p8f = "f 4"; group.tick(0.3)')
+    check(A2.eval('Z.gate') is False and A2.eval('OUT.p8l') is None, "a guest that isn't split never leads")
+
+
+def vehicles_seat_four_players_by_slot():
+    print("vehicles_seat_four_players_by_slot")
+
+    def setup(role, my_slot, peer_slot):
+        L = lua()
+        L.execute(FAKES + r"""
+            local role, MY, PS = ...
+            CAR_PARENT = nil
+            PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end,
+                           GetAttachParentActor = function() return CAR_PARENT end,
+                           K2_SetActorLocation = function(self, l) PLAYER_AT = l end })
+            GHOST_AT = nil
+            GHOST = obj({ K2_SetActorLocationAndRotation = function(self, l) GHOST_AT = l end, PlayAnimMontage = function() end,
+                          CharacterMovement = { SetMovementMode = function() end } })
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return nil end,
+                                              on_world_reset = function() end }
+            package.loaded["mirror.ghost"] = { get = function() return GHOST end, set_seated = function() end, generation = function() return 1 end }
+            package.loaded["mirror.link"].tags = function() return nil end
+            package.loaded["mirror.link"].peer_name = function() return "Peer" end
+            StaticFindObject = function() return obj({}) end
+            util = require("mirror.util")
+            util.ensure_hook = function() return true end
+            local ksl = obj({})
+            ksl.IsValid = function(self, a) if a == nil then return true end return a.dead ~= true end
+            util.cdo = function() return ksl end
+            OTHERS = {}
+            package.loaded["mirror.peers"] = {
+                my_slot = function() return MY end,
+                slot_of = function(out) return PS end,
+                each = function(name, fn) fn(require(name)); for _, m in ipairs(OTHERS) do fn(m) end end,
+            }
+            -- driver seat at (0, 100, 0) of a car at the origin facing +X: passenger (0, -100), rear seats 95 behind
+            A = obj({ VehicleColor = 0, Colors = {}, Mesh = { SetMaterial = function() end, SetPhysicsLinearVelocity = function() end,
+                                                             SetPhysicsAngularVelocityInDegrees = function() end },
+                      FuelComponent = { CurrentFuel = 50, MaxFuel = 100 }, VehicleHealthComponent = { CurrentHealth = 100, MaxHealth = 100 },
+                      PlayerLocation = { K2_GetComponentToWorld = function() return { Translation = { X = 0, Y = 100, Z = 0 } } end },
+                      GetActorRightVector = function() return { X = 0, Y = 1, Z = 0 } end,
+                      GetActorForwardVector = function() return { X = 1, Y = 0, Z = 0 } end,
+                      K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end,
+                      K2_GetActorRotation = function() return { Pitch = 0, Yaw = 0, Roll = 0 } end,
+                      K2_SetActorLocationAndRotation = function() end, K2_TeleportTo = function() return true end,
+                      VehicleEngineFX = function() end, IsActorBeingDestroyed = function() return false end,
+                      IsA = function() return true end, GetVelocity = function() return { X = 0, Y = 0, Z = 0 } end,
+                      VehicleMovementComponent = { SetHandbrakeInput = function() end, SetBrakeInput = function() end,
+                                                   SetThrottleInput = function() end, SetSteeringInput = function() end },
+                      GetFullName = function() return "Vehicle_Van_C /Game/L.L:P.Vehicle_Van_C_1" end,
+                      GetFName = function() return { ToString = function() return "Vehicle_Van_C_1" end } end })
+            FindAllOf = function(c) if c == "Vehicle_Van_C" then return { A } end return {} end
+            util.instances = function(c) if c == "Vehicle_Van_C" then return { A }, true end return {}, true end
+            vehicles = require("mirror.vehicles")
+            vehicles.init({ mirror_vehicles = true }, role, { guest_in_world = function() return true end, in_world = function() return true end })
+            local tick = vehicles.tick
+            vehicles.tick = function(dt) util.new_frame(); tick(dt) end
+            for i = 1, 30 do vehicles.tick(0.1) end
+        """, role, my_slot, peer_slot)
+        return L
+
+    # this game's copy shows the player in slot 3; slot 1 rides the same car (another copy): 3 gets the second passenger seat
+    L = setup("guest", 2, 3)
+    L.execute('OTHERS = { { rides_in = function() return "Vehicle_Van_C_1" end, player_slot = function() return 1 end } }')
+    L.execute('blobs_in.ride = "R Vehicle_Van_C_1"; vehicles.tick(0.1)')
+    at = L.eval('GHOST_AT')
+    check(at is not None and abs(at.X + 95) < 1e-6 and abs(at.Y - 100) < 1e-6,
+          "riders take the passenger seats in slot order (slot 3 behind the driver, after slot 1)")
+    L.execute('OTHERS = {}; vehicles.tick(0.1); vehicles.tick(0.1)')
+    at = L.eval('GHOST_AT')
+    check(abs(at.X) < 1e-6 and abs(at.Y + 100) < 1e-6, "the other rider gets out: it moves up to the front passenger seat")
+
+    # both get into the same car: the lower slot drives
+    L = setup("guest", 1, 0)
+    L.execute('CAR_PARENT = A; for i = 1, 3 do vehicles.tick(0.1) end')
+    check(L.eval('vehicles.status():find("driving Vehicle_Van_C_1") ~= nil'), "guest drives the car")
+    L.execute('vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 1.000"); for i = 1, 3 do vehicles.tick(0.1) end')
+    check(L.eval('vehicles.status():find("driving %-") ~= nil') and (L.eval('blobs_out.ride') or "").startswith("R Vehicle_Van_C_1"),
+          "the host (slot 0) got in too: the guest rides along instead")
+    L = setup("host", 0, 1)
+    L.execute('CAR_PARENT = A; for i = 1, 3 do vehicles.tick(0.1) end')
+    L.execute('vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 1.000"); for i = 1, 3 do vehicles.tick(0.1) end')
+    check(L.eval('vehicles.status():find("driving Vehicle_Van_C_1") ~= nil'), "and the host keeps driving")
 
 
 def vehicles_keep_this_worlds_fuel():
@@ -489,7 +687,7 @@ def nests_keep_real_health():
             NOW = 0
             HOOKS, TIMERS, KILLS = {}, {}, {}
             SENT, INBOX = {}, {}
-            package.loaded["mirror.events"] = { new = function(name)
+            package.loaded["mirror.events"] = evmock { new = function(name)
                 return { send = function(self, p) SENT[#SENT + 1] = p end,
                          pump = function(self, fn) local q = INBOX; INBOX = {}; for _, p in ipairs(q) do fn(p) end end } end }
             GHOST = obj({})
@@ -592,7 +790,7 @@ def horde_beacon_runs_only_on_the_host():
         L.execute(FAKES + r"""
             local role = ...
             HOOKS, SENT, INBOX, DISH, NOTES = {}, {}, {}, {}, {}
-            package.loaded["mirror.events"] = { new = function(name)
+            package.loaded["mirror.events"] = evmock { new = function(name)
                 return { send = function(self, p) SENT[#SENT + 1] = p end,
                          pump = function(self, fn) local q = INBOX; INBOX = {}; for _, p in ipairs(q) do fn(p) end end } end }
             package.loaded["mirror.ghost"] = { get = function() return nil end, location = function() return nil end }
@@ -684,7 +882,7 @@ def goto_and_bring_move_only_your_own_player():
             NOTES = {}
             package.loaded["mirror.notify"] = { show = function(t) NOTES[#NOTES + 1] = t end }
             SENT, INBOX = {}, {}
-            package.loaded["mirror.events"] = { new = function() return {
+            package.loaded["mirror.events"] = evmock { new = function() return {
                 send = function(self, m) SENT[#SENT + 1] = m end,
                 pump = function(self, fn) local q = INBOX; INBOX = {}; for _, m in ipairs(q) do fn(m) end end } end }
             package.loaded["mirror.link"].peer_name = function() return "Friend" end
@@ -950,6 +1148,64 @@ def loot_skips_containers_gone_since_listed():
     check(L.eval("#READ") == 1 and L.eval("READ[1]") == "live", "and only that one's contents are read and sent")
 
 
+def loot_asks_the_host_again_on_every_reopen():
+    print("loot_asks_the_host_again_on_every_reopen")
+    L = lua()
+    L.execute(FAKES + r"""
+        package.loaded["mirror.crumb"] = { at = function() end }
+        package.loaded["mirror.ghost"] = { get = function() return nil end, location = function() return nil end }
+        package.loaded["mirror.game"] = { player = function() return ME end, on_world_reset = function() end }
+        SENT, INBOX = {}, {}
+        package.loaded["mirror.events"] = { send = function(self, p) SENT[#SENT + 1] = p end, reliable = function(name)
+            return { send = function(self, p) SENT[#SENT + 1] = p end,
+                     pump = function(self, fn) local q = INBOX[name] or {}; INBOX[name] = {}; for _, p in ipairs(q) do fn(p) end end }
+        end }
+        APPLIED = 0
+        package.loaded["mirror.jig"] = {
+            generate = function() end, contents_of = function() return {} end, flush_ui = function() end,
+            encode = function() return "" end, decode = function(s) return { s } end, is_empty = function() return false end,
+            uid_str = function(x) return x end, full_path = function(x) return x end, guid = function(x) return x end,
+            apply_contents = function(c, list) APPLIED = APPLIED + 1; return 1, (list[1] == "two" and 1 or 0), 0, 0, {} end,
+            apply_layout = function() return 0, 0 end,
+        }
+        util = require("mirror.util")
+        HOOKS = {}
+        util.ensure_hook = function(name, fn) HOOKS[name] = fn; return true end
+        local CL = cls("Container_FuelLoot_GasPump_C")
+        StaticFindObject = function() return CL end
+        PUMP = obj({ loc = { X = 100, Y = 0, Z = 0 } })
+        PUMP.K2_GetActorLocation = function() return PUMP.loc end
+        PUMP.GetClass = function() return CL end
+        PUMP.IsA = function() return true end
+        PUMP.IsActorBeingDestroyed = function() return false end
+        COMP = obj({ GetOwner = function() return PUMP end })
+        REFRESHED = 0
+        ME = obj({ RequestServerData = function() REFRESHED = REFRESHED + 1 end })
+        util.instances = function() return { COMP }, true end
+        util.find_by_id = function() return PUMP end
+        loot = require("mirror.loot")
+        loot.init({}, "guest", { in_world = function() return true end })
+        loot.tick(0.1)
+        REQ = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:SERVER_RequestData"
+        function open() HOOKS[REQ](nil, { get = function() return COMP end }) end
+        function qs() local n = 0; for _, p in ipairs(SENT) do if p:sub(1, 2) == "Q " then n = n + 1 end end; return n end
+        open()
+        ID = SENT[1] and SENT[1]:match("^Q (%S+)$")
+        INBOX.lootc = { "C " .. tostring(ID) .. " 0 one" }
+        loot.tick(0.1)
+        for i = 1, 30 do loot.tick(0.1) end
+        open()
+        loot.tick(0.1)
+        INBOX.lootc = { "C " .. tostring(ID) .. " 0 two" }
+        loot.tick(0.1)
+    """)
+    check(L.eval("ID ~= nil"), "first open asks the host for the contents")
+    check(L.eval("qs()") == 2, "opening it again later asks again (%d asks)" % L.eval("qs()"))
+    check(L.eval("REFRESHED") == 1, "and redraws it when the host's copy changed meanwhile (%d)" % L.eval("REFRESHED"))
+    L.execute("open(); loot.tick(0.1)")
+    check(L.eval("qs()") == 2, "an open right after (the redraw itself) doesn't ask again")
+
+
 def bags_are_never_consumed_and_twin_grids_are_counted():
     print("bags_are_never_consumed_and_twin_grids_are_counted")
     L = lua()
@@ -1066,6 +1322,34 @@ def ghost_swims_without_its_own_water_detection():
     check(L.eval('G.SwimmingComponent["IsSwimming?"]') is False, "leaving the water ends the ghost's swimming")
 
 
+def ghost_never_blocks_cars():
+    print("ghost_never_blocks_cars")
+    L = lua()
+    L.execute(FAKES + r"""
+        util = require("mirror.util")
+        util.cdo = function() return obj({ SetActorSaveProperties = function() end }) end
+        StaticFindObject = function() return obj({}) end
+        FindFirstOf = function() return nil end
+        ghost = require("mirror.ghost")
+        ghost.configure({ ghost = { class = "/Game/X.Ghost_C", target_tag = "t", view_controller = false } })
+        BLOCKS = {}
+        local function body()
+            local cap = { SetCollisionEnabled = function() end, SetCollisionResponseToAllChannels = function() end,
+                          SetCollisionResponseToChannel = function(_, ch, r) if r == 2 then BLOCKS[ch] = true end end }
+            return obj({ CapsuleComponent = cap, Mesh = { SetCollisionEnabled = function() end,
+                         SetCollisionResponseToAllChannels = function() end, SetCollisionResponseToChannel = function() end },
+                         MedicalComponent = {}, CharacterMovement = {}, Tags = { Empty = function() end },
+                         AIOInvoker = {}, ActorHasTag = function() return false end,
+                         GetFullName = function() return "BP_Ghost /Game/X.Ghost" end })
+        end
+        WORLD = { SpawnActor = function() return body() end }
+    """)
+    for kind in ("guest", "host"):
+        L.execute('BLOCKS = {}; ghost.forget(); ghost.spawn(WORLD, { X = 0, Y = 0, Z = 0 }, 0, "%s")' % kind)
+        check(L.eval('BLOCKS[6]') is None, "the %s ghost's capsule doesn't block cars (a teleported capsule flings them)" % kind)
+        check(L.eval('BLOCKS[0] and BLOCKS[1] and BLOCKS[2]') is True, "the %s ghost still blocks the world and players" % kind)
+
+
 def audio_spatializes_and_shares_without_echo():
     print("audio_spatializes_and_shares_without_echo")
     L = lua()
@@ -1074,7 +1358,7 @@ def audio_spatializes_and_shares_without_echo():
         package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end }
         package.loaded["mirror.ghost"] = { is = function() return false end }
         SENT, PLAYED = {}, {}
-        package.loaded["mirror.events"] = { new = function() return {
+        package.loaded["mirror.events"] = evmock { new = function() return {
             send = function(self, m) SENT[#SENT + 1] = m end,
             pump = function(self, fn) local q = INBOX; INBOX = {}; for _, m in ipairs(q or {}) do fn(m) end end } end }
         INBOX = {}
@@ -1129,7 +1413,7 @@ def throws_and_mines_reach_the_other_game():
         package.loaded["mirror.audio"] = { attenuation_for = function() return nil end }
         SENT = {}
         INBOX = {}
-        package.loaded["mirror.events"] = { new = function(name) return {
+        package.loaded["mirror.events"] = evmock { new = function(name) return {
             send = function(self, m) SENT[#SENT + 1] = name .. ":" .. m end,
             pump = function(self, fn) local q = INBOX[name] or {}; INBOX[name] = {}; for _, m in ipairs(q) do fn(m) end end } end,
             send = function(self, m) SENT[#SENT + 1] = "builds:" .. m end }
@@ -1189,7 +1473,7 @@ def horde_rewards_reach_the_other_game():
                                           on_world_reset = function() end }
         package.loaded["mirror.bedtags"] = { gone = function() end, tick = function() end, init = function() end }
         SENT = {}
-        package.loaded["mirror.events"] = { new = function(name) return {
+        package.loaded["mirror.events"] = evmock { new = function(name) return {
             send = function(self, m) SENT[#SENT + 1] = name .. ":" .. m end,
             pump = function() end } end,
             send = function(self, m) SENT[#SENT + 1] = "drops:" .. m end }
@@ -1251,7 +1535,7 @@ def loose_magazine_rounds_reach_the_picker():
         package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
             world = function() return { SpawnActor = function() return COPY end } end }
         SENT, IN = {}, {}
-        package.loaded["mirror.events"] = { new = function(name) return {
+        package.loaded["mirror.events"] = evmock { new = function(name) return {
             send = function(self, m) SENT[#SENT + 1] = m end,
             pump = function(self, fn) local q = IN; IN = {}; for _, p in ipairs(q) do fn(p) end end } end,
             send = function(self, m) SENT[#SENT + 1] = m end }
@@ -1315,7 +1599,7 @@ def loose_magazine_picked_up_without_hooks_still_gets_its_rounds():
         package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
             world = function() return { SpawnActor = function() return COPY end } end }
         SENT, IN = {}, {}
-        package.loaded["mirror.events"] = { new = function(name) return {
+        package.loaded["mirror.events"] = evmock { new = function(name) return {
             send = function(self, m) SENT[#SENT + 1] = m end,
             pump = function(self, fn) local q = IN; IN = {}; for _, p in ipairs(q) do fn(p) end end } end,
             send = function(self, m) SENT[#SENT + 1] = m end }
@@ -1371,7 +1655,7 @@ def ground_weapon_attachments_reach_the_other_game():
         package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
             world = function() return { SpawnActor = function() return COPY end } end }
         SENT, IN = {}, {}
-        package.loaded["mirror.events"] = { new = function(name) return {
+        package.loaded["mirror.events"] = evmock { new = function(name) return {
             send = function(self, m) SENT[#SENT + 1] = m end,
             pump = function(self, fn) local q = IN; IN = {}; for _, p in ipairs(q) do fn(p) end end } end,
             send = function(self, m) SENT[#SENT + 1] = m end }
@@ -1819,7 +2103,7 @@ SPLIT_FAKES = r"""
     SPLIT, FIGHT, NEAR, SETTING, GUEST, INWORLD, SAVING, NEST, HORDE = false, false, 1e9, true, true, true, false, 1e9, false
     GHOST, INV, AI = true, 0, 40
     GL, HL = { X = 0, Y = 0, Z = 0 }, { X = 0, Y = 0, Z = 0 }
-    package.loaded["mirror.zombies"] = { set_split = function(on) SPLIT = on end, is_split = function() return SPLIT end,
+    package.loaded["mirror.zombies"] = { set_split = function(on) SPLIT = on end, is_split = function() return SPLIT end, is_follow = function() return FOLLOW == true end, set_follow = function(on) FOLLOW = on end,
         guest_busy = function() return FIGHT end, near_guest = function() return NEAR, 0.5 end, own_count = function() return 7 end }
     package.loaded["mirror.ghost"] = { exists = function() return GHOST end, location = function() return GHOST and GL or nil end,
         set_invoker = function(on) INV = on and 0 or -1; return INV end, invoker_index = function() return INV end,
@@ -1837,6 +2121,44 @@ SPLIT_FAKES = r"""
     split.init(CFG, role, { guest_in_world = function() return GUEST end, in_world = function() return INWORLD end })
     function run(secs) for i = 1, math.floor(secs * 10 + 0.5) do split.tick(0.1) end end
 """
+
+
+def group_split_host_decides_follow_and_ignores_followers():
+    print("group_split_host_decides_follow_and_ignores_followers")
+    PEERS = r"""
+        local _, me = ...
+        OTHERS = {}
+        package.loaded["mirror.peers"] = { slot_of = function() return me end, my_slot = function() return 0 end,
+            each = function(name, fn) fn(require(name)); for _, m in ipairs(OTHERS) do fn(m, { slot = m.slot() }) end end }
+        function other(slot, st, loc, lead)
+            return { slot = function() return slot end, host_state = function() return st[1] end,
+                     ghost_loc = function() return loc end, lead_slot = function() return lead end }
+        end
+    """
+    # host copy for the guest in slot 3, 500 m from the host, 20 m from the split guest in slot 2
+    H = lua()
+    H.execute(FAKES + PEERS + SPLIT_FAKES, "host", 3)
+    H.execute('LST = { "split" }; OTHERS = { other(2, LST, { X = 52000, Y = 0, Z = 0 }) }; GL = { X = 50000, Y = 0, Z = 0 }; run(1.1)')
+    check(H.eval('split.host_state()') == "asking" and H.eval('blobs_out.p8') == "f 1 2",
+          "far from the host, next to a split guest with a lower slot: asks to follow it")
+    check(H.eval('INV') == 0, "the host keeps the AI there until the guest confirms")
+    H.execute('blobs_in.p8g = "f 1 0"; run(0.3)')
+    check(H.eval('split.host_state()') == "following" and H.eval('INV') == -1 and H.eval('SPLIT') is True,
+          "confirmed: ghost out of the optimizer, no snapshots")
+    H.execute('run(5)')
+    check(H.eval('split.host_state()') == "following", "the leader next to it doesn't merge it")
+    H.execute('LST[1] = "merged"; run(1.1)')
+    check(H.eval('split.host_state()') == "merged" and H.eval('INV') == 0 and H.eval('blobs_out.p8') == "m 2",
+          "the leader merged: the follower goes back to the host's AI")
+    # the leader's copy (slot 2): its follower next to it doesn't count as "another player near"
+    A = lua()
+    A.execute(FAKES + PEERS + SPLIT_FAKES, "host", 2)
+    A.execute('GL = { X = 50000, Y = 0, Z = 0 }; run(12); blobs_in.p8g = "s 1 0"; run(0.5)')
+    check(A.eval('split.host_state()') == "split", "leader split on its own")
+    A.execute('OTHERS = { other(3, { "following" }, { X = 50500, Y = 0, Z = 0 }, 2) }; run(3)')
+    check(A.eval('split.host_state()') == "split", "its follower 5 m away: still split")
+    A.execute('OTHERS = { other(3, { "merged" }, { X = 50500, Y = 0, Z = 0 }, nil) }; run(1.1)')
+    check(A.eval('split.host_state()') == "merged", "a guest next to it that isn't following: merged")
 
 
 def load_split_switches_only_when_both_agree():
@@ -1979,17 +2301,383 @@ def load_split_hands_the_ai_to_the_guest():
               'zombies.set_split(false); zombies._test.sweep(10); zombies._test.sweep(95)')
     check(L.eval('E.gone') is True, "guest: a kept zombie goes after drain_s")
 
+def reliable_events_survive_pauses_and_restarts():
+    print("reliable_events_survive_pauses_and_restarts")
+    def side(t0):
+        L = lua()
+        L.execute(FAKES + r"""
+            T = ...; os.time = function() return math.floor(T) end
+            CLOCK = 0; os.clock = function() return CLOCK end
+            package.loaded["mirror.link"].peer_age = function(s) return os.time() - s end
+            package.loaded["mirror.link"].same_clock = function() return true end
+            events = require("mirror.events")
+            ch = events.reliable("drops")
+            plain = events.new("hits", 32, 3)
+            GOT, GOTP = {}, {}
+            function tick(dt)
+                T = T + dt; CLOCK = CLOCK + dt
+                ch:pump(function(p) GOT[#GOT + 1] = p end)
+                plain:pump(function(p) GOTP[#GOTP + 1] = p end)
+            end
+        """, t0)
+        return L
+    def ship(a, b):
+        out = a.eval('blobs_out')
+        inn = b.eval('blobs_in')
+        for k in list(out.keys()):
+            inn[k] = out[k]
+        a.execute('blobs_out = {}')
+    A, B = side(1000), side(1000)
+    def run(n, dt=0.25):
+        for _ in range(n):
+            A.execute('tick(%f)' % dt); B.execute('tick(%f)' % dt)
+            ship(A, B); ship(B, A)
+    A.execute('for i = 1, 40 do ch:send("I item" .. i) end; ch:send("T 1"); plain:send("hit")')
+    A.execute('tick(0.25)'); ship(A, B)
+    B.execute('T = T + 30')           # B sat in the ESC menu for 30 s
+    run(4)
+    check(B.eval('#GOT') == 41 and B.eval('GOT[41]') == "T 1", "a reliable message read after a 30 s pause is applied (41 of 41)")
+    check(B.eval('#GOTP') == 0, "a plain (combat) message still expires")
+    run(8)
+    A.execute('ch:send("T 2")'); run(4)
+    check(B.eval('GOT[42]') == "T 2" and B.eval('#GOT') == 42, "later messages still arrive once")
+    check(A.eval('#ch.recent') <= 1, "acked messages are dropped from the sender's history")
+    C = side(1200)                     # B restarted: a fresh game must not replay the old session
+    A.execute('ch.recent = { "1 7 900 T old" }; ch.ids = { { id = 7, t = 0 } }; ch.dirty = true')
+    A.execute('tick(0.25)'); ship(A, C); C.execute('tick(0.25)')
+    check(C.eval('#GOT') == 0, "a restarted game skips messages stamped before it started")
+    # join: the guest holds the host's messages while loading and skips those before the host's join save
+    A2, B2 = side(5000), side(5000)
+    B2.execute('JOINING = true; events.set_hold(function() return JOINING end)')
+    A2.execute('ch:send("D before"); T = T + 3'); A2.execute('tick(0.25)'); ship(A2, B2)
+    A2.execute('events.set_cut(os.time()); CUT = os.time(); T = T + 1; ch:send("D after")')
+    A2.execute('tick(0.25)'); ship(A2, B2)
+    for _ in range(40):
+        B2.execute('tick(0.25)')   # a 10 s load: nothing read yet
+    check(B2.eval('#GOT') == 0, "nothing is applied while the guest loads in")
+    B2.execute('events.set_cut(%d); JOINING = false; tick(0.25)' % A2.eval('CUT'))
+    check(B2.eval('#GOT') == 1 and B2.eval('GOT[1]') == "D after",
+          "after the load only the messages since the host's join save are applied")
+    # nobody reads: the history shrinks to the small keep after a while instead of growing to 512
+    A2.execute('for i = 1, 200 do ch:send("M x") end; CLOCK = CLOCK + 400; ch:send("M y")')
+    check(A2.eval('#ch.recent') == 64, "an unread history shrinks to the small keep")
 
-for t in (posepack_recovers_lost_packets, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
+
+def jig_probe_names_what_a_patch_removed():
+    print("jig_probe_names_what_a_patch_removed")
+    SETUP = """
+        local function fn(n) return { IsValid = function() return true end,
+                                      GetFName = function() return { ToString = function() return n end } end } end
+        GONE = {}
+        StaticFindObject = function(p) local f = p:match(":(.+)$"); if GONE[f] then return nil end return fn(f) end
+        local function arr(list) return { ForEach = function(self, cb) for i, v in ipairs(list) do cb(i, { get = function() return v end }) end end } end
+        function inv(item)
+            local c = { ReplicationUID_23_EB27D09649B6E02591DCA98708B06332 = {}, InContainerUID_24_D1504ED7438699C73EA046AD734E79BF = {},
+                        ContainerIndex_22_9A211B86466A9D1C57E1FC839A5B0896 = 0,
+                        ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B = arr(item and { item } or {}) }
+            return { MainJigContainers = arr({ c }) }
+        end
+        function item()
+            return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = {}, SlotIndex_6_8ED1F34A4AF1D565616883B80192E3DD = 3,
+                     Rotated_9_3CFE5D9342A81FB1FF17DEB7B491CE56 = false,
+                     ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { ItemID_28_01CA27D84AF7D1014D9E2E83894C1848 = {},
+                         Count_8_DD79AF2A46126A338C8DCCB4616D91CD = 1, Durability_22_A3557C454274D193D47AB9B71FB0C0CA = {} } }
+        end
+        jig = require("mirror.jig")
+    """
+    L = lua()
+    L.execute(SETUP)
+    check(L.eval('#jig.probe(inv(item()))') == 0, "today's layout passes (rotated = false counts as present)")
+    check(L.eval('#jig.probe(inv(nil))') == 0, "an empty inventory checks the containers only")
+    L.execute('local it = item(); it.ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7.Count_8_DD79AF2A46126A338C8DCCB4616D91CD = nil; M = jig.probe(inv(it))')
+    check(L.eval('#M') == 1 and L.eval('M[1]') == "Count_8_DD79AF2A46126A338C8DCCB4616D91CD", "a renamed item member is named")
+    L = lua()  # a found function stays cached (right), so the removal runs in a fresh game
+    L.execute(SETUP)
+    L.execute('GONE.RemoveGetInfo = true; M = jig.probe(inv(item()))')
+    check(L.eval('#M') == 1 and L.eval('M[1]') == "RemoveGetInfo", "a removed inventory function is named")
+    check(L.eval('#jig.probe({})') >= 1, "no MainJigContainers at all is reported, not an error")
+
+
+def find_by_id_reuses_the_object_it_found():
+    print("find_by_id_reuses_the_object_it_found")
+    L = lua()
+    L.execute("""
+        util = require("mirror.util")
+        WALKS = 0
+        local function crate(addr, x, y, z)
+            local o = { loc = { X = x, Y = y, Z = z }, addr = addr }
+            o.IsValid = function() return true end
+            o.GetAddress = function() return o.addr end
+            o.GetFullName = function() return "Crate_C /Game/Map.Map:Crate_" .. o.addr end
+            o.GetFName = function() return { ToString = function() return "Crate_" .. o.addr end } end
+            o.GetClass = function() return { GetFName = function() return { ToString = function() return "Crate_C" end } end,
+                                             IsValid = function() return true end, GetFullName = function() return "BlueprintGeneratedClass /Game/Crate.Crate_C" end } end
+            o.K2_GetActorLocation = function() return o.loc end
+            return o
+        end
+        A, B = crate(101, 1000, 2000, 30), crate(102, 5000, 5000, 0)
+        FindAllOf = function() WALKS = WALKS + 1; return { A, B } end
+        CLOCK = 0; os.clock = function() return CLOCK end
+    """)
+    first = L.eval('util.find_by_id("Crate_C@100,200,3") == A')
+    w1 = L.eval('WALKS')
+    L.execute('CLOCK = 100')  # far past the 5 s list cache: only the id cache can avoid a walk
+    again = L.eval('util.find_by_id("Crate_C@100,200,3") == A')
+    check(first and again, "the container is found by its id")
+    check(w1 == 1 and L.eval('WALKS') == 1, "the second lookup reuses the object, no walk (walks %d)" % L.eval('WALKS'))
+    L.execute('A.loc = { X = 9000, Y = 0, Z = 0 }; CLOCK = 200; R = util.find_by_id("Crate_C@100,200,3")')
+    check(L.eval('R') is None and L.eval('WALKS') == 2, "an object that moved off the id is not returned; one walk to re-check")
+    L.execute('A.loc = { X = 1000, Y = 2000, Z = 30 }; util.find_by_id("Crate_C@100,200,3"); util.find_reset(); CLOCK = 300; util.find_by_id("Crate_C@100,200,3")')
+    check(L.eval('WALKS') == 3, "a world reset forgets the cache (walks %d)" % L.eval('WALKS'))
+
+
+def tooltip_never_calls_into_null_objects():
+    print("tooltip_never_calls_into_null_objects")
+    L = lua()
+    L.execute(FAKES + r"""
+        package.loaded["mirror.game"] = { player = function() return nil end, on_world_reset = function() end,
+                                          keybind = function() end, on_ready = function() end }
+        util = require("mirror.util")
+        HOOKS = {}
+        util.ensure_hook = function(p, fn) HOOKS[p:match(":(.+)$")] = fn; return true end
+        names = require("mirror.names")
+        names.tick(2)
+        TOUCHED = nil
+        -- a UE4SS wrapper around NULL: IsValid says false, anything else is a native crash in the game
+        function null(what)
+            return setmetatable({ IsValid = function() return false end },
+                                { __index = function(_, k) TOUCHED = what .. "." .. k; return function() TOUCHED = what .. ":" .. k end end })
+        end
+        function hover(tip) HOOKS.Update({ get = function() return tip end }) end
+        local uid = { A = 1, B = 2, C = 3, D = 4 }
+        ITEM_NO_DA = obj({ ItemUniqueID = uid, JigDataAsset = null("JigDataAsset") })
+        TIP = obj({ ItemRef = ITEM_NO_DA, NameText = null("NameText"), descr = null("descr") })
+    """)
+    check(L.eval('HOOKS.Update ~= nil'), "the tooltip hook is installed")
+    L.execute('hover(TIP)')
+    check(L.eval('TOUCHED') is None, "an item without a data asset is left alone (touched %s)" % L.eval('TOUCHED'))
+    L.execute('names.set("1_2_3_4", "Bag"); hover(TIP)')
+    check(L.eval('TOUCHED') is None, "a named item whose title text isn't built is left alone (touched %s)" % L.eval('TOUCHED'))
+    L.execute('hover(null("tooltip"))')
+    check(L.eval('TOUCHED') is None, "a torn-down tooltip is left alone (touched %s)" % L.eval('TOUCHED'))
+    L.execute('TIP.ItemRef = null("ItemRef"); hover(TIP)')
+    check(L.eval('TOUCHED') is None, "a tooltip whose item is gone is left alone (touched %s)" % L.eval('TOUCHED'))
+
+
+def settlement_camps_follow_the_host():
+    print("settlement_camps_follow_the_host")
+    def side(role):
+        L = lua()
+        L.execute(FAKES + r"""
+            util = require("mirror.util")
+            WORLD = {}
+            util.instances = function(cls) local l = {} for _, a in ipairs(WORLD[cls] or {}) do if not a.gone then l[#l + 1] = a end end return l end
+            function camp(cls, at) local a = obj({ cls = cls }); a.K2_DestroyActor = function() if not at then a.gone = true end end
+                               a.K2_GetActorLocation = function() return at or { X = 5000, Y = 7000, Z = 300 } end
+                               WORLD[cls] = WORLD[cls] or {}; table.insert(WORLD[cls], a); return a end
+            function spawner(cls) local s = obj({ Settlement = { GetFName = function() return { ToString = function() return cls end } end } })
+                                  s.SpawnSettlement = function() camp(cls) end
+                                  WORLD.BP_SettlementCampSpawner_C = WORLD.BP_SettlementCampSpawner_C or {}
+                                  table.insert(WORLD.BP_SettlementCampSpawner_C, s) end
+            for i = 1, 4 do spawner("Prefab_Settlement" .. i .. "_C") end
+            JOINED = true
+            package.loaded["mirror.game"] = { on_world_reset = function() end }
+            camps = require("mirror.camps")
+            camps.init({}, "%s", { in_world = function() return JOINED end }, function() return true end)
+            function n(cls) return #util.instances(cls) end
+        """ % role)
+        return L
+    H, G = side("host"), side("guest")
+    H.execute('camp("Prefab_Settlement4_C"); camps.tick(5)')
+    sent = H.eval('blobs_out.camps')
+    check(sent == "Prefab_Settlement4_C=1", "the host sends its camps (%r)" % sent)
+    # (the game also keeps an empty Settlement1 at the world origin that can't be destroyed: not a camp)
+    G.execute('camp("Prefab_Settlement1_C", { X = 0, Y = 0, Z = 0 }); camp("Prefab_Settlement2_C"); camp("Prefab_Settlement3_C")')
+    G.execute('blobs_in.camps = ...; camps.tick(5)', sent)
+    check(G.eval('n("Prefab_Settlement2_C") + n("Prefab_Settlement3_C")') == 2, "nothing changes in the first seconds after arriving")
+    for _ in range(4):
+        G.execute('camps.tick(5)')
+    check(G.eval('n("Prefab_Settlement2_C") + n("Prefab_Settlement3_C")') == 0, "the guest's own leftover camps are removed")
+    check(G.eval('n("Prefab_Settlement4_C")') == 1, "the host's camp is spawned through its spawner")
+    for _ in range(4):
+        G.execute('camps.tick(5)')
+    check(G.eval('n("Prefab_Settlement4_C")') == 1, "and only once")
+    # a spawned camp that isn't seen (no BeginPlay of its own, test 2026-10-25: 6 copies) is still spawned only once
+    G.execute('for _, a in ipairs(WORLD.Prefab_Settlement4_C) do a.gone = true end; for i = 1, 6 do camps.tick(5) end')
+    check(G.eval('#WORLD.Prefab_Settlement4_C') == 1, "a camp is never spawned twice in one world (%d)" % G.eval('#WORLD.Prefab_Settlement4_C'))
+    G.execute('for _, a in ipairs(WORLD.Prefab_Settlement4_C) do a.gone = nil end')
+    check(G.eval('n("Prefab_Settlement1_C")') == 1, "the empty template at the origin is not touched")
+    G.execute('JOINED = false; camp("Prefab_Settlement2_C"); for i = 1, 6 do camps.tick(5) end')
+    check(G.eval('n("Prefab_Settlement2_C")') == 1, "the guest's home world is left alone")
+    check(H.eval('n("Prefab_Settlement4_C")') == 1, "the host's world is never changed")
+
+
+PEERS_FAKES = r'''
+    LINKDIR = ...
+    os.getenv = (function(real) return function(k) if k == "LOCALAPPDATA" then return LINKDIR end return real(k) end end)(os.getenv)
+    STARTED = {}
+    package.preload["mirror.phase1"] = function(name, tag)
+        local p = { tag = tag }
+        function p.init(cfg, role, id, tags) STARTED[#STARTED + 1] = { tag = tag, role = role, id = id, out = tags.out, inn = tags.inn }; p.running = true end
+        function p.stop() p.running = false; STOPPED = (STOPPED or 0) + 1 end
+        return p
+    end
+    GHOSTS = {}
+    package.preload["mirror.ghost"] = function(name, tag)
+        local g = { tag = (tag ~= ":preload:" and tag) or "main" }
+        function g.is(o) return o ~= nil and o == GHOSTS[g.tag] end
+        function g.get() return GHOSTS[g.tag] end
+        function g.location() local o = GHOSTS[g.tag]; return o and o.loc or nil end
+        return g
+    end
+    package.preload["mirror.world"] = function() return { main_world = true } end
+    peers = require("mirror.peers")
+    function roster(lines) local f = io.open(LINKDIR .. "\\SurrounDead\\mirror_roster.txt", "wb"); f:write("v1\n" .. lines .. "END\n"); f:close() end
+'''
+
+
+def peers_give_every_player_their_own_copy():
+    print("peers_give_every_player_their_own_copy")
+    d = tempfile.mkdtemp(prefix="mirror_peers_")
+    os.makedirs(os.path.join(d, "SurrounDead"))
+    try:
+        L = lua()
+        L.execute(PEERS_FAKES, d)
+        L.execute('''
+            inst = peers._new_instance("to2", "host")
+            main_link, copy_link = require("mirror.link"), inst.require("mirror.link")
+            main_link.configure({ transport = "file" }); copy_link.configure({ transport = "file" })
+            main_link.open("host"); copy_link.open("host", "1003", { out = "to2", inn = "from2" })
+            main_link.put_blob("look", "main"); copy_link.put_blob("look", "copy")
+        ''')
+        check(L.eval('main_link ~= copy_link and copy_link.tags().out == "to2"'), "a copy gets its own link module")
+        read = lambda n: open(os.path.join(d, "SurrounDead", n), encoding="utf-8").read() if os.path.exists(os.path.join(d, "SurrounDead", n)) else None
+        check((read("mirror_look_host.txt") or "").startswith("main") and (read("mirror_look_to2.txt") or "").startswith("copy"),
+              "the copy writes to<slot> files, the main link keeps the two-player names")
+        check(L.eval('inst.require("mirror.util") == require("mirror.util")'), "shared helpers (util) are the same module")
+        check(L.eval('inst.require("mirror.events") ~= require("mirror.events")'), "per-player state (events) is a copy")
+        check(L.eval('debug.getinfo(inst.require("mirror.events").new, "S").short_src:sub(-4) == "#to2"'),
+              "a copy's chunk name ends with its tag, so call-site keyed hook/tick slots stay apart")
+        check(L.eval('copy_link.bridge_cmd("stop") == false'), "only the main link may command the bridge")
+        L.execute('mate = peers._new_instance("to1", "mate")')
+        check(L.eval('mate.require("mirror.world") == require("mirror.world")'), "a mate copy uses the host link's world modules")
+        check(L.eval('mate.require("mirror.link") ~= require("mirror.link") and mate.require("mirror.link") ~= copy_link'),
+              "but has its own link")
+        check(L.eval('inst.require("mirror.log") ~= require("mirror.log")'), "a copy's log lines carry its tag")
+
+        # the bridge's player list starts the copies
+        L.execute('''
+            peers.start({}, "host")
+            roster("me 0 1001 host\\npeer host guest 1 1002 connected Ann\\npeer to2 from2 2 1003 connected Bob\\npeer to3 from3 3 1004 connecting Cid\\n")
+            peers.tick(1.1)
+        ''')
+        check(L.eval('#STARTED') == 2, "host: two copies started for guests 2 and 3, guest 1 uses the normal modules (%d)" % L.eval('#STARTED'))
+        check(L.eval('STARTED[1].out == "to2" and STARTED[1].inn == "from2" and STARTED[1].role == "host" and STARTED[1].id == "1003"'),
+              "copy for slot 2: host role, its tags and id")
+        L.execute('peers.tick(1.1); peers.tick(1.1)')
+        check(L.eval('#STARTED') == 2, "an unchanged list starts nothing again")
+        L.execute('roster("me 0 1001 host\\npeer host guest 1 1002 connected Ann\\npeer to2 from2 2 1009 connected Dan\\npeer to3 from3 3 1004 connecting Cid\\n"); peers.tick(1.1)')
+        check(L.eval('#STARTED') == 3 and L.eval('STARTED[3].id') == "1009", "a new player in slot 2 restarts that copy for them")
+        L.execute('STOPPED = 0; roster("me 0 1001 host\\npeer host guest 1 1002 connected Ann\\npeer to2 from2 2 1009 silent Dan\\n"); peers.tick(1.1)')
+        check(L.eval('STOPPED') == 2, "players who left or went silent: their copies stop (%s)" % L.eval('STOPPED'))
+        L.execute('roster("me 0 1001 host\\npeer host guest 1 1002 connected Ann\\npeer to2 from2 2 1009 connected Dan\\npeer to3 from3 3 1004 connecting Cid\\n"); peers.tick(1.1)')
+        check(L.eval('#STARTED') == 5 and L.eval('STARTED[4].id') == "1009", "and start again when they're back")
+        L.execute('STOPPED = 0')
+        L.execute('peers.stop(); STARTED = {}; peers.start({}, "guest"); roster("me 2 1003 guest\\npeer guest host 0 1001 connected Host\\npeer to1 from1 1 1002 connected Ann\\n"); peers.tick(1.1)')
+        check(L.eval('STOPPED') == 2, "stop stops every copy")
+        check(L.eval('#STARTED') == 1 and L.eval('STARTED[1].role') == "mate" and L.eval('STARTED[1].out') == "to1",
+              "guest: a mate copy for the other guest, none for the host link")
+
+        # ghosts of every copy count
+        L.execute('''
+            peers.stop(); STARTED = {}; peers.start({}, "host")
+            roster("me 0 1001 host\\npeer host guest 1 1002 connected Ann\\npeer to2 from2 2 1003 connected Bob\\n"); peers.tick(1.1)
+            local i2 = peers.instances()[1]
+            i2.require("mirror.ghost")
+            GHOSTS.main = { loc = { X = 0, Y = 0, Z = 0 } }
+            GHOSTS.to2 = { loc = { X = 5000, Y = 0, Z = 0 } }
+        ''')
+        check(L.eval('peers.is_ghost(GHOSTS.main) and peers.is_ghost(GHOSTS.to2) and not peers.is_ghost({})'),
+              "is_ghost knows every player's ghost")
+        check(L.eval('#peers.ghost_list()') == 2, "ghost_list has both")
+        check(L.eval('#peers.ghost_locations(require("mirror.ghost"))') == 1, "ghost_locations leaves out the asking copy's own")
+        check(L.eval('peers.ghost_nearest(require("mirror.ghost"), {X=0,Y=0,Z=0}, {X=9000,Y=0,Z=0}, {X=100,Y=0,Z=0})') is True,
+              "nearest: my ghost is the nearest player")
+        check(L.eval('peers.ghost_nearest(require("mirror.ghost"), {X=0,Y=0,Z=0}, {X=9000,Y=0,Z=0}, {X=4900,Y=0,Z=0})') is False,
+              "not when another guest's ghost is nearer")
+
+        # relay: every other copy, never back to the sender, no loops
+        L.execute('''
+            package.preload["mirror.relaytest"] = function(name, tag)
+                local m = { tag = (tag ~= ":preload:" and tag) or "main", got = {} }
+                function m.relay_send(p) m.got[#m.got + 1] = p; peers.relay("mirror.relaytest", m, function(o) o.relay_send("again " .. p) end) end
+                return m
+            end
+            package.loaded["mirror.relaytest"] = package.preload["mirror.relaytest"]("mirror.relaytest")
+            local i2 = peers.instances()[1]
+            r2 = i2.require("mirror.relaytest")
+            peers.relay("mirror.relaytest", require("mirror.relaytest"), function(o) o.relay_send("P x") end)
+        ''')
+        check(L.eval('#r2.got') == 1 and L.eval('r2.got[1]') == "P x" and L.eval('#require("mirror.relaytest").got') == 0,
+              "relay reaches the other copies once, not the sender, and doesn't loop")
+        L.execute('peers.stop(); peers.start({}, "guest"); r2.got = {}; peers.relay("mirror.relaytest", nil, function(o) o.relay_send("G") end)')
+        check(L.eval('#r2.got') == 0, "only the host relays")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def chat_and_voice_reach_every_player():
+    print("chat_and_voice_reach_every_player")
+    d = tempfile.mkdtemp(prefix="mirror_peers2_")
+    os.makedirs(os.path.join(d, "SurrounDead"))
+    try:
+        L = lua()
+        L.execute(PEERS_FAKES, d)
+        L.execute('''
+            package.loaded["mirror.notify"] = { show = function() end }
+            package.preload["mirror.events"] = function(name, tag)
+                local e = {}
+                CH = CH or {}
+                function e.new(n)
+                    local ch = { name = n, out = {}, inb = {}, send = function(self, p) self.out[#self.out + 1] = p end,
+                        pump = function(self, fn) for _, p in ipairs(self.inb) do fn(p) end; self.inb = {} end }
+                    CH[(tag or "main") .. ":" .. n] = ch
+                    return ch
+                end
+                e.reliable = e.new
+                return e
+            end
+            package.loaded["mirror.events"] = package.preload["mirror.events"]("mirror.events")
+            package.loaded["mirror.teleport"] = { command = function() return true end }
+            peers.start({}, "host")
+            roster("me 0 1001 host\\npeer host guest 1 1002 connected Ann\\npeer to2 from2 2 1003 connected Bob\\n"); peers.tick(1.1)
+            i2 = peers.instances()[1]
+            c1, c2 = require("mirror.chat"), i2.require("mirror.chat")
+            -- the copy's link answers peer_name for its player
+            i2.require("mirror.link").peer_name = function() return "Bob" end
+        ''')
+        L.execute('c1.send("hello all")')
+        check(L.eval('#c1.recent(5)') == 1, "my line is in the history once")
+        check(L.eval('c1 ~= c2'), "each player's link has its own chat channel")
+        check(L.eval('c2.recent(5)[1].text') == "hello all", "and they share one history")
+        check(L.eval('CH["main:chat"].out[1]') == "hello all" and L.eval('CH["to2:chat"].out[1]') == "hello all",
+              "a line typed once goes to every player's link")
+        L.execute('CH["to2:chat"].inb = { "hi from Bob" }; c2.tick()')
+        check(L.eval('c1.recent(5)[2].who') == "Bob" and L.eval('c1.recent(5)[2].text') == "hi from Bob",
+              "a line from guest 2 shows in the one history with their name")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+for t in (group_split_host_decides_follow_and_ignores_followers, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, tactical_reads_only_lights_the_class_has,
           vehicles_keep_this_worlds_fuel, harvest_uses_up_nodes_once, zombie_copies_take_the_hosts_look,
           copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
-          ghost_swims_without_its_own_water_detection, audio_spatializes_and_shares_without_echo,
+          ghost_swims_without_its_own_water_detection, ghost_never_blocks_cars, audio_spatializes_and_shares_without_echo,
           throws_and_mines_reach_the_other_game, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, loose_magazine_picked_up_without_hooks_still_gets_its_rounds, ground_weapon_attachments_reach_the_other_game, ghost_gun_in_hand_is_known, missing_zombie_looks_get_loaded,
           random_and_debug_weather_is_shared,
           trader_stock_is_the_hosts, instances_walk_once_then_follow_beginplay,
           link_reads_only_blobs_the_index_says_changed, host_settled_corpses_cost_almost_nothing,
-          standing_hooks_skip_the_lookup, container_items_keep_their_cell_and_rotation, loot_skips_containers_gone_since_listed, bags_are_never_consumed_and_twin_grids_are_counted,
+          standing_hooks_skip_the_lookup, hook_lookups_share_one_budget, find_remembers_misses, container_items_keep_their_cell_and_rotation, loot_skips_containers_gone_since_listed, bags_are_never_consumed_and_twin_grids_are_counted,
           load_split_switches_only_when_both_agree, load_split_hands_the_ai_to_the_guest):
     try:
         t()

@@ -18,6 +18,8 @@ local SIT = "/Game/Character/Anims/Interaction/Chr_SitInCar_Montage.Chr_SitInCar
 local CLASS_EVERY = 1.0
 
 local cfg, role, session
+-- mate: a copy for another guest (peers.lua) - only their driving/riding, the cars list and states come from the host
+local mate = false
 local cars = {}
 local alias, rev = {}, {}
 local scan_age = math.huge
@@ -34,7 +36,8 @@ local out_for = 0.0
 local wake_at = {}
 local riding = nil
 local entered_with = nil
-local ride_fix, ride_at = 0, -100.0
+local ride_fix, ride_at, ride_seat = 0, -100.0, nil
+local seated_seat = 0
 local peer_rides = nil
 local LIST_EVERY = 5.0
 local list_at, applied_at = -100.0, -100.0
@@ -42,7 +45,7 @@ local PASSES = { 3, 10, 18 }
 local host_cars, pass = nil, 0
 local stats = { moved = 0, added = 0, removed = 0, spawners = 0 }
 
-local apply_ride, seat_point, physics
+local apply_ride, seat_point, physics, seat_of, P
 local function shared() return role == "host" or (session and session.in_world()) end
 local KSL = "/Script/Engine.Default__KismetSystemLibrary"
 local function alive(a)
@@ -369,7 +372,7 @@ local function apply_list(body)
             local r = { Pitch = tonumber(pi), Yaw = tonumber(ya), Roll = tonumber(ro) }
             local c = alias[n] or cars[n]
             if alive(c) then
-                local busy = (peer and util.same(peer.car, c)) or util.same(c, driving)
+                local busy = (peer and util.same(peer.car, c)) or util.same(c, driving) or vehicles.other_drives(c)
                 if not busy then set_state(c, sc, sf, sh) end
                 local cl = transform(c)
                 if cl and util.dist(cl, l) > 100 and not busy then
@@ -394,17 +397,27 @@ local function send_drive(dt)
     local parent
     pcall(function() parent = p:GetAttachParentActor() end)
     local car = is_car(parent) and parent or nil
-    if car and peer and util.same(car, peer.car) then
+    local mine_drives = car and vehicles.peer_drives(car)
+    if car and (mine_drives or vehicles.other_drives(car)) then
+        local nm = (mine_drives and peer and peer.name) or peer_name(car)
         if not util.same(riding, car) then
-            riding, ride_fix = car, 2
-            link.put_blob("ride", "R " .. tostring(peer.name))
-            log.info("vehicles: riding along in " .. tostring(peer.name))
-            notify.show("Riding along - your friend is driving.", "info")
+            riding, ride_fix, ride_seat = car, 2, nil
+            -- got in together with someone who drives it (lower slot): no longer the driver, no "parked"
+            if util.same(driving, car) then driving, entered_with, out_for = nil, nil, 0.0 end
+            link.put_blob("ride", "R " .. tostring(nm))
+            if mine_drives then
+                log.info("vehicles: riding along in " .. tostring(nm))
+                notify.show("Riding along - your friend is driving.", "info")
+            end
         end
-        if ride_fix > 0 and now - ride_at > 0.4 then
-            ride_fix, ride_at = ride_fix - 1, now
-            local pt = seat_point(car, true)
-            if pt then pcall(function() p:K2_SetActorLocation(pt, false, {}, true) end) end
+        if mine_drives then
+            local s = seat_of(nm, P().my_slot())
+            if s ~= ride_seat then ride_seat, ride_fix = s, 2 end
+            if ride_fix > 0 and now - ride_at > 0.4 then
+                ride_fix, ride_at = ride_fix - 1, now
+                local pt = seat_point(car, s)
+                if pt then pcall(function() p:K2_SetActorLocation(pt, false, {}, true) end) end
+            end
         end
         return
     elseif riding then
@@ -479,32 +492,65 @@ function vehicles.drive_line()
     return line
 end
 
-seat_point = function(car, passenger)
+-- Seats: 0 driver (the car's PlayerLocation), 1 front passenger (mirrored across the car), 2 and 3 the
+-- seats behind them. The game has only the driver's seat; the others are spots the mod puts people in.
+local REAR = 95
+seat_point = function(car, seat)
+    seat = (seat == true and 1) or tonumber(seat) or 0
     local pt
     pcall(function()
         local t = car.PlayerLocation:K2_GetComponentToWorld()
         pt = { X = t.Translation.X, Y = t.Translation.Y, Z = t.Translation.Z }
-        if passenger then
+        if seat % 2 == 1 then
             local c, rv = car:K2_GetActorLocation(), car:GetActorRightVector()
             local d = (pt.X - c.X) * rv.X + (pt.Y - c.Y) * rv.Y + (pt.Z - c.Z) * rv.Z
             pt = { X = pt.X - 2 * d * rv.X, Y = pt.Y - 2 * d * rv.Y, Z = pt.Z - 2 * d * rv.Z }
+        end
+        if seat >= 2 then
+            local fv = car:GetActorForwardVector()
+            pt = { X = pt.X - REAR * fv.X, Y = pt.Y - REAR * fv.Y, Z = pt.Z - REAR * fv.Z }
         end
     end)
     return pt
 end
 
-local function seat_ghost(car, passenger)
+local peers_mod
+P = function() peers_mod = peers_mod or require("mirror.peers"); return peers_mod end
+-- slot (host 0, guests 1-3) of the player this copy shows
+function vehicles.player_slot() local t = link.tags(); return P().slot_of(t and t.out) end
+-- name of the car this copy's player rides along in (nil = none)
+function vehicles.rides_in() return peer_rides end
+
+-- Passenger seat (1-3) of the player in `slot` riding car n: the riders in slot order, the same on every game.
+seat_of = function(n, slot)
+    local set, order = {}, {}
+    local function add(s) if s and not set[s] then set[s] = true; order[#order + 1] = s end end
+    if riding and peer_name(riding) == n then add(P().my_slot()) end
+    P().each("mirror.vehicles", function(m)
+        if m.rides_in and m.rides_in() == n then add(m.player_slot()) end
+    end)
+    add(slot)
+    table.sort(order)
+    for i, s in ipairs(order) do if s == slot then return math.min(i, 3) end end
+    return 1
+end
+
+local function seat_ghost(car, seat)
     local g = ghost.get()
     if not (g and alive(car)) then return end
-    local pt = seat_point(car, passenger)
-    if pt then pcall(function() g:K2_SetActorLocationAndRotation(pt, car:K2_GetActorRotation(), false, {}, true) end) end
+    seat = (seat == true and 1) or tonumber(seat) or 0
+    -- moving seats: off the old one first
+    if seated then pcall(function() g:K2_DetachFromActor(1, 1, 1) end) end
+    -- collision off before the move: a body put into the seat with collision on pushes the car away
     pcall(function() g:SetActorEnableCollision(false) end)
+    local pt = seat_point(car, seat)
+    if pt then pcall(function() g:K2_SetActorLocationAndRotation(pt, car:K2_GetActorRotation(), false, {}, true) end) end
     pcall(function() g.CharacterMovement:SetMovementMode(0, 0) end)
     pcall(function() g:K2_AttachToActor(car, FName("None"), 1, 1, 1, true) end)
     local m = StaticFindObject(SIT)
     if util.valid(m) then pcall(function() g:PlayAnimMontage(m, 1.0, FName("None")) end) end
     ghost.set_seated(true)
-    seated, seated_as = true, passenger and "passenger" or "driver"
+    seated, seated_as, seated_seat = true, seat > 0 and "passenger" or "driver", seat
 end
 local function unseat_ghost()
     if not seated then return end
@@ -586,10 +632,16 @@ local function apply_drive(body)
     local ts0 = nums[12]
     if parked[n] and ts0 and ts0 <= parked[n] then return end
     local mine = driving and car_named(n)
-    if mine and util.same(mine, driving) then return end
+    if mine and util.same(mine, driving) then
+        -- we both got into this car: the lower slot drives, the other rides along (send_drive switches)
+        if vehicles.player_slot() > P().my_slot() then return end
+        log.info("vehicles: " .. link.peer_name() .. " got into " .. n .. " too - they drive, I ride along")
+    end
     if peer and peer.name ~= n then release_peer_car() end
     if not peer then
         local c = car_named(n)
+        -- a third player's game: two others in this car - the lower slot's copy follows it
+        if c and vehicles.other_drives(c, vehicles.player_slot()) then return end
         if not c then
             local cp = rest:match("(/%S+)$")
             if cp and not made_for_drive[n] then
@@ -676,8 +728,13 @@ apply_ride = function(body)
     end
     local c = car_named(n)
     if not c then return end
+    if peer and peer.name == n then
+        -- they were driving it and now ride along (someone with a lower slot got in): the driver's copy
+        -- follows the car from now on - let go of it without parking it
+        unseat_ghost(); peer = nil
+    end
     peer_rides = n
-    seat_ghost(c, true)
+    seat_ghost(c, seat_of(n, vehicles.player_slot()))
     log.info("vehicles: the other player rides along in " .. n)
 end
 
@@ -828,8 +885,23 @@ function vehicles.tick(dt)
     local d = link.get_blob("drive")
     if d then util.safe(apply_drive, "vehicles.drive", d) end
     util.safe(follow, "vehicles.follow", dt)
+    if mate then
+        util.safe(follow, "vehicles.follow", dt)
+        local g = ghost.get()
+        if g and seated and peer_rides and not peer then
+            -- someone else got in or out: riders keep their slot order
+            local c, want = car_named(peer_rides), seat_of(peer_rides, vehicles.player_slot())
+            if c and want ~= seated_seat then seat_ghost(c, want) end
+        end
+        if not g and seated then seated, seated_as = false, nil; ghost.set_seated(false)
+        elseif g and not seated then
+            if peer and alive(peer.car) then seat_ghost(peer.car, false)
+            elseif peer_rides then local c = car_named(peer_rides); if c then seat_ghost(c, seat_of(peer_rides, vehicles.player_slot())) end end
+        end
+        return
+    end
     local function busy(c)
-        return util.same(c, driving) or (peer and (util.same(c, peer.car) or (peer.tow and util.same(c, peer.tow.car)))) or false
+        return util.same(c, driving) or vehicles.peer_drives(c) or vehicles.other_drives(c)
     end
     if ghost.get() then util.safe(watch_states, "vehicles.states", dt, busy) end
     local cs = link.get_blob("carstate")
@@ -843,11 +915,32 @@ function vehicles.tick(dt)
         end
     end
     local g = ghost.get()
+    if g and seated and peer_rides and not peer then
+        -- someone else got in or out: riders keep their slot order
+        local c, want = car_named(peer_rides), seat_of(peer_rides, vehicles.player_slot())
+        if c and want ~= seated_seat then seat_ghost(c, want) end
+    end
     if not g and seated then seated, seated_as = false, nil; ghost.set_seated(false)
     elseif g and not seated then
         if peer and alive(peer.car) then seat_ghost(peer.car, false)
-        elseif peer_rides then local c = car_named(peer_rides); if c then seat_ghost(c, true) end end
+        elseif peer_rides then local c = car_named(peer_rides); if c then seat_ghost(c, seat_of(peer_rides, vehicles.player_slot())) end end
     end
+end
+
+-- Is the player of this copy driving (or towing) car c?
+function vehicles.peer_drives(c)
+    return (peer and (util.same(c, peer.car) or (peer.tow and util.same(c, peer.tow.car)))) or false
+end
+
+-- 4 players: is another player's copy of this module driving car c? (its moves come from them, not the host's list)
+-- below_slot: only copies whose player has a lower slot count
+function vehicles.other_drives(c, below_slot)
+    local hit = false
+    P().each("mirror.vehicles", function(m)
+        if not hit and m ~= vehicles and m.peer_drives and m.peer_drives(c)
+                and (not below_slot or m.player_slot() < below_slot) then hit = true end
+    end)
+    return hit
 end
 
 -- Why a player can't be teleported right now (nil = not in or towing a car).
@@ -874,8 +967,8 @@ local function forget_world()
     state_keys, state_idx = {}, 0
 end
 
-function vehicles.init(c, r, s)
-    cfg, role, session = c, r, s
+function vehicles.init(c, r, s, is_mate)
+    cfg, role, session, mate = c, r, s, is_mate == true
     game.on_world_reset(forget_world)
 end
 

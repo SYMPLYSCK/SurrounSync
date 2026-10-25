@@ -217,11 +217,26 @@ namespace SurrounSyncSetup
                 if (IsLink(target)) Log("Mods\\SurrounSync is a developer link - left as it is.");
                 else
                 {
-                    if (Directory.Exists(target)) DeleteDir(target);
-                    Extract(z, ModPath, target, null);
+                    // staged: the new mod is unpacked next to Mods first and swapped in whole, so a file still
+                    // in use (the bridge exits a few seconds after the game) can't leave a half-deleted mod
+                    StopBridges(target);
+                    string fresh = Path.Combine(ue, "SurrounSync.new"), prev = Path.Combine(ue, "SurrounSync.old");
+                    if (Directory.Exists(fresh)) DeleteDir(fresh);
+                    if (Directory.Exists(prev)) DeleteDir(prev);
+                    Extract(z, ModPath, fresh, null);
                     // bug reports compare this with the game's build (game update after this release?)
-                    try { string mb = PayloadText("made_for_build.txt"); if (!string.IsNullOrEmpty(mb)) File.WriteAllText(Path.Combine(target, "made_for_build.txt"), mb.Trim()); }
+                    try { string mb = PayloadText("made_for_build.txt"); if (!string.IsNullOrEmpty(mb)) File.WriteAllText(Path.Combine(fresh, "made_for_build.txt"), mb.Trim()); }
                     catch { }
+                    try { Directory.SetCurrentDirectory(Path.GetTempPath()); } catch { }
+                    if (Directory.Exists(target)) MoveDir(target, prev);
+                    try { MoveDir(fresh, target); }
+                    catch
+                    {
+                        if (Directory.Exists(prev) && !Directory.Exists(target)) MoveDir(prev, target);
+                        throw;
+                    }
+                    try { if (Directory.Exists(prev)) DeleteDir(prev); }
+                    catch (Exception ex) { Log("Note: couldn't remove the old copy " + prev + " (" + ex.Message + ") - it is removed next time."); }
                     Log("Installed SurrounSync " + (ThisVersion() ?? "") + ".");
                 }
                 EnableMod(mods, "SurrounSync");
@@ -440,6 +455,38 @@ namespace SurrounSyncSetup
             {
                 try { foreach (var f in Directory.GetFiles(d, "*", SearchOption.AllDirectories)) File.SetAttributes(f, FileAttributes.Normal); Directory.Delete(d, true); return; }
                 catch (IOException) { if (i >= 5) throw; Thread.Sleep(400); }
+            }
+        }
+        static void MoveDir(string from, string to)
+        {
+            for (int i = 0; ; i++)
+            {
+                try { Directory.Move(from, to); return; }
+                catch (IOException) { if (i >= 10) throw; Thread.Sleep(500); }
+                catch (UnauthorizedAccessException) { if (i >= 10) throw; Thread.Sleep(500); }
+            }
+        }
+        // The bridge runs from Mods\SurrounSyncridge and exits ~10 s after the game: wait for it, then end it.
+        void StopBridges(string modDir)
+        {
+            string root = Path.GetFullPath(modDir).TrimEnd('\\') + "\\";
+            for (int waited = 0; ; waited += 500)
+            {
+                var mine = new List<Process>();
+                foreach (var p in Process.GetProcessesByName("SurrounSyncBridge"))
+                {
+                    string path = null;
+                    try { path = p.MainModule.FileName; } catch { }
+                    if (path == null || path.StartsWith(root, StringComparison.OrdinalIgnoreCase)) mine.Add(p);
+                }
+                if (mine.Count == 0) return;
+                if (waited >= 20000)
+                {
+                    foreach (var p in mine) { try { p.Kill(); p.WaitForExit(5000); } catch { } }
+                    Log("Closed the old Steam connector (it was still running).");
+                    return;
+                }
+                Thread.Sleep(500);
             }
         }
         static void TryDelete(string f) { try { if (File.Exists(f)) { File.SetAttributes(f, FileAttributes.Normal); File.Delete(f); } } catch { } }

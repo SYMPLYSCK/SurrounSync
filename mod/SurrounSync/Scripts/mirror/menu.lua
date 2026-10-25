@@ -119,8 +119,10 @@ local function stopping_tick(dt)
     if stopping.t < 1.5 then return end
     if guest_in then log.warn("menu: stop hosting - the guest didn't leave within 15 s (unreachable?) - stopping anyway") end
     p1().stop()
+    session.forget_hosted()
+    local why = stopping.why
     stopping = nil
-    notify.show("You stopped hosting. Your world is saved.", "good")
+    notify.show(why or "You stopped hosting. Your world is saved.", why and "info" or "good")
 end
 
 local function leave()
@@ -139,18 +141,32 @@ local function copy_code(code)
         ("Your friend code: " .. code), "good")
 end
 
+-- "Ann, Bob (connecting)" - every other player the bridge knows (up to three guests)
+local function players_text(l, only_guests)
+    local out = {}
+    for _, p in ipairs((l and l.players) or {}) do
+        if not (only_guests and p.slot == 0) then
+            out[#out + 1] = p.name .. (p.state == "connecting" and " (connecting)" or p.state == "lost" and " (no signal)" or "")
+        end
+    end
+    if #out == 0 and l and l.peer then out[1] = l.peer.name .. (l.peer.connected and "" or " (connecting)") end
+    return #out > 0 and table.concat(out, ", ") or nil
+end
+
 local function status_text()
     local r, l = my_role(), link.lobby()
     if not r then
         return "Not in co-op. Host so friends can join you, or join a friend below."
     end
     if r == "host" then
-        local who = l and l.peer and l.peer.name
-        return who and ("Hosting - " .. who .. (l.peer.connected and " is connected" or " is connecting"))
-            or "Hosting - waiting for a friend to join"
+        local names = players_text(l)
+        return names and ("Hosting - " .. names) or "Hosting - waiting for a friend to join"
     end
     local st = session.state()
-    if st == "joined" then return "In " .. link.peer_name() .. "'s world - Leave takes you back to yours" end
+    if st == "joined" then
+        local others = players_text(l, true)
+        return "In " .. link.peer_name() .. "'s world" .. (others and (" with " .. others) or "") .. " - Leave takes you back to yours"
+    end
     if st ~= "idle" then return "Joining " .. link.peer_name() .. "..." end
     if p1().connected() then return "Connected to " .. link.peer_name() .. " - Join enters their world" end
     return "Looking for the host..."
@@ -171,7 +187,8 @@ local function model()
         if not seen[sv.id] then
             local tags, ok = { "public", sv.players }, true
             if sv.locked then tags[#tags + 1] = "password" end
-            if sv.players == "2/2" then tags[#tags + 1] = "full"; ok = false end
+            local have, max = tostring(sv.players):match("^(%d+)/(%d+)$")
+            if have and tonumber(have) >= tonumber(max) then tags[#tags + 1] = "full"; ok = false end
             if sv.proto ~= "?" and sv.proto ~= PROTO then tags[#tags + 1] = "other version"; ok = false end
             m.hosts[#m.hosts + 1] = { id = sv.id, name = sv.name, label = sv.name .. " (" .. table.concat(tags, ", ") .. ")", joinable = ok }
         end
@@ -194,9 +211,10 @@ local function model()
     if not r then
         m.headline, m.detail = "NOT IN CO-OP", "Host a game so friends can join you, or join a friend who is hosting."
     elseif r == "host" then
-        local p = l and l.peer
-        m.headline = "HOSTING"
-        m.detail = p and (p.name .. (p.connected and " is connected." or " is connecting...")) or "Waiting for a friend to join."
+        local names = players_text(l)
+        local n = l and l.players and #l.players or (l and l.peer and 1 or 0)
+        m.headline = "HOSTING" .. (n > 0 and string.format(" (%d/%d)", n + 1, (l and l.slots or 3) + 1) or "")
+        m.detail = names and (names .. (n == 1 and " is here." or " are here.")) or "Waiting for friends to join (up to 3)."
     elseif session.state() == "joined" then
         m.headline = "IN " .. who:upper() .. "'S WORLD"
         m.detail = "Leave any time - your character goes home with everything you have."
@@ -311,6 +329,8 @@ local JOIN_ERRORS = {
     badpass = "Wrong password. Check it with the host and join again.",
     blocked = "Too many wrong passwords. The host has to host again before you can retry.",
     declined = "The host declined your request to join.",
+    full = "That game is full (four players). Try again when someone leaves.",
+    kicked = "The host removed you from their game.",
 }
 local function watch_requests()
     local l = link.lobby()
@@ -431,6 +451,12 @@ end
 menu.dev_password = set_password
 
 function menu.init(c)
+    -- the guest's things must not land in another save of mine: send it home and stop
+    session.on_host_world_change(function()
+        if my_role() ~= "host" or stopping then return end
+        stopping = { t = 0.0, why = "You loaded another save, so the co-op session ended and your friend went home." }
+        p1().say_bye()
+    end)
     cfg = c
     require("mirror.hostrules").init(my_role)
     require("mirror.itemclean").init(my_role)

@@ -73,15 +73,25 @@ local function fam_class(path)
     return nil
 end
 local applying_hit = false
+-- (cached per class address in fam_cls: up to 7 IsA per call otherwise; forgotten with the world)
 local function family_of(o)
     if not util.valid(o) then return nil end
+    local ca
+    pcall(function() ca = o:GetClass():GetAddress() end)
+    local known = ca and fam_cls[ca]
+    if known ~= nil then return known or nil end
+    local all = true
     for _, f in ipairs(FAMILIES) do
         local c = fam_class(f[2])
         if c then
             local ok, r = pcall(function() return o:IsA(c) end)
-            if ok and r == true then return f[1] end
-        end
+            if ok and r == true then
+                if ca then fam_cls[ca] = f[1] end
+                return f[1]
+            end
+        else all = false end
     end
+    if ca and all then fam_cls[ca] = false end
     return nil
 end
 local function is_zombie(o) return family_of(o) ~= nil end
@@ -138,10 +148,16 @@ local ZLIST_FULL_EVERY, ZLIST_PRUNE_EVERY = 120.0, 0.0
 local zlist, zlist_at, zlist_pruned = {}, -100, -100
 local zlist_new, zlist_set, zlist_addr = {}, {}, {}
 local notify_on = false
+-- zlist_set[a]: true = listed, false = EndPlay'd (still in zlist until the next prune), nil = not listed
 local function zlist_add(z)
     local a = util.addr(z)
-    if a and not zlist_set[a] then zlist_set[a] = true; zlist[#zlist + 1] = z; zlist_addr[#zlist] = a end
+    if not a or zlist_set[a] then return end
+    -- an ended entry at this address is this object now (UE reuses the slot): just mark it live again
+    if zlist_set[a] == nil then zlist[#zlist + 1] = z; zlist_addr[#zlist] = a end
+    zlist_set[a] = true
 end
+-- an ended zombie leaves at the next prune, before it can be freed (a freed one's wrapper still passes IsValid)
+util.on_end(function(a) if zlist_set[a] then zlist_set[a] = false end end)
 local function watch_new_zombies()
     if notify_on then return end
     notify_on = pcall(function()
@@ -192,7 +208,7 @@ local function zombies_cached(t)
             local j, n = 0, #zlist
             for i = 1, n do
                 local z, a = zlist[i], zlist_addr[i]
-                if util.valid(z) then
+                if zlist_set[a] and util.valid(z) then
                     j = j + 1; zlist[j], zlist_addr[j] = z, a
                 else
                     zlist_set[a] = nil
@@ -464,7 +480,7 @@ local function apply_hit(payload)
         zkills:send(string.format("%s %.2f", id, worth or 0))
         if fam ~= "zombie" then xp.hold_for(0.5) end
     end
-    log.info(string.format("zombies: guest hit zombie %s for %.1f%s%s - health %s -> %s, IsDead? %s",
+    log.every("zguesthit", 1.0, string.format("zombies: guest hit zombie %s for %.1f%s%s - health %s -> %s, IsDead? %s",
         id, tonumber(amt) or 0, kind == "F" and " (fire)" or "", tname, h0, h1, dead))
     if dead == "true" and cfg.diagnostics then watch_dead = { z = z, id = id, t = 1.0 } end
 end
@@ -635,6 +651,7 @@ local dress_copy, kill_copy, ragdoll
 local destroyed = {}
 local pass_in = 0.0
 local active = false
+local secondary = false
 local active_at = 0.0
 local player_cls = nil
 local warned_ignore = false
@@ -644,7 +661,16 @@ local loot_wait_logged = 0
 local spawn_budget = 0
 local spawned_class = {}
 
-function zombies.is_copy(obj) return copy_addr[util.addr(obj) or 0] ~= nil end
+-- 4 players: every copy of this module (one per other player, peers.lua) keeps its own copies; a copy made
+-- by any of them is a copy here too (never swept as "own AI", never a damage source)
+local ANY_COPIES = require("mirror.peers").shared_table("zombie_copies")
+ANY_COPIES[zombies] = copy_addr
+function zombies.is_copy(obj)
+    local a = util.addr(obj) or 0
+    if copy_addr[a] ~= nil then return true end
+    for _, t in pairs(ANY_COPIES) do if t[a] ~= nil then return true end end
+    return false
+end
 
 function zombies.nearest_copy(loc, r)
     local best, bd = nil, r or 150
@@ -1310,9 +1336,9 @@ local function guest_tick(dt)
     end
     if not active then return end
     local busy = now - active_at < 20 or require("mirror.save_guard").busy()
-    util.safe(loader.tick, "zombies.loader", dt, busy)
+    if not secondary then util.safe(loader.tick, "zombies.loader", dt, busy) end
     pass_in = pass_in - dt
-    if pass_in <= 0 then perf.run("z.pass", function()
+    if pass_in <= 0 and not secondary then perf.run("z.pass", function()
         pass_in = 2.0
         local ok, missing = loot_ready()
         loot_ok = ok
@@ -1328,7 +1354,7 @@ local function guest_tick(dt)
         install_hit_hooks()
         hook_archetypes()
     end) end
-    if not p8.on then perf.run("z.read", read_snapshot) end
+    if not (p8.on or p8.follow) then perf.run("z.read", read_snapshot) end
     perf.run("z.drive", drive, dt)
 end
 
@@ -1373,6 +1399,26 @@ function zombies.set_split(on)
 end
 
 function zombies.is_split() return p8.on end
+
+-- 4 players, group split (split.lua / group.lua): this guest follows another guest who runs the AI around both;
+-- the host sends no zombies here, its copies go, own AI is still removed (the leader's copies come instead).
+function zombies.set_follow(on)
+    on = on == true
+    if on == (p8.follow == true) then return end
+    p8.follow = on
+    if on and role ~= "host" then destroy_all_copies("your group's leader runs the AI here") end
+end
+function zombies.is_follow() return p8.follow == true end
+
+-- A copy of this module for another player (group.lua): only runs while the group is on.
+local gate = true
+function zombies.set_gate(on)
+    on = on == true
+    if on == gate then return end
+    gate = on
+    if not on and role ~= "host" then destroy_all_copies("group split ended") end
+    if not on and role == "host" then ids, by_id, statics = {}, {}, {} end
+end
 function zombies.guest_busy() return p8.fighting end
 -- Host: distance from the guest to the nearest host AI the last snapshot found (math.huge = none in range), and its age.
 function zombies.near_guest() return p8.near.d, now - p8.near.at end
@@ -1569,7 +1615,7 @@ end
 zombies._rad = rad
 
 function zombies.tick(dt)
-    if not (cfg and cfg.zombies.enabled) then return end
+    if not (cfg and cfg.zombies.enabled) or not gate then return end
     if role ~= "host" then util.safe(rad.watch, "zombies.watch_rad", dt) end
     now = now + dt
     util.safe(selftest_tick, "zombies.selftest", dt)
@@ -1614,7 +1660,7 @@ apply_zhit = function(payload)
     replaying = false
     zhit_stats.played = zhit_stats.played + 1
     if not ok then log.warn("zombies: replaying a host hit failed: " .. tostring(err))
-    else log.info(string.format("zombies: host hit on zombie %s replayed on its copy (%s)", id, amt)) end
+    else log.every("zreplay", 1.0, string.format("zombies: host hit on zombie %s replayed on its copy (%s)", id, amt)) end
 end
 
 apply_med = function(payload)
@@ -1797,14 +1843,17 @@ local function forget_world()
     ids, by_id, statics, watch_dead = {}, {}, {}, nil
     zlist, zlist_set, zlist_addr, zlist_new, zlist_at, zlist_pruned = {}, {}, {}, {}, -100, -100
     copies, copy_addr, destroyed, volumes_stopped, xlooks = {}, {}, {}, {}, {}
-    p8.on, p8.fighting, p8.drain, p8.stopped = false, false, {}, {}
+    ANY_COPIES[zombies] = copy_addr
+    p8.on, p8.fighting, p8.drain, p8.stopped, p8.follow = false, false, {}, {}, false
     arch_seen, arch_seen_n = {}, 0
     rad.comp, rad.seen, rad.retry = nil, nil, 0
     cache, missed, appeared, loot_obj, fam_cls, fam_retry, player_cls = {}, {}, {}, {}, {}, {}, nil
 end
 
-function zombies.init(c, r, s)
+-- opts.secondary: a copy for another player (group.lua) - the main copy does the sweeps, spawners and loading
+function zombies.init(c, r, s, opts)
     cfg, role, session = c, r, s
+    secondary = opts and opts.secondary or false
     game.on_world_reset(forget_world)
     util.safe(watch_new_zombies, "zombies.watch")
     game.keybind("F12", { ModifierKey.CONTROL }, function() want_steamtest = true end)
@@ -1862,7 +1911,7 @@ function zombies.init(c, r, s)
             if amt > 0 then
                 zhits:send(string.format("%d %.3f %s", id, amt, cls))
                 zhit_stats.sent = zhit_stats.sent + 1
-                log.info(string.format("zombies: my hit on zombie %d (%.0f, %s) -> guest", id, amt, cls:match("([%w_]+)$") or cls))
+                log.every("zmyhit", 1.0, string.format("zombies: my hit on zombie %d (%.0f, %s) -> guest", id, amt, cls:match("([%w_]+)$") or cls))
             end
         end
         install_host_hooks = function() util.ensure_hook(DC .. ":DamageTaken", on_host_damage) end

@@ -18,14 +18,7 @@ local C_INDEX = "ContainerIndex_22_9A211B86466A9D1C57E1FC839A5B0896"
 local SLOT_INDEX = "SlotIndex_6_8ED1F34A4AF1D565616883B80192E3DD"
 local ROTATED = "Rotated_9_3CFE5D9342A81FB1FF17DEB7B491CE56"
 
-local asset_cache = {}
-function jig.asset(path)
-    local a = util.cached(asset_cache, path)
-    if a then return a end
-    a = StaticFindObject(path)
-    if util.valid(a) then asset_cache[path] = a; return a end
-    return nil
-end
+function jig.asset(path) return util.find(path) end
 
 function jig.full_path(obj)
     if not util.valid(obj) then return nil end
@@ -505,8 +498,9 @@ function jig.apply_contents(comp, want, no_add)
                     local now, at = jig.contents_of(comp), nil
                     for i, h in ipairs(now) do if h.uid == uid then at = i end end
                     for i = #now, 1, -1 do
-                        local p = now[i].parent
-                        while p and p ~= at do p = now[p].parent end
+                        local p, depth = now[i].parent, 0
+                        -- depth cap: a parent cycle (corrupt inventory / uid collision) would hang the game thread
+                        while p and p ~= at and depth < 32 do p = now[p] and now[p].parent; depth = depth + 1 end
                         if at and p == at then consume(comp, now[i]); removed = removed + 1 end
                     end
                 else
@@ -697,6 +691,38 @@ function jig.reduce_item(comp, da, left)
         end
     end
     return taken
+end
+
+-- Game-patch check: the inventory struct members and functions item sync relies on.
+-- Returns the names that are gone (empty = fine). Item members are checked only if the inventory holds an item.
+local JIG_CLASS = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
+local PROBE_FNS = { "AddNewItemToSlot", "RemoveGetInfo", "HandleNewItemAdded", "ClientUpdateCount", "InitializeJigComponent" }
+function jig.probe(comp)
+    local missing = {}
+    local function has(t, k)
+        local ok, v = pcall(function() return t[k] end)
+        if not ok or v == nil then missing[#missing + 1] = k; return nil end
+        return v
+    end
+    for _, f in ipairs(PROBE_FNS) do
+        if not util.find(JIG_CLASS .. ":" .. f) then missing[#missing + 1] = f end
+    end
+    local conts = has(comp, "MainJigContainers")
+    local first, item
+    if conts then pcall(function() conts:ForEach(function(_, c) first = first or c:get() end) end) end
+    if first then
+        has(first, C_REPUID); has(first, C_IN); has(first, C_INDEX)
+        local items = has(first, ITEMS)
+        if items then pcall(function() conts:ForEach(function(_, c)
+            if not item then c:get()[ITEMS]:ForEach(function(_, el) item = item or el:get() end) end
+        end) end) end
+    end
+    if item then
+        has(item, UID); has(item, SLOT_INDEX); has(item, ROTATED)
+        local info = has(item, INFO)
+        if info then has(info, ITEM_ID); has(info, COUNT); has(info, DURABILITY) end
+    end
+    return missing
 end
 
 return jig

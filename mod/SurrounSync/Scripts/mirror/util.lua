@@ -120,13 +120,23 @@ local function nearest_of(list, gx, gy, gz, near)
     return best
 end
 
+-- id -> the object found for it last time (a walk is 30-40 ms; events for one container come in runs)
+local by_id, id_of_addr = {}, {}
+local function forget_ids() by_id, id_of_addr = {}, {} end
 function util.find_by_id(id, near)
     local cls, gx, gy, gz = id:match("^([^@]+)@(%-?%d+),(%-?%d+),(%-?%d+)$")
     if not cls then return nil end
     gx, gy, gz = tonumber(gx) * 10, tonumber(gy) * 10, tonumber(gz) * 10
+    local c = by_id[id]
+    if c then
+        if util.addr(c.o) == c.a and util.class_name(c.o) == cls and nearest_of({ c.o }, gx, gy, gz, near) then return c.o end
+        by_id[id], id_of_addr[c.a] = nil, nil
+    end
     local list, age = util.all_of(cls)
     local best = nearest_of(list, gx, gy, gz, near)
     if not best and age > 0.5 then best = nearest_of(util.all_of(cls, 0), gx, gy, gz, near) end
+    local a = best and util.addr(best)
+    if a then by_id[id], id_of_addr[a] = { o = best, a = a }, id end
     return best
 end
 
@@ -191,17 +201,22 @@ local hooked_fn = {}
 local hooked_obj = {}   -- hk -> the UFunction we hooked
 local next_check = {}
 local backoff = {}
-local RECHECK, LOOKUPS_PER_FRAME, MAX_BACKOFF = 15.0, 1, 60
-local lookups, lookup_frame, frame_no = 0, -1, 0
+-- One budget for ALL hook lookups (first ones too): ~160 hook paths looked up in one frame froze the game
+-- 0.7-1.2 s at co-op start and after every join/leave load. A lookup runs while this frame's lookups took
+-- under LOOKUP_MS (at least one per frame). A miss is shared by every function of that class: while
+-- the class isn't loaded, its other functions skip their lookup too (each miss ~15 ms) - unless one of
+-- them was found since the world load (then the class is there and only that function is missing).
+local RECHECK, LOOKUP_MS, MAX_BACKOFF = 15.0, 2.0, 60   -- 60: a class that loads later (a placed beacon) gets hooked within a minute
+local lookup_ms, lookup_frame, frame_no = 0, -1, 0
 local lookup_count = {}
-function util.recheck_hooks() next_check, backoff = {}, {} end
+local class_miss, class_hit = {}, {}
+function util.recheck_hooks() next_check, backoff, class_miss, class_hit = {}, {}, {}, {} end
 function util.new_frame() frame_no = frame_no + 1 end
-function util.ensure_hook(path, pre, post)
+-- urgent: look it up now, outside the budget (a hook that must stand before the next level load)
+function util.ensure_hook(path, pre, post, urgent)
     local t = os.clock()
     local hk = path .. "|" .. tostring(pre)
     if next_check[hk] and t < next_check[hk] then return hooked_fn[hk] ~= nil end
-    if lookup_frame ~= frame_no then lookup_frame, lookups = frame_no, 0 end
-    if lookups >= LOOKUPS_PER_FRAME and next_check[hk] then return hooked_fn[hk] ~= nil end
     -- StaticFindObject costs ~1.7 ms (a miss ~15 ms, measured in-game): while the function we hooked
     -- is still the live object of that name the hook stands - only a gone/replaced one needs a lookup
     local held = hooked_obj[hk]
@@ -210,14 +225,21 @@ function util.ensure_hook(path, pre, post)
         pcall(function() same = held:GetFName():ToString() == path:match("([^:]+)$") end)
         if same then next_check[hk] = t + RECHECK; return true end
     end
-    lookups = lookups + 1
+    local cls = path:match("^(.-):[^:]+$") or path
+    local cm = class_miss[cls]
+    if cm and t < cm and not urgent then return hooked_fn[hk] ~= nil end
+    if lookup_frame ~= frame_no then lookup_frame, lookup_ms = frame_no, 0 end
+    if lookup_ms >= LOOKUP_MS and not urgent then return hooked_fn[hk] ~= nil end
     lookup_count[path] = (lookup_count[path] or 0) + 1
     local fn = StaticFindObject(path)
+    lookup_ms = lookup_ms + (os.clock() - t) * 1000
     if not util.valid(fn) then
         backoff[hk] = math.min((backoff[hk] or 1) * 2, MAX_BACKOFF)
         next_check[hk] = t + backoff[hk]
+        if not class_hit[cls] then class_miss[cls] = math.max(class_miss[cls] or 0, next_check[hk]) end
         return false
     end
+    class_hit[cls], class_miss[cls] = true, nil
     backoff[hk] = nil
     next_check[hk] = t + RECHECK
     local a = util.addr(fn)
@@ -236,6 +258,31 @@ end
 local TRACK_HOOKED, TRACK_UNHOOKED, TRACK_NO_HOOK, TRACK_GAP = 1800.0, 60.0, 300.0, 5.0
 local tracked, track_hooks = {}, {}
 local track_frame, track_rewalk_at = -1, -100
+-- EndPlay: an ended object leaves every list at once. A freed object's slot is reused and its wrapper
+-- still passes IsValid, so a list holding it until the next prune can call into a different object.
+local end_fns, ended_n, end_hooked = {}, 0, false
+function util.on_end(fn) end_fns[#end_fns + 1] = fn end
+util.on_end(function(a)
+    local id = id_of_addr[a]
+    if id then by_id[id], id_of_addr[a] = nil, nil end
+end)
+local function on_end_play(self)
+    local o
+    pcall(function() o = self:get() end)
+    local a = util.addr(o)
+    if not a then return end
+    for _, t in pairs(tracked) do
+        if t.set[a] then t.set[a], t.gone = nil, true; ended_n = ended_n + 1 end
+    end
+    for _, fn in ipairs(end_fns) do pcall(fn, a) end
+end
+local function hook_end_play()
+    if end_hooked then return end
+    end_hooked = true
+    -- classes without their own ReceiveEndPlay run the engine's (an override is hooked per class below)
+    util.hook("/Script/Engine.Actor:ReceiveEndPlay", on_end_play, nil, true)
+    util.hook("/Script/Engine.ActorComponent:ReceiveEndPlay", on_end_play, nil, true)
+end
 local function track_add(t, o)
     local a = util.addr(o)
     if a and not t.set[a] then t.set[a] = util.class_name(o) or true; t.list[#t.list + 1] = o end
@@ -258,11 +305,18 @@ local function track_hooked(paths, clock)
             local fn = StaticFindObject(p .. ":ReceiveBeginPlay")
             local a = util.valid(fn) and util.addr(fn) or nil
             h.loaded = a ~= nil or util.valid(StaticFindObject(p))
+            -- loaded without a BeginPlay of its own: it won't get one, and each miss costs ~15 ms
+            if not a and h.loaded then h.check = clock + 30.0 end
             if not a then h.on, h.addr = false, nil
             elseif a ~= h.addr then
                 h.on = util.hook(p .. ":ReceiveBeginPlay", on_begin, nil, true) == true
                 h.addr = h.on and a or nil
-                if h.on then h.gen = (h.gen or 0) + 1 end
+                if h.on then
+                    h.gen = (h.gen or 0) + 1
+                    -- (looked up once per class load: a miss costs ~15 ms)
+                    local ef = StaticFindObject(p .. ":ReceiveEndPlay")
+                    if util.valid(ef) then util.hook(p .. ":ReceiveEndPlay", on_end_play, nil, true) end
+                end
             end
         end
         on, gen = on or h.on, gen + (h.gen or 0)
@@ -278,6 +332,7 @@ function util.instances(cls, hooks)
         tracked[cls] = t
     end
     local clock = os.clock()
+    hook_end_play()
     local loaded, gen = true, 0
     if #t.hooks > 0 then t.hooked, loaded, gen = track_hooked(t.hooks, clock) end
     if t.hooked and gen ~= t.walked_gen then t.due = 0 end   -- a hook just went in: catch what came before it
@@ -302,8 +357,8 @@ function util.instances(cls, hooks)
         t.walked, t.walked_gen = true, gen
         t.due = clock + (t.hooked and TRACK_HOOKED or #t.hooks > 0 and TRACK_UNHOOKED or TRACK_NO_HOOK)
         t.pruned = clock
-    elseif clock - t.pruned >= 1.0 then
-        t.pruned = clock
+    elseif t.gone or clock - t.pruned >= 1.0 then
+        t.pruned, t.gone = clock, nil
         -- A freed object's address can come back as a different object: keep only the same class.
         local list, set = {}, {}
         for _, o in ipairs(t.list) do
@@ -317,6 +372,7 @@ function util.instances(cls, hooks)
 end
 -- World reset: the old objects are freed - drop them untouched; every class is walked again.
 function util.instances_reset()
+    forget_ids()
     for _, t in pairs(tracked) do t.list, t.set, t.due, t.walked = {}, {}, 0, false end
 end
 function util.instances_status()
@@ -326,7 +382,7 @@ function util.instances_status()
         if t.hooked then hooked = hooked + 1 end
         if t.walked then walked = walked + 1 end
     end
-    return string.format("%d classes tracked, %d by BeginPlay, %d walked", n, hooked, walked)
+    return string.format("%d classes tracked, %d by BeginPlay, %d walked, %d ended", n, hooked, walked, ended_n)
 end
 
 function util.lookup_top(n)
@@ -369,6 +425,30 @@ function util.cached(cache, path)
     cache[path] = nil
     return nil
 end
+
+-- StaticFindObject with a positive AND a negative cache: a miss costs ~15 ms (measured in-game), and hot paths
+-- (received shots, events, item adds) asked again for the same unloaded path every time. A missing path is asked
+-- again 2 s after the miss, doubling up to 60 s; util.find_reset() (world load) forgets the misses.
+local find_cache, find_missed = {}, {}
+util.find_misses = 0
+function util.find(path)
+    if not path or path == "" or path == "-" then return nil end
+    local o = util.cached(find_cache, path)
+    if o then return o end
+    local miss = find_missed[path]
+    local now = os.clock()
+    if miss and now < miss.at then return nil end
+    o = StaticFindObject(path)
+    if util.valid(o) then
+        find_cache[path], find_missed[path] = o, nil
+        return o
+    end
+    util.find_misses = util.find_misses + 1
+    local wait = miss and math.min(miss.wait * 2, 60.0) or 2.0
+    find_missed[path] = { at = now + wait, wait = wait }
+    return nil
+end
+function util.find_reset() find_missed = {}; forget_ids() end
 
 local cdo_cache = {}
 function util.cdo(path)

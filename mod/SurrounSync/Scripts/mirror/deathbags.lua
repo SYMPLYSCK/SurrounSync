@@ -27,6 +27,7 @@ local GIVE_UP = 60.0
 local cfg, role, session
 local together = function() return false end
 local bags = events.new("dbag", 4, 900)
+local peers = require("mirror.peers")
 local takes = events.new("dbagt", 32, 300)
 local clock = 0.0
 local owners_path = nil
@@ -136,7 +137,7 @@ end
 local function on_spawn_loot(self)
     local p
     pcall(function() p = self:get() end)
-    if not p or ghost.is(p) then return end
+    if not p or require("mirror.peers").is_ghost(p) then return end
     local before = {}
     for k in pairs(sent_keys) do before[k] = true end
     local l = loc_of(p)
@@ -351,6 +352,11 @@ function deathbags.tick(dt)
         if not (stamp and together()) then return end
         local loc, rest = parse(stamp .. " " .. body)
         if loc then util.safe(function() make_copy(from .. "@" .. stamp, loc, jig.decode(rest)) end, "deathbags.copy") end
+        -- host, more than two players: the other guests get the bag too (stamped with this clock, theirs is the host's)
+        if loc then
+            local again = string.format("B %d %s %s", os.time(), from, body)
+            peers.relay("mirror.deathbags", deathbags, function(m) m.relay_bag(again) end)
+        end
     end)
     takes:pump(function(p)
         local body = p:match("^S (.*)$")
@@ -359,6 +365,8 @@ function deathbags.tick(dt)
         if loc then util.safe(apply_state, "deathbags.state", loc, rest) end
     end)
 end
+
+function deathbags.relay_bag(p) bags:send(p) end
 
 function deathbags.status()
     return string.format("death bags: sent %d, copies %d (failed %d%s) | taken: reported %d, applied %d",

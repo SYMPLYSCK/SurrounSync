@@ -1,4 +1,4 @@
-// SurrounSyncBridge: carries the mod's link files between the two games over Steam P2P, using the
+﻿// SurrounSyncBridge: carries the mod's link files between the two games over Steam P2P, using the
 // game's own steam_api64.dll. Also handles join requests, passwords, public games, voice and update checks.
 
 using System;
@@ -242,7 +242,7 @@ class SteamNet : INet
         lobbyData = data;
         if (lobby != 0) { ApplyLobbyData(); return; }
         if (createCall != 0) return;
-        createCall = Steam.SteamAPI_ISteamMatchmaking_CreateLobby(MM(), listed ? 2 : 0, 2);
+        createCall = Steam.SteamAPI_ISteamMatchmaking_CreateLobby(MM(), listed ? 2 : 0, 4);
         publicState = "creating";
     }
     public string Debug() { return "createCall=" + createCall + " lobby=" + lobby + " mm=" + mm; }
@@ -320,19 +320,42 @@ class SteamNet : INet
     }
 }
 
+// Loopback stand-in for Steam: the host listens on 127.0.0.1:<port>, every guest bridge connects to it.
+// Ids: host 1001, guests 1002 (default) or SURROUNSYNC_TEST_ID / --test-id, so up to three guests can run on one PC.
+// Each connection starts with an id frame (channel 9), so the host knows who sent what.
 class TestNet : INet
 {
     readonly int port;
+    readonly ulong guestId;
     string role = "idle";
     TcpListener listener;
-    TcpClient client;
-    NetworkStream stream;
-    readonly object qlock = new object();
-    readonly Queue<byte[]>[] queues = { new Queue<byte[]>(), new Queue<byte[]>() };
-    ulong pendingRequest;
+    string listenError;
+    bool listenLogged;
     long nextConnect;
+    TcpClient connecting;
+    IAsyncResult connectAr;
+    long connectStarted;
+    readonly object qlock = new object();
+    readonly Queue<KeyValuePair<ulong, byte[]>>[] queues = { new Queue<KeyValuePair<ulong, byte[]>>(), new Queue<KeyValuePair<ulong, byte[]>>(), new Queue<KeyValuePair<ulong, byte[]>>() };
+    readonly Queue<ulong> pendingRequests = new Queue<ulong>();
 
-    public TestNet(int port) { this.port = port; }
+    class Conn
+    {
+        public TcpClient client;
+        public volatile NetworkStream stream;   // (cleared by its writer thread when a write fails)
+        public readonly Queue<byte[]> outq = new Queue<byte[]>();
+        public readonly AutoResetEvent signal = new AutoResetEvent(false);
+        public ulong id;
+        public volatile bool dead;
+    }
+    readonly Dictionary<ulong, Conn> conns = new Dictionary<ulong, Conn>();   // host: by guest id; guest: 1001 = the host
+    readonly List<Conn> unnamed = new List<Conn>();                          // host: accepted, id frame not read yet
+
+    public TestNet(int port, ulong guestId)
+    {
+        this.port = port;
+        this.guestId = guestId >= 1002 ? guestId : 1002UL;
+    }
     public IntPtr SteamUser { get { return IntPtr.Zero; } }
     string publicState = "off";
     List<Dictionary<string, string>> servers = new List<Dictionary<string, string>>();
@@ -365,15 +388,15 @@ class TestNet : INet
         }
         catch { }
     }
-    public ulong Me { get { return role == "host" ? 1001UL : 1002UL; } }
-    public string MyName { get { return "Test-" + role; } }
+    public ulong Me { get { return role == "host" ? 1001UL : guestId; } }
+    public string MyName { get { return Me == 1001UL ? "Test-host" : Me == 1002UL ? "Test-guest" : "Test-guest" + (Me - 1000); } }
     public bool Init(Action<string> log) { return true; }
 
     public void SetPresence(string r)
     {
         if (r != role)
         {
-            DropClient();
+            DropAll();
             if (listener != null && r != "host") { try { listener.Stop(); } catch { } listener = null; }
         }
         role = r;
@@ -383,40 +406,28 @@ class TestNet : INet
     void TryListen()
     {
         if (role != "host" || listener != null) return;
-        try { var l = new TcpListener(IPAddress.Loopback, port); l.Start(); listener = l; }
-        catch { listener = null; }
+        try { var l = new TcpListener(IPAddress.Loopback, port); l.Start(); listener = l; listenError = null; listenLogged = false; }
+        catch (Exception e) { listener = null; listenError = e.Message; }
     }
 
-    void DropClient()
+    void DropConn(Conn c)
     {
-        if (client != null) try { client.Close(); } catch { }
-        client = null; stream = null;
-        lock (qlock) { queues[0].Clear(); queues[1].Clear(); }
+        c.dead = true;
+        try { c.client.Close(); } catch { }
+        c.signal.Set();
     }
 
-    void StartReader(TcpClient c, ulong from)
+    void DropAll()
     {
-        var s = c.GetStream();
-        var t = new Thread(() =>
+        lock (qlock)
         {
-            try
-            {
-                var head = new byte[5];
-                while (true)
-                {
-                    if (!ReadFull(s, head, 5)) break;
-                    int len = BitConverter.ToInt32(head, 0);
-                    var data = new byte[len];
-                    if (!ReadFull(s, data, len)) break;
-                    int ch = head[4] == 1 ? 1 : 0;
-                    lock (qlock) queues[ch].Enqueue(data);
-                }
-            }
-            catch { }
-        });
-        t.IsBackground = true;
-        t.Start();
-        if (role == "host") pendingRequest = from;
+            foreach (var c in conns.Values) DropConn(c);
+            foreach (var c in unnamed) DropConn(c);
+            conns.Clear(); unnamed.Clear();
+            foreach (var q in queues) q.Clear();
+        }
+        if (connecting != null) try { connecting.Close(); } catch { }
+        connecting = null;
     }
 
     static bool ReadFull(NetworkStream s, byte[] b, int n)
@@ -426,66 +437,186 @@ class TestNet : INet
         return true;
     }
 
+    // frames: <len:4> <channel:1> <data>; channel 9 = the sender's id (first frame of a connection)
+    void StartReader(Conn c, ulong knownId)
+    {
+        var s = c.stream;
+        var t = new Thread(() =>
+        {
+            ulong from = knownId;
+            try
+            {
+                var head = new byte[5];
+                while (!c.dead)
+                {
+                    if (!ReadFull(s, head, 5)) break;
+                    int len = BitConverter.ToInt32(head, 0);
+                    if (len < 0 || len > (1 << 22)) break;
+                    var data = new byte[len];
+                    if (!ReadFull(s, data, len)) break;
+                    if (head[4] == 9)
+                    {
+                        if (len >= 8 && from == 0)
+                        {
+                            from = BitConverter.ToUInt64(data, 0);
+                            lock (qlock)
+                            {
+                                unnamed.Remove(c);
+                                Conn old;
+                                if (conns.TryGetValue(from, out old) && old != c) DropConn(old);
+                                c.id = from; conns[from] = c;
+                                pendingRequests.Enqueue(from);
+                            }
+                        }
+                        continue;
+                    }
+                    if (from == 0) continue;
+                    int ch = head[4] <= 2 ? head[4] : 0;
+                    lock (qlock) queues[ch].Enqueue(new KeyValuePair<ulong, byte[]>(from, data));
+                }
+            }
+            catch { }
+            c.dead = true;
+            lock (qlock) { Conn cur; if (from != 0 && conns.TryGetValue(from, out cur) && cur == c) conns.Remove(from); unnamed.Remove(c); }
+        });
+        t.IsBackground = true;
+        t.Start();
+    }
+
+    // writes go out on the connection's own thread, like Steam's send that only queues
+    void StartWriter(Conn c)
+    {
+        var t = new Thread(() =>
+        {
+            try
+            {
+                while (!c.dead)
+                {
+                    byte[] f = null;
+                    lock (c.outq) if (c.outq.Count > 0) f = c.outq.Dequeue();
+                    if (f != null) { c.stream.Write(f, 0, f.Length); continue; }
+                    c.signal.WaitOne(1000);
+                }
+            }
+            catch { c.dead = true; }
+        });
+        t.IsBackground = true;
+        t.Start();
+    }
+
+    static byte[] Frame(byte[] data, int channel)
+    {
+        var frame = new byte[5 + data.Length];
+        BitConverter.GetBytes(data.Length).CopyTo(frame, 0);
+        frame[4] = (byte)channel;
+        Buffer.BlockCopy(data, 0, frame, 5, data.Length);
+        return frame;
+    }
+
     public void Pump(Func<ulong, bool> onSessionRequest, Action<string> log)
     {
         long t = Environment.TickCount;
-        if (role == "host" && listener == null && t >= nextConnect) { nextConnect = t + 1000; TryListen(); }
-        if (role == "host" && listener != null && listener.Pending())
+        if (role == "host" && listener == null && t >= nextConnect) { nextConnect = t + 1000; TryListen(); if (listenError != null) log("testnet: can't listen: " + listenError); }
+        if (listener != null && !listenLogged) { listenLogged = true; log("testnet: listening on " + port); }
+        while (role == "host" && listener != null && listener.Pending())
         {
-            var c = listener.AcceptTcpClient();
-            c.NoDelay = true;
-            if (client != null) try { client.Close(); } catch { }
-            client = c; stream = c.GetStream();
-            StartReader(c, 1002UL);
+            var tc = listener.AcceptTcpClient();
+            tc.NoDelay = true;
+            var c = new Conn { client = tc, stream = tc.GetStream() };
+            lock (qlock) unnamed.Add(c);
+            log("testnet: accepted " + tc.Client.RemoteEndPoint);
+            StartWriter(c);
+            StartReader(c, 0);
         }
-        else if (role == "guest" && (client == null || !client.Connected) && t >= nextConnect)
+        if (role == "guest")
         {
-            nextConnect = t + 1000;
-            try
+            Conn host;
+            lock (qlock) conns.TryGetValue(1001UL, out host);
+            if (host != null && host.dead) { lock (qlock) conns.Remove(1001UL); host = null; }
+            // the connect runs on while the loop goes on (antivirus made loopback connects take 0.3-9 s)
+            if (host == null && connecting != null)
             {
-                var c = new TcpClient();
-                c.NoDelay = true;
-                // (a blocking Connect with no host listening stalled the loop past the 12 s watchdog)
-                var ar = c.BeginConnect(IPAddress.Loopback, port, null, null);
-                if (!ar.AsyncWaitHandle.WaitOne(300)) { c.Close(); client = null; return; }
-                c.EndConnect(ar);
-                client = c; stream = c.GetStream();
-                StartReader(c, 1001UL);
+                if (connectAr.IsCompleted)
+                {
+                    var tc = connecting;
+                    connecting = null;
+                    try
+                    {
+                        tc.EndConnect(connectAr);
+                        var c = new Conn { client = tc, stream = tc.GetStream(), id = 1001UL };
+                        lock (c.outq) c.outq.Enqueue(Frame(BitConverter.GetBytes(guestId), 9));
+                        lock (qlock) conns[1001UL] = c;
+                        log("testnet: connected from " + tc.Client.LocalEndPoint + " in " + (t - connectStarted) + " ms as " + guestId);
+                        StartWriter(c);
+                        StartReader(c, 1001UL);
+                    }
+                    catch { try { tc.Close(); } catch { } nextConnect = t + 1000; }
+                }
+                else if (t - connectStarted > 15000)
+                {
+                    log("testnet: connect still pending after 15 s - starting over");
+                    try { connecting.Close(); } catch { }
+                    connecting = null; nextConnect = t + 1000;
+                }
             }
-            catch { client = null; }
+            else if (host == null && t >= nextConnect)
+            {
+                nextConnect = t + 1000;
+                try
+                {
+                    var tc = new TcpClient();
+                    tc.NoDelay = true;
+                    connectAr = tc.BeginConnect(IPAddress.Loopback, port, null, null);
+                    connecting = tc; connectStarted = t;
+                }
+                catch { connecting = null; }
+            }
         }
-        if (pendingRequest != 0) { ulong p = pendingRequest; pendingRequest = 0; onSessionRequest(p); }
+        while (true)
+        {
+            ulong p;
+            lock (qlock) { if (pendingRequests.Count == 0) break; p = pendingRequests.Dequeue(); }
+            if (role == "host") onSessionRequest(p);
+        }
     }
 
     public bool Send(ulong to, byte[] data, bool reliable, int channel)
     {
-        if (stream == null) return false;
-        try
-        {
-            var frame = new byte[5 + data.Length];
-            BitConverter.GetBytes(data.Length).CopyTo(frame, 0);
-            frame[4] = (byte)channel;
-            Buffer.BlockCopy(data, 0, frame, 5, data.Length);
-            stream.Write(frame, 0, frame.Length);
-            return true;
-        }
-        catch { stream = null; client = null; return false; }
+        Conn c;
+        lock (qlock) conns.TryGetValue(to, out c);
+        if (c == null || c.dead || c.stream == null) return false;
+        lock (c.outq) c.outq.Enqueue(Frame(data, channel));
+        c.signal.Set();
+        return true;
     }
 
     public byte[] Read(int channel, out ulong from)
     {
-        from = role == "host" ? 1002UL : 1001UL;
+        from = 0;
         if (channel < 0 || channel >= queues.Length) return null;
-        lock (qlock) return queues[channel].Count > 0 ? queues[channel].Dequeue() : null;
+        lock (qlock)
+        {
+            if (queues[channel].Count == 0) return null;
+            var kv = queues[channel].Dequeue();
+            from = kv.Key;
+            return kv.Value;
+        }
     }
 
     public void Accept(ulong id) { }
-    public void Close(ulong id) { DropClient(); }
+    public void Close(ulong id)
+    {
+        lock (qlock)
+        {
+            Conn c;
+            if (conns.TryGetValue(id, out c)) { DropConn(c); conns.Remove(id); }
+        }
+    }
     // (SURROUNSYNC_TEST_STRANGERS=1: answer like Steam does for someone who isn't your friend)
     public string NameOf(ulong id)
     {
         if (Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_STRANGERS") == "1") return "[unknown]";
-        return id == 1001UL ? "Test-host" : "Test-guest";
+        return id == 1001UL ? "Test-host" : id == 1002UL ? "Test-guest" : "Test-guest" + (id - 1000);
     }
     public string Route(ulong id) { return "route test queued 0 B"; }
     public int FriendCount() { return 0; }
@@ -495,7 +626,7 @@ class TestNet : INet
         if (r == "host") l.Add(new KeyValuePair<ulong, string>(1001UL, "Test-host"));
         return l;
     }
-    public void Shutdown() { try { if (client != null) client.Close(); if (listener != null) listener.Stop(); } catch { } }
+    public void Shutdown() { DropAll(); try { if (listener != null) listener.Stop(); } catch { } }
 }
 
 static class Win
@@ -514,91 +645,16 @@ static class Win
     [DllImport("winmm.dll")] public static extern int waveOutClose(IntPtr h);
 }
 
-class Voice
+// One player we hear: their own wave output (Windows mixes several), loudness by their distance.
+class VoiceOut
 {
-    IntPtr user = IntPtr.Zero;
-    public bool Available { get { return user != IntPtr.Zero; } }
-    public bool On;
-    public int Key = 0x56;
-    public double Volume = 1.0;
     public double Distance = 0;
-    public bool Talking;
-    public long HeardAt = -100000;   // when the other player's last voice packet arrived (TickCount)
-    public bool PeerTalking { get { return Environment.TickCount - HeardAt < 400; } }
-    uint rate = 24000;
+    public long HeardAt = -100000;   // when their last voice packet arrived (TickCount)
+    public bool Talking { get { return Environment.TickCount - HeardAt < 400; } }
     IntPtr wave = IntPtr.Zero;
     readonly List<IntPtr> queued = new List<IntPtr>();
-    readonly byte[] cbuf = new byte[16 * 1024], pcm = new byte[96 * 1024];
-    public long Sent, Played;
-    string gameExe;
 
-    public void Init(IntPtr steamUser, Action<string> log)
-    {
-        user = steamUser;
-        if (user == IntPtr.Zero) return;
-        try { rate = Steam.SteamAPI_ISteamUser_GetVoiceOptimalSampleRate(user); } catch { }
-        if (rate < 8000 || rate > 48000) rate = 24000;
-        try { gameExe = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, @"..\..\..\..\SurrounDead-Win64-Shipping.exe")); } catch { }
-        log("voice ready (" + rate + " Hz)");
-    }
-
-    bool GameFocused()
-    {
-        try
-        {
-            uint pid; Win.GetWindowThreadProcessId(Win.GetForegroundWindow(), out pid);
-            var p = Process.GetProcessById((int)pid);
-            return p.ProcessName == "SurrounDead-Win64-Shipping"
-                && (gameExe == null || string.Equals(p.MainModule.FileName, gameExe, StringComparison.OrdinalIgnoreCase));
-        }
-        catch { return false; }
-    }
-
-    long focusAt = 0; bool focused = false;
-    public void Tick(Func<byte[], bool> send)
-    {
-        if (!Available) return;
-        long t = Environment.TickCount;
-        if (t - focusAt > 300) { focusAt = t; focused = GameFocused(); }
-        bool want = On && focused && (Win.GetAsyncKeyState(Key) & 0x8000) != 0;
-        if (want != Talking)
-        {
-            Talking = want;
-            if (want) Steam.SteamAPI_ISteamUser_StartVoiceRecording(user); else Steam.SteamAPI_ISteamUser_StopVoiceRecording(user);
-        }
-        uint avail;
-        if (Steam.SteamAPI_ISteamUser_GetAvailableVoice(user, out avail, IntPtr.Zero, 0) != 0 || avail == 0) return;
-        uint got;
-        if (Steam.SteamAPI_ISteamUser_GetVoice(user, true, cbuf, (uint)cbuf.Length, out got, false, IntPtr.Zero, 0, IntPtr.Zero, 0) != 0 || got == 0) return;
-        var pkt = new byte[got + 1];
-        pkt[0] = (byte)'V';
-        Buffer.BlockCopy(cbuf, 0, pkt, 1, (int)got);
-        if (send(pkt)) Sent++;
-    }
-
-    double Gain() { double d = Distance; double g = d <= 5 ? 1.0 : d >= 50 ? 0.0 : 1.0 - (d - 5) / 45.0; return g * Volume; }
-
-    public void Play(byte[] data, int offset)
-    {
-        if (!Available || !On) return;
-        double g = Gain();
-        if (g <= 0.001) return;
-        var src = new byte[data.Length - offset];
-        Buffer.BlockCopy(data, offset, src, 0, src.Length);
-        uint got;
-        if (Steam.SteamAPI_ISteamUser_DecompressVoice(user, src, (uint)src.Length, pcm, (uint)pcm.Length, out got, rate) != 0 || got == 0) return;
-        for (int i = 0; i + 1 < got; i += 2)
-        {
-            int v = (short)(pcm[i] | (pcm[i + 1] << 8));
-            v = (int)(v * g);
-            if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
-            pcm[i] = (byte)(v & 0xff); pcm[i + 1] = (byte)((v >> 8) & 0xff);
-        }
-        Output(pcm, (int)got);
-        Played++;
-    }
-
-    public bool Output(byte[] buf, int n)
+    public bool Output(byte[] buf, int n, uint rate)
     {
         int hsize = Marshal.SizeOf(typeof(Win.WAVEHDR));
         if (wave == IntPtr.Zero)
@@ -630,11 +686,132 @@ class Voice
         return true;
     }
 
+    public void Close() { if (wave != IntPtr.Zero) { Win.waveOutClose(wave); wave = IntPtr.Zero; } }
+}
+
+class Voice
+{
+    IntPtr user = IntPtr.Zero;
+    public bool Available { get { return user != IntPtr.Zero; } }
+    public bool On;
+    public int Key = 0x56;
+    public double Volume = 1.0;
+    public bool Talking;
+    uint rate = 24000;
+    readonly byte[] cbuf = new byte[16 * 1024], pcm = new byte[96 * 1024];
+    public long Sent, Played;
+    string gameExe;
+
+    public void Init(IntPtr steamUser, Action<string> log)
+    {
+        user = steamUser;
+        if (user == IntPtr.Zero) return;
+        try { rate = Steam.SteamAPI_ISteamUser_GetVoiceOptimalSampleRate(user); } catch { }
+        if (rate < 8000 || rate > 48000) rate = 24000;
+        try { gameExe = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, @"..\..\..\..\SurrounDead-Win64-Shipping.exe")); } catch { }
+        log("voice ready (" + rate + " Hz)");
+    }
+
+    bool GameFocused()
+    {
+        try
+        {
+            uint pid; Win.GetWindowThreadProcessId(Win.GetForegroundWindow(), out pid);
+            var p = Process.GetProcessById((int)pid);
+            return p.ProcessName == "SurrounDead-Win64-Shipping"
+                && (gameExe == null || string.Equals(p.MainModule.FileName, gameExe, StringComparison.OrdinalIgnoreCase));
+        }
+        catch { return false; }
+    }
+
+    long focusAt = 0; bool focused = false;
+    // the packet we recorded this loop (or null): the bridge sends it to everyone who should hear us
+    public byte[] Tick()
+    {
+        if (!Available) return null;
+        long t = Environment.TickCount;
+        if (t - focusAt > 300) { focusAt = t; focused = GameFocused(); }
+        bool want = On && focused && (Win.GetAsyncKeyState(Key) & 0x8000) != 0;
+        if (want != Talking)
+        {
+            Talking = want;
+            if (want) Steam.SteamAPI_ISteamUser_StartVoiceRecording(user); else Steam.SteamAPI_ISteamUser_StopVoiceRecording(user);
+        }
+        uint avail;
+        if (Steam.SteamAPI_ISteamUser_GetAvailableVoice(user, out avail, IntPtr.Zero, 0) != 0 || avail == 0) return null;
+        uint got;
+        if (Steam.SteamAPI_ISteamUser_GetVoice(user, true, cbuf, (uint)cbuf.Length, out got, false, IntPtr.Zero, 0, IntPtr.Zero, 0) != 0 || got == 0) return null;
+        var pkt = new byte[got + 1];
+        pkt[0] = (byte)'V';
+        Buffer.BlockCopy(cbuf, 0, pkt, 1, (int)got);
+        Sent++;
+        return pkt;
+    }
+
+    double Gain(double d) { double g = d <= 5 ? 1.0 : d >= 50 ? 0.0 : 1.0 - (d - 5) / 45.0; return g * Volume; }
+
+    public void Play(VoiceOut who, byte[] data, int offset)
+    {
+        who.HeardAt = Environment.TickCount;
+        if (!Available || !On) return;
+        double g = Gain(who.Distance);
+        if (g <= 0.001) return;
+        var src = new byte[data.Length - offset];
+        Buffer.BlockCopy(data, offset, src, 0, src.Length);
+        uint got;
+        if (Steam.SteamAPI_ISteamUser_DecompressVoice(user, src, (uint)src.Length, pcm, (uint)pcm.Length, out got, rate) != 0 || got == 0) return;
+        for (int i = 0; i + 1 < got; i += 2)
+        {
+            int v = (short)(pcm[i] | (pcm[i + 1] << 8));
+            v = (int)(v * g);
+            if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+            pcm[i] = (byte)(v & 0xff); pcm[i + 1] = (byte)((v >> 8) & 0xff);
+        }
+        who.Output(pcm, (int)got, rate);
+        Played++;
+    }
+
+    public bool Output(VoiceOut who, byte[] buf, int n) { return who.Output(buf, n, rate); }
+
     public void Shutdown()
     {
         if (Talking && Available) Steam.SteamAPI_ISteamUser_StopVoiceRecording(user);
-        if (wave != IntPtr.Zero) { Win.waveOutClose(wave); wave = IntPtr.Zero; }
     }
+}
+
+// One other player. The host has one per guest (slot 1..3); a guest has one for the host (slot 0) and one per
+// other guest ("mate", reached through the host's bridge: 'X' <id:8> <packet>). Files: we send
+// mirror_<name>_<outTag>.txt, we write what arrives to mirror_<name>_<inTag>.txt. The first guest's link (host
+// side) and the host link (guest side) keep the old two-player names (host/guest), so two players work as before.
+class PeerLink
+{
+    public ulong id;
+    public int slot;
+    public bool mate;
+    public string outTag, inTag;
+    public bool primary { get { return outTag == "host" || outTag == "guest"; } }
+    public string name = "";
+    public string game = "?";
+    public string epoch = null;          // their bridge session, from their 'H'
+    public string blobEpoch = null;
+    public int gen = 0;                  // host: bumped when this guest (re)connects; guest: the host's number for a mate
+    public long lastRx, lastHeard, lastHello, lastNameSent, pingAt, quietAt;
+    public double rtt = -1;
+    public readonly Dictionary<string, string> sent = new Dictionary<string, string>();
+    public readonly Dictionary<string, DateTime> seenWrite = new Dictionary<string, DateTime>();
+    public readonly HashSet<string> loggedTx = new HashSet<string>(), loggedRx = new HashSet<string>();
+    public string lastPose = null;
+    public long txBytes, rxBytes, txPkts, rxPkts, txBlobs, rxBlobs;
+    public string chunkName, chunkKey; public string[] chunkParts; public int chunkGot;
+    public int rxFragId = -1, rxFragHave; public byte[][] rxFrags;
+    public readonly Dictionary<string, long> blobGen = new Dictionary<string, long>();
+    public readonly string indexRun = DateTime.UtcNow.Ticks.ToString();
+    public double pktTokens = -1, byteTokens; public long tokensAt;
+    public readonly Queue<long> drops = new Queue<long>();
+    public readonly Dictionary<string, long> dropLogged = new Dictionary<string, long>();
+    public readonly VoiceOut voice = new VoiceOut();
+    public bool Connected { get { return epoch != null; } }
+    public bool liveSent;
 }
 
 class Bridge
@@ -644,23 +821,24 @@ class Bridge
     string role, other, dir, logPath, mutexName;
     bool auto, gameCheck = true;
     readonly List<KeyValuePair<ulong, string>> hosting = new List<KeyValuePair<ulong, string>>();
-    ulong me, peer, configuredPeer, pendingFrom;
-    string peerGame = "?";
-    long lastHeard;
-    string peerName = "";
+    ulong me, configuredPeer, pendingFrom;
     INet net;
     string epoch = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
     readonly DateTime startedUtc = DateTime.UtcNow.AddSeconds(-30);
-    string peerEpoch = null;
-    string blobEpoch = null;
-    long lastRx = 0;
-    readonly Dictionary<string, string> sent = new Dictionary<string, string>();
-    readonly Dictionary<string, DateTime> seenWrite = new Dictionary<string, DateTime>();
-    readonly HashSet<string> loggedTx = new HashSet<string>(), loggedRx = new HashSet<string>();
-    string lastPose = null;
-    long txBytes, rxBytes, txPkts, rxPkts, txBlobs, rxBlobs;
     int msgId = 0;
-    string chunkName; string chunkKey; string[] chunkParts; int chunkGot;
+    readonly List<PeerLink> links = new List<PeerLink>();
+    int maxGuests = 3, mySlot = -1, rosterGen = 0;
+    readonly Dictionary<ulong, int> slotOf = new Dictionary<ulong, int>();   // host: the slot each guest had, kept for a rejoin
+    bool rosterDirty = true; long rosterAt = 0; string rosterFile = null;
+    PeerLink HostLink() { foreach (var l in links) if (!l.mate && l.slot == 0) return l; return null; }
+    PeerLink Direct(ulong id) { foreach (var l in links) if (!l.mate && l.id == id) return l; return null; }
+    PeerLink Mate(ulong id) { foreach (var l in links) if (l.mate && l.id == id) return l; return null; }
+    PeerLink Primary() { foreach (var l in links) if (l.primary) return l; return null; }
+    int Guests() { int n = 0; foreach (var l in links) if (!l.mate && l.slot > 0) n++; return n; }
+    bool Reachable(PeerLink l) { if (!l.mate) return true; var h = HostLink(); return h != null && h.Connected; }
+    string NameFile(PeerLink l) { return Path.Combine(dir, "mirror_peer_" + l.outTag + ".name"); }
+    string StatusFile(string outTag) { return Path.Combine(dir, "mirror_bridge_status_" + outTag + ".txt"); }
+    string ClockFile(PeerLink l) { return Path.Combine(dir, l.primary ? "mirror_clock_offset.txt" : "mirror_clock_offset_" + l.outTag + ".txt"); }
 
     readonly HashSet<ulong> approved = new HashSet<ulong>();
     readonly HashSet<ulong> blocked = new HashSet<ulong>();
@@ -671,9 +849,6 @@ class Bridge
     const long REQUEST_TIMEOUT = 60000;
     const int MAX_POSE = 2048, MAX_HELLO = 256, MAX_PART = CHUNK + 1024, MAX_PARTS = 32;
     const double PKT_RATE = 600, PKT_BURST = 3000, BYTE_RATE = 4.0 * 1024 * 1024, BYTE_BURST = 16.0 * 1024 * 1024;
-    double pktTokens = PKT_BURST, byteTokens = BYTE_BURST; long tokensAt = 0;
-    readonly Queue<long> drops = new Queue<long>();
-    readonly Dictionary<string, long> dropLogged = new Dictionary<string, long>();
     const int KICK_DROPS = 20; const long KICK_WINDOW = 10000;
     byte[] passKey = null;
     byte[] joinKey = null;
@@ -778,8 +953,10 @@ class Bridge
             Thread.Sleep(50);
         }
         Steam.SteamAPI_ISteamUser_StopVoiceRecording(sn.SteamUser);
-        bool played = v.Output(new byte[(int)(24000 * 2 * 0.3)], (int)(24000 * 2 * 0.3));
+        var vo = new VoiceOut();
+        bool played = v.Output(vo, new byte[(int)(24000 * 2 * 0.3)], (int)(24000 * 2 * 0.3));
         Thread.Sleep(400);
+        vo.Close();
         v.Shutdown();
         sn.Shutdown();
         Console.WriteLine("SMOKE: voice results ok " + ok + ", no data " + nodata + ", other " + other + " (last code " + lastOther + "); waveOut " + (played ? "ok" : "FAILED"));
@@ -789,7 +966,8 @@ class Bridge
     int Run(string[] args)
     {
         dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SurrounDead");
-        role = "guest"; bool selftest = false; int testPort = 0;
+        role = "guest"; bool selftest = false; int testPort = 0; ulong testId = 0;
+        ulong.TryParse(Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_ID") ?? "", out testId);
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--role" && i + 1 < args.Length) role = args[++i];
@@ -798,6 +976,7 @@ class Bridge
             else if (args[i] == "--dir" && i + 1 < args.Length) dir = args[++i];
             else if (args[i] == "--test-net" && i + 1 < args.Length) int.TryParse(args[++i], out testPort);
             else if (args[i] == "--no-game-check") gameCheck = false;
+            else if (args[i] == "--test-id" && i + 1 < args.Length) ulong.TryParse(args[++i], out testId);
             else if (args[i] == "--lobby-smoke") return LobbySmoke();
             else if (args[i] == "--voice-smoke") return VoiceSmoke();
         }
@@ -820,11 +999,11 @@ class Bridge
                 if (!created) { Log("the other bridge is still running - exiting"); return 0; }
                 Log("the old bridge is gone - taking over");
             }
-            net = testPort > 0 ? (INet)new TestNet(testPort) : new SteamNet();
+            net = testPort > 0 ? (INet)new TestNet(testPort, testId) : new SteamNet();
             if (!net.Init(Log)) return 2;
             me = net.Me;
             voice.Init(net.SteamUser, Log);
-            net.SetPresence(role);
+            net.SetPresence(role); me = net.Me;
             Log("bridge " + role + " up" + (testPort > 0 ? " (TEST NET on 127.0.0.1:" + testPort + ")" : "") + " - my id " + me
                 + ", folder " + dir + (configuredPeer != 0 ? ", peer from config " + configuredPeer : ", looking for a Steam friend"));
             if (selftest)
@@ -841,10 +1020,16 @@ class Bridge
             finally
             {
                 FlushWrites();
-                if (peer != 0) net.Close(peer);
-                try { File.Delete(Path.Combine(dir, "mirror_clock_offset.txt")); } catch { }
-                try { File.Delete(PeerNameFile()); } catch { }
-                try { File.Delete(Path.Combine(dir, "mirror_bridge_status_" + role + ".txt")); } catch { }
+                foreach (var l in links)
+                {
+                    if (!l.mate) try { net.Close(l.id); } catch { }
+                    try { File.Delete(ClockFile(l)); } catch { }
+                    try { File.Delete(NameFile(l)); } catch { }
+                    try { File.Delete(StatusFile(l.outTag)); } catch { }
+                    l.voice.Close();
+                }
+                try { File.Delete(StatusFile(role)); } catch { }
+                try { File.Delete(RosterFile()); } catch { }
                 if (auto) { try { File.Delete(LobbyFile()); } catch { } }
                 voice.Shutdown();
                 net.Shutdown();
@@ -854,19 +1039,44 @@ class Bridge
         return 0;
     }
 
-    string PeerNameFile() { return Path.Combine(dir, "mirror_peer_" + role + ".name"); }
+    string RosterFile() { return Path.Combine(dir, "mirror_roster.txt"); }
 
+    // what the other players sent us before (the files of every link this role can have), and their names
     void ClearPeerFiles()
     {
-        string pn = Path.GetFileName(PeerNameFile()), tail = "_" + other + ".txt";
-        DropQueuedWrites(n => n == pn || (n.StartsWith("mirror_") && n.EndsWith(tail)));
-        try { File.Delete(PeerNameFile()); } catch { }
-        try
-        {
-            foreach (var f in Directory.GetFiles(dir, "mirror_*_" + other + ".txt"))
-                try { File.Delete(f); } catch { }
-        }
+        var tails = new List<string> { "_" + other + ".txt" };
+        for (int s = 1; s <= 3; s++) tails.Add("_from" + s + ".txt");
+        Func<string, bool> mine = n => n.StartsWith("mirror_") && (n.StartsWith("mirror_peer_") && n.EndsWith(".name") || tails.Exists(t => n.EndsWith(t)));
+        DropQueuedWrites(mine);
+        try { foreach (var f in Directory.GetFiles(dir, "mirror_*")) if (mine(Path.GetFileName(f))) try { File.Delete(f); } catch { } }
         catch { }
+    }
+
+    // one link's files, when it goes away
+    void ClearLinkFiles(PeerLink l)
+    {
+        string tail = "_" + l.inTag + ".txt", nf = Path.GetFileName(NameFile(l));
+        Func<string, bool> mine = n => n == nf || (n.StartsWith("mirror_") && n.EndsWith(tail));
+        DropQueuedWrites(mine);
+        try { foreach (var f in Directory.GetFiles(dir, "mirror_*" + tail)) try { File.Delete(f); } catch { } } catch { }
+        try { File.Delete(NameFile(l)); } catch { }
+        if (!l.primary) { try { File.Delete(ClockFile(l)); } catch { } try { File.Delete(StatusFile(l.outTag)); } catch { } }
+    }
+
+    void DropLink(PeerLink l, string why)
+    {
+        if (!l.mate) try { net.Close(l.id); } catch { }
+        ClearLinkFiles(l);
+        l.voice.Close();
+        links.Remove(l);
+        rosterDirty = true;
+        Log("left " + l.name + " (" + l.id + ")" + (l.mate ? " [via the host]" : "") + " - " + why);
+    }
+
+    void DropAllLinks(string why)
+    {
+        foreach (var l in new List<PeerLink>(links)) DropLink(l, why);
+        mySlot = -1;
     }
 
     void Loop()
@@ -892,30 +1102,37 @@ class Bridge
                 if (GameGone(ref lastGameCheck, ref gameMissing)) { Log("game closed - exiting"); return; }
                 continue;
             }
-            if (peer == 0 && t - lastScan > 3000) { Step("friend scan"); lastScan = t; Discover(); }
-            if (peer != 0 && t - lastHello > 1000)
+            if (role == "guest" && HostLink() == null && t - lastScan > 3000) { Step("friend scan"); lastScan = t; Discover(); }
+            foreach (var l in new List<PeerLink>(links))
             {
-                Step("hello"); lastHello = t;
-                SendRaw('H', epoch + " " + Unix() + " " + role + " " + (!gameCheck || gameMissing == 0 ? "1" : "0"), false);
-                // Steam only knows the names of your friends ("[unknown]" for anyone else): we say ours
-                if (t - lastNameSent > 5000) { lastNameSent = t; SendRaw('N', net.MyName ?? "", false); }
+                if (t - l.lastHello > 1000 && Reachable(l))
+                {
+                    Step("hello"); l.lastHello = t;
+                    SendRaw(l, 'H', epoch + " " + Unix() + " " + role + " " + (!gameCheck || gameMissing == 0 ? "1" : "0"), false);
+                    // Steam only knows the names of your friends ("[unknown]" for anyone else): we say ours
+                    if (t - l.lastNameSent > 5000) { l.lastNameSent = t; SendRaw(l, 'N', net.MyName ?? "", false); }
+                }
+                if (l.lastRx != 0 && t - l.lastRx > 20000 && t - l.quietAt > 20000)
+                {
+                    Log("no packets from " + l.name + " for 20 s");
+                    l.quietAt = t;
+                    if (configuredPeer == 0 && role == "guest" && l.slot == 0) DropLink(l, "lost");
+                }
             }
-            if (peer != 0 && lastRx != 0 && t - lastRx > 20000)
+            if (links.Count > 0)
             {
-                Log("no packets from " + peerName + " for 20 s");
-                lastRx = t;
-                if (configuredPeer == 0 && role == "guest") { peer = 0; peerEpoch = null; }
-            }
-            if (peer != 0)
-            {
-                if (t - lastPoseRead >= 10) { Step("pose send"); lastPoseRead = t; PumpPose(); }
+                if (t - lastPoseRead >= 10) { Step("pose send"); lastPoseRead = t; foreach (var l in links) if (CanPump(l)) PumpPose(l); }
                 if (t - lastBlobScan > 15) { Step("blob send"); lastBlobScan = t; PumpBlobs(); }
             }
-            Step("ping"); Ping(t);
+            Step("ping"); foreach (var l in links) Ping(l, t);
             Step("receive"); Receive(0); Receive(1);
             if (voice.Available) Receive(2);
             Step("voice");
-            if (peer != 0) voice.Tick(pkt => { bool ok = net.Send(peer, pkt, false, 2); if (ok) { txPkts++; txBytes += pkt.Length; } return ok; });
+            var vp = voice.Tick();
+            // the host talks to every guest; a guest only to the host, whose bridge passes it on to the others
+            if (vp != null) foreach (var l in links) if (!l.mate && (role == "host" || l.slot == 0)) SendBytesRaw(l, vp, false, 2);
+            if (role == "host") foreach (var l in links) if (Live(l) != l.liveSent) { l.liveSent = !l.liveSent; rosterDirty = true; }
+            if (role == "host" && (rosterDirty || t - rosterAt > 5000)) { Step("roster"); SendRoster(t); }
             if (t - voiceCfgAt > 250) { voiceCfgAt = t; ReadVoiceSettings(); }
             WriteVoiceState();
             if (t - lastStatus > 2000) { Step("status file"); lastStatus = t; WriteStatus(); }
@@ -972,8 +1189,8 @@ class Bridge
     }
     void TakeOrRequest(ulong from, string why)
     {
-        if (blocked.Contains(from)) return;
-        if (Approved(from)) SetPeer(from, why); else Request(from);
+        if (blocked.Contains(from) || Direct(from) != null) return;
+        if (Approved(from)) AddGuest(from, why); else Request(from);
     }
 
     static byte[] KeyOf(string password) { using (var h = SHA256.Create()) return h.ComputeHash(Encoding.UTF8.GetBytes(password)); }
@@ -997,9 +1214,7 @@ class Bridge
     bool SendTo(ulong to, char type, string body)
     {
         byte[] data = Encoding.UTF8.GetBytes(type + body);
-        bool ok = net.Send(to, data, true, 1);
-        if (ok) { txPkts++; txBytes += data.Length; }
-        return ok;
+        return net.Send(to, data, true, 1);
     }
     void Challenge(ulong from)
     {
@@ -1042,10 +1257,14 @@ class Bridge
             return false;
         }
         if (blocked.Contains(from)) return false;
-        if (role == "host" && peer == 0 && !Approved(from)) { Request(from); return false; }
-        bool ok = (peer == 0 && (role == "host" || from == configuredPeer)) || from == peer;
-        if (ok) { if (peer == 0) SetPeer(from, "it connected to us"); return true; }
-        Log("ignored a session request from " + from + " (talking to " + peer + ")");
+        if (Direct(from) != null) return true;
+        if (role == "host")
+        {
+            if (!Approved(from)) { Request(from); return false; }
+            return AddGuest(from, "it connected to us") != null;
+        }
+        if (HostLink() == null && from == configuredPeer && from != 0) { SetHost(from, "it connected to us"); return true; }
+        Log("ignored a session request from " + from + (HostLink() != null ? " (in " + HostLink().name + "'s game)" : ""));
         return false;
     }
 
@@ -1078,13 +1297,11 @@ class Bridge
         {
             if (role != "idle")
             {
-                if (peer != 0) { try { net.Close(peer); } catch { } Log("left " + peerName + " (" + peer + ") - switching"); }
+                DropAllLinks("switching");
                 ClearPeerFiles();
-                peer = 0; peerEpoch = null; pendingFrom = 0;
-                sent.Clear(); lastPose = null;
-                try { File.Delete(PeerNameFile()); } catch { }
+                pendingFrom = 0;
             }
-            if (c == "host") { role = "host"; configuredPeer = 0; }
+            if (c == "host") { role = "host"; configuredPeer = 0; slotOf.Clear(); }
             else
             {
                 role = "guest";
@@ -1100,7 +1317,7 @@ class Bridge
             }
             other = role == "host" ? "guest" : "host";
             epoch = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
-            net.SetPresence(role);
+            net.SetPresence(role); me = net.Me;
             ClearPeerFiles();
             Log("menu: now " + role + (configuredPeer != 0 ? " - connecting to " + configuredPeer : role == "guest" ? " - looking for a friend who hosts" : " - friends can join"));
             if (role == "host")
@@ -1129,7 +1346,7 @@ class Bridge
                 approved.Add(id);
                 if (parts[0] == "allow") AddToAllowList(id);
                 Log((parts[0] == "allow" ? "always allowed " : "accepted ") + name + " (" + id + ")");
-                if (role == "host" && peer == 0) SetPeer(id, "the host accepted");
+                if (role == "host" && Direct(id) == null) AddGuest(id, "the host accepted");
             }
             WriteLobby();
         }
@@ -1151,13 +1368,24 @@ class Bridge
             net.RequestServers(); browsing = true;
             Log("searching for public games");
         }
+        else if (c.StartsWith("kick "))
+        {
+            ulong id; var l = ulong.TryParse(c.Substring(5).Trim(), out id) ? Direct(id) : null;
+            if (role == "host" && l != null && l.slot > 0) Kick(l, "the host removed them");
+            else Log("kick: nobody with id " + c.Substring(5));
+        }
+        else if (c.StartsWith("slots "))
+        {
+            int n; if (int.TryParse(c.Substring(6).Trim(), out n)) maxGuests = Math.Max(1, Math.Min(3, n));
+            Log("up to " + maxGuests + " guest(s)");
+            UpdatePublic(); WriteLobby();
+        }
         else if (c == "stop")
         {
-            if (peer != 0) { try { net.Close(peer); } catch { } Log("left " + peerName + " (" + peer + ") - stopped"); }
+            DropAllLinks("stopped");
             ClearPeerFiles();
-            peer = 0; peerEpoch = null; pendingFrom = 0; configuredPeer = 0;
-            sent.Clear(); lastPose = null; requests.Clear(); approved.Clear(); blocked.Clear();
-            try { File.Delete(PeerNameFile()); } catch { }
+            pendingFrom = 0; configuredPeer = 0;
+            requests.Clear(); approved.Clear(); blocked.Clear(); slotOf.Clear();
             role = "idle"; other = "host";
             net.SetPresence("idle");
             publicOn = false; UpdatePublic();
@@ -1178,7 +1406,14 @@ class Bridge
         sb.Append("me ").Append(me).Append(' ').Append(me & 0xFFFFFFFFUL).Append(' ').Append(Clean(net.MyName)).Append('\n');
         sb.Append("role ").Append(role).Append('\n');
         sb.Append("time ").Append(Unix()).Append('\n');
-        if (peer != 0) sb.Append("peer ").Append(peer).Append(' ').Append(Clean(peerName)).Append(' ').Append(peerEpoch != null ? "connected" : "connecting").Append('\n');
+        var pl = Primary();
+        if (pl != null) sb.Append("peer ").Append(pl.id).Append(' ').Append(Clean(pl.name)).Append(' ').Append(pl.Connected ? "connected" : "connecting").Append('\n');
+        // every other player: "player <slot> <id> <state> <outTag> <name>" (slot 0 = the host)
+        foreach (var l in links)
+            sb.Append("player ").Append(l.slot).Append(' ').Append(l.id).Append(' ')
+              .Append(!l.Connected ? "connecting" : Now() - l.lastRx > 20000 ? "lost" : "connected").Append(' ').Append(l.outTag).Append(' ').Append(Clean(l.name)).Append('\n');
+        if (role == "host") sb.Append("slots ").Append(maxGuests).Append('\n');
+        if (mySlot >= 0) sb.Append("myslot ").Append(mySlot).Append('\n');
         foreach (var h in hosting) sb.Append("host ").Append(h.Key).Append(' ').Append(Clean(h.Value)).Append('\n');
         foreach (var r in requests) sb.Append("request ").Append(r.Key).Append(' ').Append(Clean(r.Value.Key)).Append('\n');
         if (kickedLine != null && Now() - kickedAt < 30000) sb.Append(kickedLine).Append('\n');
@@ -1298,7 +1533,10 @@ class Bridge
     string voiceState = null;
     void WriteVoiceState()
     {
-        string st = "me " + (voice.Talking ? 1 : 0) + " peer " + (peer != 0 && voice.PeerTalking ? 1 : 0);
+        var pv = Primary();
+        var vsb = new StringBuilder("me " + (voice.Talking ? 1 : 0) + " peer " + (pv != null && pv.voice.Talking ? 1 : 0));
+        foreach (var l in links) vsb.Append(' ').Append(l.outTag).Append(' ').Append(l.voice.Talking ? 1 : 0);
+        string st = vsb.ToString();
         if (st == voiceState) return;
         voiceState = st;
         try { WriteAtomic(Path.Combine(dir, "mirror_voice_state.txt"), st); } catch { }
@@ -1315,7 +1553,8 @@ class Bridge
             if (f[i] == "on") voice.On = v != 0;
             else if (f[i] == "key" && v > 0 && v < 256) voice.Key = (int)v;
             else if (f[i] == "volume") voice.Volume = Math.Max(0, Math.Min(1, v / 100.0));
-            else if (f[i] == "dist") voice.Distance = v;
+            else if (f[i] == "dist") { var p = Primary(); if (p != null) p.voice.Distance = v; }
+            else if (f[i].StartsWith("dist_")) { string tag = f[i].Substring(5); foreach (var l in links) if (l.outTag == tag) l.voice.Distance = v; }
         }
     }
 
@@ -1324,41 +1563,144 @@ class Bridge
         if (!(publicOn && role == "host")) { net.SetPublic(false, false, null); return; }
         var d = new Dictionary<string, string>();
         d["surrounsync"] = "1"; d["name"] = publicName; d["proto"] = publicProto;
-        d["locked"] = passKey != null ? "1" : "0"; d["players"] = (peer != 0 ? "2" : "1") + "/2"; d["host"] = net.Me.ToString();
+        d["locked"] = passKey != null ? "1" : "0"; d["players"] = (1 + Guests()) + "/" + (1 + maxGuests); d["host"] = net.Me.ToString();
         net.SetPublic(true, true, d);
     }
 
-    void SetPeer(ulong id, string why)
+    PeerLink NewLink(ulong id, int slot, bool mate, string name, string why)
     {
-        peer = id; peerGame = "?"; lastHeard = Now();
-        peerName = net.NameOf(id);
-        if (string.IsNullOrEmpty(peerName)) peerName = id.ToString();
-        net.Accept(id);
-        lastRx = Now(); peerEpoch = null;
-        sent.Clear(); lastPose = null;
-        Log("peer " + peerName + " (" + id + ") - " + why);
+        var l = new PeerLink { id = id, slot = slot, mate = mate };
+        if (role == "host") { l.outTag = slot == 1 ? "host" : "to" + slot; l.inTag = slot == 1 ? "guest" : "from" + slot; }
+        else if (slot == 0) { l.outTag = "guest"; l.inTag = "host"; }
+        else { l.outTag = "to" + slot; l.inTag = "from" + slot; }
+        l.name = !string.IsNullOrEmpty(name) ? name : net.NameOf(id);
+        if (string.IsNullOrEmpty(l.name)) l.name = id.ToString();
+        l.lastHeard = l.lastRx = Now();
+        links.Add(l);
+        rosterDirty = true;
+        if (!mate) net.Accept(id);
+        Log("peer " + l.name + " (" + id + ")" + (role == "host" ? " in slot " + slot : mate ? " - another guest, slot " + slot : "") + " - " + why);
+        try { WriteAtomic(NameFile(l), l.name); } catch { }
+        if (Reachable(l))
+        {
+            SendRaw(l, 'H', epoch + " " + Unix() + " " + role, false);
+            SendRaw(l, 'N', net.MyName ?? "", true);
+            l.lastNameSent = Now();
+        }
         UpdatePublic();
-        try { WriteAtomic(PeerNameFile(), peerName); } catch { }
-        SendRaw('H', epoch + " " + Unix() + " " + role, false);
-        SendRaw('N', net.MyName ?? "", true);
-        lastNameSent = Now();
+        WriteLobby();
+        WriteRoster();
+        return l;
     }
 
-    long lastNameSent;
+    void SetHost(ulong id, string why) { if (HostLink() == null) NewLink(id, 0, false, null, why); }
+
+    // a free slot for this guest: the one it had before if that's still free, else the lowest one nobody had
+    PeerLink AddGuest(ulong id, string why)
+    {
+        var l = Direct(id);
+        if (l != null) return l;
+        int slot = 0, had;
+        Func<int, bool> free = s => !links.Exists(x => !x.mate && x.slot == s);
+        if (slotOf.TryGetValue(id, out had) && had <= maxGuests && free(had)) slot = had;
+        for (int s = 1; s <= maxGuests && slot == 0; s++) if (free(s) && !slotOf.ContainsValue(s)) slot = s;
+        for (int s = 1; s <= maxGuests && slot == 0; s++) if (free(s)) slot = s;
+        if (slot == 0)
+        {
+            // full: a guest silent for 30 s gives its place up
+            PeerLink stale = null;
+            foreach (var x in links) if (!x.mate && Now() - x.lastRx > 30000 && (stale == null || x.lastRx < stale.lastRx)) stale = x;
+            if (stale == null)
+            {
+                Log("can't take " + id + " - the game is full (" + maxGuests + " guests)");
+                SendTo(id, 'R', "full");
+                return null;
+            }
+            slot = stale.slot;
+            DropLink(stale, "silent for 30 s, its place goes to " + id);
+        }
+        slotOf[id] = slot;
+        string asked = requests.ContainsKey(id) ? requests[id].Key : null;
+        requests.Remove(id);
+        l = NewLink(id, slot, false, asked, why);
+        l.gen = ++rosterGen;
+        return l;
+    }
+
+    // host: who is in the game ('W', reliable) - sent on every change and every 5 s; "<slot> <id> <gen> <name>"
+    void SendRoster(long t)
+    {
+        rosterDirty = false; rosterAt = t;
+        var sb = new StringBuilder();
+        sb.Append("0 ").Append(me).Append(" 0 ").Append(Clean(net.MyName)).Append('\n');
+        foreach (var l in links) if (Live(l)) sb.Append(l.slot).Append(' ').Append(l.id).Append(' ').Append(l.gen).Append(' ').Append(Clean(l.name)).Append('\n');
+        string body = sb.ToString();
+        foreach (var l in links) if (l.Connected) SendRaw(l, 'W', body, true);
+        WriteRoster();
+    }
+
+    // guest: the host's list -> a link for every other guest (their traffic goes through the host's bridge)
+    void TakeRoster(PeerLink from, string body)
+    {
+        if (from.slot != 0 || from.mate) return;
+        var seen = new HashSet<ulong>();
+        foreach (var line in body.Split('\n'))
+        {
+            var f = line.Split(new[] { ' ' }, 4);
+            int slot, gen; ulong id;
+            if (f.Length < 3 || !int.TryParse(f[0], out slot) || !ulong.TryParse(f[1], out id) || !int.TryParse(f[2], out gen)) continue;
+            if (id == me) { if (mySlot != slot) { mySlot = slot; Log("I'm guest " + slot + " in " + from.name + "'s game"); WriteLobby(); } continue; }
+            if (slot <= 0 || slot > 3) continue;
+            seen.Add(id);
+            var m = Mate(id);
+            if (m != null && m.slot != slot) { DropLink(m, "moved to another slot"); m = null; }
+            if (m == null) { m = NewLink(id, slot, true, f.Length > 3 ? f[3] : null, "in " + from.name + "'s game"); m.gen = gen; }
+            else if (m.gen != gen)
+            {
+                // they reconnected to the host: what we sent while they were gone never arrived
+                m.gen = gen; m.epoch = null; m.sent.Clear(); m.lastPose = null;
+            }
+        }
+        foreach (var m in new List<PeerLink>(links)) if (m.mate && !seen.Contains(m.id)) DropLink(m, "left " + from.name + "'s game");
+        WriteRoster();
+    }
+
+    // mirror_roster.txt for the mod: "me <slot> <id> <role>", then "peer <outTag> <inTag> <slot> <id> <state> <name>"
+    void WriteRoster()
+    {
+        var sb = new StringBuilder("v1\n");
+        sb.Append("me ").Append(role == "host" ? 0 : mySlot).Append(' ').Append(me).Append(' ').Append(role).Append('\n');
+        foreach (var l in links)
+            sb.Append("peer ").Append(l.outTag).Append(' ').Append(l.inTag).Append(' ').Append(l.slot).Append(' ').Append(l.id).Append(' ')
+              .Append(Live(l) ? "connected" : l.Connected ? "silent" : "connecting").Append(' ').Append(Clean(l.name)).Append('\n');
+        sb.Append("END\n");
+        string text = sb.ToString();
+        if (text == rosterFile) return;
+        rosterFile = text;
+        try { WriteAtomic(RosterFile(), text); } catch { }
+    }
+
+    // in the game right now: connected and heard from lately (a crashed guest keeps its slot, but leaves the list)
+    bool Live(PeerLink l) { return l.Connected && Now() - l.lastRx < 20000; }
+
+    bool CanPump(PeerLink l) { return Reachable(l) && (!l.mate || l.Connected); }
+
     static bool NameKnown(string n, ulong id)
     {
         return !string.IsNullOrEmpty(n) && n != "[unknown]" && n != id.ToString();
     }
 
     // the other player told us their Steam name: use it when Steam doesn't know them
-    void TakePeerName(string body)
+    void TakePeerName(PeerLink l, string body)
     {
         string n = Clean(body).Trim();
         if (n.Length > 32) n = n.Substring(0, 32);
-        if (n == "" || n == "[unknown]" || n == peerName || NameKnown(peerName, peer)) return;
-        peerName = n;
+        if (n == "" || n == "[unknown]" || n == l.name || NameKnown(l.name, l.id)) return;
+        l.name = n;
+        rosterDirty = true;
         Log("the other player is " + n);
-        try { WriteAtomic(PeerNameFile(), peerName); } catch { }
+        try { WriteAtomic(NameFile(l), l.name); } catch { }
+        WriteRoster();
         UpdatePublic();
         WriteLobby();
     }
@@ -1366,24 +1708,46 @@ class Bridge
     void Discover()
     {
         if (role == "host" && auto) return;
-        if (configuredPeer != 0) { SetPeer(configuredPeer, "from your code"); return; }
+        if (configuredPeer != 0) { SetHost(configuredPeer, "from your code"); return; }
         var found = net.FriendsWithPresence(other);
-        if (found.Count > 0) SetPeer(found[0].Key, "Steam friend running SurrounSync as " + other);
+        if (found.Count > 0) SetHost(found[0].Key, "Steam friend running SurrounSync as " + other);
     }
 
-    bool SendBytes(char type, byte[] payload, bool reliable)
+    // a packet to one player: straight to them, or for another guest wrapped for the host's bridge to pass on
+    bool SendBytesRaw(PeerLink l, byte[] data, bool reliable, int channel)
     {
-        if (peer == 0) return false;
-        var data = new byte[payload.Length + 1];
-        data[0] = (byte)type;
-        Buffer.BlockCopy(payload, 0, data, 1, payload.Length);
-        bool ok = net.Send(peer, data, reliable, reliable ? 1 : 0);
-        if (ok) { txPkts++; txBytes += data.Length; }
+        bool ok;
+        if (l.mate)
+        {
+            var h = HostLink();
+            if (h == null || !h.Connected) return false;
+            ok = net.Send(h.id, Wrap(l.id, data), reliable, channel);
+        }
+        else ok = net.Send(l.id, data, reliable, channel);
+        if (ok) { l.txPkts++; l.txBytes += data.Length; }
         return ok;
     }
 
+    static byte[] Wrap(ulong id, byte[] data) { return Wrap(id, data, 0); }
+    static byte[] Wrap(ulong id, byte[] data, int offset)
+    {
+        var p = new byte[9 + data.Length - offset];
+        p[0] = (byte)'X';
+        BitConverter.GetBytes(id).CopyTo(p, 1);
+        Buffer.BlockCopy(data, offset, p, 9, data.Length - offset);
+        return p;
+    }
+
+    bool SendBytes(PeerLink l, char type, byte[] payload, bool reliable)
+    {
+        var data = new byte[payload.Length + 1];
+        data[0] = (byte)type;
+        Buffer.BlockCopy(payload, 0, data, 1, payload.Length);
+        return SendBytesRaw(l, data, reliable, reliable ? 1 : 0);
+    }
+
     // 'F' <id:4> <index:1> <count:1> <part>
-    bool SendFragments(byte[] z, int parts)
+    bool SendFragments(PeerLink l, byte[] z, int parts)
     {
         int id = ++fragId;
         for (int i = 0; i < parts; i++)
@@ -1393,7 +1757,7 @@ class Bridge
             BitConverter.GetBytes(id).CopyTo(p, 0);
             p[4] = (byte)i; p[5] = (byte)parts;
             Buffer.BlockCopy(z, off, p, 6, len);
-            if (!SendBytes('F', p, false)) return false;
+            if (!SendBytes(l, 'F', p, false)) return false;
         }
         return true;
     }
@@ -1426,39 +1790,35 @@ class Bridge
     }
 
     // fragments of the newest latest-wins blob; an older or incomplete one is simply dropped
-    int rxFragId = -1, rxFragHave;
-    byte[][] rxFrags;
-    void TakeFragment(byte[] data)
+    // (data[o] = 'F', then <id:4> <index:1> <count:1> <part>)
+    void TakeFragment(PeerLink l, byte[] data, int o)
     {
-        if (data.Length < 8) return;
-        int id = BitConverter.ToInt32(data, 1), idx = data[5], count = data[6];
-        if (count == 0 || count > MAX_FRAGS || idx >= count) { Dropped("size F"); return; }
-        if (id != rxFragId)
+        if (data.Length - o < 8) return;
+        int id = BitConverter.ToInt32(data, o + 1), idx = data[o + 5], count = data[o + 6];
+        if (count == 0 || count > MAX_FRAGS || idx >= count) { Dropped(l, "size F"); return; }
+        if (id != l.rxFragId)
         {
-            if (rxFragId >= 0 && id < rxFragId && rxFragId - id < 100000) return;     // late part of an older one
-            rxFragId = id; rxFrags = new byte[count][]; rxFragHave = 0;
+            if (l.rxFragId >= 0 && id < l.rxFragId && l.rxFragId - id < 100000) return;     // late part of an older one
+            l.rxFragId = id; l.rxFrags = new byte[count][]; l.rxFragHave = 0;
         }
-        if (rxFrags == null || rxFrags.Length != count || rxFrags[idx] != null) return;   // (already complete / mismatched)
-        rxFrags[idx] = new byte[data.Length - 7];
-        Buffer.BlockCopy(data, 7, rxFrags[idx], 0, data.Length - 7);
-        if (++rxFragHave < count) return;
+        if (l.rxFrags == null || l.rxFrags.Length != count || l.rxFrags[idx] != null) return;   // (already complete / mismatched)
+        l.rxFrags[idx] = new byte[data.Length - o - 7];
+        Buffer.BlockCopy(data, o + 7, l.rxFrags[idx], 0, data.Length - o - 7);
+        if (++l.rxFragHave < count) return;
         int total = 0;
-        foreach (var f in rxFrags) total += f.Length;
+        foreach (var f in l.rxFrags) total += f.Length;
         var z = new byte[total];
         int at = 0;
-        foreach (var f in rxFrags) { Buffer.BlockCopy(f, 0, z, at, f.Length); at += f.Length; }
-        rxFrags = null;
-        Handle('B', Inflate(z, 0, MAX_PART));
+        foreach (var f in l.rxFrags) { Buffer.BlockCopy(f, 0, z, at, f.Length); at += f.Length; }
+        l.rxFrags = null;
+        Handle(l, 'B', Inflate(z, 0, MAX_PART));
     }
 
-    bool SendRaw(char type, string body, bool reliable)
+    bool SendRaw(PeerLink l, char type, string body, bool reliable)
     {
-        if (peer == 0) return false;
         byte[] data = Encoding.UTF8.GetBytes(type + body);
-        if (!reliable && data.Length > 1200) reliable = true;
-        bool ok = net.Send(peer, data, reliable, reliable ? 1 : 0);
-        if (ok) { txPkts++; txBytes += data.Length; }
-        return ok;
+        if (!reliable && data.Length > (l.mate ? 1190 : 1200)) reliable = true;
+        return SendBytesRaw(l, data, reliable, reliable ? 1 : 0);
     }
 
     static string ReadShared(string path)
@@ -1565,37 +1925,48 @@ class Bridge
         }
     }
 
-    void PumpPose()
+    void PumpPose(PeerLink l)
     {
-        string s = ReadShared(Path.Combine(dir, "mirror_link_" + role + ".txt"));
+        string s = ReadShared(Path.Combine(dir, "mirror_link_" + l.outTag + ".txt"));
         if (s == null) return;
         s = s.TrimEnd('\r', '\n');
-        if (!s.EndsWith(" END") || s == lastPose) return;
-        lastPose = s;
-        SendRaw('P', s, false);
+        if (!s.EndsWith(" END") || s == l.lastPose) return;
+        l.lastPose = s;
+        SendRaw(l, 'P', s, false);
     }
 
+    // one folder listing for every link: mirror_<name>_<outTag>.txt goes to the link with that tag
     void PumpBlobs()
     {
         string[] files;
-        try { files = Directory.GetFiles(dir, "mirror_*_" + role + ".txt"); } catch { return; }
+        try { files = Directory.GetFiles(dir, "mirror_*.txt"); } catch { return; }
+        var byTag = new Dictionary<string, PeerLink>();
+        foreach (var l in links) if (CanPump(l)) byTag[l.outTag] = l;
+        if (byTag.Count == 0) return;
         foreach (var path in files)
         {
             string file = Path.GetFileName(path);
-            if (file.StartsWith("mirror_link_") || file.StartsWith("mirror_index_")) continue;
+            if (file.StartsWith("mirror_link_") || file.StartsWith("mirror_index_") || file.StartsWith("mirror_bridge_")) continue;
+            int us = file.LastIndexOf('_');
+            if (us <= "mirror".Length) continue;
+            string tag = file.Substring(us + 1, file.Length - us - 1 - ".txt".Length);
+            PeerLink l;
+            if (!byTag.TryGetValue(tag, out l)) continue;
             DateTime w;
             try { w = File.GetLastWriteTimeUtc(path); } catch { continue; }
             if (w < startedUtc) continue;
             DateTime prev;
-            if (seenWrite.TryGetValue(file, out prev) && prev == w && sent.ContainsKey(file)) continue;
+            if (l.seenWrite.TryGetValue(file, out prev) && prev == w && l.sent.ContainsKey(file)) continue;
+            step = "blob send (read " + file + ")";     // finer label, same timer
             string s = ReadShared(path);
             if (s != null) s = s.Replace("\r\n", "\n");
             if (s == null || !s.EndsWith("\nEND\n")) continue;
-            seenWrite[file] = w;
+            l.seenWrite[file] = w;
             string last;
-            if (sent.TryGetValue(file, out last) && last == s) continue;
-            string name = file.Substring("mirror_".Length, file.Length - "mirror_".Length - ("_" + role + ".txt").Length);
-            if (SendBlob(name, s)) sent[file] = s;
+            if (l.sent.TryGetValue(file, out last) && last == s) continue;
+            string name = file.Substring("mirror_".Length, us - "mirror_".Length);
+            step = "blob send (send " + name + ", " + s.Length + " chars)";
+            if (SendBlob(l, name, s)) l.sent[file] = s;
         }
     }
 
@@ -1606,22 +1977,22 @@ class Bridge
     const int COMPRESS_FROM = 512, FRAG = 1100, MAX_FRAGS = 64;
     int fragId;
 
-    bool SendBlob(string name, string body)
+    bool SendBlob(PeerLink l, string name, string body)
     {
         bool ok;
         if (body.Length > COMPRESS_FROM && body.Length <= CHUNK)
         {
             byte[] z = Deflate(Encoding.UTF8.GetBytes(epoch + "\n" + name + "\n" + body));
             int parts = (z.Length + FRAG - 1) / FRAG;
-            ok = LatestWins.Contains(name) && parts <= MAX_FRAGS ? SendFragments(z, parts) : SendBytes('Z', z, true);
+            ok = LatestWins.Contains(name) && parts <= MAX_FRAGS ? SendFragments(l, z, parts) : SendBytes(l, 'Z', z, true);
             if (ok)
             {
-                txBlobs++;
-                if (loggedTx.Add(name)) Log("sent " + name + " (" + body.Length + " chars, " + z.Length + " B compressed)");
+                l.txBlobs++;
+                if (l.loggedTx.Add(name)) Log("sent " + name + " to " + l.name + " (" + body.Length + " chars, " + z.Length + " B compressed)");
             }
             return ok;
         }
-        if (body.Length <= CHUNK) ok = SendRaw('B', epoch + "\n" + name + "\n" + body, true);
+        if (body.Length <= CHUNK) ok = SendRaw(l, 'B', epoch + "\n" + name + "\n" + body, true);
         else
         {
             int id = ++msgId, count = (body.Length + CHUNK - 1) / CHUNK;
@@ -1629,13 +2000,13 @@ class Bridge
             for (int i = 0; i < count && ok; i++)
             {
                 string part = body.Substring(i * CHUNK, Math.Min(CHUNK, body.Length - i * CHUNK));
-                ok = SendRaw('K', epoch + " " + id + " " + i + " " + count + "\n" + name + "\n" + part, true);
+                ok = SendRaw(l, 'K', epoch + " " + id + " " + i + " " + count + "\n" + name + "\n" + part, true);
             }
         }
         if (ok)
         {
-            txBlobs++;
-            if (loggedTx.Add(name)) Log("sent " + name + " (" + body.Length + " chars)" + (body.Length > CHUNK ? " in pieces" : ""));
+            l.txBlobs++;
+            if (l.loggedTx.Add(name)) Log("sent " + name + " to " + l.name + " (" + body.Length + " chars)" + (body.Length > CHUNK ? " in pieces" : ""));
         }
         return ok;
     }
@@ -1649,44 +2020,44 @@ class Bridge
         WriteLobby();
     }
 
-    bool WithinLimits(byte[] data)
+    // rate and size limits per player; o = where the packet starts (after a relay header)
+    bool WithinLimits(PeerLink l, byte[] data, int o)
     {
         long t = Now();
-        if (tokensAt == 0) tokensAt = t;
-        double dt = (t - tokensAt) / 1000.0; tokensAt = t;
-        pktTokens = Math.Min(PKT_BURST, pktTokens + dt * PKT_RATE);
-        byteTokens = Math.Min(BYTE_BURST, byteTokens + dt * BYTE_RATE);
-        if (pktTokens < 1 || byteTokens < data.Length) { Dropped("rate"); return false; }
-        pktTokens -= 1; byteTokens -= data.Length;
-        char type = data.Length > 0 ? (char)data[0] : '?';
+        if (l.pktTokens < 0) { l.pktTokens = PKT_BURST; l.byteTokens = BYTE_BURST; l.tokensAt = t; }
+        double dt = (t - l.tokensAt) / 1000.0; l.tokensAt = t;
+        l.pktTokens = Math.Min(PKT_BURST, l.pktTokens + dt * PKT_RATE);
+        l.byteTokens = Math.Min(BYTE_BURST, l.byteTokens + dt * BYTE_RATE);
+        int len = data.Length - o;
+        if (l.pktTokens < 1 || l.byteTokens < len) { Dropped(l, "rate"); return false; }
+        l.pktTokens -= 1; l.byteTokens -= len;
+        char type = len > 0 ? (char)data[o] : '?';
         int max = type == 'P' ? MAX_POSE : type == 'H' ? MAX_HELLO : (type == 'B' || type == 'K' || type == 'Z') ? MAX_PART
-                : (type == 'C' || type == 'A' || type == 'R' || type == 'T' || type == 'N') ? 256 : type == 'V' ? 8192 : type == 'F' ? FRAG + 16 : 0;
-        if (data.Length > max) { Dropped("size " + type + " " + data.Length + " B"); return false; }
+                : (type == 'C' || type == 'A' || type == 'R' || type == 'T' || type == 'N') ? 256 : type == 'V' ? 8192 : type == 'F' ? FRAG + 16
+                : type == 'W' ? 1024 : type == 'X' ? MAX_PART + 9 : 0;
+        if (len > max) { Dropped(l, "size " + type + " " + len + " B"); return false; }
         return true;
     }
 
-    void Dropped(string why)
+    void Dropped(PeerLink l, string why)
     {
         long t = Now();
         string kind = why.Split(' ')[0];
         long last;
-        if (!dropLogged.TryGetValue(kind, out last) || t - last > KICK_WINDOW) { dropLogged[kind] = t; Log("dropped a packet from " + peerName + " (" + why + ")"); }
-        drops.Enqueue(t);
-        while (drops.Count > 0 && t - drops.Peek() > KICK_WINDOW) drops.Dequeue();
-        if (drops.Count >= KICK_DROPS && peer != 0) Kick("too much data");
+        if (!l.dropLogged.TryGetValue(kind, out last) || t - last > KICK_WINDOW) { l.dropLogged[kind] = t; Log("dropped a packet from " + l.name + " (" + why + ")"); }
+        l.drops.Enqueue(t);
+        while (l.drops.Count > 0 && t - l.drops.Peek() > KICK_WINDOW) l.drops.Dequeue();
+        // another guest's packets come through the host: only the host link and the host's guests can be cut off
+        if (l.drops.Count >= KICK_DROPS && !l.mate && links.Contains(l)) Kick(l, "too much data");
     }
 
-    void Kick(string why)
+    void Kick(PeerLink l, string why)
     {
-        ulong id = peer;
-        Log("disconnected " + peerName + " (" + id + "): " + why + " - blocked until you host again");
-        blocked.Add(id); approved.Remove(id);
-        kickedLine = "kicked " + id + " " + Clean(peerName); kickedAt = Now();
-        try { net.Close(id); } catch { }
-        ClearPeerFiles();
-        peer = 0; peerEpoch = null; drops.Clear();
-        chunkKey = null; chunkParts = null;
-        try { File.Delete(PeerNameFile()); } catch { }
+        Log("disconnected " + l.name + " (" + l.id + "): " + why + " - blocked until you host again");
+        blocked.Add(l.id); approved.Remove(l.id);
+        kickedLine = "kicked " + l.id + " " + Clean(l.name); kickedAt = Now();
+        if (role == "host") SendTo(l.id, 'R', "kicked");
+        DropLink(l, "kicked");
         WriteLobby();
     }
 
@@ -1697,12 +2068,13 @@ class Bridge
             ulong from;
             byte[] data = net.Read(channel, out from);
             if (data == null) break;
-            if (role == "host" && from != peer && data.Length > 1 && data[0] == (byte)'A' && data.Length < 200)
+            var l = Direct(from);
+            if (role == "host" && l == null && data.Length > 1 && data[0] == (byte)'A' && data.Length < 200)
             {
                 CheckAnswer(from, Encoding.UTF8.GetString(data, 1, data.Length - 1));
                 continue;
             }
-            if (role == "host" && from != peer && data.Length > 1 && data[0] == (byte)'N' && data.Length < 100)
+            if (role == "host" && l == null && data.Length > 1 && data[0] == (byte)'N' && data.Length < 100)
             {
                 // someone asking to join says who they are (Steam only names your friends)
                 KeyValuePair<string, long> r;
@@ -1715,83 +2087,114 @@ class Bridge
                 }
                 continue;
             }
-            if (peer == 0 && role == "host") TakeOrRequest(from, "it sent us data");
-            if (from != peer) continue;
-            rxPkts++; rxBytes += data.Length;
-            if (!WithinLimits(data)) continue;
-            lastRx = Now(); lastHeard = lastRx;
-            if (data[0] == (byte)'V') { voice.HeardAt = Environment.TickCount; voice.Play(data, 1); continue; }
-            if (data[0] == (byte)'Z' || data[0] == (byte)'F')
-            {
-                try { if (data[0] == (byte)'Z') Handle('B', Inflate(data, 1, MAX_PART)); else TakeFragment(data); }
-                catch (Exception e) { Dropped("bad " + (char)data[0] + " " + e.Message); }
-                continue;
-            }
-            string msg = Encoding.UTF8.GetString(data);
-            if (msg.Length == 0) continue;
-            try { Handle(msg[0], msg.Substring(1)); } catch (Exception e) { Log("handle " + msg[0] + ": " + e.Message); }
+            if (role == "host" && l == null) { TakeOrRequest(from, "it sent us data"); l = Direct(from); }
+            if (l == null) continue;
+            l.rxPkts++; l.rxBytes += data.Length;
+            if (!WithinLimits(l, data, 0)) continue;
+            l.lastRx = Now(); l.lastHeard = l.lastRx;
+            if (data[0] == (byte)'X') { Relayed(l, data, channel); continue; }
+            ProcessPacket(l, data, 0);
         }
     }
 
-    void BlobEpoch(string ep)
+    // a packet that came through the host's bridge: on the host, pass it on; on a guest, it's from another guest
+    void Relayed(PeerLink from, byte[] data, int channel)
     {
-        if (ep == blobEpoch) return;
-        if (blobEpoch != null) Log("the other game restarted - cleared its old data");
-        blobEpoch = ep;
+        if (data.Length < 10) return;
+        ulong id = BitConverter.ToUInt64(data, 1);
+        if (role == "host")
+        {
+            var to = Direct(id);
+            if (to == null || to == from || to.slot == 0 || !to.Connected) return;
+            if (net.Send(to.id, Wrap(from.id, data, 9), channel == 1, channel)) { to.txPkts++; to.txBytes += data.Length; }
+            return;
+        }
+        if (from.slot != 0) return;
+        var m = Mate(id);
+        if (m == null) return;           // not in the host's list (yet)
+        m.rxPkts++; m.rxBytes += data.Length - 9;
+        if (!WithinLimits(m, data, 9)) return;
+        m.lastRx = Now(); m.lastHeard = m.lastRx;
+        ProcessPacket(m, data, 9);
+    }
+
+    void ProcessPacket(PeerLink l, byte[] data, int o)
+    {
+        byte t = data[o];
+        if (t == (byte)'V')
+        {
+            voice.Play(l.voice, data, o + 1);
+            // the host passes a guest's voice on to the other guests
+            if (role == "host" && !l.mate)
+                foreach (var x in links) if (x != l && x.slot > 0 && x.Connected && net.Send(x.id, Wrap(l.id, data, o), false, 2)) { x.txPkts++; x.txBytes += data.Length; }
+            return;
+        }
+        if (t == (byte)'Z' || t == (byte)'F')
+        {
+            try { if (t == (byte)'Z') Handle(l, 'B', Inflate(data, o + 1, MAX_PART)); else TakeFragment(l, data, o); }
+            catch (Exception e) { Dropped(l, "bad " + (char)t + " " + e.Message); }
+            return;
+        }
+        string msg = Encoding.UTF8.GetString(data, o, data.Length - o);
+        if (msg.Length == 0) return;
+        try { Handle(l, msg[0], msg.Substring(1)); } catch (Exception e) { Log("handle " + msg[0] + ": " + e.Message); }
+    }
+
+    void BlobEpoch(PeerLink l, string ep)
+    {
+        if (ep == l.blobEpoch) return;
+        if (l.blobEpoch != null) Log(l.name + "'s game restarted - cleared its old data");
+        l.blobEpoch = ep;
         try
         {
-            string tail = "_" + other + ".txt";
+            string tail = "_" + l.inTag + ".txt";
             DropQueuedWrites(n => n.StartsWith("mirror_") && n.EndsWith(tail) && !n.StartsWith("mirror_link_"));
-            foreach (var f in Directory.GetFiles(dir, "mirror_*_" + other + ".txt"))
+            foreach (var f in Directory.GetFiles(dir, "mirror_*" + tail))
                 if (!Path.GetFileName(f).StartsWith("mirror_link_")) try { File.Delete(f); } catch { }
         }
         catch { }
     }
 
-    void WriteBlob(string name, string body)
+    void WriteBlob(PeerLink l, string name, string body)
     {
         if (name.Length == 0 || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return;
-        WriteAtomic(Path.Combine(dir, "mirror_" + name + "_" + other + ".txt"), body);
-        BumpIndex(name);
-        rxBlobs++;
-        if (loggedRx.Add(name)) Log("got " + name + " (" + body.Length + " chars)");
+        WriteAtomic(Path.Combine(dir, "mirror_" + name + "_" + l.inTag + ".txt"), body);
+        BumpIndex(l, name);
+        l.rxBlobs++;
+        if (l.loggedRx.Add(name)) Log("got " + name + " from " + l.name + " (" + body.Length + " chars)");
     }
 
     // One small file the game reads instead of opening every blob file each frame: a counter per blob name,
-    // bumped after the blob is written. The first token changes per bridge run so the game drops old counters.
-    readonly Dictionary<string, long> blobGen = new Dictionary<string, long>();
-    readonly string indexRun = DateTime.UtcNow.Ticks.ToString();
-    void BumpIndex(string name)
+    // bumped after the blob is written. The first token changes per link so the game drops old counters.
+    void BumpIndex(PeerLink l, string name)
     {
         long g;
-        blobGen.TryGetValue(name, out g);
-        blobGen[name] = g + 1;
-        var sb = new StringBuilder("v1 ").Append(indexRun).Append('\n');
-        foreach (var kv in blobGen) sb.Append(kv.Key).Append(' ').Append(kv.Value).Append('\n');
+        l.blobGen.TryGetValue(name, out g);
+        l.blobGen[name] = g + 1;
+        var sb = new StringBuilder("v1 ").Append(l.indexRun).Append('\n');
+        foreach (var kv in l.blobGen) sb.Append(kv.Key).Append(' ').Append(kv.Value).Append('\n');
         sb.Append("END\n");
-        WriteAtomic(Path.Combine(dir, "mirror_index_" + other + ".txt"), sb.ToString());
+        WriteAtomic(Path.Combine(dir, "mirror_index_" + l.inTag + ".txt"), sb.ToString());
     }
 
     // bridge-to-bridge round trip, without the games in between (what the network itself costs)
-    long pingAt;
-    double rttMs = -1;
-    void Ping(long t)
+    void Ping(PeerLink l, long t)
     {
-        if (peer == 0 || t - pingAt < 2000) return;
-        pingAt = t;
-        SendRaw('T', "q" + t, false);
+        if (t - l.pingAt < 2000 || !CanPump(l)) return;
+        l.pingAt = t;
+        SendRaw(l, 'T', "q" + t, false);
     }
 
-    void Handle(char type, string body)
+    void Handle(PeerLink l, char type, string body)
     {
         if (type == 'T')
         {
             long sent;
-            if (body.StartsWith("q")) SendRaw('T', "a" + body.Substring(1), false);
+            if (body.StartsWith("q")) SendRaw(l, 'T', "a" + body.Substring(1), false);
             else if (body.StartsWith("a") && long.TryParse(body.Substring(1), out sent))
             {
                 double r = Now() - sent;
-                if (r >= 0 && r < 30000) rttMs = rttMs < 0 ? r : rttMs * 0.7 + r * 0.3;
+                if (r >= 0 && r < 30000) l.rtt = l.rtt < 0 ? r : l.rtt * 0.7 + r * 0.3;
             }
             return;
         }
@@ -1800,15 +2203,15 @@ class Bridge
             int a = body.IndexOf(' '), b2 = a < 0 ? -1 : body.IndexOf(' ', a + 1);
             if (b2 < 0) return;
             string line = body.Substring(0, a) + " " + Unix() + body.Substring(b2);
-            WriteAtomic(Path.Combine(dir, "mirror_link_" + other + ".txt"), line + "\n");
+            WriteAtomic(Path.Combine(dir, "mirror_link_" + l.inTag + ".txt"), line + "\n");
         }
         else if (type == 'B')
         {
             int n1 = body.IndexOf('\n');
             int n2 = n1 < 0 ? -1 : body.IndexOf('\n', n1 + 1);
             if (n2 < 0) return;
-            BlobEpoch(body.Substring(0, n1));
-            WriteBlob(body.Substring(n1 + 1, n2 - n1 - 1), body.Substring(n2 + 1));
+            BlobEpoch(l, body.Substring(0, n1));
+            WriteBlob(l, body.Substring(n1 + 1, n2 - n1 - 1), body.Substring(n2 + 1));
         }
         else if (type == 'K')
         {
@@ -1820,54 +2223,70 @@ class Bridge
             string name = body.Substring(n1 + 1, n2 - n1 - 1);
             int idx, count;
             if (!int.TryParse(h[2], out idx) || !int.TryParse(h[3], out count) || count <= 0 || idx >= count) return;
-            if (count > MAX_PARTS) { Dropped("size K " + count + " parts"); return; }
-            BlobEpoch(h[0]);
+            if (count > MAX_PARTS) { Dropped(l, "size K " + count + " parts"); return; }
+            BlobEpoch(l, h[0]);
             string key = h[0] + " " + h[1];
-            if (key != chunkKey || idx == 0) { chunkKey = key; chunkName = name; chunkParts = new string[count]; chunkGot = 0; }
-            if (chunkParts[idx] == null) { chunkParts[idx] = body.Substring(n2 + 1); chunkGot++; }
-            if (chunkGot == count)
+            if (key != l.chunkKey || idx == 0) { l.chunkKey = key; l.chunkName = name; l.chunkParts = new string[count]; l.chunkGot = 0; }
+            if (l.chunkParts[idx] == null) { l.chunkParts[idx] = body.Substring(n2 + 1); l.chunkGot++; }
+            if (l.chunkGot == count)
             {
-                WriteBlob(chunkName, string.Concat(chunkParts));
-                chunkKey = null; chunkParts = null;
+                WriteBlob(l, l.chunkName, string.Concat(l.chunkParts));
+                l.chunkKey = null; l.chunkParts = null;
             }
         }
-        else if (type == 'C' && role == "guest")
+        else if (type == 'C' && role == "guest" && l.slot == 0 && !l.mate)
         {
             if (answered) return;
             answered = true;
-            SendRaw('A', joinKey == null ? "none" : Answer(joinKey, body.Trim(), me), true);
+            SendRaw(l, 'A', joinKey == null ? "none" : Answer(joinKey, body.Trim(), me), true);
             Log("answered the host's password check" + (joinKey == null ? " (no password typed)" : ""));
         }
-        else if (type == 'R' && role == "guest")
+        else if (type == 'R' && role == "guest" && l.slot == 0 && !l.mate)
         {
             joinError = body.Trim();
             Log("the host refused: " + joinError);
             WriteLobby();
         }
-        else if (type == 'N') TakePeerName(body);
+        else if (type == 'W' && role == "guest") TakeRoster(l, body);
+        else if (type == 'N') TakePeerName(l, body);
         else if (type == 'H')
         {
             var f = body.Split(' ');
             long remote;
             if (f.Length >= 2 && long.TryParse(f[1], out remote))
-                WriteAtomic(Path.Combine(dir, "mirror_clock_offset.txt"), (Unix() - remote).ToString());
-            if (f.Length >= 4) peerGame = f[3] == "1" ? "alive" : "gone";
-            if (f.Length >= 1 && f[0] != peerEpoch)
+                WriteAtomic(ClockFile(l), (Unix() - remote).ToString());
+            if (f.Length >= 4) l.game = f[3] == "1" ? "alive" : "gone";
+            if (f.Length >= 1 && f[0] != l.epoch)
             {
-                peerEpoch = f[0];
-                Log("connected to " + peerName + " (their session " + peerEpoch + ")");
-                sent.Clear(); lastPose = null;
+                l.epoch = f[0];
+                Log("connected to " + l.name + " (their session " + l.epoch + ")");
+                l.sent.Clear(); l.lastPose = null;
+                rosterDirty = true;
+                if (role == "host") l.gen = ++rosterGen;
+                // the host's bridge restarted: what we sent the other guests through it may be lost
+                if (role == "guest" && l.slot == 0) foreach (var m in links) if (m.mate) { m.epoch = null; m.sent.Clear(); m.lastPose = null; }
+                WriteRoster();
+                WriteLobby();
             }
         }
     }
 
     void WriteStatus()
     {
-        double hb = peer == 0 || lastHeard == 0 ? -1 : (Now() - lastHeard) / 1000.0;
+        // the first guest's / the host's link keeps the old file name; a host without guests says "searching"
+        if (Primary() == null && role != "idle") WriteStatusOf(null, role);
+        foreach (var l in links) WriteStatusOf(l, l.outTag);
+    }
+
+    void WriteStatusOf(PeerLink l, string tag)
+    {
+        double hb = l == null || l.lastHeard == 0 ? -1 : (Now() - l.lastHeard) / 1000.0;
         string s = string.Format("bridge {0}: me {1}, peer {2} ({3}), last rx {4:0.0} s, pkts tx {5} rx {6}, KB tx {7:0} rx {8:0}, blobs tx {9} rx {10} peer_hb {4:0.0} peer_game {12} at {11}",
-            role, me, peer == 0 ? "searching" : peerName, peer, hb,
-            txPkts, rxPkts, txBytes / 1024.0, rxBytes / 1024.0, txBlobs, rxBlobs, Unix(), peer == 0 ? "?" : peerGame)
-            + (rttMs >= 0 ? string.Format(" rtt {0:0} ms", rttMs) : " rtt ?") + (peer != 0 ? " " + net.Route(peer) : "");
-        try { WriteAtomic(Path.Combine(dir, "mirror_bridge_status_" + role + ".txt"), s); } catch { }
+            role, me, l == null ? "searching" : l.name, l == null ? 0 : l.id, hb,
+            l == null ? 0 : l.txPkts, l == null ? 0 : l.rxPkts, l == null ? 0 : l.txBytes / 1024.0, l == null ? 0 : l.rxBytes / 1024.0,
+            l == null ? 0 : l.txBlobs, l == null ? 0 : l.rxBlobs, Unix(), l == null ? "?" : l.game)
+            + (l != null && l.rtt >= 0 ? string.Format(" rtt {0:0} ms", l.rtt) : " rtt ?")
+            + (l != null ? " " + (l.mate ? "route via-host" : net.Route(l.id)) + " slot " + l.slot : "");
+        try { WriteAtomic(StatusFile(tag), s); } catch { }
     }
 }

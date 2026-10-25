@@ -14,7 +14,6 @@ local next_id = 0
 local recent = {}
 local dirty = false
 local seen = {}
-local cache = {}
 
 local function path_of(obj)
     if not util.valid(obj) then return nil end
@@ -57,13 +56,7 @@ local function is_real(self)
     return not ghost.is(o) and util.same(o, game.player())
 end
 
-local function find_montage(p)
-    local m = util.cached(cache, p)
-    if m then return m end
-    m = StaticFindObject(p)
-    if util.valid(m) then cache[p] = m; return m end
-    return nil
-end
+local find_montage = util.find
 
 local function apply_use(g, asset_p, extra)
     local mp, op = (extra or ""):match("^(%S+) (%S+)$")

@@ -29,7 +29,17 @@ local SLOT_INDEX = "SlotIndex_6_8ED1F34A4AF1D565616883B80192E3DD"
 local IN_INDEX = "InContainerIndex_31_A61F5C3A47C8E761BA5CF0ADA1DF9FDE"
 
 local cfg, role, session
-local channel = events.new("drops", 32, 5)
+local channel = events.reliable("drops")
+local peers = require("mirror.peers")
+-- More than two players (host): a dropped item lies once in the host's world, held by the copy of this module
+-- of whoever dropped it. A "T" (picked up) that this copy sends goes to the other guests as well.
+channel.send = function(self, p)
+    local r = events.send(self, p)
+    if p:sub(1, 2) == "T " and not peers.relaying() then
+        peers.relay("mirror.drops", drops, function(m) m.relay_take(p) end)
+    end
+    return r
+end
 local tracked = {}
 local seen = {}
 local copies = {}
@@ -98,8 +108,8 @@ local function forget(uid)
 end
 
 local function jig_of(actor)
-    local cls = StaticFindObject(JIG)
-    if not util.valid(cls) then return nil end
+    local cls = util.find(JIG)
+    if not cls then return nil end
     local c
     pcall(function() c = actor:GetComponentByClass(cls) end)
     return util.valid(c) and c or nil
@@ -108,7 +118,7 @@ end
 local function item_of(actor)
     local da
     pcall(function()
-        local c = actor:GetComponentByClass(StaticFindObject(PICKUP_COMP))
+        local c = actor:GetComponentByClass(util.find(PICKUP_COMP))
         da = full_path(c.ItemDataAsset)
     end)
     if not da then
@@ -146,7 +156,7 @@ local function note_unfilled(uid, actor, placed, missing)
     unfilled[uid] = list
     local n = 0
     for _, w in ipairs(list) do if not w.parent then n = n + (w.count or 1) end end
-    pcall(function() actor:GetComponentByClass(StaticFindObject(PICKUP_COMP)).RepCapacity = n end)
+    pcall(function() actor:GetComponentByClass(util.find(PICKUP_COMP)).RepCapacity = n end)
     log.info(string.format("drops: the copy has no container for its %d item(s) (%d inside) - they go into it when it's picked up here",
         #list, n))
 end
@@ -293,8 +303,8 @@ local function make(payload)
     if not uid then return end
     if not shared() then return end
     if tracked[uid] and alive(tracked[uid]) then return end
-    local asset = StaticFindObject(da)
-    if not util.valid(asset) then
+    local asset = util.find(da)
+    if not asset then
         log.info("drops: the other player dropped " .. (da:match("[^%.]+$") or da) .. " - not loaded here, not shown")
         return
     end
@@ -492,6 +502,12 @@ local function finish_copies()
 end
 
 local picking = nil
+function drops.tracks(actor) return tracked_uid(actor) ~= nil end
+local function other_tracks(actor)
+    local hit = false
+    peers.each("mirror.drops", function(m) if m ~= drops and not hit and m.tracks(actor) then hit = true end end)
+    return hit
+end
 
 -- A copy with unfilled contents was picked up here (uid = its drop uid, item = the new inventory item's uid if known).
 local function queue_refill(uid, item, before)
@@ -569,6 +585,8 @@ local function on_add_actor_pre(ActorRef)
     local actor
     pcall(function() actor = ActorRef:get() end)
     local uid = tracked_uid(actor)
+    -- another guest's drop (more than two players): the copy that holds it tells everyone
+    if not uid and shared() and actor and other_tracks(actor) then picking = nil; return end
     if uid then
         picking = { uid = uid, at = now }
         if unfilled[uid] then
@@ -732,7 +750,17 @@ function drops.tick(dt)
         elseif k == "I" then util.safe(take_content, "drops.content", payload)
         elseif k == "C" then util.safe(take_changed, "drops.changed", payload)
         else util.safe(remove, "drops.remove", payload) end
+        -- host, more than two players: the other guests get it too; a pickup also removes the host's copy,
+        -- which the copy of this module of whoever dropped it holds
+        if k == "T" then peers.relay("mirror.drops", drops, function(m) m.relay_take(payload) end)
+        else peers.relay("mirror.drops", drops, function(m) m.relay_send(payload) end) end
     end)
+end
+
+function drops.relay_send(p) channel:send(p) end
+function drops.relay_take(p)
+    util.safe(remove, "drops.remove", p)
+    channel:send(p)
 end
 
 function drops.status()

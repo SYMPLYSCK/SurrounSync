@@ -147,14 +147,11 @@ function look.capture(player)
     return table.concat(lines, "\n")
 end
 
-local asset_cache = {}
 local missing = {}
 local function load(path)
     if not path or path == "-" or path == "" then return nil end
-    local o = util.cached(asset_cache, path)
+    local o = util.find(path)
     if o then return o end
-    o = StaticFindObject(path)
-    if util.valid(o) then asset_cache[path] = o; return o end
     missing[#missing + 1] = path
     return nil
 end

@@ -42,6 +42,11 @@ local guest_state, guest_epoch, guest_fighting = "m", -1, false
 local measure = nil         -- { at, what, before } one follow-up AI count after a switch
 local stats = { splits = 0, merges = 0, timeouts = 0, reout = 0, last = "-" }
 local GHOST_GRACE = 5.0     -- the ghost is briefly gone around saves and respawns
+-- 4 players (host): the slot of the guest whose game runs the AI around this one (group split, group.lua)
+local leader = nil
+local peers_mod
+local function P() peers_mod = peers_mod or require("mirror.peers"); return peers_mod end
+local function others(fn) P().each("mirror.split", function(m) if m ~= split and m.slot then fn(m) end end) end
 
 local function sp() return cfg.zombies.split end
 
@@ -58,11 +63,46 @@ local function read_guest()
     if s then guest_state, guest_epoch, guest_fighting = s, tonumber(e), f == "1" end
 end
 
+-- The slot of the guest this copy is for, its ghost's location, and the leader it follows (asking or following).
+function split.slot() local t = link.tags and link.tags(); return P().slot_of(t and t.out) end
+function split.ghost_loc() return ghost.location() end
+function split.lead_slot() return (state == "asking" or state == "following") and leader or nil end
+function split.host_state() return state end
+
+-- How far this guest is from the nearest other player: the host, or (more than two players) another guest's ghost.
+-- A guest runs its own AI only alone - or in a group: its leader and the leader's other followers don't count
+-- (group split). Anyone else coming near merges it, so players together otherwise share the host's AI.
+-- Returns that distance, my ghost's location and the distance to the host.
 local function players_apart()
     local gl, hl = ghost.location(), nil
     pcall(function() hl = game.player():K2_GetActorLocation() end)
     if not (gl and hl) then return nil, gl end
-    return util.dist(gl, hl), gl
+    local dh = util.dist(gl, hl)
+    local d, grp = dh, leader or split.slot()
+    others(function(m)
+        local l = m.ghost_loc()
+        if not l or m.slot() == grp or m.lead_slot() == grp then return end
+        d = math.min(d, util.dist(gl, l))
+    end)
+    return d, gl, dh
+end
+
+-- A guest with a lower slot that is split, near enough to lead this one (nil = none).
+local function find_leader(gl)
+    local me, best, bd = split.slot(), nil, math.huge
+    others(function(m)
+        if m.slot() < me and m.host_state() == "split" then
+            local l = m.ghost_loc()
+            local dd = l and util.dist(gl, l)
+            if dd and dd < sp().split_radius and dd < bd then best, bd = m, dd end
+        end
+    end)
+    return best, bd
+end
+local function leader_copy()
+    local hit
+    others(function(m) if m.slot() == leader then hit = m end end)
+    return hit
 end
 
 local function blocked(gl)
@@ -75,9 +115,13 @@ local function merge(why)
     local idx = ghost.exists() and ghost.set_invoker(true) or -1
     zombies.set_split(false)
     local was = state
-    state, epoch, far_since = "merged", epoch + 1, nil
+    state, epoch, far_since, leader = "merged", epoch + 1, nil, nil
     put("m " .. epoch)
-    if was == "split" then
+    if was == "following" then
+        stats.merges = stats.merges + 1
+        stats.last = why
+        log.info(string.format("split: stopped following (%s) - the host runs the AI around the guest again (invoker %d)", why, idx))
+    elseif was == "split" then
         stats.merges = stats.merges + 1
         stats.last = why
         measure = { at = now + 20.0, what = "after the merge", before = ghost.ai_count() }
@@ -109,15 +153,25 @@ local function host_tick(dt)
     local urgent = state ~= "merged" and require("mirror.infest").guest_hit_age() < 1.0
     eval_in = eval_in - dt
     if eval_in > 0 and not urgent then return end
-    eval_in = state == "splitting" and 0.25 or 1.0
+    eval_in = (state == "splitting" or state == "asking") and 0.25 or 1.0
     read_guest()
-    local d, gl = players_apart()
+    local d, gl, dh = players_apart()
     if not d then return end
     local why = blocked(gl)
     local c = sp()
     if state == "merged" then
         local near, age = zombies.near_guest()
         local quiet = age < 2.0 and near >= c.quiet_radius
+        -- near a split guest (lower slot), far from the host: follow it - its game runs the AI here too
+        local lead_m = not why and dh > c.split_radius and now >= retry_at and find_leader(gl)
+        if lead_m then
+            leader = lead_m.slot()
+            state, epoch, asked_at, eval_in, far_since = "asking", epoch + 1, now, 0.25, nil
+            put("f " .. epoch .. " " .. leader)
+            log.info(string.format("split: %.0f m from the host, next to the split guest in slot %d - asking to follow it (epoch %d)",
+                dh / 100, leader, epoch))
+            return
+        end
         if d > c.split_radius and not why and quiet then
             far_since = far_since or now
         else
@@ -146,6 +200,31 @@ local function host_tick(dt)
             retry_at = now + c.retry_after
             merge("the guest didn't take over in time")
         end
+    elseif state == "asking" or state == "following" then
+        local lm = leader_copy()
+        local ll = lm and lm.host_state() == "split" and lm.ghost_loc()
+        local apart = ll and util.dist(gl, ll)
+        if not ll then merge("the leader isn't split any more")
+        elseif why then merge(why)
+        elseif apart > c.split_radius * 1.25 then merge(string.format("%.0f m from the leader", apart / 100))
+        elseif d < c.force_radius or (d < c.merge_radius and not guest_fighting) then merge(string.format("players %.0f m apart", d / 100))
+        elseif state == "asking" then
+            if guest_state == "f" and guest_epoch == epoch then
+                local idx = ghost.set_invoker(false)
+                zombies.set_split(true)
+                state = "following"
+                stats.splits = stats.splits + 1
+                log.info(string.format("split: the guest in slot %d runs the AI around this guest now - ghost invoker out (index %d), snapshots off",
+                    leader, idx))
+            elseif now - asked_at > c.ack_timeout then
+                stats.timeouts = stats.timeouts + 1
+                retry_at = now + c.retry_after
+                merge("no follow answer in time")
+            end
+        elseif ghost.invoker_index() >= 0 then
+            ghost.set_invoker(false)
+            stats.reout = stats.reout + 1
+        end
     else
         if ghost.invoker_index() >= 0 then
             -- a respawned ghost (after a save) registers itself again
@@ -161,7 +240,7 @@ end
 
 -- Guest -------------------------------------------------------------------------------------------------
 
-local host_want, host_epoch = "m", 0
+local host_want, host_epoch, host_leader = "m", 0, nil
 local answer_in = 0.0
 local was_in = false
 
@@ -169,7 +248,8 @@ local function guest_tick(dt)
     local in_world = session.in_world()
     if not in_world then
         if was_in then
-            was_in, host_want, host_epoch, sent = false, "m", 0, nil
+            was_in, host_want, host_epoch, host_leader, sent = false, "m", 0, nil, nil
+            zombies.set_follow(false)
             link.reset_blob("p8")
         end
         return
@@ -180,8 +260,22 @@ local function guest_tick(dt)
     answer_in = 0.5
     local body = link.get_blob("p8")
     if body then
-        local s, e = body:match("^(%a) (%d+)")
-        if s then host_want, host_epoch = s, tonumber(e) end
+        local s, e, l = body:match("^(%a) (%d+) ?(%d*)")
+        if s then host_want, host_epoch, host_leader = s, tonumber(e), tonumber(l) end
+    end
+    -- group split: ask the leader's copy to show its AI here; the host hears "f" once the leader confirmed
+    local follow, acked = host_want == "f", false
+    P().each("mirror.group", function(g, inst)
+        if not (inst and g.follow and not g.leads()) then return end
+        local mine = follow and inst.slot == host_leader
+        g.follow(mine, host_epoch)
+        if mine and g.follow_acked(host_epoch) then acked = true end
+    end)
+    if acked ~= zombies.is_follow() then
+        zombies.set_follow(acked)
+        log.info(string.format("split: %s (epoch %d)", acked and ("the guest in slot " .. tostring(host_leader) .. " runs the AI around me")
+            or "the host runs the AI around me again", host_epoch))
+        if acked then stats.splits = stats.splits + 1 else stats.merges = stats.merges + 1 end
     end
     local want = host_want == "s"
     if want ~= zombies.is_split() then
@@ -192,7 +286,8 @@ local function guest_tick(dt)
             host_epoch, n))
         if want then stats.splits = stats.splits + 1 else stats.merges = stats.merges + 1 end
     end
-    put(string.format("%s %d %d", zombies.is_split() and "s" or "m", host_epoch, zombies.guest_busy() and 1 or 0))
+    put(string.format("%s %d %d", zombies.is_split() and "s" or (zombies.is_follow() and "f" or "m"), host_epoch,
+        zombies.guest_busy() and 1 or 0))
 end
 
 function split.tick(dt)

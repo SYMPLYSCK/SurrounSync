@@ -322,4 +322,7 @@ function world.init(c, r, s, connected)
     log.info("world: " .. (role == "host" and "sending time + weather" or role == "guest" and "copying the host's time + weather while joined" or "off"))
 end
 
+-- the old world's sky/weather actors are freed with it
+function world.forget() sky, weather = nil, nil end
+
 return world

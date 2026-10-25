@@ -8,6 +8,10 @@ local link = {}
 local cfg, backend, kind
 local bridge_role = nil
 local auto = false
+-- one of several other players (peers.lua): its own file names; the bridge itself belongs to the main link
+local tags = nil
+local function out_tag() return tags and tags.out or bridge_role end
+function link.tags() return tags end
 local function app_dir()
     local base = (os.getenv("LOCALAPPDATA") or ".") .. "\\SurrounDead"
     return (cfg and cfg.link_dir) and (base .. "\\" .. cfg.link_dir) or base
@@ -47,7 +51,7 @@ local function flush_cmds()
     f:close()
 end
 function link.bridge_cmd(text)
-    if kind ~= "steam" then return false end
+    if kind ~= "steam" or tags then return false end
     cmd_queue[#cmd_queue + 1] = text
     flush_cmds()
     return true
@@ -75,11 +79,12 @@ end
 local join_password = ""
 function link.set_join_password(pw) join_password = tostring(pw or ""):gsub("[\r\n]", "") end
 
-function link.open(role, peer_id)
+function link.open(role, peer_id, t)
     if not backend then link.configure({ transport = "file" }) end
-    local a, b = backend.open(role)
+    tags = t
+    local a, b = backend.open(role, t)
     bridge_role = role
-    if kind == "steam" then
+    if kind == "steam" and not t then
         if auto then
             local c = role == "host" and "host" or ("join " .. tostring(peer_id or 0)
                 .. (join_password ~= "" and (" " .. join_password) or ""))
@@ -200,7 +205,7 @@ local clock_off, clock_read_at = 0, -100
 function link.peer_age(stamp)
     if kind == "steam" and now - clock_read_at > 2 then
         clock_read_at = now
-        local f = io.open(app_dir() .. "\\mirror_clock_offset.txt", "r")
+        local f = io.open(app_dir() .. (tags and ("\\mirror_clock_offset_" .. tags.out .. ".txt") or "\\mirror_clock_offset.txt"), "r")
         if f then clock_off = tonumber(f:read("*a")) or clock_off; f:close() end
     end
     if kind ~= "steam" then return os.time() - stamp end
@@ -263,6 +268,18 @@ function link.lobby()
         elseif k == "kicked" then
             local id, name = rest:match("^(%d+) ?(.*)$")
             if id then l.kicked = { id = id, name = name ~= "" and name or id } end
+        elseif k == "player" then
+            -- every other player (more than two): "<slot> <id> <state> <outTag> <name>", slot 0 = the host
+            local slot, id, st, tag, name = rest:match("^(%d+) (%d+) (%S+) (%S+) ?(.*)$")
+            if slot then
+                l.players = l.players or {}
+                l.players[#l.players + 1] = { slot = tonumber(slot), id = id, state = st, tag = tag,
+                                              name = (name ~= "" and name ~= "[unknown]") and name or id }
+            end
+        elseif k == "slots" then
+            l.slots = tonumber(rest)
+        elseif k == "myslot" then
+            l.myslot = tonumber(rest)
         elseif k == "allowed" then
             l.allowed = tonumber(rest) or 0
         elseif k == "password" then
@@ -300,7 +317,7 @@ function link.idle_tick(dt) now = now + dt; resend_after_restart(); flush_cmds()
 function link.status()
     local s = kind
     if kind == "steam" and bridge_role then
-        local f = io.open(app_dir() .. "\\mirror_bridge_status_" .. bridge_role .. ".txt", "r")
+        local f = io.open(app_dir() .. "\\mirror_bridge_status_" .. out_tag() .. ".txt", "r")
         if f then s = f:read("*a") or s; f:close() else s = "steam: bridge not reporting (not running?)" end
     end
     if sim() then
@@ -314,19 +331,19 @@ local peer_name, name_read_at = nil, -100
 function link.peer_name()
     if kind == "steam" and bridge_role and now - name_read_at > 2 then
         name_read_at = now
-        local f = io.open(app_dir() .. "\\mirror_peer_" .. bridge_role .. ".name", "r")
+        local f = io.open(app_dir() .. "\\mirror_peer_" .. out_tag() .. ".name", "r")
         if f then
             local s = (f:read("*a") or ""):gsub("^%s+", ""):gsub("%s+$", "")
             f:close()
             peer_name = (s ~= "" and s ~= "[unknown]") and s or nil
         end
     end
-    return peer_name or (bridge_role == "host" and "the guest" or (bridge_role and "the host" or "the other player"))
+    return peer_name or ((bridge_role == "host" or bridge_role == "mate") and "the guest" or (bridge_role and "the host" or "the other player"))
 end
 
 function link.bridge_alive()
     if kind ~= "steam" then return nil end
-    local name = (auto or not bridge_role) and "mirror_lobby.txt" or ("mirror_bridge_status_" .. bridge_role .. ".txt")
+    local name = (auto or not bridge_role) and "mirror_lobby.txt" or ("mirror_bridge_status_" .. out_tag() .. ".txt")
     local f = io.open(app_dir() .. "\\" .. name, "rb")
     if not f then return false end
     local s = f:read("*a") or ""

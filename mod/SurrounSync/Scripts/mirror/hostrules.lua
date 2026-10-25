@@ -21,7 +21,7 @@ hostrules.LIST = {
 local mine = {}
 local peer = {}
 local peer_raw = ""
-local sent = nil
+local sent, sent_to = nil, {}
 local role_fn = function() return nil end
 
 local function load()
@@ -95,9 +95,14 @@ end
 function hostrules.tick()
     if role_fn() == "host" then
         local s = encode(mine)
-        if s ~= sent then sent = s; link.put_blob("rules", s) end
+        if s ~= sent then sent, sent_to = s, {} end
+        -- every guest's link (more than two players: peers.lua), also the ones that start later
+        require("mirror.peers").each("mirror.link", function(l, inst)
+            local k = inst and inst.tag or "main"
+            if not sent_to[k] then sent_to[k] = true; l.put_blob("rules", s) end
+        end)
     else
-        sent = nil
+        sent, sent_to = nil, {}
     end
 end
 

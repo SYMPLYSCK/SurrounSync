@@ -190,10 +190,30 @@ local function answer(yes)
     end
 end
 
+function teleport.matches(arg) return ghost.get() ~= nil and arg ~= "" and name_matches(arg) end
+
+-- More than two players: every other player's link has its own copy of this module. The main one hands
+-- /accept and /deny to the copy with an open request, and /goto <name> to the copy whose player has that name.
+local function other_copy(cmd, arg)
+    if (link.tags and link.tags()) then return nil end
+    local target
+    require("mirror.peers").each("mirror.teleport", function(t, inst)
+        if not inst or target then return end
+        if cmd == "accept" or cmd == "yes" or cmd == "deny" or cmd == "decline" or cmd == "no" then
+            if not pending and t.pending() then target = t end
+        elseif (cmd == "goto" or cmd == "bring") and not (ghost.get() and name_matches(arg)) and t.matches(arg) then
+            target = t
+        end
+    end)
+    return target
+end
+
 -- Handles a chat line starting with "/". Returns true when it was a command (not chat).
 function teleport.command(text)
     local cmd, arg = text:match("^/(%a+)%s*(.-)%s*$")
     cmd = (cmd or ""):lower()
+    local other = other_copy(cmd, arg or "")
+    if other then return other.command(text) end
     if cmd == "accept" or cmd == "yes" then answer(true); return true end
     if cmd == "deny" or cmd == "decline" or cmd == "no" then answer(false); return true end
     if cmd ~= "goto" and cmd ~= "bring" then
@@ -219,10 +239,12 @@ function teleport.command(text)
 end
 
 function teleport.pending()
-    return pending and { kind = pending.kind, who = peer() } or nil
+    if pending then return { kind = pending.kind, who = peer() } end
+    local other = other_copy("accept", "")
+    return other and other.pending() or nil
 end
-function teleport.accept() answer(true) end
-function teleport.decline() answer(false) end
+function teleport.accept() local o = other_copy("accept", ""); if o then o.accept() else answer(true) end end
+function teleport.decline() local o = other_copy("deny", ""); if o then o.decline() else answer(false) end end
 
 function teleport.tick(dt)
     if hold then util.safe(hold_tick, "teleport.hold", dt) end

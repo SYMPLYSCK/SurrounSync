@@ -138,8 +138,8 @@ function backups.take(o)
     for _, f in ipairs(files) do
         local data, err = savefs.read_file(f[1])
         if not data then return nil, "can't read " .. f[1] .. ": " .. tostring(err) end
-        f[4] = data
-        sig[#sig + 1] = f[2] .. " " .. #data .. " " .. savefs.crc32(data)
+        f[4], f[5] = data, savefs.crc32(data)
+        sig[#sig + 1] = f[2] .. " " .. #data .. " " .. f[5]
     end
 
     local sdir = slot_dir(slot)
@@ -179,7 +179,9 @@ function backups.take(o)
         if not ok then return fail(err) end
         local data = savefs.read(dst)
         if not data then return fail("can't read back " .. dst) end
-        lines[#lines + 1] = string.format("file %s %d %s%s", f[2], #data, savefs.crc32(data), f[3] and " sidecar" or "")
+        -- the copy must be byte-equal to what we read: then it has the CRC we already have (CRC32 in Lua is slow)
+        if data ~= f[4] then return fail("read-back of " .. dst .. " differs from the source") end
+        lines[#lines + 1] = string.format("file %s %d %s%s", f[2], #data, f[5], f[3] and " sidecar" or "")
     end
     local pinned = #entries == 0
     local time = os.date("%Y-%m-%d %H:%M:%S")

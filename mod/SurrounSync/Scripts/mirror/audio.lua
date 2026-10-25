@@ -5,6 +5,7 @@ local util = require("mirror.util")
 local crumb = require("mirror.crumb")
 local game = require("mirror.game")
 local ghost = require("mirror.ghost")
+local peers = require("mirror.peers")
 local events = require("mirror.events")
 
 local audio = {}
@@ -134,7 +135,7 @@ local function on_sound(kind, ctx, snd, l, vol, pitch)
     local path0 = path_of(snd)
     if path0 and l then remember(path0, l) end
     local a, owner = chain(ctx)
-    if not util.valid(a) or ghost.is(a) or ghost.is(owner) then return end
+    if not util.valid(a) or peers.is_ghost(a) or peers.is_ghost(owner) then return end
     if zombies.is_copy(a) or zombies.is_copy(owner) then return end
     local cls = util.class_name(a) or ""
     if cls:find("^AnimBP_") or cls:find("Throwable") then return end

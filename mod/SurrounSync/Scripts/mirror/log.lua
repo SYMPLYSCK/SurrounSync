@@ -40,4 +40,16 @@ function log.info(m)  emit("INFO",  m) end
 function log.debug(m) emit("DEBUG", m) end
 function log.trace(m) emit("TRACE", m) end
 
+-- info at most once per `secs` per key (per-hit lines flushed the file many times a second in fights);
+-- the next line says how many were left out
+local every_at, every_skipped = {}, {}
+function log.every(key, secs, m)
+    local t = os.clock()
+    if every_at[key] and t < every_at[key] then every_skipped[key] = (every_skipped[key] or 0) + 1; return end
+    every_at[key] = t + secs
+    local n = every_skipped[key]
+    every_skipped[key] = nil
+    emit("INFO", n and (m .. " (+" .. n .. " more since the last)") or m)
+end
+
 return log

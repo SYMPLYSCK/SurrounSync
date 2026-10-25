@@ -10,7 +10,8 @@ local voice = {}
 
 local KEY_VK = 0x56
 local VOLUMES = { 100, 60, 30 }
-local on, vol_i = false, 1
+-- on/off and volume belong to the player, not to one link (more than two players: every copy sees this)
+local st = require("mirror.peers").shared("voice", { on = false, vol_i = 1 })
 local write_in = 0.0
 local same_world = function() return false end
 
@@ -22,13 +23,21 @@ local function distance_m()
     return d
 end
 
+function voice.distance() return distance_m() end
+
 function voice.tick(dt)
+    -- one file for the bridge, written by the main link: "dist" = it, "dist_<tag>" = every other player's link
+    if (link.tags and link.tags()) then return end
     write_in = write_in - dt
     if write_in > 0 then return end
     write_in = 0.25
+    local more = {}
+    require("mirror.peers").each("mirror.voice", function(v, inst)
+        if inst then more[#more + 1] = string.format(" dist_%s %.1f", inst.tag, v.distance()) end
+    end)
     local f = io.open(link.dir() .. "\\mirror_voice.txt", "wb")
     if not f then return end
-    f:write(string.format("on %d key %d volume %d dist %.1f", on and 1 or 0, KEY_VK, VOLUMES[vol_i], distance_m()))
+    f:write(string.format("on %d key %d volume %d dist %.1f", st.on and 1 or 0, KEY_VK, VOLUMES[st.vol_i], distance_m()) .. table.concat(more))
     f:close()
 end
 
@@ -38,20 +47,21 @@ function voice.toggle()
         notify.show("Voice needs Steam - it isn't available in the one-PC test mode.", "bad")
         return
     end
-    on = not on
+    st.on = not st.on
+    local on = st.on
     notify.show(on and "Voice on: hold V to talk. Your microphone is the one set in Steam (Settings > Voice)."
         or "Voice off: you won't hear or send voice.", on and "good" or "info")
     write_in = 0
 end
 
 function voice.cycle_volume()
-    vol_i = vol_i % #VOLUMES + 1
-    notify.show("Voice volume " .. VOLUMES[vol_i] .. "%", "info")
+    st.vol_i = st.vol_i % #VOLUMES + 1
+    notify.show("Voice volume " .. VOLUMES[st.vol_i] .. "%", "info")
     write_in = 0
 end
 
 function voice.label()
-    return (on and "VOICE: ON" or "VOICE: OFF"), ("VOL " .. VOLUMES[vol_i] .. "%")
+    return (st.on and "VOICE: ON" or "VOICE: OFF"), ("VOL " .. VOLUMES[st.vol_i] .. "%")
 end
 
 -- Who is talking right now: the bridge writes mirror_voice_state.txt ("me 0|1 peer 0|1") only when it changes.
@@ -63,7 +73,11 @@ function voice.talking(dt)
         local f = io.open(link.dir() .. "\\mirror_voice_state.txt", "rb")
         local s = f and f:read("*a") or ""
         if f then f:close() end
-        state_me, state_peer = s:find("me 1", 1, true) ~= nil, s:find("peer 1", 1, true) ~= nil
+        -- "me 0|1 peer 0|1 <tag> 0|1 ...": the peer flag is the main link's, the others by their file tag
+        local t = (link.tags and link.tags())
+        state_me = s:find("me 1", 1, true) ~= nil
+        if t then state_peer = s:find(" " .. t.out .. " 1", 1, true) ~= nil
+        else state_peer = s:find("peer 1", 1, true) ~= nil end
     end
     return state_me, state_peer
 end

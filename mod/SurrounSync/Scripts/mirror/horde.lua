@@ -30,6 +30,8 @@ local channel = events.new("horde", 32, 10)
 local now, state_in, hook_in = 0.0, 0.0, 0.0
 local active = {}          -- host: addr -> { obj, id }
 local last_blob = nil
+-- an ended beacon leaves at once, before it can be freed (a freed one's wrapper still passes IsValid)
+util.on_end(function(a) if active[a] then active[a], last_blob = nil, nil end end)
 local guest_body = ""     -- guest: the host's last hordes list (re-applied each STATE_EVERY)
 local shown = {}           -- guest: id -> { s, c } last host state applied
 local local_at = {}        -- guest: id -> time of the copy's own start
@@ -152,7 +154,7 @@ local function on_lock_target(self)
     for _, h in pairs(active) do
         local bl = h.loc
         if bl and util.dist(zl, bl) < WAVE_RADIUS then
-            if util.dist(gl, bl) < util.dist(pl, bl) then
+            if require("mirror.peers").ghost_nearest(ghost, gl, pl, bl) then
                 retargeting = true
                 pcall(function() comp:SetBB_LockOnTarget(gl) end)
                 retargeting = false

@@ -29,9 +29,9 @@ local UID = "UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"
 
 local cfg, role, session
 -- Taken/put-in events must not expire: replaying a full contents list over a lost one dupes or loses items.
-local channel = events.new("loot", 64, 120)
+local channel = events.reliable("loot")
 -- Host -> guest full contents ("C <id> <ack> <items>"), kept apart so the event blob stays small.
-local cchan = events.new("lootc", 16, 120)
+local cchan = events.reliable("lootc", 64)
 local applying = false
 local hook_in = 0.0
 local stats = { sent = 0, applied = 0, missing = 0, put = 0, added = 0 }
@@ -56,7 +56,10 @@ local game = require("mirror.game")
 local ghost = require("mirror.ghost")
 local crumb = require("mirror.crumb")
 local now = 0.0
-local opened_at = {}
+local opened_at, reopened = {}, {}
+-- guest: when the host's list of a container came, and when this game last asked for it
+local list_at, asked_at = {}, {}
+local FRESH = 3.0
 local pushed = {}
 local push_q = {}
 local host_list = {}
@@ -385,8 +388,8 @@ local function apply_add(payload)
         return
     end
     if count_of(comp, uid) > 0 or (alias[uid] and count_of(comp, alias[uid]) > 0) then added_once[uid] = true; acked(id, s, comp); return end
-    local asset = StaticFindObject(da)
-    if not util.valid(asset) then
+    local asset = util.find(da)
+    if not asset then
         log.info("loot: the other player put " .. (da:match("[^%.]+$") or da) .. " into " .. id .. " - not loaded here")
         if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
         return
@@ -443,7 +446,13 @@ local function sync_from_host(id)
     if lok and mv > 0 then log.info(string.format("loot: %s rearranged to the host's layout (%d moved)", id, mv)) end
     stats.synced = (stats.synced or 0) + 1
     if not first then
+        local again = reopened[id]
+        reopened[id] = nil
         if added + removed > 0 then
+            -- still open on screen after a reopen: redraw it with the host's items
+            if again and now - (opened_at[id] or -100) < 5.0 then
+                pcall(function() game.player():RequestServerData(comp, {}) end)
+            end
             stats.fixed = (stats.fixed or 0) + 1
             log.info(string.format("loot: %s corrected to the host's contents (%d added, %d removed%s)", id, added, removed,
                 missing > 0 and (", " .. missing .. " not loaded here") or ""))
@@ -451,10 +460,10 @@ local function sync_from_host(id)
         return
     end
     if added + removed > 0 and now - (opened_at[id] or -100) < 5.0 then
+        -- open on screen: redraw it with the host's items (no message - it should just look right)
         local owner
         pcall(function() owner = comp:GetOwner() end)
         if util.valid(owner) then pcall(function() game.player():RequestServerData(comp, {}) end) end
-        require("mirror.notify").show("This container was just updated to match the host - close it and open it again.", "info")
     end
     recheck[id] = now + 1.0
     log.info(string.format("loot: %s now holds the host's items (%d: %d kept, %d added, %d removed%s)", id, #list, set, added,
@@ -477,8 +486,23 @@ local function on_generated(comp, via)
         -- Every generation, not just the first: some containers (shops) roll new stock after a while.
         pushed[id] = true
         push_q[id] = { comp = comp, at = now + 0.3 }
-    elseif not opened[id] then
+    elseif opened[id] then
+        -- Opened again: the host's copy may have changed since (things the game adds or fills on its own,
+        -- like a gas pump's cans, fire no event here). Ask again; its answer corrects this copy.
+        if now - (opened_at[id] or -100) < 2.0 then return end
         opened[id], opened_at[id] = comp, now
+        reopened[id] = true
+        -- asked when the player began interacting (prefetch): that answer is fresh - use it now
+        if host_list[id] and now - (list_at[id] or -100) < FRESH then apply_q[id] = now
+        else asked_at[id] = now; channel:send("Q " .. id) end
+    else
+        opened[id], opened_at[id] = comp, now
+        if not host_list[id] and not jig.is_empty(comp) then
+            -- the host's list isn't here yet: show nothing rather than this game's own roll, its items come in a moment
+            applying = true
+            pcall(jig.apply_contents, comp, {})
+            applying = false
+        end
         if host_list[id] and jig.is_empty(comp) then
             local n, miss = jig.set_starting(comp, host_list[id])
             log.info("loot: " .. id .. " preset to the host's items (" .. tostring(n) .. " set"
@@ -581,8 +605,10 @@ end
 local function prefetch(actor)
     if role == "host" or not shared() or not util.valid(actor) then return end
     local ok, id = pcall(id_of, actor)
-    if not ok or asked[id] or host_list[id] then return end
-    asked[id] = true
+    if not ok then return end
+    -- every interaction asks again (the host's copy can change without events), at most every 2 s
+    if now - (asked_at[id] or -100) < 2.0 or (host_list[id] and now - (list_at[id] or -100) < FRESH) then return end
+    asked[id], asked_at[id] = true, now
     channel:send("Q " .. id)
 end
 local prefetch_fn = function(self) util.safe(function() prefetch(self:get()) end, "loot.prefetch") end
@@ -661,7 +687,7 @@ function loot.tick(dt)
             alias, rev, added_once, put_sent, add_q, moved, move_q = {}, {}, {}, {}, {}, {}, {}
             pushed, push_q, host_list, opened, asked, synced, apply_q = {}, {}, {}, {}, {}, {}, {}
             pending, held, ack, main_by_class = {}, {}, {}, {}
-            host_ack, recheck = {}, {}
+            host_ack, recheck, reopened, list_at, asked_at = {}, {}, {}, {}, {}
         end
     end
     crumb.at("loot: moves/adds")
@@ -689,7 +715,7 @@ function loot.tick(dt)
         if role == "host" or not shared() then return end
         local id, a, rest = p:match("^C (%S+) (%d+) ?(.*)$")
         if not id then return end
-        host_list[id], host_ack[id] = jig.decode(rest), tonumber(a)
+        host_list[id], host_ack[id], list_at[id] = jig.decode(rest), tonumber(a), now
         if (pending[id] or 0) <= tonumber(a) then util.safe(sync_from_host, "loot.sync", id) end
     end
     crumb.at("loot: messages")

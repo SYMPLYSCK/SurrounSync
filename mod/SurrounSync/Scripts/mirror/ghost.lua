@@ -130,13 +130,15 @@ end
 function ghost.kind() return ghost.exists() and kind or nil end
 
 local ECR_IGNORE, ECR_BLOCK, ECC_PAWN, QUERY_AND_PHYSICS, NO_COLLISION, QUERY_ONLY = 0, 2, 2, 3, 0, 1
-local ECC_WORLD_STATIC, ECC_WORLD_DYNAMIC, ECC_PHYSICS_BODY, ECC_VEHICLE = 0, 1, 5, 6
+local ECC_WORLD_STATIC, ECC_WORLD_DYNAMIC, ECC_PHYSICS_BODY = 0, 1, 5
 local function capsule_body(g)
     util.safe(function()
         local cap = g.CapsuleComponent
         cap:SetCollisionEnabled(QUERY_AND_PHYSICS)
         cap:SetCollisionResponseToAllChannels(ECR_IGNORE)
-        for _, ch in ipairs({ ECC_PAWN, ECC_WORLD_STATIC, ECC_WORLD_DYNAMIC, ECC_PHYSICS_BODY, ECC_VEHICLE }) do
+        -- not ECC_VEHICLE: the capsule is moved by teleports, and one put into a car's body (getting in or out,
+        -- or a little lag next to it) pushes the car out of it - that flung parked cars
+        for _, ch in ipairs({ ECC_PAWN, ECC_WORLD_STATIC, ECC_WORLD_DYNAMIC, ECC_PHYSICS_BODY }) do
             cap:SetCollisionResponseToChannel(ch, ECR_BLOCK)
         end
     end, "ghost.capsule")
@@ -230,8 +232,20 @@ end
 
 local function release_zombies(g)
     local n = 0
-    local ok, list = pcall(FindAllOf, "BP_ZombieAIController_C")
-    if not ok or not list then return 0 end
+    -- the zombie module's list (no 30-40 ms walk at every save); a walk only if it has none yet
+    local ok_z, z = pcall(require, "mirror.zombies")
+    local list = {}
+    pcall(function()
+        for _, p in ipairs(ok_z and z.all_cached() or {}) do
+            local c = p.Controller
+            if util.valid(c) then list[#list + 1] = c end
+        end
+    end)
+    if #list == 0 then
+        local ok, all = pcall(FindAllOf, "BP_ZombieAIController_C")
+        if not ok or not all then return 0 end
+        list = all
+    end
     local at = util.vec(g:K2_GetActorLocation())
     for _, c in ipairs(list) do
         pcall(function()

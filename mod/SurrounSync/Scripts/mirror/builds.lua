@@ -21,7 +21,8 @@ local BOOM_FX = "/Game/PolygonFiles/PolygonMilitary/FX/FX_Explosion_New.FX_Explo
 local BOOM_CUE = "/Game/Audio/WARFARE_SOUNDS/Explosion_Fire_Gas/Cues/explosion_large_06_Cue.explosion_large_06_Cue"
 
 local cfg, role, session
-local channel = events.new("builds", 64, 10)
+local channel = events.reliable("builds")
+local peers = require("mirror.peers")
 local hook_in = 0.0
 local hooked_logged = nil
 local last_moving_id = nil
@@ -176,7 +177,7 @@ local function place(payload)
     local da, x, y, z, pi, ya, ro, sx, sy, sz =
         payload:match("^P (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+)$")
     if not da then return end
-    local asset = StaticFindObject(da)
+    local asset = util.find(da)
     local cls
     pcall(function() cls = asset.BuildActorClass end)
     if not util.valid(cls) then
@@ -291,8 +292,13 @@ function builds.tick(dt)
         elseif k == "R" then util.safe(remove, "builds.remove", p)
         elseif k == "X" then util.safe(exploded, "builds.exploded", p)
         elseif k == "N" then util.safe(bedtags.apply, "builds.bedname", p) end
+        -- more than two players: the host built / moved / removed it with plain actor calls no hook sees,
+        -- so the other guests hear it from here (ids are places, the same in every world)
+        peers.relay("mirror.builds", builds, function(m) m.relay_send(p) end)
     end)
 end
+
+function builds.relay_send(p) channel:send(p) end
 
 function builds.status()
     return string.format("builds: placed %d, moved %d, removed %d | made %d, moves %d, removes %d%s",

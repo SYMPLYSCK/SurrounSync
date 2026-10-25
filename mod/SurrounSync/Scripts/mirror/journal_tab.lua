@@ -526,7 +526,7 @@ local function show(on)
 end
 
 local function click_sound()
-    pcall(function() util.cdo(GS):PlaySound2D(game.player(), StaticFindObject(CLICK_CUE), 1.0, 1.0, 0.0, nil, nil, true) end)
+    pcall(function() util.cdo(GS):PlaySound2D(game.player(), util.find(CLICK_CUE), 1.0, 1.0, 0.0, nil, nil, true) end)
 end
 
 local function clicked(b)
@@ -712,5 +712,7 @@ end
 
 function journal_tab.configure(c) ctx = c end
 function journal_tab.act(name, ...) if ctx and ctx.act[name] then return ctx.act[name](...) end end
+-- the old world's JournalUI and our widgets are freed with it; a new JournalUI may reuse the address
+game.on_world_reset(function() S = nil end)
 
 return journal_tab

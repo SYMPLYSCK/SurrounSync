@@ -25,7 +25,7 @@ local function hooks_of(kind, cls)
 end
 
 local cfg, role, session
-local channel = events.new("power", 64, 30)
+local channel = events.reliable("power")
 local known = {}
 local by_class = {}
 local scan_at, scan_in, poll_in, blob_in = 0, 0.0, 0.0, 0.0

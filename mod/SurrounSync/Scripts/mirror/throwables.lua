@@ -53,8 +53,17 @@ local function loc_of(a)
 end
 local function fmt(l) return string.format("%.0f %.0f %.0f", l.X, l.Y, l.Z) end
 
+-- (more than two players: a copy another player's link made isn't ours either)
+function throwables.made_here(addr) return made[addr] == true end
+local function made_anywhere(addr)
+    if made[addr] then return true end
+    local hit = false
+    require("mirror.peers").each("mirror.throwables", function(m) if not hit and m ~= throwables and m.made_here(addr) then hit = true end end)
+    return hit
+end
+
 local function on_begin(a)
-    if not util.valid(a) or made[util.addr(a) or 0] then return end
+    if not util.valid(a) or made_anywhere(util.addr(a) or 0) then return end
     local kind = KINDS[short_of(a)]
     if not kind then return end
     local owner, parent, owner2, wo, inst

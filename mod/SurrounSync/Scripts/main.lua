@@ -27,7 +27,7 @@ do
 end
 log.configure(cfg)
 local util, devtest = require("mirror.util"), require("mirror.devtest")
-util.safe(devtest.startup_probe, "devtest.startup_probe")
+if cfg.devtest then util.safe(devtest.startup_probe, "devtest.startup_probe") end
 util.safe(devtest.watch, "devtest.watch", cfg)
 util.safe(function() local l = require("mirror.loader"); l.configure(cfg); l.start(cfg) end, "loader.start")
 if role ~= "off" then
