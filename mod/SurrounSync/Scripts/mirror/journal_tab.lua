@@ -68,7 +68,7 @@ local function find(tree, name, owner)
     local function walk(p, depth)
         if depth > 8 or not util.valid(p) then return nil end
         local n
-        pcall(function() n = p:GetFName():ToString() end)
+        pcall(function() n = util.fname(p) end)
         if n == name then return p end
         local count = 0
         pcall(function() count = p:GetChildrenCount() end)

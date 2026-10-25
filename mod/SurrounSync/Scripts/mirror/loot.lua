@@ -54,6 +54,7 @@ local PREFETCH = {
 local jig = require("mirror.jig")
 local game = require("mirror.game")
 local ghost = require("mirror.ghost")
+local crumb = require("mirror.crumb")
 local now = 0.0
 local opened_at = {}
 local pushed = {}
@@ -142,6 +143,22 @@ local function comp_of(actor)
     local c
     pcall(function() c = actor.BP_JigMultiplayer end)
     return util.valid(c) and c or nil
+end
+
+-- A container component kept from an earlier frame (list up to 120 s old, queue, opened), or nil when
+-- it's gone. IsValid alone passes a component whose actor is being destroyed (a picked-up buildable, a
+-- despawned car), or a new object at a freed one's address - calls on it can walk junk (report 122034:
+-- native crash in UE4SS property lookup during loot, the host ahead-loading right after a guest joined).
+local function still(id, comp)
+    if not util.valid(comp) then return nil end
+    local owner, ok = nil, false
+    pcall(function()
+        owner = comp:GetOwner()
+        ok = util.valid(owner) and not owner:IsActorBeingDestroyed()
+    end)
+    if not ok then return nil end
+    local idok, now_id = pcall(id_of, owner)
+    return (idok and now_id == id) and comp or nil
 end
 
 local function count_of(comp, uid)
@@ -321,7 +338,7 @@ end
 
 local function flush_moves()
     for id, comp in pairs(move_q) do
-        if util.valid(comp) then
+        if still(id, comp) then
             local list = jig.contents_of(comp)
             for _, h in ipairs(list) do h.uid = rev[h.uid] or h.uid end
             channel:send(string.format("M %s %d %s", id, next_seq(id), jig.encode(list, true)))
@@ -408,7 +425,8 @@ end
 
 local function sync_from_host(id)
     local comp, list = opened[id], host_list[id]
-    if not (comp and list) or not util.valid(comp) then return end
+    if not (comp and list) then return end
+    if not still(id, comp) then opened[id] = nil; return end
     if held[id] then return end
     local first = not synced[id]
     synced[id] = true
@@ -475,7 +493,7 @@ local function flush_pushes()
     for id, q in pairs(push_q) do
         if now >= q.at then
             push_q[id] = nil
-            if util.valid(q.comp) then
+            if still(id, q.comp) then
                 cchan:send("C " .. id .. " " .. (ack[id] or 0) .. " " .. jig.encode(jig.contents_of(q.comp), true))
                 stats.pushed = (stats.pushed or 0) + 1
             end
@@ -538,7 +556,7 @@ local function ahead_tick(dt)
     if ahead_step_in > 0 or #ahead == 0 then return end
     ahead_step_in = AHEAD_STEP
     local e = table.remove(ahead)
-    if pushed[e.id] or not util.valid(e.comp) then return end
+    if pushed[e.id] or not still(e.id, e.comp) then return end
     jig.generate(e.comp)
     pushed[e.id] = true
     push_q[e.id] = { comp = e.comp, at = now + 0.3 }
@@ -607,6 +625,8 @@ local function repair_player_stats()
     if not util.valid(comp) then log.info("loot: stat repair skipped - no inventory component"); return end
     local n, names = jig.repair_stats(comp)
     if n > 0 then log.info("loot: gave " .. n .. " item(s) their missing stats: " .. table.concat(names, ", ")) end
+    local twins = jig.twin_grids(comp)
+    if twins > 0 then log.warn("loot: " .. twins .. " bag compartment(s) in the inventory exist twice - items in them may not show (drop the bag and pick it up)") end
 end
 
 function loot.tick(dt)
@@ -616,10 +636,12 @@ function loot.tick(dt)
     end
     if role == "off" then return end
     now = now + dt
+    crumb.at("loot: ui")
     util.safe(jig.flush_ui, "jig.ui")
     hook_in = hook_in - dt
     if hook_in <= 0 then
         hook_in = 1.0
+        crumb.at("loot: hooks")
         -- Blueprint hooks here are pre-hooks only (UE4SS 3.0.1 never runs the post callback).
         util.ensure_hook(GENERATE, generate_fn)
         util.ensure_hook(REQUEST, request_fn)
@@ -642,12 +664,16 @@ function loot.tick(dt)
             host_ack, recheck = {}, {}
         end
     end
+    crumb.at("loot: moves/adds")
     util.safe(flush_moves, "loot.moves")
     util.safe(flush_adds, "loot.adds")
     if role == "host" then
+        crumb.at("loot: push")
         util.safe(flush_pushes, "loot.push")
+        crumb.at("loot: ahead")
         if ghost.get() then util.safe(ahead_tick, "loot.ahead", dt) end
     else
+        crumb.at("loot: sync")
         -- only while the host's list already has all of this player's takes/puts (never undoes one)
         for id, at in pairs(recheck) do
             if now >= at then
@@ -666,6 +692,7 @@ function loot.tick(dt)
         host_list[id], host_ack[id] = jig.decode(rest), tonumber(a)
         if (pending[id] or 0) <= tonumber(a) then util.safe(sync_from_host, "loot.sync", id) end
     end
+    crumb.at("loot: messages")
     cchan:pump(take_contents)
     channel:pump(function(p)
         local k = p:sub(1, 2)

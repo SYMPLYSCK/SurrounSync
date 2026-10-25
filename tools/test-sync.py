@@ -91,6 +91,20 @@ def util_null_objects_are_invalid():
     check(L.eval('util.class_path(null)') is None, "class_path never touches a null object")
     check(L.eval('util.class_path(good)') == "/Game/A.A_C", "class_path of a live object")
     check(L.eval('util.class_name(good)') == "A_C", "class_name of a live object")
+    # crash reports 2026-10-20..24: a collected material's address and index went to a new object,
+    # IsValid passed and a zombie copy got that object as its material
+    L.execute('''
+        named = function(n) return { IsValid = function() return true end,
+                                     GetFName = function() return { ToString = function() return n end } end } end
+        C = { ["/Game/M/Mat_A.Mat_A"] = named("Mat_A"), ["/Game/M/Mat_B.Mat_B"] = named("SomethingElse"),
+              ["/Game/M/Mat_C.Mat_C"] = null, ["/Game/X.Y:Sub"] = named("Sub") }
+    ''')
+    check(L.eval('util.cached(C, "/Game/M/Mat_A.Mat_A") == C["/Game/M/Mat_A.Mat_A"]') is True, "a cached asset that still is itself is returned")
+    check(L.eval('util.cached(C, "/Game/X.Y:Sub") ~= nil') is True, "a subobject path matches its own name")
+    check(L.eval('util.cached(C, "/Game/M/Mat_B.Mat_B")') is None and L.eval('C["/Game/M/Mat_B.Mat_B"]') is None,
+          "a valid object with another name in the cached slot is dropped, not returned")
+    check(L.eval('util.cached(C, "/Game/M/Mat_C.Mat_C")') is None and L.eval('util.cached(C, "/none")') is None,
+          "a dead or missing entry is nil")
 
 
 def jig_stats_copy_the_asset_defaults():
@@ -450,9 +464,14 @@ def zombie_copies_take_the_hosts_look():
     check(L.eval('zombies._look.arch_of(H, "nohook")') == 4, "a screamer is recognised without the hook")
     check(L.eval('zombies._look.bones_of(H)') == 7, "hidden jaw and forearms read as a bone mask")
     # Guest side: the copy rolled its own crawler legs, a plain material and no archetype.
+    # This game never ran a Screamer itself: calling it would load its assets from our Lua (guest freeze).
+    L.execute('N = zombie(); NCOPY = { z = N, fam = "zombie" }; zombies._look.sync(2, NCOPY, E, { arch = 4, bones = 0, eyes = 0 })')
+    check(L.eval('#N.called') == 0, "an archetype this game hasn't run itself is not called on a copy")
+    L.execute('local G = zombie(); zombies._look.arch_hooks[4]({ get = function() return G end })')
     L.execute('C = zombie(); C.Mesh.hidden = { calf_l = true, Foot_R = true }; COPY = { z = C, fam = "zombie" }; '
               'zombies._look.sync(1, COPY, E, { arch = 4, bones = 7, eyes = 1 })')
-    check(L.eval('C.called[1]') == "Screamer" and L.eval('#C.called') == 1, "the copy runs the host's archetype once")
+    check(L.eval('C.called[1]') == "Screamer" and L.eval('#C.called') == 1, "once the game ran it itself, the copy runs the host's archetype once")
+    check(L.eval('zombies._look.arch_hooks.calling') is False, "and our own call doesn't count as the game's")
     check(L.eval('zombies._look.bones_of(C)') == 7, "the copy's bones match the host's")
     check(L.eval('C.Mesh.mat.Parent == MAT'), "the host's material is put back, with the eye glow on top")
     L.execute('zombies._look.sync(1, COPY, E, { arch = 4, bones = 7, eyes = 1 })')
@@ -886,6 +905,86 @@ def container_items_keep_their_cell_and_rotation():
     check(L.eval('SI') == 6 and L.eval('SR') is True and L.eval('SI2') == 2, "a not-yet-opened container starts with the same layout")
 
 
+def loot_skips_containers_gone_since_listed():
+    print("loot_skips_containers_gone_since_listed")
+    L = lua()
+    L.execute(FAKES + r"""
+        package.loaded["mirror.crumb"] = { at = function() end }
+        package.loaded["mirror.ghost"] = { get = function() return GH end, location = function() return { X = 0, Y = 0, Z = 0 } end }
+        package.loaded["mirror.game"] = { player = function() return ME end, on_world_reset = function() end }
+        GEN, READ = {}, {}
+        package.loaded["mirror.jig"] = {
+            generate = function(c) GEN[#GEN + 1] = c.name end,
+            contents_of = function(c) READ[#READ + 1] = c.name; return {} end,
+            encode = function() return "" end, uid_str = function(x) return x end, full_path = function(x) return x end,
+            guid = function(x) return x end, flush_ui = function() end,
+        }
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        GH, ME = obj({}), obj({})
+        local CL = cls("BP_LootContainer_C")
+        StaticFindObject = function() return CL end
+        function box(name, x)
+            local a = obj({ loc = { X = x, Y = 0, Z = 0 }, dying = false })
+            a.K2_GetActorLocation = function() return a.loc end
+            a.GetClass = function() return CL end
+            a.IsA = function() return true end
+            a.IsActorBeingDestroyed = function() return a.dying end
+            local c = obj({ name = name, GetOwner = function() return a end })
+            return c, a
+        end
+        LIVE = box("live", 500)
+        DYING, DA = box("dying", 700)
+        MOVED, MA = box("moved", 900)
+        local comps = { LIVE, DYING, MOVED }
+        util.instances = function() return comps, true end
+        loot = require("mirror.loot")
+        loot.init({}, "host", { in_world = function() return true end })
+        for i = 1, 5 do loot.tick(0.2) end
+        DA.dying = true
+        loot.guest_arriving()
+        -- a car being driven: never where it was when listed (the list is redone on arrival)
+        for i = 1, 30 do MA.loc = { X = 900 + i * 100, Y = 0, Z = 0 }; loot.tick(0.2) end
+    """)
+    check(L.eval("#GEN") == 1 and L.eval("GEN[1]") == "live", "ahead-loading skips a listed container being destroyed or moved away since")
+    check(L.eval("#READ") == 1 and L.eval("READ[1]") == "live", "and only that one's contents are read and sent")
+
+
+def bags_are_never_consumed_and_twin_grids_are_counted():
+    print("bags_are_never_consumed_and_twin_grids_are_counted")
+    L = lua()
+    L.execute(FAKES + r"""
+        local ITEMS, INFO = "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B", "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
+        local ITEM_ID, UID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848", "UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"
+        local C_IN, C_INDEX = "InContainerUID_24_D1504ED7438699C73EA046AD734E79BF", "ContainerIndex_22_9A211B86466A9D1C57E1FC839A5B0896"
+        local function arr(t) return { ForEach = function(self, fn) for i, v in ipairs(t) do fn(i, { get = function() return v end }) end end } end
+        local function g(a) return { A = a, B = 0, C = 0, D = 0 } end
+        local function item(u, da) return { [UID] = g(u), [INFO] = { [ITEM_ID] = { GetFullName = function() return "DA " .. da end }, Count_8_DD79AF2A46126A338C8DCCB4616D91CD = 1,
+            Durability_22_A3557C454274D193D47AB9B71FB0C0CA = { X = 0, Y = 0 } } } end
+        GRIDS = {
+            { [C_IN] = g(0), [C_INDEX] = 0, [ITEMS] = arr({ item(1, "/Game/I.DA_Backpack"), item(2, "/Game/I.DA_Can") }) },
+            { [C_IN] = g(0), [C_INDEX] = 0, [ITEMS] = arr({}) },
+            { [C_IN] = g(1), [C_INDEX] = 0, [ITEMS] = arr({}) },
+            { [C_IN] = g(1), [C_INDEX] = 1, [ITEMS] = arr({}) },
+            { [C_IN] = g(1), [C_INDEX] = 0, [ITEMS] = arr({ item(3, "/Game/I.DA_Bag") }) },
+        }
+        CONSUMED, REMOVE_OK = {}, false
+        COMP = obj({ MainJigContainers = arr(GRIDS),
+            RemoveGetInfo = function() if not REMOVE_OK then error("no") end end, MC_ItemRemoved = function() end,
+            HandleLocalRequestConsumeItem = function(self, guid) CONSUMED[#CONSUMED + 1] = guid.A end })
+        jig = require("mirror.jig")
+        TWINS = jig.twin_grids(COMP)
+        OK1, ERR1 = jig.take(COMP, "1_0_0_0", 1, 1)
+        REMOVE_OK = true
+        OK2 = jig.take(COMP, "1_0_0_0", 1, 1)
+        OK3 = jig.take(COMP, "2_0_0_0", 1, 1)
+    """)
+    check(L.eval("TWINS") == 1, "a bag compartment that exists twice is counted once; main containers aren't")
+    check(L.eval("OK1") is False and L.eval("ERR1") is not None, "a bag that can't be removed whole is reported, not taken")
+    check(L.eval("OK2") is True, "a bag removed whole is taken")
+    check(L.eval("#CONSUMED") == 1 and L.eval("CONSUMED[1]") == 2, "only the plain item was ever consumed")
+
+
 def beds_get_a_rename_row_and_shared_names():
     print("beds_get_a_rename_row_and_shared_names")
     import tempfile
@@ -1200,6 +1299,62 @@ def loose_magazine_rounds_reach_the_picker():
     check(L.eval('FILLED') is None, "the rounds are put in once")
 
 
+def loose_magazine_picked_up_without_hooks_still_gets_its_rounds():
+    # in-game 2026-10-24: the game's pickup of a mag copy ran none of the pickup hooks - it was only seen as "gone"
+    print("loose_magazine_picked_up_without_hooks_still_gets_its_rounds")
+    L = lua()
+    L.execute(FAKES + r"""
+        PC = obj({})
+        PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end, BP_JigMultiplayer = PC })
+        COMP = obj({ PickupInfo = { ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = {},
+                                    UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = { A = 7, B = 7, C = 7, D = 7 } } })
+        GONE = false
+        COPY = obj({ K2_GetActorLocation = function() return { X = 100, Y = 0, Z = 0 } end,
+                     IsActorBeingDestroyed = function() return GONE end, GetAttachParentActor = function() return nil end,
+                     GetComponentByClass = function() return COMP end, K2_DestroyActor = function() end })
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+            world = function() return { SpawnActor = function() return COPY end } end }
+        SENT, IN = {}, {}
+        package.loaded["mirror.events"] = { new = function(name) return {
+            send = function(self, m) SENT[#SENT + 1] = m end,
+            pump = function(self, fn) local q = IN; IN = {}; for _, p in ipairs(q) do fn(p) end end } end,
+            send = function(self, m) SENT[#SENT + 1] = m end }
+        CLIP = "/Game/Items/DA_AR45Clip.DA_AR45Clip"
+        StaticFindObject = function(p)
+            if p == CLIP then return obj({ PickupClass = obj({}), ["IsContainer?"] = true }) end
+            return obj({})
+        end
+        -- the player already carries an empty mag of the same kind: that one must not get the rounds
+        INV, FILLED = { { uid = "5_5_5_5", da = CLIP } }, nil
+        package.loaded["mirror.jig"] = {
+            full_path = function() return CLIP end, guid = function() return {} end,
+            uid_str = function(g) return string.format("%d_%d_%d_%d", g.A, g.B, g.C, g.D) end,
+            contents_of = function(c) if c == PC then return INV end return {} end,
+            apply_contents = function(c, want) return 0, 0, 0, #want end,
+            fill = function(c, uid, list) FILLED = { comp = c, uid = uid, list = list }; return #list - 1, 0 end }
+        package.loaded["mirror.names"] = { set = function() end, decode = function(s) return s end, moved = function() end }
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        util.cdo = function() return { IsValid = function() return not GONE end } end
+        drops = require("mirror.drops")
+        drops.init({ mirror_drops = true }, "host", nil)
+        IN = { "D 1_2_3_4 " .. CLIP .. " 1 0 0 0 0 0 0 0 0 1 2 0.2 10",
+               "I 1_2_3_4 /Game/Items/DA_45ACPAmmo.DA_45ACPAmmo 25 0.000 0.000 0 0" }
+        drops.tick(0.1)
+        drops.tick(0.6)
+        drops.tick(0.6)
+        GONE = true
+        INV[2] = { uid = "9_9_9_9", da = CLIP }
+        drops.tick(0.6)
+        drops.tick(0.4)
+    """)
+    check(any(m == "T 1_2_3_4" for m in L.eval('SENT').values()), "the other game is told it was taken")
+    check(L.eval('FILLED and FILLED.uid') == "9_9_9_9", "the rounds go into the new mag, not the one carried before")
+    check(L.eval('FILLED and FILLED.list[2].count') == 25, "all 25 rounds")
+    L.execute('FILLED = nil; drops.tick(1.0); drops.tick(1.0)')
+    check(L.eval('FILLED') is None, "the rounds are put in once")
+
+
 def ground_weapon_attachments_reach_the_other_game():
     print("ground_weapon_attachments_reach_the_other_game")
     L = lua()
@@ -1268,7 +1423,46 @@ def ground_weapon_attachments_reach_the_other_game():
         IN = { "C 1_2_3_4 /Game/Items/DA_Scope.DA_Scope;/Game/Items/DA_Grip.DA_Grip" }
         drops.tick(0.1)
         drops.tick(0.4)
+        drops.tick(0.6)
         ECHO = #SENT
+        -- in the real game the move hook never fires: the change is still found by looking
+        SENT = {}
+        HAVE = { { uid = "6_6_6_6", da = "/Game/Items/DA_Laser.DA_Laser" } }
+        drops.tick(0.6)
+        drops.tick(0.6)
+        POLLED = SENT
+        SENT = {}
+        drops.tick(0.6)
+        drops.tick(0.6)
+        POLLED_AGAIN = #SENT
+        COPY.K2_GetActorLocation = function() return { X = 1000, Y = 0, Z = 0 } end
+        HAVE = {}
+        drops.tick(0.6)
+        drops.tick(0.6)
+        FAR = #SENT
+        -- a fresh copy spawns with the item's default parts; the other game's real parts land 0.5 s later
+        -- (seen in-game: the guest sent the host's own parts back) - that landing isn't a change made here
+        CRIFLE = "/Game/Items/DA_CRifle.DA_CRifle"
+        StaticFindObject = function(p)
+            if p == CRIFLE then return obj({ PickupClass = obj({}), ["IsContainer?"] = true }) end
+            return obj({})
+        end
+        package.loaded["mirror.jig"].apply_contents = function(c, want) HAVE = want; return 0, #want, 0, 0 end
+        COPY.K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end
+        HAVE = { { uid = "8_8_8_8", da = "/Game/Items/DA_DefaultMag.DA_DefaultMag" } }
+        IN = { "D 9_9_9_9 " .. CRIFLE .. " 1 0 0 0 0 0 0 0 0 4 2 3 100",
+               "I 9_9_9_9 /Game/Items/DA_Scope.DA_Scope 1 0 0" }
+        drops.tick(0.1)
+        SENT = {}
+        -- the 0.5 s check looks at the copy before its parts land (frame ticks, as in the game)
+        drops.tick(0.45)
+        LOOKED_EARLY = #HAVE == 1 and HAVE[1].uid == "8_8_8_8"
+        drops.tick(0.6)
+        drops.tick(0.6)
+        drops.tick(0.6)
+        LANDED = {}
+        for _, m in ipairs(SENT) do if m:find("^C 9_9_9_9") then LANDED[#LANDED + 1] = m end end
+        LANDED_N, LANDED_HAVE = #LANDED, #HAVE
     """)
     first = list(L.eval('FIRST').values())
     check(L.eval('EARLY') == 0, "the change is sent once the move has settled")
@@ -1279,6 +1473,13 @@ def ground_weapon_attachments_reach_the_other_game():
     check(L.eval('APPLIED and APPLIED.comp == COMP') and L.eval('#APPLIED.want') == 2,
           "the other game's change goes onto this game's copy")
     check(L.eval('ECHO') == 0, "applying the other game's change isn't echoed back")
+    check(list(L.eval('POLLED').values()) == ["C 1_2_3_4 /Game/Items/DA_Laser.DA_Laser"],
+          "a part put on without any hook is found by looking and sent")
+    check(L.eval('POLLED_AGAIN') == 0, "and sent once")
+    check(L.eval('FAR') == 0, "an item 10 m away isn't looked at")
+    check(L.eval('LOOKED_EARLY') == True, "(the check saw the copy's default parts first)")
+    check(L.eval('LANDED_HAVE') == 1, "the copy got the other game's parts")
+    check(L.eval('LANDED_N') == 0, "the other game's parts landing on a fresh copy aren't sent back")
 
 
 def ghost_gun_in_hand_is_known():
@@ -1353,6 +1554,7 @@ def random_and_debug_weather_is_shared():
                         ["Animate Time of Day"] = true })
             FindAllOf = function(c) if c == "Ultra_Dynamic_Sky_C" then return { SKY } elseif c == "Ultra_Dynamic_Weather_C" then return { W } end return {} end
             StaticFindObject = function(p) if p:find("^/Engine/Transient%.") then return nil end return obj({}) end
+            FindFirstOf = function() return obj({}) end
             world = require("mirror.world")
             world.init({}, ROLE, { in_world = function() return true end }, function() return true end)
         """.replace("ROLE", '"' + role + '"'))
@@ -1392,6 +1594,26 @@ def random_and_debug_weather_is_shared():
     check(G.eval('SKY["Animate Time of Day"]') is True, "and it runs again when the host's does")
     G.execute('world.init({}, "off", { in_world = function() return true end }, function() return true end)')
     check(G.eval('W["Random Weather Variation"]') == 1, "leaving gives the guest its own random weather back")
+    # What the host SEES is its live state (random weather), not the preset it names: the guest copies that.
+    # (The host named a storm preset under a clear sky; the guest copied the preset -> rain + snow on one screen.)
+    H2, G2 = side("host"), side("guest")
+    for L in (H2, G2):
+        L.execute('GWS = settings("UDS_Weather_Settings_C_12", "UDS_Weather_Settings_C /Engine/Transient.G", 0); '
+                  'W["Global Weather State"] = GWS; W["Change Weather"] = function(self, ws, t) self.Weather = ws; '
+                  'CHANGES = CHANGES + 1; for k, v in pairs({ "Cloud Coverage", "Rain", "Snow" }) do GWS[v] = ws[v] end end')
+    H2.execute('W.Weather = settings("Rain_Thunderstorm", "UDS_Weather_Settings_C /Game/UDS/R.Rain_Thunderstorm", 9); world.tick(2.1)')
+    pass_blobs(H2, G2)
+    G2.execute('Storm = settings("Rain_Thunderstorm", "UDS_Weather_Settings_C /Game/UDS/R.Rain_Thunderstorm", 9); '
+               'local fa = FindAllOf; FindAllOf = function(c) if c == "UDS_Weather_Settings_C" then return { Storm } end return fa(c) end; '
+               'GWS.Rain = 7; world.tick(2.1)')
+    check(G2.eval('GWS.Rain') == 0 and G2.eval('W.Weather:GetFName():ToString()') != "Rain_Thunderstorm",
+          "the guest takes the host's live weather (clear), not the storm preset it names")
+    G2.execute('world.tick(2.1); world.tick(2.1)')
+    check(G2.eval('CHANGES') == 1, "matched live weather isn't set again")
+    H2.execute('GWS.Rain = 6; GWS.Snow = 3; world.tick(2.1)')
+    pass_blobs(H2, G2)
+    G2.execute('world.tick(2.1)')
+    check(G2.eval('GWS.Rain') == 6 and G2.eval('GWS.Snow') == 3, "the host's live weather changing reaches the guest")
 
 
 def trader_stock_is_the_hosts():
@@ -1763,11 +1985,11 @@ for t in (posepack_recovers_lost_packets, clockmap_quiet_places_without_stats, u
           vehicles_keep_this_worlds_fuel, harvest_uses_up_nodes_once, zombie_copies_take_the_hosts_look,
           copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
           ghost_swims_without_its_own_water_detection, audio_spatializes_and_shares_without_echo,
-          throws_and_mines_reach_the_other_game, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, ground_weapon_attachments_reach_the_other_game, ghost_gun_in_hand_is_known, missing_zombie_looks_get_loaded,
+          throws_and_mines_reach_the_other_game, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, loose_magazine_picked_up_without_hooks_still_gets_its_rounds, ground_weapon_attachments_reach_the_other_game, ghost_gun_in_hand_is_known, missing_zombie_looks_get_loaded,
           random_and_debug_weather_is_shared,
           trader_stock_is_the_hosts, instances_walk_once_then_follow_beginplay,
           link_reads_only_blobs_the_index_says_changed, host_settled_corpses_cost_almost_nothing,
-          standing_hooks_skip_the_lookup, container_items_keep_their_cell_and_rotation,
+          standing_hooks_skip_the_lookup, container_items_keep_their_cell_and_rotation, loot_skips_containers_gone_since_listed, bags_are_never_consumed_and_twin_grids_are_counted,
           load_split_switches_only_when_both_agree, load_split_hands_the_ai_to_the_guest):
     try:
         t()

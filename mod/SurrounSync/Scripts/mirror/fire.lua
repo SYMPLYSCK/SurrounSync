@@ -32,8 +32,8 @@ end
 local cache = {}
 local function find(p)
     if not p or p == "-" then return nil end
-    local o = cache[p]
-    if util.valid(o) then return o end
+    local o = util.cached(cache, p)
+    if o then return o end
     o = StaticFindObject(p)
     if util.valid(o) then cache[p] = o; return o end
     return nil

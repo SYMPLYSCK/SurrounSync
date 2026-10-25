@@ -281,7 +281,7 @@ local function ems_share_player(coop, own)
         if dst and util.valid(src) then
             local ok, err = pcall(function() dst:set(src) end)
             log.info(string.format("session: EMS cache %s@%s -> own object %s: %s",
-                file, coop, src:GetFName():ToString(), ok and "ok" or tostring(err)))
+                file, coop, util.fname(src), ok and "ok" or tostring(err)))
         elseif dst then
             log.warn(string.format("session: EMS cache has a stale %s for %s but none for %s", file, coop, own))
         else
@@ -544,6 +544,7 @@ end
 local world_slot = nil
 local level_loading = false
 local restore_name = nil
+local cleared_world, discard_pending = false, false
 local function point_at(slot)
     return pcall(function() lib():SetCurrentSaveGameName(game.world(), slot) end)
 end
@@ -559,6 +560,19 @@ local function firewall(why)
         local ok = point_at(world_slot)
         log.warn(string.format("session: firewall - a save pointed at the co-op save %s outside its session; sent to %s (%s)",
             cur, world_slot, tostring(ok)))
+        return
+    end
+    if level_loading and cleared_world then
+        -- The old world's actors are already removed and the new one isn't loaded: this save would write
+        -- a half-empty world over either save. Send it to a scratch co-op slot that gets emptied.
+        local scratch = cfg.phase2.coop_slot
+        if cur ~= scratch then
+            local ok = point_at(scratch)
+            restore_name = restore_name or cur
+            discard_pending = true
+            log.warn(string.format("session: firewall - a save started during a load (%s); sent to the scratch slot %s (%s)",
+                cur, scratch, tostring(ok)))
+        end
         return
     end
     if level_loading and world_slot and cur ~= world_slot and slotguard.valid_name(world_slot) then
@@ -581,9 +595,61 @@ local function hold_autosave()
 end
 session.hold_autosave = hold_autosave
 
-local function on_any_load() level_loading = true end
+-- The game "loads" a save in place: the level blueprint only swaps the LongdownValley sublevel, so
+-- everything spawned at runtime into the persistent level (buildings, crates, cars, item spawners,
+-- traders) stays and the next save writes it into the new world - the host's base turned up in the
+-- guest's own save. A load must start from an empty persistent level like a fresh game: remove every
+-- actor EMS saves there; EMS spawns the loaded world's own ones from its file.
+local PERSISTENT = "/Game/Levels/PersistentLevel.PersistentLevel:PersistentLevel."
+local function clear_runtime_actors()
+    local w = game.world()
+    if not w then return end
+    local gs = util.cdo("/Script/Engine.Default__GameplayStatics")
+    local ic = StaticFindObject("/Script/EasyMultiSave.EMSActorSaveInterface")
+    if not util.valid(gs) or not util.valid(ic) then
+        log.warn("session: can't clear the old world's actors (no GameplayStatics / EMS save interface)")
+        return
+    end
+    local out = {}
+    local ok, err = pcall(function() gs:GetAllActorsWithInterface(w, ic, out) end)
+    if not ok then log.warn("session: can't list the old world's actors: " .. tostring(err)); return end
+    local n, failed, kinds = 0, 0, {}
+    for _, ref in ipairs(out) do
+        local a
+        pcall(function() a = ref:get() end)
+        local cls = util.valid(a) and util.class_name(a) or nil
+        local full
+        if cls then pcall(function() full = a:GetFullName() end) end
+        if full and full:find(PERSISTENT, 1, true) and not cls:find("^BP_PlayerC") then
+            local ctrl
+            pcall(function() ctrl = a.Controller end)
+            if pcall(function() a:K2_DestroyActor() end) then
+                n = n + 1
+                local k = cls:gsub("_C$", ""):gsub("^Container_", ""):gsub("^Buildable_", "B:")
+                kinds[k] = (kinds[k] or 0) + 1
+                if util.valid(ctrl) and util.class_name(ctrl) ~= "BP_PlayerController_C" then
+                    pcall(function() ctrl:K2_DestroyActor() end)
+                end
+            else failed = failed + 1 end
+        end
+    end
+    cleared_world = true
+    game.reset_world()
+    local top = {}
+    for k, c in pairs(kinds) do top[#top + 1] = { k, c } end
+    table.sort(top, function(x, y) return x[2] > y[2] end)
+    local s = {}
+    for i = 1, math.min(8, #top) do s[#s + 1] = top[i][2] .. " " .. top[i][1] end
+    log.info(string.format("session: load - removed %d runtime actor(s) of the old world%s (%s)", n,
+        failed > 0 and (", " .. failed .. " failed") or "", table.concat(s, ", ")))
+end
+
+local function on_any_load()
+    level_loading = true
+    util.safe(clear_runtime_actors, "session.clear_runtime_actors")
+end
 local function on_world_ready()
-    level_loading = false
+    level_loading, cleared_world = false, false
     world_slot = ems_current_name()
     log.info("session: this world is save " .. tostring(world_slot))
 end
@@ -593,6 +659,11 @@ local function firewall_tick()
         restore_name = nil
         local ok = point_at(n)
         log.info(string.format("session: firewall - pointed the game at %s again (%s)", n, tostring(ok)))
+    end
+    if discard_pending and not restore_name and not level_loading and not saving() then
+        discard_pending = false
+        slotguard.adopt(cfg.phase2.coop_slot)
+        slotguard.purge(cfg.phase2.coop_slot)
     end
 end
 

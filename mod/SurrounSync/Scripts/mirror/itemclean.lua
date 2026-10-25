@@ -50,7 +50,7 @@ local function info_of(a)
         local c = a:GetComponentByClass(jig_cls)
         local info = c.PickupInfo
         local id = info[INFO][ITEM_ID]
-        pcall(function() da = id:GetFName():ToString() end)
+        pcall(function() da = util.fname(id) end)
         local g = info[UID]
         uid = string.format("%d_%d_%d_%d", g.A, g.B, g.C, g.D)
     end)

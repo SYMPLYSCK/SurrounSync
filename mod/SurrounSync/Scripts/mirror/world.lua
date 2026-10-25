@@ -51,7 +51,7 @@ local function current_weather(w)
     local p, name, label
     pcall(function() p = w.Weather end)
     if not util.valid(p) then return nil end
-    pcall(function() name = p:GetFName():ToString() end)
+    pcall(function() name = util.fname(p) end)
     pcall(function() label = str(p["User Friendly Name"]) end)
     return name, label
 end
@@ -90,17 +90,28 @@ local function differ(a, b)
     for i = 1, #FIELDS do if math.abs((a[i] or 0) - (b[i] or 0)) > 0.02 then return true end end
     return false
 end
+-- Live values move by themselves while weather blends: only a clear difference counts.
+local function differ_live(a, b)
+    if not (a and b) then return true end
+    for i = 1, #FIELDS do if math.abs((a[i] or 0) - (b[i] or 0)) > 0.25 then return true end end
+    return false
+end
+-- The weather the player sees right now (a settings object UDW blends towards its target).
+local function global_state(w)
+    local g
+    pcall(function() g = w["Global Weather State"] end)
+    return util.valid(g) and g or nil
+end
 -- One settings object of our own (transient, kept from garbage collection) to hold copied values.
 local own_ws
 local function own_settings(tag)
     if util.valid(own_ws) then return own_ws end
-    local name = "SurrounSync_Weather_" .. tag
-    own_ws = StaticFindObject("/Engine/Transient." .. name)
-    if util.valid(own_ws) then return own_ws end
     own_ws = nil
-    local cls, outer = StaticFindObject(WS_CLASS), StaticFindObject("/Engine/Transient")
+    -- (StaticFindObject("/Engine/Transient") raises "Name wasn't long" in UE4SS 3.0.1: this never worked.
+    -- The game instance outlives every world and isn't saved.)
+    local cls, outer = StaticFindObject(WS_CLASS), FindFirstOf("SD_GameInstance_C")
     if not (util.valid(cls) and util.valid(outer)) then return nil end
-    pcall(function() own_ws = StaticConstructObject(cls, outer, FName(name), 0x42) end)
+    pcall(function() own_ws = StaticConstructObject(cls, outer, FName("SurrounSync_Weather_" .. tag), 0x42) end)
     if not util.valid(own_ws) then own_ws = nil; log.warn("world: couldn't make a weather settings object - random weather can't be copied") end
     return own_ws
 end
@@ -118,7 +129,7 @@ local function find_preset(name, label)
     local ok, err = pcall(function()
         for _, o in ipairs(FindAllOf("UDS_Weather_Settings_C") or {}) do
             if util.valid(o) and not o:GetFullName():find("Default__", 1, true) then
-                if o:GetFName():ToString() == name then exact = o; return end
+                if util.fname(o) == name then exact = o; return end
                 if not by_label and label ~= "" and str(o["User Friendly Name"]) == label then by_label = o end
             end
         end
@@ -147,14 +158,16 @@ local function host_tick()
             log.info("world: the guest changed the weather (" .. (rl ~= "" and rl or "random") .. ") - now shared")
         end
     end
-    local name, label, vals, asset = nil, nil, "", 0
+    local name, label, vals, asset, live_vals = nil, nil, "", 0, ""
     if w then
         name, label = current_weather(w)
         local p
         pcall(function() p = w.Weather end)
         if util.valid(p) then vals, asset = values_str(values_of(p)), is_asset(p) and 1 or 0 end
+        local g = global_state(w)
+        if g then live_vals = values_str(values_of(g)) end
     end
-    link.put_blob("sky", string.format("%.2f|%s|%s|%s|%d", tod, name or "", label or "", vals, asset))
+    link.put_blob("sky", string.format("%.2f|%s|%s|%s|%d|%s", tod, name or "", label or "", vals, asset, live_vals))
 end
 
 -- Guest-side game settings changed while joined (restored on leaving):
@@ -187,9 +200,9 @@ world.restore = restore_guest_settings
 local function guest_tick()
     local msg = peer_live() and link.get_blob("sky") or nil
     if msg then
-        local t, n, l, v, a = msg:match("^([^|]+)|([^|]*)|([^|]*)|([^|]*)|(%d)$")
+        local t, n, l, v, a, g = msg:match("^([^|]+)|([^|]*)|([^|]*)|([^|]*)|(%d)|?([^|]*)$")
         if not t then t, n, l = msg:match("^([^|]+)|([^|]*)|(.*)$") end
-        if t then host = { tod = tonumber(t), name = n, label = l, vals = parse_values(v), asset = a ~= "0" } end
+        if t then host = { tod = tonumber(t), name = n, label = l, vals = parse_values(v), asset = a ~= "0", live = parse_values(g) } end
     end
     if not host or not session.in_world() then matched, mine_set = nil, nil; restore_guest_settings(); return end
     local s, w = actors()
@@ -233,7 +246,23 @@ local function guest_tick()
     end
 
     if now < hold_until then return end
-    if w and host.vals and not host.asset then
+    if w and host.live then
+        -- What the host sees is its live weather state (clouds, rain, snow right now), not the preset it names:
+        -- the same preset name with a different live state showed rain + snow here under the host's clear sky.
+        local g = global_state(w)
+        local have = g and values_of(g) or nil
+        if have and not differ_live(have, host.live) then
+            matched = "live"
+        elseif not want or differ_live(want.vals, host.live) or now - want.at > RETRY then
+            want = { vals = host.live, at = now }
+            local ok, ws = apply_values(w, host.live, "Host")
+            if ok then
+                mine_set, matched = ws, "live"
+                stats.weather_sets = stats.weather_sets + 1
+                log.info("world: weather -> the host's live weather (" .. values_str(host.live) .. "), was " .. values_str(have or {}))
+            end
+        end
+    elseif w and host.vals and not host.asset then
         local p
         pcall(function() p = w.Weather end)
         local have = util.valid(p) and values_of(p) or nil

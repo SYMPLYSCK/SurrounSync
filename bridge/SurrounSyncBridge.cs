@@ -445,7 +445,10 @@ class TestNet : INet
             {
                 var c = new TcpClient();
                 c.NoDelay = true;
-                c.Connect(IPAddress.Loopback, port);
+                // (a blocking Connect with no host listening stalled the loop past the 12 s watchdog)
+                var ar = c.BeginConnect(IPAddress.Loopback, port, null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(300)) { c.Close(); client = null; return; }
+                c.EndConnect(ar);
                 client = c; stream = c.GetStream();
                 StartReader(c, 1001UL);
             }
@@ -717,11 +720,15 @@ class Bridge
     }
     static long Unix() { return DateTimeOffset.UtcNow.ToUnixTimeSeconds(); }
 
+    readonly object logLock = new object();
     void Log(string m)
     {
         string line = DateTime.Now.ToString("HH:mm:ss") + " " + m;
-        Console.WriteLine(line);
-        try { File.AppendAllText(logPath, line + "\r\n"); } catch { }
+        lock (logLock)
+        {
+            Console.WriteLine(line);
+            try { File.AppendAllText(logPath, line + "\r\n"); } catch { }
+        }
     }
 
     static int Main(string[] args)
@@ -828,10 +835,12 @@ class Bridge
             }
             ClearPeerFiles();
             if (auto) StartUpdateCheck();
+            StartWriter();
             StartWatchdog();
             try { Loop(); }
             finally
             {
+                FlushWrites();
                 if (peer != 0) net.Close(peer);
                 try { File.Delete(Path.Combine(dir, "mirror_clock_offset.txt")); } catch { }
                 try { File.Delete(PeerNameFile()); } catch { }
@@ -849,6 +858,8 @@ class Bridge
 
     void ClearPeerFiles()
     {
+        string pn = Path.GetFileName(PeerNameFile()), tail = "_" + other + ".txt";
+        DropQueuedWrites(n => n == pn || (n.StartsWith("mirror_") && n.EndsWith(tail)));
         try { File.Delete(PeerNameFile()); } catch { }
         try
         {
@@ -877,7 +888,6 @@ class Bridge
             if (role == "idle")
             {
                 Step("idle receive"); Drain(0); Drain(1);
-                Step("idle writes"); FlushWrites();
                 Step("idle sleep"); Thread.Sleep(20);
                 if (GameGone(ref lastGameCheck, ref gameMissing)) { Log("game closed - exiting"); return; }
                 continue;
@@ -908,7 +918,6 @@ class Bridge
             if (peer != 0) voice.Tick(pkt => { bool ok = net.Send(peer, pkt, false, 2); if (ok) { txPkts++; txBytes += pkt.Length; } return ok; });
             if (t - voiceCfgAt > 250) { voiceCfgAt = t; ReadVoiceSettings(); }
             WriteVoiceState();
-            Step("file writes"); FlushWrites();
             if (t - lastStatus > 2000) { Step("status file"); lastStatus = t; WriteStatus(); }
             Step("game check");
             if (GameGone(ref lastGameCheck, ref gameMissing)) { Log("game closed - exiting"); return; }
@@ -930,7 +939,9 @@ class Bridge
     HashSet<ulong> AllowList()
     {
         var set = new HashSet<ulong>();
-        string s = ReadShared(AllowFile());
+        string s;
+        lock (writeLock) pendingWrites.TryGetValue(AllowFile(), out s);
+        if (s == null) s = ReadShared(AllowFile());
         if (s != null) foreach (var line in s.Split('\n')) { ulong id; if (ulong.TryParse(line.Trim(), out id)) set.Add(id); }
         return set;
     }
@@ -1460,7 +1471,17 @@ class Bridge
         catch { return null; }
     }
 
+    // Every file the game reads is written by one writer thread, never by the network loop: on a PC where
+    // each write takes long (antivirus scanning every new file, a slow or busy disk) the loop used to wait on
+    // ~30 writes a second - round trips of 1-4 s, then a write stuck past the watchdog and the bridge quit
+    // and restarted every ~35 s (friend test 2026-10-24). Queued writes of the same file keep only the
+    // newest content; a re-queued file moves to the back, so a blob always lands before the index bump
+    // that announces it.
+    readonly object writeLock = new object();
     readonly Dictionary<string, string> pendingWrites = new Dictionary<string, string>();
+    readonly List<string> writeOrder = new List<string>();
+    readonly AutoResetEvent writeSignal = new AutoResetEvent(false);
+    long slowWriteLogAt = -60000;
 
     static bool TryWrite(string path, string content)
     {
@@ -1477,20 +1498,71 @@ class Bridge
 
     void WriteAtomic(string path, string content)
     {
-        pendingWrites.Remove(path);
-        for (int i = 0; i < 3; i++)
+        lock (writeLock)
         {
-            if (TryWrite(path, content)) return;
-            Thread.Sleep(1);
+            if (pendingWrites.ContainsKey(path)) writeOrder.Remove(path);
+            pendingWrites[path] = content;
+            writeOrder.Add(path);
         }
-        pendingWrites[path] = content;
+        writeSignal.Set();
     }
 
+    // drops queued writes whose file name passes the filter (the other game's old blobs after it restarted)
+    void DropQueuedWrites(Func<string, bool> drop)
+    {
+        lock (writeLock)
+            foreach (var p in new List<string>(writeOrder))
+                if (drop(Path.GetFileName(p))) { writeOrder.Remove(p); pendingWrites.Remove(p); }
+    }
+
+    void StartWriter()
+    {
+        var th = new Thread(() =>
+        {
+            while (true)
+            {
+                writeSignal.WaitOne(250);
+                while (true)
+                {
+                    string path, content;
+                    lock (writeLock)
+                    {
+                        if (writeOrder.Count == 0) break;
+                        path = writeOrder[0]; writeOrder.RemoveAt(0);
+                        content = pendingWrites[path]; pendingWrites.Remove(path);
+                    }
+                    long t0 = Environment.TickCount;
+                    bool ok = false;
+                    for (int i = 0; i < 3 && !ok; i++) { ok = TryWrite(path, content); if (!ok) Thread.Sleep(1); }
+                    long took = Environment.TickCount - t0;
+                    if (took > 500 && Environment.TickCount - slowWriteLogAt > 60000)
+                    {
+                        slowWriteLogAt = Environment.TickCount;
+                        Log("slow disk: writing " + Path.GetFileName(path) + " took " + took + " ms (antivirus or a busy disk?) - the link keeps running, only file updates wait");
+                    }
+                    if (!ok)
+                    {
+                        // the game had it open: try again shortly unless a newer content replaced it meanwhile
+                        lock (writeLock) if (!pendingWrites.ContainsKey(path)) { pendingWrites[path] = content; writeOrder.Add(path); }
+                        Thread.Sleep(2);
+                    }
+                }
+            }
+        });
+        th.IsBackground = true;
+        th.Start();
+    }
+
+    // the last queued writes before the bridge stops (up to 2 s)
     void FlushWrites()
     {
-        if (pendingWrites.Count == 0) return;
-        foreach (var kv in new List<KeyValuePair<string, string>>(pendingWrites))
-            if (TryWrite(kv.Key, kv.Value)) pendingWrites.Remove(kv.Key);
+        long t0 = Environment.TickCount;
+        while (Environment.TickCount - t0 < 2000)
+        {
+            lock (writeLock) if (writeOrder.Count == 0) return;
+            writeSignal.Set();
+            Thread.Sleep(10);
+        }
     }
 
     void PumpPose()
@@ -1668,6 +1740,8 @@ class Bridge
         blobEpoch = ep;
         try
         {
+            string tail = "_" + other + ".txt";
+            DropQueuedWrites(n => n.StartsWith("mirror_") && n.EndsWith(tail) && !n.StartsWith("mirror_link_"));
             foreach (var f in Directory.GetFiles(dir, "mirror_*_" + other + ".txt"))
                 if (!Path.GetFileName(f).StartsWith("mirror_link_")) try { File.Delete(f); } catch { }
         }

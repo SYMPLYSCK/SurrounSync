@@ -54,9 +54,10 @@ local ATT_NEAR = { "DoorOpeningClosing", "FootSteps", "BulletImpact" }
 local att_of, att_obj, att_warned = {}, {}, false
 local function att_asset(list)
     for _, n in ipairs(list) do
-        local a = att_obj[n]
-        if not util.valid(a) then a = StaticFindObject(ATT .. n .. "." .. n); att_obj[n] = util.valid(a) and a or nil end
-        if att_obj[n] then return att_obj[n] end
+        local p = ATT .. n .. "." .. n
+        local a = util.cached(att_obj, p)
+        if not a then a = StaticFindObject(p); att_obj[p] = util.valid(a) and a or nil end
+        if att_obj[p] then return att_obj[p] end
     end
     return nil
 end
@@ -128,7 +129,7 @@ local function on_sound(kind, ctx, snd, l, vol, pitch)
     if not shared() then drop("notshared"); return end
     if not util.valid(snd) or not util.valid(ctx) then drop("invalid"); return end
     local name = ""
-    pcall(function() name = snd:GetFName():ToString() end)
+    pcall(function() name = util.fname(snd) end)
     if skipped(name) then drop("skip"); return end
     local path0 = path_of(snd)
     if path0 and l then remember(path0, l) end
@@ -183,9 +184,10 @@ local function hook_all()
                         pcall(function() l = vec_of(c:get()) end)
                         pcall(function() vol, pitch = e:get(), f:get() end)
                     end
+                    local prev = crumb.current()
                     crumb.at(step)
                     util.safe(on_sound, "audio.sound", kind, ctx, snd, l, tonumber(vol), tonumber(pitch))
-                    crumb.at(after)
+                    crumb.leave(prev, after)
                 end)
             end)
             log.info("audio: hook " .. fn .. (ok and " on" or " FAILED"))
@@ -194,8 +196,8 @@ local function hook_all()
 end
 
 local function sound(path)
-    local s = cache[path]
-    if util.valid(s) then return s end
+    local s = util.cached(cache, path)
+    if s then return s end
     if os.clock() < (missing[path] or 0) then return nil end
     s = StaticFindObject(path)
     if util.valid(s) then cache[path] = s; return s end

@@ -19,7 +19,7 @@ local timers = {}
 
 local function name_of(obj)
     if not util.valid(obj) then return "nil" end
-    local n; pcall(function() n = obj:GetFName():ToString() end)
+    local n; pcall(function() n = util.fname(obj) end)
     return n or "?"
 end
 

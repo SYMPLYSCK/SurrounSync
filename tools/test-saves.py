@@ -676,7 +676,8 @@ local function obj(t)
     t.GetAddress = t.GetAddress or function() return t.addr or 1 end
     return t
 end
-local function cls(name) return function() return { GetFName = function() return { ToString = function() return name end } end } end end
+-- (util.class_name valid-checks the class: a fake class needs IsValid too)
+local function cls(name) return function() return obj{ GetFName = function() return { ToString = function() return name end } end } end end
 -- the game saving into the current slot, the way EMS does: Slot.sav (save time) + the player files change
 function GAME_SAVE()
     SAVES, SAVING = SAVES + 1, 2

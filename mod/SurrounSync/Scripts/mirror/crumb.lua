@@ -47,4 +47,12 @@ function crumb.at(step)
     f:flush()
 end
 
+-- Around a hook: the step before it, then back to that step afterwards when the hook fired inside mod
+-- code (a sound or call the mod made itself) - else a hang in that native call was blamed on the game
+-- ("game (after hook audio PlaySoundAtLocation)", report 131713) instead of the mod step that made it.
+function crumb.current() return last end
+function crumb.leave(prev, after)
+    if prev and prev:sub(1, 4) ~= "game" then crumb.at(prev) else crumb.at(after) end
+end
+
 return crumb

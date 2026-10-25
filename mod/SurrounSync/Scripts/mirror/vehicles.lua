@@ -54,7 +54,7 @@ local function alive(a)
     pcall(function() dying = a:IsActorBeingDestroyed() == true end)
     return not dying
 end
-local function name_of(a) local n; pcall(function() n = a:GetFName():ToString() end); return n end
+local function name_of(a) local n; pcall(function() n = util.fname(a) end); return n end
 local new_car, car_hook_in = false, 0.0
 local function on_car_begin(self)
     if role ~= "host" or not in_world then return end
@@ -207,8 +207,11 @@ local function fuel_health(car)
 end
 
 local known_state, told, applied_state = {}, {}, {}
-local STATE_NEAR, STATE_EVERY = 2500, 0.5
-local state_in, state_keys, state_idx = 0.0, {}, 0
+-- Fuel/health/colour changes are watched on the cars near the player 4x a second (a refuel shows live on the
+-- other screen); a slow round over all cars (~400) keeps that near set. It used to check 12 cars per 0.5 s
+-- over all of them: a change at the car you stood at went out up to ~17 s later.
+local STATE_NEAR, STATE_EVERY, SCAN_PER_TICK = 2500, 0.25, 40
+local state_in, state_keys, state_idx, near_cars = 0.0, {}, 0, {}
 local function remember_state(n, car) known_state[n] = state_of(car) end
 local function watch_states(dt, busy)
     state_in = state_in - dt
@@ -221,21 +224,23 @@ local function watch_states(dt, busy)
         state_keys, state_idx = {}, 0
         for n in pairs(cars) do state_keys[#state_keys + 1] = n end
     end
-    local changed = false
-    for _ = 1, 12 do
+    for _ = 1, SCAN_PER_TICK do
         state_idx = state_idx + 1
         local mine = state_keys[state_idx]
         if not mine then break end
+        local car, l = cars[mine], nil
+        if alive(car) then pcall(function() l = car:K2_GetActorLocation() end) end
+        near_cars[mine] = (l and util.dist(l, pl) < STATE_NEAR) or nil
+    end
+    local changed = false
+    for mine in pairs(near_cars) do
         local car = cars[mine]
-        if alive(car) and not busy(car) then
-            local l
-            pcall(function() l = car:K2_GetActorLocation() end)
-            if l and util.dist(l, pl) < STATE_NEAR then
-                local n = peer_name(car)
-                local st = state_of(car)
-                if n and known_state[n] and known_state[n] ~= st then told[n], changed = st, true end
-                if n then known_state[n] = st end
-            end
+        if not alive(car) then near_cars[mine] = nil
+        elseif not busy(car) then
+            local n = peer_name(car)
+            local st = state_of(car)
+            if n and known_state[n] and known_state[n] ~= st then told[n], changed = st, true end
+            if n then known_state[n] = st end
         end
     end
     if changed then
@@ -862,7 +867,7 @@ end
 -- The old world's cars are gone (respawn/reload): drop them, keep what the other game told us.
 local function forget_world()
     cars, alias, rev, retired, frozen, unknown, wake_at, pending = {}, {}, {}, {}, {}, {}, {}, {}
-    made_for_drive, parked, known_state = {}, {}, {}
+    made_for_drive, parked, known_state, near_cars, state_keys, state_idx = {}, {}, {}, {}, {}, 0
     driving, riding, entered_with, peer, master_cls = nil, nil, nil, nil, nil
     seated, seated_as, ghost_collide_at = false, nil, nil
     scan_age, list_sent, pass, entered_at, applied_at = math.huge, nil, 0, now, -100.0

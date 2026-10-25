@@ -42,6 +42,10 @@ local finished = {}
 -- item list the copy couldn't hold; when it's picked up here the list goes into the new inventory item.
 local unfilled = {}
 local refill = {}
+-- The game's own pickup of a mag copy ran none of the pickup hooks (2026-10-24 in-game): it was only seen
+-- as "gone" from the ground. held[uid] = the inventory items of the copy's kind while it lies near the
+-- player, so the new one can be told apart when it goes.
+local held = {}
 local ITEMS = "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"
 local now = 0.0
 local check_in = 0.0
@@ -89,7 +93,8 @@ local resend, sent_list
 local function forget(uid)
     local a = tracked[uid]
     if a then ended[util.addr(a) or 0] = nil end
-    tracked[uid], copies[uid], seen[uid], resend[uid], sent_list[uid] = nil, nil, nil, nil, nil
+    tracked[uid], copies[uid], seen[uid], resend[uid], sent_list[uid], held[uid] = nil, nil, nil, nil, nil, nil
+    unfilled[uid] = nil
 end
 
 local function jig_of(actor)
@@ -121,10 +126,15 @@ local function describe(list)
     end
     return table.concat(out, ", ")
 end
-local function apply_contents(comp, want, what)
+-- What the copy holds after the other game's list went on is the parts check's baseline: a fresh copy
+-- spawns with the item's default parts and the check could look before the list lands - that landing
+-- isn't a change made here (in-game the guest sent the host's own parts back).
+local function apply_contents(uid, comp, want, what)
     local set, added, removed, missing = jig.apply_contents(comp, want)
+    local now_in = contents_of(comp)
     log.info(string.format("drops: %s contents - %d set, %d added, %d extra removed, %d missing (of %d) - now [%s]", what,
-        set, added, removed, missing, #want, describe(contents_of(comp))))
+        set, added, removed, missing, #want, describe(now_in)))
+    pcall(function() sent_list[uid] = jig.encode(now_in) end)
     return set + added, missing
 end
 
@@ -358,7 +368,7 @@ local function take_content(payload)
     local a = finished[uid]
     if a and alive(a) then
         local comp = jig_of(a)
-        if comp then note_unfilled(uid, a, apply_contents(comp, list, da:match("[^%.]+$") or da)) end
+        if comp then note_unfilled(uid, a, apply_contents(uid, comp, list, da:match("[^%.]+$") or da)) end
     end
 end
 
@@ -394,16 +404,30 @@ local function send_contents()
         end
     end
 end
+-- The move hook above never fired in a real game (no "parts changed" in any log), so dropped items near
+-- the player are also compared with their last known parts list every check (0.5 s). The first look
+-- only records the list; a later difference goes over like a hooked move.
+local PARTS_NEAR_CM = 400
+local function poll_parts(uid, a, pl)
+    local l
+    pcall(function() l = util.vec(a:K2_GetActorLocation()) end)
+    if not (l and util.dist(l, pl) <= PARTS_NEAR_CM) then return end
+    local comp = jig_of(a)
+    if not comp then return end
+    local line = jig.encode(contents_of(comp))
+    if sent_list[uid] == nil then sent_list[uid] = line
+    elseif line ~= sent_list[uid] and not resend[uid] then resend[uid] = now end
+end
 local function take_changed(payload)
     local uid, line = payload:match("^C (%S+) ?(.*)$")
     if not uid then return end
     local list = jig.decode(line)
-    contents[uid], sent_list[uid] = list, line
+    contents[uid], sent_list[uid] = list, nil
     local a = finished[uid] or tracked[uid]
     local comp = alive(a) and jig_of(a)
     if not comp then return end
     applying = true
-    local ok, placed, missing = pcall(apply_contents, comp, list, "changed parts")
+    local ok, placed, missing = pcall(apply_contents, uid, comp, list, "changed parts")
     applying = false
     if ok then note_unfilled(uid, a, placed, missing) end
 end
@@ -461,7 +485,7 @@ local function finish_copies()
             end) end
             if not ok then log.warn("drops: couldn't finish a container copy: " .. tostring(err)) end
             finished[f.uid] = f.actor
-            if comp then note_unfilled(f.uid, f.actor, apply_contents(comp, contents[f.uid] or {}, "copy")) end
+            if comp then note_unfilled(f.uid, f.actor, apply_contents(f.uid, comp, contents[f.uid] or {}, "copy")) end
         end
     end
     finish = keep
@@ -498,6 +522,26 @@ local function do_refill(r)
     end
     local added, missing = jig.fill(pc, target.uid, fl)
     log.info(string.format("drops: put the picked-up copy's contents into it - %d added, %d missing", added, missing))
+end
+local NEAR_CM = 600
+local function note_held()
+    local pc, pl = inventory(), nil
+    pcall(function() pl = util.vec(game.player():K2_GetActorLocation()) end)
+    if not (pc and pl) then return end
+    local all
+    for uid in pairs(unfilled) do
+        local a, l = tracked[uid], nil
+        pcall(function() l = util.vec(a:K2_GetActorLocation()) end)
+        local da = copies[uid] and copies[uid].da
+        if da and l and util.dist(l, pl) < NEAR_CM then
+            all = all or contents_of(pc)
+            local set = {}
+            for _, h in ipairs(all) do if h.da == da then set[h.uid] = true end end
+            held[uid] = set
+        else
+            held[uid] = nil
+        end
+    end
 end
 local function run_refills()
     local keep = {}
@@ -660,17 +704,25 @@ function drops.tick(dt)
         if #begun > 0 and begun[#begun].at < now then begun = {} end
         if not shared() then
             tracked, copies, alias, finish, ended, contents, finished, unfilled = {}, {}, {}, {}, {}, {}, {}, {}
-            resend, sent_list = {}, {}
+            resend, sent_list, held = {}, {}, {}
         end
+        local pl
+        pcall(function() pl = util.vec(game.player():K2_GetActorLocation()) end)
         for uid, a in pairs(tracked) do
             local here, why = on_ground(a)
-            if here then seen[uid] = true end
+            if here then
+                seen[uid] = true
+                if pl then util.safe(poll_parts, "drops.poll_parts", uid, a, pl) end
+            end
             if not here and (why ~= "hidden" or seen[uid]) then
                 log.info("drops: a dropped item was picked up here (" .. why .. ") - telling the other game")
+                if held[uid] then queue_refill(uid, nil, held[uid]) end
                 forget(uid)
                 channel:send("T " .. uid)
             end
         end
+        -- after the check: a snapshot taken once the new mag is already in the inventory would hide it
+        if next(unfilled) then util.safe(note_held, "drops.note_held") end
     end
     channel:pump(function(payload)
         local k = payload:sub(1, 1)
@@ -708,7 +760,7 @@ end
 
 local function forget_world()
     tracked, finish, finished, ended, filled, picking, begun, rewards, unfilled, refill = {}, {}, {}, {}, {}, nil, {}, {}, {}, {}
-    resend, sent_list = {}, {}
+    resend, sent_list, held = {}, {}, {}
 end
 function drops.init(c, r, s)
     game.on_world_reset(forget_world)

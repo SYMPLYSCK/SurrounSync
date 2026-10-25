@@ -4,6 +4,7 @@
 local log = require("mirror.log")
 local util = require("mirror.util")
 local ghost = require("mirror.ghost")
+local crumb = require("mirror.crumb")
 
 local save_guard = {}
 
@@ -31,15 +32,19 @@ function save_guard.busy() return pending end
 
 local function on_save_start(path)
     log.info("save starting (" .. path:match(":(.+)$") .. ")")
+    -- (a guest froze/crashed inside this hook once with no dump: the steps say which part next time)
+    crumb.at("save: before_save")
     if before_save then before_save() end
     if not cfg.save.destroy_ghost_on_save then
         if ghost.exists() then log.warn("save with ghost present (destroy_ghost_on_save=false): testing bSkipSave alone") end
         return
     end
     if ghost.exists() then
+        crumb.at("save: ghost pose")
         local yaw = 0
         pcall(function() yaw = ghost.get():K2_GetActorRotation().Yaw end)
         saved_pose = { loc = ghost.location(), yaw = yaw }
+        crumb.at("save: ghost destroy")
         ghost.destroy("save")
         pending, since = true, 0.0
     end

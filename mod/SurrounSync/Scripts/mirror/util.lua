@@ -74,10 +74,18 @@ function util.same(a, b)
     return x ~= nil and x == y
 end
 
+-- An object's name, or nil. GetFName on a wrapper around NULL is a native crash pcall can't catch
+-- (UE4SS GetNamePrivate on NULL, AV 0x18: six crashes in tick code 2026-10-24) - always check first.
+function util.fname(obj)
+    if not util.valid(obj) then return nil end
+    local ok, n = pcall(function() return obj:GetFName():ToString() end)
+    return ok and n or nil
+end
+
 function util.class_name(obj)
     if not util.valid(obj) then return nil end
     local ok, c = pcall(obj.GetClass, obj)
-    if not (ok and c) then return nil end
+    if not (ok and util.valid(c)) then return nil end
     local ok2, n = pcall(function() return c:GetFName():ToString() end)
     return ok2 and n or nil
 end
@@ -158,16 +166,18 @@ function util.hook(path, pre, post, force)
     local in_pre, in_post, after = "hook " .. short, "hook post " .. short, "game (after hook " .. short .. ")"
     local tramp_pre = function(...)
         if not slot.pre then return end
+        local prev = crumb.current()
         crumb.at(in_pre)
         local r = slot.pre(...)
-        crumb.at(after)
+        crumb.leave(prev, after)
         return r
     end
     local tramp_post = post and function(...)
         if not slot.post then return end
+        local prev = crumb.current()
         crumb.at(in_post)
         local r = slot.post(...)
-        crumb.at(after)
+        crumb.leave(prev, after)
         return r
     end or nil
     local ok, err = pcall(function()
@@ -347,10 +357,23 @@ function util.move(actor, loc, yaw)
     return ok and moved ~= false
 end
 
+-- A cached object found by path, or nil. IsValid alone can't tell a garbage-collected asset from a
+-- new object the engine put at the same address and index - it then passes as the old one (a zombie
+-- copy got a non-material as its material: native crash in the material relevance code, 4 reports) -
+-- so a hit must still carry the path's own name.
+function util.cached(cache, path)
+    local o = cache[path]
+    if o == nil then return nil end
+    -- native (/Script) classes and their defaults are never collected: IsValid is enough there
+    if util.valid(o) and (path:sub(1, 8) == "/Script/" or util.fname(o) == path:match("[^%.:]+$")) then return o end
+    cache[path] = nil
+    return nil
+end
+
 local cdo_cache = {}
 function util.cdo(path)
-    local o = cdo_cache[path]
-    if util.valid(o) then return o end
+    local o = util.cached(cdo_cache, path)
+    if o then return o end
     o = StaticFindObject(path)
     if util.valid(o) then cdo_cache[path] = o; return o end
     return nil

@@ -45,7 +45,7 @@ local stats = { sent = 0, made = 0, failed = 0, missing = 0, took = 0, taken = 0
 
 local function key_of(a)
     local k
-    pcall(function() k = a:GetFName():ToString() end)
+    pcall(function() k = util.fname(a) end)
     return k
 end
 

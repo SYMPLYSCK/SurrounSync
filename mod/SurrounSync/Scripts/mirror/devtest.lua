@@ -574,7 +574,7 @@ function devtest.watch(cfg)
                 local d = dist_to_player(b)
                 local n, items = 0, 0
                 pcall(function() for _, h in ipairs(jig.contents_of(b.BP_JigMultiplayer)) do n = n + h.count; items = items + 1 end end)
-                log.info(string.format("devtest: bag %s at %.0f m: %d stacks, %d items", b:GetFName():ToString(), d / 100, items, n))
+                log.info(string.format("devtest: bag %s at %.0f m: %d stacks, %d items", util.fname(b), d / 100, items, n))
                 if d < bd then best, bd = b, d end
             end
             if cmd == "takebag" and best then
@@ -615,7 +615,7 @@ function devtest.watch(cfg)
             pcall(function()
                 for _, c in ipairs(list) do
                     local name, en, vis, ext = "?", -1, -1, nil
-                    pcall(function() name = c:GetFName():ToString() .. " (" .. util.class_name(c) .. ")" end)
+                    pcall(function() name = util.fname(c) .. " (" .. util.class_name(c) .. ")" end)
                     pcall(function() en = c:GetCollisionEnabled() end)
                     pcall(function() vis = c:GetCollisionResponseToChannel(3) end)
                     pcall(function() local b = c.Bounds.BoxExtent; ext = string.format("%.0fx%.0fx%.0f", b.X * 2, b.Y * 2, b.Z * 2) end)
@@ -652,7 +652,7 @@ function devtest.watch(cfg)
                         pcall(function() c = h.Component:Get() end)
                         pcall(function() d = h.Distance end)
                         what = string.format("%s / %s at %s cm", util.valid(a) and (util.class_name(a) .. (util.same(a, g) and " [GHOST]" or "")) or "?",
-                            util.valid(c) and c:GetFName():ToString() or "?", tostring(d and math.floor(d)))
+                            util.valid(c) and util.fname(c) or "?", tostring(d and math.floor(d)))
                     end
                     log.info(string.format("devtest: ghosttrace side %d cm, height +%d: %s", side, up, what))
                 end

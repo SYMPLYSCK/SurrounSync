@@ -97,8 +97,10 @@ namespace SurrounSyncShared
             var curLines = cur != null ? Parse(cur, ref n) : new List<Line>();
             List<Line> runLines = curLines;
             d.TimelineFrom = "mirror_log.txt (the newest game run)";
+            // a game restarted within minutes of the crash also has its newest log "near" it: the run that
+            // started after the crash isn't the one that crashed (report 122034 explained the new run)
             if (recentCrash && prev != null && File.Exists(prev) && Near(File.GetLastWriteTime(prev), crashAt)
-                && !(File.Exists(cur) && Near(File.GetLastWriteTime(cur), crashAt)))
+                && (!(File.Exists(cur) && Near(File.GetLastWriteTime(cur), crashAt)) || SecondsAfter(curLines, 0, crashAt) > 0))
             {
                 runLines = Parse(prev, ref n);
                 d.TimelineFrom = "mirror_log.1.txt (the game run that crashed)";
@@ -119,16 +121,16 @@ namespace SurrounSyncShared
             if (recentCrash)
             {
                 var cf = CrashFinding(win64, crash, crashAt, d);
-                if (runLines.Count > 0)
+                double? after = runLines.Count > 0 ? SecondsAfter(runLines, runLines.Count - 1, crashAt) : null;
+                if (after.HasValue)
                 {
-                    TimeSpan last;
-                    if (TimeSpan.TryParse(runLines[runLines.Count - 1].Time, out last))
-                    {
-                        double gap = (crashAt.TimeOfDay - last).TotalSeconds;
-                        if (gap < 0) gap += 86400;
-                        cf.Evidence.Add("Last SurrounSync log line " + runLines[runLines.Count - 1].Time + ", " + (int)gap + " s before the crash"
+                    string at = runLines[runLines.Count - 1].Time;
+                    double gap = -after.Value;
+                    if (gap >= 0)
+                        cf.Evidence.Add("Last SurrounSync log line " + at + ", " + (int)gap + " s before the crash"
                                         + (gap > 60 ? " (the game was probably frozen in between)" : ""));
-                    }
+                    else
+                        cf.Evidence.Add("Last SurrounSync log line " + at + ", " + (int)-gap + " s after the crash's file time (the crash files were written late)");
                 }
                 d.Findings.Add(cf);
             }
@@ -160,6 +162,18 @@ namespace SurrounSyncShared
         static bool IsCrash(Finding f) { return f.Category.StartsWith("Crash") || f.Category == "Freeze"; }
 
         static bool Near(DateTime a, DateTime b) { return Math.Abs((a - b).TotalMinutes) < 10; }
+
+        // Seconds from t to log line i (negative = before t), or null. Lines carry only the time of day:
+        // the nearest reading within +-12 h is taken, so a run across midnight still compares right.
+        static double? SecondsAfter(List<Line> lines, int i, DateTime t)
+        {
+            TimeSpan at;
+            if (i < 0 || i >= lines.Count || !TimeSpan.TryParse(lines[i].Time, out at)) return null;
+            double s = (at - t.TimeOfDay).TotalSeconds;
+            if (s > 43200) s -= 86400;
+            else if (s <= -43200) s += 86400;
+            return s;
+        }
 
         static List<Line> Concat(List<Line> a, List<Line> b) { var l = new List<Line>(a); l.AddRange(b); return l; }
 

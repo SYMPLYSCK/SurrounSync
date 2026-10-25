@@ -165,6 +165,17 @@ static class TestReport
         Check(g.Timeline.Count == 2 && g.Timeline[1].Contains("hit by car"), "the timeline is the last events before the crash, status lines left out");
         Check(g.Top != null && g.Top.Confidence == "possible" && g.Top.Cause.Contains("Unknown"), "no step info = cause stays unknown, confidence 'possible'");
 
+        // restarted within 2 minutes: the new run's log is also "near" the crash, but it began after it
+        DateTime ca = DateTime.Now.AddMinutes(-5);
+        Func<int, string> t = s => ca.AddSeconds(s).ToString("HH:mm:ss");
+        d = Dir("quickrestart");
+        Log(d, "mirror_log.1.txt", new[] { L(t(-60), "INFO", "phase1[host]: rx 20/s"), L(t(-5), "INFO", "loot: open seen (init): BP_Zombie_Roamer_C") }, ca.AddSeconds(-5));
+        Log(d, "mirror_log.txt", new[] { L(t(47), "INFO", "SurrounSync 0.12.0 (protocol 48) starting"), L(t(98), "INFO", "SurrounSync ready.") }, ca.AddSeconds(98));
+        Crash(d, "UECC-8", "Unhandled Exception: EXCEPTION_ACCESS_VIOLATION reading address 0xffffffffffffffff", "UE4SS", ca);
+        g = Run(d);
+        Check(g.TimelineFrom.Contains("mirror_log.1.txt"), "a quick restart: the run that crashed is explained, not the new one");
+        Check(g.Top != null && g.Top.Evidence.Any(x => x.Contains("5 s before the crash")), "the last line's gap is seconds, not a day");
+
         d = Dir("oldcrash");
         Log(d, "mirror_log.txt", new[] { L("09:40:00", "INFO", "SurrounSync ready.") }, DateTime.Now);
         Crash(d, "UECC-7", "GPU Crash dump Triggered", "SurrounDead_Win64_Shipping", DateTime.Now.AddDays(-2));

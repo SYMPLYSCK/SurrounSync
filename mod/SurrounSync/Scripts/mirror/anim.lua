@@ -58,8 +58,8 @@ local function is_real(self)
 end
 
 local function find_montage(p)
-    local m = cache[p]
-    if util.valid(m) then return m end
+    local m = util.cached(cache, p)
+    if m then return m end
     m = StaticFindObject(p)
     if util.valid(m) then cache[p] = m; return m end
     return nil

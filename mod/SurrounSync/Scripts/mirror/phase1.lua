@@ -403,7 +403,8 @@ local function on_tick(dt)
                 end
             end
         end
-        if peer_protocol == nil and not hello_missing_logged and first_rx and now - first_rx > 10 then
+        -- a join keeps the host busy: its announcement came 11 s after its first poses once (false alarm, 2026-10-25)
+        if peer_protocol == nil and not hello_missing_logged and first_rx and now - first_rx > 30 then
             hello_missing_logged = true
             log.error("phase1: the other game sends poses but no protocol announcement - it runs an OLDER SurrounSync; restart it")
         end

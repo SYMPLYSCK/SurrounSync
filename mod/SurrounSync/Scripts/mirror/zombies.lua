@@ -64,8 +64,8 @@ local FAMILIES = {
 }
 local fam_cls, fam_retry = {}, {}
 local function fam_class(path)
-    local c = fam_cls[path]
-    if util.valid(c) then return c end
+    local c = util.cached(fam_cls, path)
+    if c then return c end
     if (fam_retry[path] or 0) > os.clock() then return nil end
     c = StaticFindObject(path)
     if util.valid(c) then fam_cls[path] = c; return c end
@@ -234,8 +234,8 @@ local missed, appeared = {}, {}
 local SETTLE = 5.0
 local function find(p)
     if not p or p == "-" then return nil end
-    local o = cache[p]
-    if util.valid(o) then return o end
+    local o = util.cached(cache, p)
+    if o then return o end
     -- a miss costs StaticFindObject ~15 ms (measured in-game): ask again for a missing path once for all
     -- copies, 5 s after the first miss, doubling up to 60 s (most never load here - no safe LoadAsset)
     local miss = missed[p]
@@ -331,11 +331,16 @@ local BONES = { "Jaw", "lowerarm_r", "lowerarm_l", "calf_l", "Foot_R", "calf_r",
 local BIT = { 1, 2, 4, 8, 16, 32, 64 }
 local bone_fnames = {}
 local arch_seen, arch_seen_n = {}, 0
-local arch_hooks = {}
+-- .ready[i] = when this game itself last ran archetype i (its mesh/effects are loaded then); .calling = our
+-- own call is running. Calling an Archetype_ function from Lua loads what it needs synchronously when it
+-- isn't loaded yet - a guest froze in "z.look.arch" right after its first copies (report 20261024-203718).
+local arch_hooks = { ready = {}, calling = false }
+local ARCH_READY_S = 120
 for i, a in ipairs(ARCH) do
     arch_hooks[i] = function(self)
+        if not arch_hooks.calling then arch_hooks.ready[i] = os.clock() end
         local n
-        pcall(function() n = self:get():GetFName():ToString() end)
+        pcall(function() n = util.fname(self:get()) end)
         if not n then return end
         if arch_seen_n > 4000 then arch_seen, arch_seen_n = {}, 0 end
         if not arch_seen[n] then arch_seen_n = arch_seen_n + 1 end
@@ -540,7 +545,7 @@ local function host_tick(dt)
                 if d < nearest then nearest = d end
                 local a = znames[z]
                 if not a then
-                    pcall(function() a = z:GetFName():ToString() end)
+                    pcall(function() a = util.fname(z) end)
                     a = a or tostring(util.addr(z))
                     znames[z] = a
                 end
@@ -1003,17 +1008,23 @@ local function sync_look(id, c, e)
     if c.dead_at or not util.valid(z) then return end
     if x and x.arch > 0 and c.arch ~= x.arch then
         local mine
-        pcall(function() mine = arch_of(z, z:GetFName():ToString()) end)
-        if mine ~= x.arch then
+        pcall(function() mine = arch_of(z, util.fname(z)) end)
+        local seen = arch_hooks.ready[x.arch]
+        if mine ~= x.arch and seen and os.clock() - seen < ARCH_READY_S then
             local ok, err
+            arch_hooks.calling = true
             perf.run("z.look.arch", function() ok, err = pcall(function() local f = z["Archetype_" .. ARCH[x.arch]]; f(z) end) end)
+            arch_hooks.calling = false
             if not ok then log.warn("zombies: copy " .. id .. " archetype " .. ARCH[x.arch] .. ": " .. tostring(err)) end
+        elseif mine ~= x.arch then
+            arch_mismatch = arch_mismatch + 1
+            if arch_mismatch <= 5 then log.info("zombies: copy " .. id .. " is a " .. ARCH[x.arch] .. " on the host - not loaded here, the copy keeps its own look") end
         end
         c.arch = x.arch
     elseif x and x.arch == 0 and not c.arch then
         c.arch = 0
         local mine
-        pcall(function() mine = arch_of(z, z:GetFName():ToString()) end)
+        pcall(function() mine = arch_of(z, util.fname(z)) end)
         if mine and mine > 0 then
             arch_mismatch = arch_mismatch + 1
             if arch_mismatch <= 5 then log.info("zombies: copy " .. id .. " rolled " .. ARCH[mine] .. " here, the host's has none (kept)") end
@@ -1044,7 +1055,7 @@ local function sync_look(id, c, e)
 end
 
 -- For tools/test-sync.py.
-zombies._look = { arch_of = function(z, n) return arch_of(z, n) end, bones_of = function(z) return bones_of(z) end,
+zombies._look = { arch_hooks = arch_hooks, arch_of = function(z, n) return arch_of(z, n) end, bones_of = function(z) return bones_of(z) end,
                   sync = function(id, c, e, x) xlooks[id] = x; sync_look(id, c, e) end }
 zombies._host = { tick = function(c, dt) cfg = cfg or c; now = now + dt; host_tick(dt) end }
 zombies._test = { setup = function(c, r) cfg, role = c, r end, sweep = function(dt) now = now + (dt or 0); suppress_natives() end }
@@ -1510,7 +1521,7 @@ end
 function zombies.all_cached() return zombies_cached(now) end
 function zombies.host_id_of(z)
     local a
-    pcall(function() a = z:GetFName():ToString() end)
+    pcall(function() a = util.fname(z) end)
     return a and ids[a] or nil
 end
 function zombies.copy(id) return copies[id] end
@@ -1695,7 +1706,7 @@ local function fx_id(comp_param)
     if not comp then return nil end
     pcall(function() owner = comp:GetOwner() end)
     if not util.valid(owner) then return nil end
-    pcall(function() id = ids[owner:GetFName():ToString()] end)
+    pcall(function() id = ids[util.fname(owner)] end)
     return id
 end
 local function v3(v) return string.format("%.1f %.1f %.1f", v.X, v.Y, v.Z) end
@@ -1805,7 +1816,7 @@ function zombies.init(c, r, s)
             local amt, cls, id, l = 0, "-", -1, { X = 0, Y = 0, Z = 0 }
             pcall(function() amt = Damage:get() end)
             cls = util.class_path(util.obj(DamageType)) or "-"
-            pcall(function() id = ids[ai:GetFName():ToString()] or -1 end)
+            pcall(function() id = ids[util.fname(ai)] or -1 end)
             pcall(function() l = ai:K2_GetActorLocation() end)
             local fam = family_of(ai)
             local ranged = (fam == "human" or fam == "boss") and 1 or 0
@@ -1837,7 +1848,7 @@ function zombies.init(c, r, s)
             pcall(function() owner = self:get():GetOwner() end)
             if not (owner and is_zombie(owner)) then return end
             local id
-            pcall(function() id = ids[owner:GetFName():ToString()] end)
+            pcall(function() id = ids[util.fname(owner)] end)
             if not id or applying_hit then return end
             -- bosses pass junk pointers here; reading them crashes outside pcall
             local boss = family_of(owner) == "boss"
@@ -1872,7 +1883,7 @@ function zombies.init(c, r, s)
             end
             local id, l = -1, gl or { X = 0, Y = 0, Z = 0 }
             if best then
-                pcall(function() id = ids[best:GetFName():ToString()] or -1 end)
+                pcall(function() id = ids[util.fname(best)] or -1 end)
                 pcall(function() l = best.Mesh:K2_GetComponentLocation() end)
             end
             return string.format("%d %.1f %.1f %.1f", id, l.X, l.Y, l.Z)
@@ -1950,7 +1961,7 @@ function zombies.init(c, r, s)
             hits:send(string.format("D %d %.3f 0 %s", id, amt, tp))
         else
             local id
-            pcall(function() id = ids[z:GetFName():ToString()] end)
+            pcall(function() id = ids[util.fname(z)] end)
             if not id or (causer and ghost.is(causer)) then return end
             local cls = util.class_path(util.obj(DamageType)) or "-"
             zhits:send(string.format("%d %.3f %s", id, amt, cls))

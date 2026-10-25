@@ -20,8 +20,8 @@ local ROTATED = "Rotated_9_3CFE5D9342A81FB1FF17DEB7B491CE56"
 
 local asset_cache = {}
 function jig.asset(path)
-    local a = asset_cache[path]
-    if util.valid(a) then return a end
+    local a = util.cached(asset_cache, path)
+    if a then return a end
     a = StaticFindObject(path)
     if util.valid(a) then asset_cache[path] = a; return a end
     return nil
@@ -420,9 +420,33 @@ function jig.remove_whole(comp, uid)
     else log.warn("jig: couldn't remove a bag whole: " .. tostring(err)) end
     return ok
 end
+-- A bag is never consumed: that leaves its compartments behind under its uid, and when the same bag comes
+-- back the game adds a second set - items then sit in a twin grid the UI doesn't show (a bag inside a bag
+-- "invisible" after a trip through storage). A bag that can't be removed whole stays.
 function jig.take(comp, uid, n, total)
-    if (total == nil or n >= total) and #containers_of(comp, uid) > 0 and jig.remove_whole(comp, uid) then return true end
+    if (total == nil or n >= total) and #containers_of(comp, uid) > 0 then
+        if jig.remove_whole(comp, uid) then return true end
+        return false, "a bag couldn't be removed whole - left in place"
+    end
     return pcall(function() comp:HandleLocalRequestConsumeItem(jig.guid(uid), n, comp, "", false) end)
+end
+
+-- Compartments that exist twice (same holder, same index): left by bags consumed in older versions.
+function jig.twin_grids(comp)
+    local is_item, seen, twins = {}, {}, 0
+    for _, h in ipairs(jig.contents_of(comp)) do is_item[h.uid] = true end
+    pcall(function()
+        comp.MainJigContainers:ForEach(function(_, c)
+            local ct = c:get()
+            local holder, slot
+            pcall(function() holder = jig.uid_str(ct[C_IN]); slot = ct[C_INDEX] end)
+            if holder and is_item[holder] then
+                local key = holder .. "#" .. tostring(slot)
+                if seen[key] then twins = twins + 1 else seen[key] = true end
+            end
+        end)
+    end)
+    return twins
 end
 local function consume(comp, h) jig.take(comp, h.uid, h.count, h.count) end
 

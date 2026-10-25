@@ -105,10 +105,13 @@ def main():
         check(wait_for(lambda: get_blob(B, "life", "host")) == "alive", "a new blob arrives")
         put_blob(A, "life", "host", "dead")
         check(wait_for(lambda: get_blob(B, "life", "host") == "dead"), "a changed blob arrives again")
-        idx = get_blob(B, "index", "host") or ""
-        gens = dict(l.split(" ", 1) for l in idx.splitlines()[1:] if " " in l)
-        check(idx.startswith("v1 ") and int(gens.get("life", "0")) >= 2 and "hello" in gens,
-              "the change index counts every blob write")
+        # the writer thread writes a blob before its index line (the game reads the index to find changed blobs),
+        # so the index can trail the blob by a moment
+        def index_ok():
+            idx = get_blob(B, "index", "host") or ""
+            gens = dict(l.split(" ", 1) for l in idx.splitlines()[1:] if " " in l)
+            return idx.startswith("v1 ") and int(gens.get("life", "0")) >= 2 and "hello" in gens
+        check(wait_for(index_ok), "the change index counts every blob write")
 
         print("1b. the game reading the file non-stop while updates arrive")
         import threading

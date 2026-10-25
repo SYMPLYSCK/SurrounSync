@@ -187,7 +187,7 @@ local function place(payload)
     local loc = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
     local rot = { Pitch = tonumber(pi), Yaw = tonumber(ya), Roll = tonumber(ro) }
     local cname
-    pcall(function() cname = cls:GetFName():ToString() end)
+    pcall(function() cname = util.fname(cls) end)
     if cname and find(string.format("%s@%d,%d,%d", cname, grid(loc))) then return end
     local actor
     log.info("builds: building the other player's " .. (da:match("[^%.]+$") or da) .. "...")

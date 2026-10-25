@@ -3,6 +3,7 @@
 local log = require("mirror.log")
 local util = require("mirror.util")
 local ghost = require("mirror.ghost")
+local crumb = require("mirror.crumb")
 
 local game = {}
 
@@ -18,12 +19,15 @@ function game.player() return player end
 function game.world() return world end
 function game.controller() return controller end
 
-local tick_slot, ready_slot = {}, {}
+-- tick_steps[i] = "tick <file:line>" of handler i: the crash step names the handler (a crash inside
+-- one used to show only "hook ReceiveTick" - the GetFName crash was in itemclean, seven times)
+local tick_slot, ready_slot, tick_steps = {}, {}, {}
 function game.on_tick(fn)
     local site = util.callsite(2)
     local i = site and tick_slot[site]
     if i then tick_handlers[i] = fn; return end
     tick_handlers[#tick_handlers + 1] = fn
+    tick_steps[#tick_handlers] = "tick " .. tostring(site and site:match("([^/\\]+)$") or #tick_handlers)
     if site then tick_slot[site] = #tick_handlers end
 end
 function game.on_ready(fn)
@@ -67,6 +71,12 @@ function game.on_world_reset(fn)
     if i then reset_handlers[i] = fn; return end
     reset_handlers[#reset_handlers + 1] = fn
     if site then reset_slot[site] = #reset_handlers end
+end
+
+-- Runs the reset handlers now: a load that removes the old world's actors itself calls this right away.
+function game.reset_world()
+    util.instances_reset()
+    for _, fn in ipairs(reset_handlers) do util.safe(fn, "game.on_world_reset") end
 end
 
 local function adopt(pawn, pc)
@@ -194,8 +204,12 @@ local function on_tick(self, DeltaSeconds)
         ready_done = true
         for _, fn in ipairs(ready_handlers) do util.safe(fn, "game.on_ready") end
     end
+    crumb.at("tick keys")
     util.safe(process_keys, "game.keys", dt)
-    for i = 1, #tick_handlers do util.safe(tick_handlers[i], "game.on_tick", dt) end
+    for i = 1, #tick_handlers do
+        crumb.at(tick_steps[i])
+        util.safe(tick_handlers[i], "game.on_tick", dt)
+    end
 end
 
 -- The player class can exist before its functions are ready: hooking then fails ("UFunction::Func: 0x0").

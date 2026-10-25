@@ -49,6 +49,8 @@ local function adopt(slot)
     end
 end
 
+slotguard.adopt = adopt
+
 function slotguard.make_coop_dir(slot)
     if not slotguard.is_coop(slot) then return refuse("make_coop_dir", tostring(slot) .. " is not a co-op save") end
     return savefs.mkdir(dir(slot))

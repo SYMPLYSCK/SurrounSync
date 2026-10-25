@@ -151,8 +151,8 @@ local asset_cache = {}
 local missing = {}
 local function load(path)
     if not path or path == "-" or path == "" then return nil end
-    local o = asset_cache[path]
-    if util.valid(o) then return o end
+    local o = util.cached(asset_cache, path)
+    if o then return o end
     o = StaticFindObject(path)
     if util.valid(o) then asset_cache[path] = o; return o end
     missing[#missing + 1] = path
@@ -301,7 +301,7 @@ function look.dump(g)
                         pcall(function() sock = c.AttachSocketName:ToString() end)
                         local who = "[mod]"
                         if not ours[util.addr(c) or 0] then
-                            who = "[owner " .. tostring(util.class_name(c:GetOwner())) .. " " .. tostring(c:GetFName():ToString()) .. "]"
+                            who = "[owner " .. tostring(util.class_name(c:GetOwner())) .. " " .. tostring(util.fname(c)) .. "]"
                         end
                         out[#out + 1] = sock .. ":" .. mesh:match("[^%.]+$") .. who
                     end
