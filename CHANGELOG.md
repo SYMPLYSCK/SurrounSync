@@ -2,6 +2,39 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 0.13.1 (2026-10-25)
+
+A safety update: your saves, your loot and getting into a friend's world. Everyone needs to update (it won't connect to 0.13.0).
+
+**🧩 New: MODS tab in the handbook (J)**
+A new tab lists every mod you have installed (UE4SS and pak mods) with an ON/OFF switch. In co-op you see which mods the host runs: different ones are marked, mods only the host has show as MISSING, and **MATCH HOST** switches yours to match in one click. Mods load when the game starts, so it tells you when a restart is needed.
+
+**🛠️ New: one-click FIX in SurrounSync Setup**
+Setup now shows your game version, Steam branch and UE4SS version, and the new **FIX** button repairs most problems by itself: a missing or old UE4SS, SurrounSync switched off, old multiplayer mods in the way, read-only saves, a game stuck loading a leftover co-op save, Steam not running, and more. SurrounSync is made for the **Experimental 0.8** branch (Steam → SurrounDead → Properties → Betas); Setup tells you if you're on another one.
+
+**💾 Saves**
+- Windows user names with non-English letters (Cyrillic and others) broke backups and joining ("Couldn't back up your save"). Fixed.
+- After a crash, the game's Continue could open a leftover co-op save instead of your own world ("Load one of your own saves first"). It now points back at your own save, and if you do land in a co-op save, one click loads yours.
+- A co-op session that couldn't be finished no longer blocks joining forever: your co-op character is kept in Backups and you can join again.
+- Error messages now say what is actually wrong (disk full, antivirus blocking, etc.) instead of always blaming disk space.
+- Help messages are now in English, Russian, German, Spanish, French and Portuguese (from your Windows language).
+
+**🎒 No more duplicated items**
+- Two players taking the same item at the same moment (from the ground, a container or a zombie) both got it. Now the first one keeps it and the other gets a message.
+- Taking from a car's trunk, or from a container far away from the host, could leave the item in both places. Fixed.
+- Loot taken from containers could come back after reopening them or after the host restarted. Fixed.
+- Death bags stay in sync even after a long connection drop.
+
+**🔧 Fixes**
+- Players who crash or quit now drop out of the host's player list within a minute.
+- Joining is quicker (the world is sent smaller).
+- Chat no longer runs off the page when players are listed in the CO-OP tab.
+- The time of day no longer jumps every few seconds for guests.
+- If one of you has an older SurrounSync, the message now says who needs to update.
+
+**⚠️ Known issues**
+- A backpack inside another backpack can still show up twice or go missing after a trip through a storage box. Drop it and pick it back up to fix it.
+
 ## 0.13.0 (2026-10-25)
 
 Hey everyone! Big one this time: you can finally play with more than one friend.

@@ -672,6 +672,18 @@ function devtest.watch(cfg)
             log.info("devtest: jpage " .. tostring(which) .. " -> " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
         elseif cmd == "coopbackups" or cmd == "coopfriends" then
             require("mirror.journal_tab").dev_section(cmd == "coopbackups")
+        elseif cmd == "coopmods" then
+            require("mirror.journal_tab").dev_mods(true)
+            log.info("devtest: coopmods")
+        elseif cmd == "mods" then
+            local peer = require("mirror.compat").peer_mods()
+            local m = require("mirror.modlist").model(peer and { set = peer, who = "peer", kind = require("mirror.compat").kind, host = true })
+            local parts = {}
+            for _, r in ipairs(m.rows) do parts[#parts + 1] = r.id .. "=" .. r.text .. (r.note and ("(" .. r.note .. ")") or "") end
+            log.info(string.format("devtest: mods %d, restart %s, differs %d, peer %s: %s", #m.rows, tostring(m.restart),
+                m.differs or 0, tostring(peer ~= nil), table.concat(parts, ", ")))
+        elseif cmd:find("^modtoggle ") then
+            log.info("devtest: modtoggle " .. tostring(arg) .. " -> " .. tostring(require("mirror.modlist").toggle(arg)))
         elseif cmd == "ticks" then
             log.info("devtest: player ticks so far " .. tostring(ticks))
         elseif cmd == "status" then

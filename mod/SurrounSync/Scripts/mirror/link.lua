@@ -13,7 +13,7 @@ local tags = nil
 local function out_tag() return tags and tags.out or bridge_role end
 function link.tags() return tags end
 local function app_dir()
-    local base = (os.getenv("LOCALAPPDATA") or ".") .. "\\SurrounDead"
+    local base = require("mirror.localdir").get()
     return (cfg and cfg.link_dir) and (base .. "\\" .. cfg.link_dir) or base
 end
 link.dir = app_dir
@@ -256,6 +256,8 @@ function link.lobby()
             l.id, l.code, l.name = rest:match("^(%d+) (%d+) ?(.*)$")
         elseif k == "role" then
             l.role = rest
+        elseif k == "lang" then
+            l.lang = rest
         elseif k == "peer" then
             local id, name, st = rest:match("^(%d+) (.-) (%a+)$")
             if id then l.peer = { id = id, name = name, connected = st == "connected" } end

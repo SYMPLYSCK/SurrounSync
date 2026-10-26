@@ -16,7 +16,9 @@ events.__index = events
 local epoch = tostring(os.time())
 local cut = os.time() - 5        -- my clock; reliable messages stamped before it are skipped
 local hold = nil                 -- fn: true while reliable messages must stay unread (guest joining)
-local MAX, UNREAD_S = 512, 300
+-- (a guest who chose WAIT while the host was gone kept looting: its takes must still be there when the host is back;
+-- once a new join starts, older ones are skipped by the cut anyway)
+local MAX, UNREAD_S = 512, 1800
 
 local reliable = {}          -- name -> channel (reliable channels only)
 local acked = {}             -- name -> highest id of my epoch the other game has read

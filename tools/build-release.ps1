@@ -34,7 +34,11 @@ $Manifest = Join-Path (Split-Path (Split-Path $Game -Parent) -Parent) 'appmanife
 $GameBuild = ''
 if (Test-Path $Manifest) { $m = Select-String -Path $Manifest -Pattern '"buildid"\s+"(\d+)"'; if ($m) { $GameBuild = $m.Matches[0].Groups[1].Value } }
 Set-Content (Join-Path $P 'made_for_build.txt') $GameBuild -Encoding ascii
-Write-Host "Made for game build $GameBuild"
+# the Steam branch (Betas) this build is on - Setup tells players on another branch to switch ("" = the normal branch)
+$GameBeta = ''
+if (Test-Path $Manifest) { $m = Select-String -Path $Manifest -Pattern '"BetaKey"\s+"([^"]*)"'; if ($m) { $GameBeta = $m.Matches[-1].Groups[1].Value } }
+Set-Content (Join-Path $P 'made_for_beta.txt') $GameBeta -Encoding ascii
+Write-Host "Made for game build $GameBuild (branch: $GameBeta)"
 $Zip = Join-Path $Stage 'payload.zip'
 Add-Type -AssemblyName System.IO.Compression
 $fs = [IO.File]::Create($Zip)

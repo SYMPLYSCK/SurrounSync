@@ -48,6 +48,9 @@ local function probe_game()
 end
 
 local function read_mods()
+    -- what runs in this game (mods.txt, enabled.txt and paks, as the game started): modlist.lua
+    local ok, ids = pcall(function() return require("mirror.modlist").loaded_ids() end)
+    if ok and type(ids) == "table" and next(ids) then return ids end
     local out = {}
     local f = io.open("ue4ss\\Mods\\mods.txt", "r")
     if f then
@@ -69,6 +72,11 @@ local function kind(name)
     if name:sub(1, 4) == "pak:" then return "unknown" end
     return KNOWN[name] or "unknown"
 end
+
+local peer_set = nil
+-- the other side's running mods (on a guest: the host's), for the MODS tab
+function compat.peer_mods() return peer_set end
+function compat.kind(name) return kind(name) end
 
 local function compare(theirs)
     local who = link.peer_name()
@@ -92,7 +100,7 @@ local function compare(theirs)
         local names = {}
         for i = 1, math.min(3, #warn) do names[#names + 1] = (warn[i].name:gsub("^pak:", "")) end
         notify.show(string.format("Mod check: %s%s differ%s between you and %s - they can change shared play and cause "
-            .. "differences. Details in the log.", table.concat(names, ", "), #warn > 3 and (" +" .. (#warn - 3)) or "",
+            .. "differences. Open J -> MODS to match them.", table.concat(names, ", "), #warn > 3 and (" +" .. (#warn - 3)) or "",
             #warn == 1 and "s" or "", who), "bad")
     end
 end
@@ -112,10 +120,11 @@ function compat.tick()
         compared = body
         local theirs = {}
         for n in body:gmatch("[^\n]+") do theirs[n] = true end
+        peer_set = theirs
         compare(theirs)
     end
 end
 
-function compat.reset() sent, compared = false, nil end
+function compat.reset() sent, compared, peer_set = false, nil, nil end
 
 return compat

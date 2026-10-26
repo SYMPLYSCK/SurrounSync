@@ -114,6 +114,36 @@ function slotguard.log_clear() savefs.remove(log_path()) end
 
 function slotguard.log_exists() return savefs.exists(log_path()) or slotguard.log_quarantined() end
 function slotguard.log_quarantined() return savefs.exists(log_path() .. ".mirror-bad") end
+function slotguard.log_live() return savefs.exists(log_path()) end
+
+-- the fields of a session log that log_read refused (damaged, or quarantined by an older version), unchecked
+function slotguard.log_peek()
+    local s = savefs.read(log_path()) or savefs.read(log_path() .. ".mirror-bad") or ""
+    local t = {}
+    for line in s:gmatch("[^\r\n]+") do
+        local k, v = line:match("^([%a_]+)=(.*)$")
+        if k and slotguard.valid_name(v) then t[k] = v end
+    end
+    return t
+end
+
+-- A session that can't be finished: its log (and a quarantined one) renamed aside - kept for bug reports, no
+-- longer blocking joins.
+function slotguard.log_archive()
+    local stamp = tostring(os.time())
+    for _, p in ipairs({ log_path(), log_path() .. ".mirror-bad" }) do
+        if savefs.exists(p) then
+            local to = p .. ".closed-" .. stamp
+            savefs.remove(to)
+            if not os.rename(p, to) then savefs.remove(p) end
+        end
+    end
+    return not slotguard.log_exists()
+end
+
+function slotguard.has_character(slot)
+    return slotguard.valid_name(slot) and savefs.exists(dir(slot) .. "\\Player.sav")
+end
 
 function slotguard.log_quarantine()
     local bad = log_path() .. ".mirror-bad"

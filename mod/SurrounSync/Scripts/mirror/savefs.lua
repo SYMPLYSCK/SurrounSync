@@ -137,10 +137,17 @@ local backend = {
     end,
 }
 
+local uepath = require("mirror.uepath")
 function savefs.set_dir_backend(b) if b then backend = b end end
-function savefs.mkdir(path) return backend.mkdir(path) == true end
-function savefs.list_dirs(path) return backend.list_dirs(path) end
-function savefs.rmdir(path) return backend.rmdir(path) == true end
+function savefs.mkdir(path)
+    if backend.mkdir(uepath.of(path)) == true then return true end
+    if uepath.ascii(path) then return false end
+    -- last resort: cmd's mkdir reads the path in the ANSI code page, like io.open
+    os.execute('mkdir "' .. path:gsub('"', "") .. '" >nul 2>nul')
+    return savefs.dir_exists(path)
+end
+function savefs.list_dirs(path) return backend.list_dirs(uepath.of(path)) end
+function savefs.rmdir(path) return backend.rmdir(uepath.of(path)) == true end
 
 function savefs.dir_exists(dir)
     local probe = dir .. "\\.mirror_probe"

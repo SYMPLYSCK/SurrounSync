@@ -263,7 +263,14 @@ local function guest_tick()
         pcall(function() mine = s["Time of Day"] end)
         if type(mine) == "number" then
             local d = (mine - host.tod + 1200) % 2400 - 1200
-            if math.abs(d) > TIME_SLACK then
+            -- the host's clock stands still (its game keeps the time fixed) but this game's own time keeps
+            -- running even with Animate off: pinned every sync instead of a 9-minute jump back every ~12 s
+            -- (243 snaps in an hour of a friend's session)
+            local still = peer_live() and host_tod_prev ~= nil and now - host_still >= 5
+            if still and math.abs(d) > 0.5 and math.abs(d) <= TIME_SLACK then
+                pcall(function() s["Time of Day"] = host.tod end)
+                stats.time_pins = (stats.time_pins or 0) + 1
+            elseif math.abs(d) > TIME_SLACK then
                 local ok = pcall(function() s["Time of Day"] = host.tod end)
                 stats.time_snaps = stats.time_snaps + 1
                 log.info(string.format("world: clock %.0f -> host's %.0f (%s)", mine, host.tod, ok and "ok" or "write failed"))

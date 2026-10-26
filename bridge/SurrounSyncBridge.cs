@@ -860,6 +860,9 @@ class Bridge
     volatile string reportLine = null;
     const long REQUEST_TIMEOUT = 60000;
     const int MAX_POSE = 2048, MAX_HELLO = 256, MAX_PART = CHUNK + 1024, MAX_PARTS = 32;
+    // a deflated blob may unpack to more than one piece: the world files at a join (~550 KB of text) go
+    // compressed in one message instead of raw in pieces (~30% less over a slow Steam relay)
+    const int MAX_INFLATE = CHUNK * MAX_PARTS;
     const double PKT_RATE = 600, PKT_BURST = 3000, BYTE_RATE = 4.0 * 1024 * 1024, BYTE_BURST = 16.0 * 1024 * 1024;
     const int KICK_DROPS = 20; const long KICK_WINDOW = 10000;
     byte[] passKey = null;
@@ -1010,6 +1013,8 @@ class Bridge
         return played && other == 0 ? 0 : 1;
     }
 
+    string localAliasNote;
+
     int Run(string[] args)
     {
         dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SurrounDead");
@@ -1028,6 +1033,18 @@ class Bridge
             else if (args[i] == "--voice-smoke") return VoiceSmoke();
             else if (args[i] == "--list-smoke") return ListSmoke();
         }
+        if (!selftest)
+            try
+            {
+                // an ASCII name for the save folder when the Windows user name needs one (see LocalAlias)
+                string how, w64 = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, @"..\..\..\.."));
+                if (File.Exists(Path.Combine(w64, SurrounSyncShared.Game.Exe)))
+                {
+                    string alias = SurrounSyncShared.LocalAlias.Ensure(w64, out how);
+                    if (how != "plain") localAliasNote = "save folder alias (" + how + "): " + (alias ?? "NONE - the mod can't reach the save folder");
+                }
+            }
+            catch (Exception e) { localAliasNote = "save folder alias failed: " + e.Message; }
         auto = role == "auto";
         if (auto) role = "idle";
         other = role == "host" ? "guest" : "host";
@@ -1054,6 +1071,7 @@ class Bridge
             net.SetPresence(role); me = net.Me;
             Log("bridge " + role + " up" + (testPort > 0 ? " (TEST NET on 127.0.0.1:" + testPort + ")" : "") + " - my id " + me
                 + ", folder " + dir + (configuredPeer != 0 ? ", peer from config " + configuredPeer : ", looking for a Steam friend"));
+            if (localAliasNote != null) Log(localAliasNote);
             if (selftest)
             {
                 Log("selftest: network OK, my id " + me + ", friends " + net.FriendCount());
@@ -1165,6 +1183,13 @@ class Bridge
                     Log("no packets from " + l.name + " for 20 s");
                     l.quietAt = t;
                     if (configuredPeer == 0 && role == "guest" && l.slot == 0) DropLink(l, "lost");
+                }
+                // a guest whose game crashed or closed without a goodbye (its bridge exits with the game): gone
+                // from everyone's player list instead of "no signal" forever; it can still ask to join again
+                if (role == "host" && !l.mate && l.lastRx != 0 && t - l.lastRx > 45000)
+                {
+                    DropLink(l, "no packets for 45 s - their game closed or crashed");
+                    WriteRoster(); WriteLobby();
                 }
             }
             if (links.Count > 0)
@@ -1453,6 +1478,8 @@ class Bridge
         var sb = new StringBuilder();
         sb.Append("me ").Append(me).Append(' ').Append(me & 0xFFFFFFFFUL).Append(' ').Append(Clean(net.MyName)).Append('\n');
         sb.Append("role ").Append(role).Append('\n');
+        // the Windows display language: the mod shows its help messages in it
+        sb.Append("lang ").Append(System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName).Append('\n');
         sb.Append("time ").Append(Unix()).Append('\n');
         var pl = Primary();
         if (pl != null) sb.Append("peer ").Append(pl.id).Append(' ').Append(Clean(pl.name)).Append(' ').Append(pl.Connected ? "connected" : "connecting").Append('\n');
@@ -2044,6 +2071,17 @@ class Bridge
     bool SendBlob(PeerLink l, string name, string body)
     {
         bool ok;
+        byte[] big = body.Length > CHUNK && body.Length <= MAX_INFLATE - 1024 ? Deflate(Encoding.UTF8.GetBytes(epoch + "\n" + name + "\n" + body)) : null;
+        if (big != null && big.Length <= CHUNK)
+        {
+            ok = SendBytes(l, 'Z', big, true);
+            if (ok)
+            {
+                l.txBlobs++;
+                if (l.loggedTx.Add(name)) Log("sent " + name + " to " + l.name + " (" + body.Length + " chars, " + big.Length + " B compressed)");
+            }
+            return ok;
+        }
         if (body.Length > COMPRESS_FROM && body.Length <= CHUNK)
         {
             byte[] z = Deflate(Encoding.UTF8.GetBytes(epoch + "\n" + name + "\n" + body));
@@ -2195,7 +2233,7 @@ class Bridge
         }
         if (t == (byte)'Z' || t == (byte)'F')
         {
-            try { if (t == (byte)'Z') Handle(l, 'B', Inflate(data, o + 1, MAX_PART)); else TakeFragment(l, data, o); }
+            try { if (t == (byte)'Z') Handle(l, 'B', Inflate(data, o + 1, MAX_INFLATE)); else TakeFragment(l, data, o); }
             catch (Exception e) { Dropped(l, "bad " + (char)t + " " + e.Message); }
             return;
         }

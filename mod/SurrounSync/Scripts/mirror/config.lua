@@ -35,7 +35,7 @@ local config = {
         legacy_coop_slot = "MirrorCoop_Session",   -- name used before 0.9; still recognised
         coop_slots = 8,
         saved_dir = { host = "Saved", guest = "Saved_Guest" },
-        teleport_settle = 3.0,
+        teleport_settle = 2.0,       -- s after a load before placing the player (the preset spawn usually already did)
         teleport_tolerance = 2000,
     },
 

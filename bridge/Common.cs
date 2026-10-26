@@ -154,6 +154,84 @@ namespace SurrounSyncShared
         }
     }
 
+    // The mod's Lua reaches %LOCALAPPDATA%\SurrounDead through the old ANSI file API, which can't spell every
+    // Windows user name (a Cyrillic name on English Windows comes out as "?"), and UE4SS hands Lua strings to UE
+    // as UTF-8. When that path isn't plain ASCII, the setup and the bridge give it an ASCII name - its 8.3 short
+    // path, else a junction under ProgramData - and write it to Win64\mirror_localdir.txt for the mod.
+    public static class LocalAlias
+    {
+        public const string FileName = "mirror_localdir.txt";
+        public static bool NoShortNames;   // (tests: a drive with 8.3 names switched off)
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        static extern uint GetShortPathName(string longPath, StringBuilder shortPath, uint size);
+
+        public static bool Ascii(string s)
+        {
+            foreach (char c in s) if (c > 126 || c < 32) return false;
+            return true;
+        }
+
+        public static string LocalDir()
+        {
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SurrounDead");
+        }
+
+        static string Short(string path)
+        {
+            try
+            {
+                var sb = new StringBuilder(1024);
+                uint n = GetShortPathName(path, sb, (uint)sb.Capacity);
+                return n > 0 && n < sb.Capacity ? sb.ToString() : null;
+            }
+            catch { return null; }
+        }
+
+        static string Junction(string target)
+        {
+            string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "SurrounSync", "links");
+            uint h = 2166136261;
+            foreach (char c in target.ToLowerInvariant()) { h ^= c; h *= 16777619; }
+            string link = Path.Combine(root, "local-" + h.ToString("x8"));
+            if (!Ascii(link)) return null;
+            try
+            {
+                if (Directory.Exists(link) && File.Exists(Path.Combine(link, ".surrounsync_alias")) &&
+                    File.ReadAllText(Path.Combine(link, ".surrounsync_alias")).Trim() == target) return link;
+                Directory.CreateDirectory(root);
+                if (Directory.Exists(link)) Directory.Delete(link);   // a stale junction (deletes the link only)
+                var psi = new ProcessStartInfo("cmd.exe", "/c mklink /J \"" + link + "\" \"" + target + "\"")
+                { UseShellExecute = false, CreateNoWindow = true };
+                using (var p = Process.Start(psi)) p.WaitForExit(10000);
+                if (!Directory.Exists(link)) return null;
+                File.WriteAllText(Path.Combine(link, ".surrounsync_alias"), target);   // (lands in the real folder)
+                return link;
+            }
+            catch { return null; }
+        }
+
+        // Writes (or removes) the alias file in win64; returns the path the mod should use and how it was made.
+        public static string Ensure(string win64, out string how) { return Ensure(win64, LocalDir(), out how); }
+        public static string Ensure(string win64, string local, out string how)
+        {
+            string file = Path.Combine(win64, FileName);
+            how = "plain";
+            try { Directory.CreateDirectory(local); } catch { }
+            if (Ascii(local))
+            {
+                try { if (File.Exists(file)) File.Delete(file); } catch { }
+                return local;
+            }
+            string alias = NoShortNames ? null : Short(local);
+            how = "short path";
+            if (alias == null || !Ascii(alias) || !Directory.Exists(alias)) { alias = Junction(local); how = "junction"; }
+            if (alias == null) { how = "none"; return null; }
+            try { File.WriteAllText(file, alias + "\r\n", Encoding.ASCII); } catch { how = "can't write " + file; return null; }
+            return alias;
+        }
+    }
+
     public static class Game
     {
         public const string AppId = "1645820";
@@ -622,7 +700,10 @@ namespace SurrounSyncShared
                 string icon = level == "CRITICAL" ? "🔴" : level == "ERROR" ? "🟠" : level == "MINOR" ? "🟡" : "🟢";
                 string desc = Diagnose.Scrub(Post(dg, message));
                 string who = Reporter();
-                string json = "{\"content\":" + JsonString(icon + " **" + level + "** bug report" + (who != "" ? " from " + who : ""))
+                // one click to the player's Steam profile, to message them about the report
+                var sid = Regex.Match(who, @"\((7656\d{13})\)$");
+                string reply = sid.Success ? "\n[Message them on Steam](<https://steamcommunity.com/profiles/" + sid.Groups[1].Value + ">)" : "";
+                string json = "{\"content\":" + JsonString(icon + " **" + level + "** bug report" + (who != "" ? " from " + who : "") + reply)
                     + ",\"embeds\":[{\"title\":" + JsonString(Trunc(icon + " " + dg.Top.Title, 250))
                     + ",\"description\":" + JsonString(Trunc(desc, 4000)) + ",\"color\":" + Diagnose.ColorOf(level) + "}]}";
                 string uploadName = "SurrounSync-" + level + "-" + Path.GetFileName(zip).Replace("SurrounSync-report-", "");

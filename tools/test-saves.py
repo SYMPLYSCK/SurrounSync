@@ -238,6 +238,55 @@ def savefs_dirs(L, tmp):
     check(L.eval('savefs.rmdir(...)', p) is True and not os.path.exists(p), "rmdir removes it")
 
 
+@test
+def savefs_non_ascii_user_name(L, tmp):
+    # report 2026-10-25: user "C:\Users\<cyrillic>" - Lua hands UE ANSI bytes, MakeDirectory fails, no join
+    ansi, ue = b"C:\\Users\\\xc0\xf0\\AppData\\Local", "C:\\Users\\Ар\\AppData\\Local".encode("utf-8")
+    L.execute('''
+        SEEN = {}
+        savefs.set_dir_backend{ mkdir = function(p) SEEN[#SEEN + 1] = p; return true end,
+            list_dirs = function(p) SEEN[#SEEN + 1] = p; return {} end,
+            rmdir = function(p) SEEN[#SEEN + 1] = p; return true end }''')
+    L.eval('require("mirror.uepath").set_map(...)', ansi, ue)
+    L.eval('savefs.mkdir(...)', ansi + b"\\SurrounDead\\Saved\\SurrounSyncBackups")
+    L.eval('savefs.list_dirs(...)', ansi + b"\\SurrounDead\\Saved\\SurrounSyncBackups")
+    L.eval('savefs.mkdir(...)', b"C:\\plain\\dir")
+    seen = [L.eval('SEEN[%d]' % i) for i in (1, 2, 3)]
+    seen = [s if isinstance(s, bytes) else s.encode("utf-8", "surrogateescape") for s in seen]
+    check(seen[0] == ue + b"\\SurrounDead\\Saved\\SurrounSyncBackups", "mkdir gets UE's spelling of LOCALAPPDATA")
+    check(seen[1] == ue + b"\\SurrounDead\\Saved\\SurrounSyncBackups", "list_dirs gets UE's spelling too")
+    check(seen[2] == b"C:\\plain\\dir", "ASCII paths pass through unchanged")
+    L.execute('savefs.set_dir_backend{ mkdir = function() return false end }')
+    odd = os.path.join(tmp, "\u00c0\u00f0", "b")
+    made = L.eval('savefs.mkdir(...)', odd.encode("mbcs"))
+    check(made is True and os.path.isdir(odd), "a failing UE mkdir falls back to cmd mkdir for non-ASCII paths")
+
+
+@test
+def localdir_reaches_saves_whatever_the_user_name(L, tmp):
+    # a user name the ANSI code page can't spell comes out as "?" - every Lua file call on the saves would fail
+    good = os.path.join(tmp, "alias")
+    os.makedirs(good)
+    af = os.path.join(tmp, "mirror_localdir.txt")
+    L.execute('ld = require("mirror.localdir")')
+    g = L.globals()
+    g.ENV = "C:\\Users\\plain\\AppData\\Local"
+    L.execute('ld.configure{ getenv = function() return ENV end, alias_file = "nope.txt" }')
+    check(L.eval('ld.get()') == "C:\\Users\\plain\\AppData\\Local\\SurrounDead" and not L.eval('ld.broken()'), "an ASCII path is used as it is")
+    g.ENV, g.AF = "C:\\Users\\??\\AppData\\Local", af
+    L.execute('ld.configure{ alias_file = AF }')
+    check(L.eval('ld.broken()') is True, "a '?' path without an alias is reported broken (Setup FIX makes one)")
+    with open(af, "w") as f:
+        f.write(good + "\r\n")
+    L.execute('ld.configure{}')   # (resets the cache - the 5 s retry in-game)
+    check(L.eval('ld.get()') == good and not L.eval('ld.broken()') and L.eval('ld.how()') == "alias",
+          "the alias file the bridge/setup writes is used")
+    g.ENV = "C:\\Users\\plain2\\AppData\\Local"
+    L.execute('ld.configure{}')
+    check(L.eval('ld.get()') == "C:\\Users\\plain2\\AppData\\Local\\SurrounDead", "an ASCII path wins over a leftover alias file")
+    L.execute('ld.configure{ getenv = os.getenv }')
+
+
 EMSH = b"EMSH\x01\x00\x00\x00\n\x02\x00\x00"
 JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF"
 
@@ -729,6 +778,9 @@ package.loaded["mirror.link"] = {
 package.loaded["mirror.ghost"] = { exists = function() return false end, destroy = function() end,
     location = function() return nil end, is = function() return false end, get = function() return nil end }
 package.loaded["mirror.notify"] = { show = function(m) NOTES[#NOTES + 1] = m end }
+ASKS = {}
+package.loaded["mirror.names"] = { ask = function(o) ASKS[#ASKS + 1] = o; return true end,
+    asking = function() return false end }
 package.loaded["mirror.invdiag"] = { snapshot = function() end, live_containers = function() return 3 end }
 package.loaded["mirror.jig"] = { contents_of = function() return {} end }
 CFG = { diagnostics = false,
@@ -816,6 +868,108 @@ def session_firewall_coop_slot_outside_session(L, tmp):
     check(L.eval('CURRENT') == "S1", "save sent back to the world's own save (%s)" % L.eval('CURRENT'))
 
 
+def stray_rt(L, tmp, coop_files=True):
+    """report 2026-10-26: own save S1, but the game's current save (Continue) is a leftover co-op slot"""
+    make_slot(tmp, "S1")
+    if coop_files:
+        make_slot(tmp, COOP, tag=b"coop")
+    session_rt(L, tmp, own=COOP)
+    L.execute('EMSLIB.GetSortedSaveSlots = function() return { "%s", "S1" } end' % COOP)
+
+
+def run_ticks(L, n=12):
+    L.execute('for _ = 1, %d do for _, fn in ipairs(TICKS) do fn(0.5) end; session.tick(0.5) end' % n)
+
+
+@test
+def stray_startup_points_continue_at_own_save(L, tmp):
+    stray_rt(L, tmp, coop_files=False)
+    L.execute('local p = PLAYER; PLAYER = nil; session.preinit(CFG); PLAYER = p')  # mod start: no world yet
+    check(L.eval('CURRENT') == "S1", "startup: Continue no longer loads the co-op slot (%s)" % L.eval('CURRENT'))
+    L.execute('CURRENT = "S1"; session.preinit(CFG)')
+    check(L.eval('CURRENT') == "S1", "an own save stays the current save")
+
+
+@test
+def stray_startup_leaves_an_open_session_alone(L, tmp):
+    stray_rt(L, tmp, coop_files=False)
+    guard(L, tmp)
+    L.eval('slotguard.log_write(...)', L.table_from({"step": "joined", "own": "S1", "coop": COOP}))
+    L.execute('slotguard.log_quarantine()')
+    L.execute('session.preinit(CFG)')
+    check(L.eval('CURRENT') == COOP, "a kept session log: the current save isn't moved")
+
+
+@test
+def stray_join_saves_nothing_and_offers_own_save(L, tmp):
+    stray_rt(L, tmp)
+    before = snapshot(tmp, COOP)
+    L.execute('session.init(CFG, "guest", function() return true end)')
+    # (startup already fixed Continue - this player got in anyway, e.g. picked the slot in Load Game)
+    L.execute('CURRENT = "%s"; for _, fn in ipairs(NEW_PLAYER) do fn() end' % COOP)
+    L.execute('session.request_toggle()')
+    run_ticks(L)
+    check(L.eval('SAVES') == 0 and snapshot(tmp, COOP) == before, "no save into the co-op slot before refusing")
+    check(L.eval('session.state()') == "idle" and L.eval('BLOBS_OUT["req"]') is None, "no join from the co-op slot")
+    check(L.eval('#ASKS') >= 1, "the player is offered their own save")
+
+
+@test
+def stray_world_offers_one_click_load(L, tmp):
+    stray_rt(L, tmp)
+    L.execute('session.init(CFG, "guest", function() return true end)')
+    # (startup already fixed Continue - this player got in anyway, e.g. picked the slot in Load Game)
+    L.execute('CURRENT = "%s"; for _, fn in ipairs(NEW_PLAYER) do fn() end' % COOP)
+    check(L.eval('session.stray_coop()') is True, "the loaded world is a leftover co-op save")
+    run_ticks(L)
+    check(L.eval('#ASKS') == 1, "one offer (not one per tick): %d" % L.eval('#ASKS'))
+    L.execute('ASKS[1].done()')
+    run_ticks(L, 2)
+    check(L.eval('LOADS[#LOADS]') == "S1", "the button loads the player's own save (%s)" % L.eval('LOADS[#LOADS]'))
+
+
+@test
+def stray_main_menu_load_fixes_continue_only_there(L, tmp):
+    # the save system may not exist at mod start: the main menu's map load is the second chance
+    stray_rt(L, tmp, coop_files=False)
+    L.execute('MAP_HOOKS = {}; function RegisterLoadMapPostHook(fn) MAP_HOOKS[#MAP_HOOKS + 1] = fn end')
+    L.execute('session.preinit(CFG); for _, fn in ipairs(NEW_PLAYER) do fn() end')
+    check(L.eval('#MAP_HOOKS') == 1, "one map-load hook")
+    L.execute('local function world(n) return { get = function() return { GetFullName = function() return n end } end } end '
+              'WORLD_AT = world')
+    L.execute('CURRENT = "%s"; MAP_HOOKS[1](nil, WORLD_AT("World /Game/Levels/LongdownValley.LongdownValley"))' % COOP)
+    check(L.eval('CURRENT') == COOP, "a loaded world: its current save is never re-pointed (its saves would hit S1)")
+    L.execute('MAP_HOOKS[1](nil, WORLD_AT("World /Game/Levels/MainMenu.MainMenu"))')
+    check(L.eval('CURRENT') == "S1", "main menu: Continue points at the own save again (%s)" % L.eval('CURRENT'))
+
+
+@test
+def i18n_messages(L, tmp):
+    L.execute('i18n = require("mirror.i18n")')
+    check(L.eval('i18n.t("load_own_first")') == "Load one of your own saves first, then join.", "English by default")
+    check(L.eval('i18n.set("ru")') is True and L.eval('i18n.t("peer_older", "Akiyame")').startswith("У Akiyame"),
+          "Russian with the friend's name")
+    check(L.eval('i18n.set("xx")') is False and L.eval('i18n.lang()') == "en", "an unknown language is refused")
+    check(L.eval('i18n.t("stray_msg", "50% off")').find("50% off") > 0, "a % in a name doesn't break the text")
+    keys = set(L.eval('(function() local k = {} for n in pairs(i18n.LANGS.en) do k[#k + 1] = n end return table.concat(k, " ") end)()').split())
+    for lang in ("ru", "de", "es", "fr", "pt"):
+        got = set(L.eval('(function(l) local k = {} for n in pairs(i18n.LANGS[l]) do k[#k + 1] = n end return table.concat(k, " ") end)(...)', lang).split())
+        check(got == keys, "%s has every message" % lang)
+        for k in keys:
+            n_en = L.eval('select(2, i18n.LANGS.en[...]:gsub("%%%%s", ""))', k)
+            n_l = L.eval('(function(l, k) return select(2, i18n.LANGS[l][k]:gsub("%%%%s", "")) end)(...)', lang, k)
+            if n_en != n_l:
+                check(False, "%s.%s has %d %%s, English %d" % (lang, k, n_l, n_en))
+
+
+@test
+def stray_not_in_a_real_session(L, tmp):
+    joined_session(L, tmp)
+    L.execute('for _, fn in ipairs(NEW_PLAYER) do fn() end')
+    run_ticks(L)
+    check(L.eval('session.stray_coop()') is False and L.eval('#ASKS') == 0, "joined: the co-op world is no stray")
+
+
 @test
 def session_leave_copies_character_home(L, tmp):
     before = joined_session(L, tmp)
@@ -901,7 +1055,9 @@ def session_join_refused_without_backup(L, tmp):
     L.execute('session.request_toggle()')
     L.execute('TICK(6)')
     check(L.eval('session.state()') == "idle" and L.eval('BLOBS_OUT["req"]') is None, "no backup -> no join request")
-    check(L.eval('note_has(...)', "Couldn't back up your save, so you can't join"), "player told")
+    check(L.eval('note_has(...)', "Your disk is full"), "player told the real cause (disk full)")
+    check(L.eval('session.backup_problem(...)', "can't write x.mirror-new: Permission denied") == "files_blocked", "permission denied -> blocked message")
+    check(L.eval('session.backup_problem(...)', "can't create C:\\x") == "backup_failed", "anything else -> the general message")
 
 
 @test
@@ -971,8 +1127,37 @@ def session_garbage_log_quarantined(L, tmp):
     write(m, b"\x00garbage\x01")
     before = snapshot(tmp, "S1")
     L.execute('session.preinit(CFG)')
-    check(snapshot(tmp, "S1") == before and os.path.exists(m + ".mirror-bad") and not os.path.exists(m),
-          "garbage session log: nothing done, kept as .mirror-bad")
+    closed = [f for f in os.listdir(saves(tmp)) if f.startswith("mirror_coop_session.txt.closed-")]
+    bk = os.path.join(tmp, "SurrounDead", "Saved", "SurrounSyncBackups", COOP)
+    rescued = os.path.isdir(bk) and any(os.path.exists(os.path.join(bk, d, "Player.sav")) for d in os.listdir(bk))
+    check(snapshot(tmp, "S1") == before and not os.path.exists(m) and not os.path.exists(m + ".mirror-bad") and len(closed) == 1,
+          "garbage session log: own save untouched, log archived (no longer blocks joins)")
+    check(rescued, "...the co-op character it may have held is kept in Backups")
+    check(not L.eval('require("mirror.slotguard").log_exists()'), "joining is possible again")
+
+
+@test
+def session_unfinishable_never_blocks_for_good(L, tmp):
+    # the own save was renamed/deleted while a session was open: copying home can never work -> rescue, close
+    make_slot(tmp, "S1")
+    make_slot(tmp, COOP, tag=b"coop")
+    session_rt(L, tmp)
+    L.execute('local d = ... ; require("mirror.backups").configure{ saves_dir = d }; '
+              'require("mirror.slotguard").configure{ saves_dir = d, coop_base = "SurrounSync_Session" }', saves(tmp))
+    stamp = L.eval('require("mirror.slotguard").stamp("S1")')
+    L.eval('require("mirror.slotguard").log_write(...)', L.table_from(
+        {"step": "joined", "own": "S1", "coop": COOP, "own_stamp": stamp, "home": "1.0 2.0 3.0 4.0"}))
+    shutil.move(os.path.join(saves(tmp), "S1"), os.path.join(saves(tmp), "S1renamed"))
+    L.execute('session.preinit(CFG)')
+    bk = os.path.join(tmp, "SurrounDead", "Saved", "SurrounSyncBackups", COOP)
+    check(os.path.isdir(bk) and len(os.listdir(bk)) >= 1, "own save gone: the co-op character is kept in Backups")
+    check(not L.eval('require("mirror.slotguard").log_exists()'), "...and the session no longer blocks joins")
+    # a quarantine an older version left behind blocked every join for good
+    m = os.path.join(saves(tmp), "mirror_coop_session.txt")
+    write(m + ".mirror-bad", b"\x00old garbage")
+    L.execute('session.preinit(CFG)')
+    check(not os.path.exists(m + ".mirror-bad") and not L.eval('require("mirror.slotguard").log_exists()'),
+          "an old .mirror-bad is closed at the next start")
 
 
 @test

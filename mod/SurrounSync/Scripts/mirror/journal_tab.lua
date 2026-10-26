@@ -22,7 +22,12 @@ local LIST_WIDTH = 560.0
 local GEAR_TEX = "/Game/UI/Textures/over_250_survival_flat_icons/gear.gear"
 local CLOSE_TEX = "/Game/UI/Textures/CrossX.CrossX"
 local INK = { R = 0.12, G = 0.08, B = 0.06, A = 1.0 }
-local SETTING_ROWS = 7
+local SETTING_ROWS = 8
+local MOD_ROWS = 9
+-- the MODS tab: one ribbon below CO-OP (label spot found in-game; the ribbon art is yellow, so a tint can only
+-- darken it: orange, not blue)
+local MODS_TINT = { R = 1.0, G = 0.5, B = 0.35, A = 1.0 }
+local MODS_PAD = { Left = LABEL_PAD.Left + RIBBON_STEP.X, Bottom = LABEL_PAD.Bottom - RIBBON_STEP.Y }
 -- The game fades the handbook in/out over 0.5 s (JournalUI "Fade", after a 0.25 s double-tap wait for
 -- the clock); playing that fade 8x faster makes J feel ~0.45 s quicker.
 local FADE_SPEED = 8.0
@@ -146,18 +151,20 @@ local function hadd(box, w, gap)
     return s
 end
 
-local function add_ribbon(page_tree, canvas, owner, outer)
+-- n: how many ribbons below the quests one (1 = CO-OP, 2 = MODS)
+local function add_ribbon(page_tree, canvas, owner, outer, n, tint)
+    n = n or 1
     local qm = find(page_tree, "QuestMarker", owner)
     if not qm then error("no QuestMarker on a handbook page") end
     local tex = texture_of(qm)
     if not tex then error("no ribbon texture") end
     local img = image_from(tex, outer or page_tree, "Ribbon")
-    pcall(function() img:SetColorAndOpacity(RIBBON_TINT) end)
+    pcall(function() img:SetColorAndOpacity(tint or RIBBON_TINT) end)
     tilt(img, TILT.ribbon)
     local slot = canvas:AddChildToCanvas(img)
     pcall(function()
         slot:SetAnchors({ Minimum = { X = 0.0, Y = 0.5 }, Maximum = { X = 0.0, Y = 0.5 } })
-        slot:SetOffsets({ Left = -203.0390625 + RIBBON_STEP.X, Top = -498.0 + RIBBON_STEP.Y, Right = 1920.0, Bottom = 1080.0 })
+        slot:SetOffsets({ Left = -203.0390625 + n * RIBBON_STEP.X, Top = -498.0 + n * RIBBON_STEP.Y, Right = 1920.0, Bottom = 1080.0 })
         slot:SetZOrder(-1)
     end)
     return img
@@ -261,6 +268,7 @@ local function build_content(page, qtree, qpage)
         u.guests[i] = { row = gr, name = name, btn = b, btn_t = bt }
     end
     local gt = new("HorizontalBox", S.tree, "GamesTitle"); vadd(u.friends_box, gt, 10)
+    u.games_title = gt
     hadd(gt, text("GAMES TO JOIN", 26, DARK_RED))
     u.refresh = button("REFRESH", 18); hadd(gt, u.refresh, 18)
     u.none = text("", 16, GREY, LIST_WIDTH); vadd(u.friends_box, u.none, 2)
@@ -272,12 +280,14 @@ local function build_content(page, qtree, qpage)
         hadd(fr, name); hadd(fr, b, 18)
         u.friends[i] = { row = fr, name = name, btn = b }
     end
-    vadd(u.friends_box, text("JOIN WITH A CODE", 26, DARK_RED), 14)
+    u.code_title = text("JOIN WITH A CODE", 26, DARK_RED); vadd(u.friends_box, u.code_title, 14)
     local jr = new("HorizontalBox", S.tree, "CodeJoin"); vadd(u.friends_box, jr, 2)
+    u.code_row = jr
     u.input = input("CodeInput", "type your friend's code", 22, 260)
     hadd(jr, u.input)
     u.join_code = button("JOIN", 22); hadd(jr, u.join_code, 18)
     local pr = new("HorizontalBox", S.tree, "PasswordRow"); vadd(u.friends_box, pr, 4)
+    u.pw_row = pr
     u.pw_label = text("PASSWORD:", 20); hadd(pr, u.pw_label)
     u.pw_input = input("PasswordInput", "optional", 20, 180)
     pcall(function() u.pw_input:SetIsPassword(true) end)
@@ -369,24 +379,90 @@ local function build_settings(page)
     u.settings_mode = false
 end
 
-local function set_mode(on)
+-- The MODS tab's page (on the CO-OP page's paper, like the settings): this PC's mods with ON/OFF, the other
+-- side's choice next to each one in co-op, MATCH HOST for a guest, and a restart note after a change.
+local function build_mods(page)
     local u = S.ui
-    if (u.settings_mode == true) == on then return end
-    u.settings_mode = on
-    if on then
+    u.mods_box = new("VerticalBox", S.tree, "Mods")
+    tilt(u.mods_box, TILT.list)
+    place(page, u.mods_box, 420.0, 230.0, 580.0, 760.0, 6)
+    vadd(u.mods_box, text("MODS", 58, DARK_RED))
+    u.mods_sub = text("", 16, GREY, 560); vadd(u.mods_box, u.mods_sub, 2)
+    u.mods_restart = text("", 20, DARK_RED, 560); vadd(u.mods_box, u.mods_restart, 6)
+    u.mods_rows = {}
+    for i = 1, MOD_ROWS do
+        local row = new("HorizontalBox", S.tree, "ModRow"); vadd(u.mods_box, row, i == 1 and 10 or 6)
+        local b, bt = button("OFF", 22, DARK_RED)
+        local label = text("", 22)
+        local note = text("", 15, GREY)
+        hadd(row, b); hadd(row, label, 16); hadd(row, note, 12)
+        u.mods_rows[i] = { row = row, btn = b, btn_t = bt, label = label, note = note }
+    end
+    u.mods_none = text("", 18, GREY, 560); vadd(u.mods_box, u.mods_none, 10)
+    local nav = new("HorizontalBox", S.tree, "ModNav"); vadd(u.mods_box, nav, 14)
+    u.mods_prev = button("< PREV", 20); hadd(nav, u.mods_prev)
+    u.mods_page_t = text("", 18, GREY); hadd(nav, u.mods_page_t, 12)
+    u.mods_next = button("NEXT >", 20); hadd(nav, u.mods_next, 12)
+    u.mods_match, u.mods_match_t = button("MATCH HOST", 22, DARK_RED); hadd(nav, u.mods_match, 30)
+    u.mods_page = 1
+    vis_hit(u.mods_box, false)
+end
+
+-- nil = the CO-OP page, "settings" (gear), "mods" (MODS tab). The other two hide the CO-OP widgets; X goes back.
+local function set_view(v)
+    local u = S.ui
+    if u.view == v then return end
+    local was = u.view
+    u.view, u.settings_mode = v, v == "settings"
+    if v and not was then
         S.coop_vis = {}
         for i, w in ipairs(S.coop_list) do
             pcall(function() S.coop_vis[i] = w:GetVisibility() end)
             pcall(function() w:SetVisibility(1) end)
         end
-    else
+    elseif not v and was then
         for i, w in ipairs(S.coop_list) do
-            local v = S.coop_vis and S.coop_vis[i]
-            if v ~= nil then pcall(function() w:SetVisibility(v) end) end
+            local x = S.coop_vis and S.coop_vis[i]
+            if x ~= nil then pcall(function() w:SetVisibility(x) end) end
         end
     end
-    vis_hit(u.gear, not on); vis(u.gear_img, not on)
-    vis_hit(u.set_box, on); vis_hit(u.set_close, on); vis(u.set_close_img, on)
+    vis_hit(u.gear, not v); vis(u.gear_img, not v)
+    vis_hit(u.set_box, v == "settings")
+    vis_hit(u.set_close, v ~= nil); vis(u.set_close_img, v ~= nil)
+    if u.mods_box then vis_hit(u.mods_box, v == "mods") end
+end
+local function set_mode(on) set_view(on and "settings" or nil) end
+
+local function refresh_mods()
+    local u = S.ui
+    local m = ctx.mods and ctx.mods() or { rows = {} }
+    S.mods_model = m
+    local rows = m.rows or {}
+    local pages = math.max(1, math.ceil(#rows / MOD_ROWS))
+    if u.mods_page > pages then u.mods_page = pages end
+    set(u.mods_sub, m.who and (m.host_side and ("Your mods next to " .. m.who .. "'s (the host). MATCH HOST switches yours like theirs.")
+            or ("Your mods next to " .. m.who .. "'s."))
+        or "Switch mods on or off for this PC. The game loads mods only when it starts.")
+    local restart = m.restart and "RESTART THE GAME to load your changes." or ""
+    if m.restart and m.in_coop then restart = restart .. " You join again after it." end
+    if (m.missing or 0) > 0 then restart = restart .. (restart ~= "" and " " or "") .. "MISSING = install that mod to match." end
+    set(u.mods_restart, restart); vis(u.mods_restart, restart ~= "")
+    for i, r in ipairs(u.mods_rows) do
+        local o = rows[(u.mods_page - 1) * MOD_ROWS + i]
+        vis_hit(r.row, o ~= nil)
+        if o then
+            set(r.label, o.label)
+            set(r.btn_t, o.text)
+            style_text(r.btn_t, 22, o.locked and GREY or (o.on and DARK_RED or GREY))
+            style_text(r.label, 22, o.differs and DARK_RED or BLACK)
+            set(r.note, o.note or "")
+        end
+    end
+    vis(u.mods_none, #rows == 0)
+    set(u.mods_none, "No other mods are installed. UE4SS mods go in ue4ss\\Mods, pak mods in Content\\Paks\\~mods.")
+    vis_hit(u.mods_prev, pages > 1); vis_hit(u.mods_next, pages > 1); vis(u.mods_page_t, pages > 1)
+    set(u.mods_page_t, u.mods_page .. " / " .. pages)
+    vis_hit(u.mods_match, m.can_match == true)
 end
 
 local function settings_list(m)
@@ -428,6 +504,7 @@ local function inject(jui)
     for _, p in ipairs(S.pages) do
         local pt = p.WidgetTree
         S.ribbons[#S.ribbons + 1] = add_ribbon(pt, pt.RootWidget, p)
+        S.ribbons[#S.ribbons + 1] = add_ribbon(pt, pt.RootWidget, p, nil, 2, MODS_TINT)
     end
 
     step("page")
@@ -465,6 +542,7 @@ local function inject(jui)
         end
     end
     add_ribbon(qtree, page, jui.Journal_QuestsUI, S.tree)
+    add_ribbon(qtree, page, jui.Journal_QuestsUI, S.tree, 2, MODS_TINT)
     local paper_src = find(qtree, "Page", jui.Journal_QuestsUI)
     local paper_box = new("Overlay", S.tree, "Paper")
     tilt(paper_box, TILT.paper)
@@ -483,25 +561,31 @@ local function inject(jui)
     build_content(page, qtree, jui.Journal_QuestsUI)
     step("settings")
     build_settings(page)
+    step("mods")
+    build_mods(page)
     vis_hit(page, false)
 
     step("tab")
     local overlay = qb:GetParent()
-    local tab = new("Button", S.tree, "CoopTab")
-    pcall(function() tab:SetBackgroundColor(CLEAR) end)
-    local label = new("TextBlock", S.tree, "CoopTabText")
-    set(label, "CO-OP")
-    style_text(label, 34, BLACK)
-    pcall(function() tab:SetContent(label) end)
-    local ts = overlay:AddChildToOverlay(tab)
-    pcall(function()
-        ts:SetPadding({ Left = LABEL_PAD.Left, Top = 0.0, Right = 0.0, Bottom = LABEL_PAD.Bottom })
-        ts:SetHorizontalAlignment(2)
-        ts:SetVerticalAlignment(2)
-    end)
-    pcall(function() tab:SetRenderTransformAngle(-80.0) end)
-    S.tab, S.tab_text = tab, label
-    log.info("journal_tab: CO-OP tab added to the handbook")
+    local function make_tab(name, caption, pad)
+        local tab = new("Button", S.tree, name)
+        pcall(function() tab:SetBackgroundColor(CLEAR) end)
+        local label = new("TextBlock", S.tree, name .. "Text")
+        set(label, caption)
+        style_text(label, 34, BLACK)
+        pcall(function() tab:SetContent(label) end)
+        local ts = overlay:AddChildToOverlay(tab)
+        pcall(function()
+            ts:SetPadding({ Left = pad.Left, Top = 0.0, Right = 0.0, Bottom = pad.Bottom })
+            ts:SetHorizontalAlignment(2)
+            ts:SetVerticalAlignment(2)
+        end)
+        pcall(function() tab:SetRenderTransformAngle(-80.0) end)
+        return tab, label
+    end
+    S.tab, S.tab_text = make_tab("CoopTab", "CO-OP", LABEL_PAD)
+    S.mods_tab, S.mods_tab_text = make_tab("ModsTab", "MODS", MODS_PAD)
+    log.info("journal_tab: CO-OP and MODS tabs added to the handbook")
 end
 
 local function journal()
@@ -578,7 +662,8 @@ end
 local function refresh()
     local m, u = ctx.model(), S.ui
     S.model = m
-    if u.settings_mode then refresh_settings(m); return end
+    if u.view == "settings" then refresh_settings(m); return end
+    if u.view == "mods" then refresh_mods(); return end
     set(u.headline, m.headline or "")
     set(u.detail, m.detail or "")
     set(u.me, m.me or "")
@@ -590,8 +675,14 @@ local function refresh()
     vis_hit(u.stop, m.show_stop)
     vis_hit(u.go_home, m.host_gone)
     vis_hit(u.wait, m.host_gone)
+    -- in co-op the join section can't be used: hidden, so the players, chat and teleport rows fit the folder
+    -- (with players listed, the chat ran past the bottom of the page)
+    local coop = m.in_coop == true
+    vis_hit(u.games_title, not coop)
+    vis(u.code_title, not coop); vis_hit(u.code_row, not coop)
+    vis_hit(u.pw_row, not coop or m.show_stop == true)
     for i, f in ipairs(u.friends) do
-        local h = m.hosts[i]
+        local h = not coop and m.hosts[i] or nil
         vis_hit(f.row, h ~= nil)
         if h then set(f.name, h.label or h.name); vis_hit(f.btn, h.joinable ~= false) end
     end
@@ -637,7 +728,7 @@ local function refresh()
     if (m.allowed or 0) > 0 then set(u.clear_allowed_t, "CLEAR ALWAYS-ALLOWED (" .. m.allowed .. ")") end
     set(u.none, #m.hosts > 0 and "" or (m.steam and "No friends are hosting right now. Your friend chooses HOST A GAME here, or sends you their code."
         or "One-PC test mode: Steam features (codes, friends) are off."))
-    vis(u.none, #m.hosts == 0)
+    vis(u.none, #m.hosts == 0 and not coop)
     vis_hit(u.friends_box, not u.show_backups)
     vis_hit(u.backups_box, u.show_backups)
     pcall(function() u.folder_friends_slot:SetZOrder(u.show_backups and 1 or 2) end)
@@ -661,7 +752,9 @@ function journal_tab.tick(dt)
     end
     if S.want_show then S.want_show = nil; show(true) end
     hover(S.tab, S.tab_text)
+    hover(S.mods_tab, S.mods_tab_text)
     if clicked(S.tab) then click_sound(); show(true) end
+    if clicked(S.mods_tab) then click_sound(); show(true); set_view("mods"); refresh() end
     for _, b in ipairs(S.originals) do
         if clicked(b) and S.shown then show(false) end
     end
@@ -669,6 +762,20 @@ function journal_tab.tick(dt)
     for _, x in ipairs(S.buttons) do hover(x.b, x.t) end
     local u, a = S.ui, ctx.act
     refresh_in = refresh_in - dt
+    if u.view == "mods" then
+        if clicked(u.set_close) then set_view(nil); ctx.refresh_now = true end
+        local mm = S.mods_model or { rows = {} }
+        local pages = math.max(1, math.ceil(#(mm.rows or {}) / MOD_ROWS))
+        if clicked(u.mods_prev) then u.mods_page = (u.mods_page - 2) % pages + 1; ctx.refresh_now = true end
+        if clicked(u.mods_next) then u.mods_page = u.mods_page % pages + 1; ctx.refresh_now = true end
+        for i, r in ipairs(u.mods_rows) do
+            local o = (mm.rows or {})[(u.mods_page - 1) * MOD_ROWS + i]
+            if o and not o.locked and clicked(r.btn) then a.mod_toggle(o.id); ctx.refresh_now = true end
+        end
+        if mm.can_match and clicked(u.mods_match) then a.mod_match(); ctx.refresh_now = true end
+        if refresh_in <= 0 or ctx.refresh_now then refresh_in, ctx.refresh_now = 1.0, false; refresh() end
+        return
+    end
     if u.settings_mode then
         if clicked(u.set_close) then set_mode(false); ctx.refresh_now = true end
         if clicked(u.set_tab_host) then u.set_tab = "host"; ctx.refresh_now = true end
@@ -756,6 +863,10 @@ end
 
 function journal_tab.dev_section(backups)
     if S and S.ui then S.ui.show_backups = backups == true; ctx.refresh_now = true end
+end
+
+function journal_tab.dev_mods(on)
+    if S and S.ui and S.ui.mods_box then set_view(on and "mods" or nil); ctx.refresh_now = true end
 end
 
 function journal_tab.dev_settings(on, tab)

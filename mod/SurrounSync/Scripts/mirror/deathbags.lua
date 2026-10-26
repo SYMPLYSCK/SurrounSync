@@ -28,7 +28,8 @@ local cfg, role, session
 local together = function() return false end
 local bags = events.new("dbag", 4, 900)
 local peers = require("mirror.peers")
-local takes = events.new("dbagt", 32, 300)
+-- (reliable: an expired last state left the taken items in the other copy of the bag - a duplicate)
+local takes = events.reliable("dbagt", 32)
 local clock = 0.0
 local owners_path = nil
 local relabel_at = nil

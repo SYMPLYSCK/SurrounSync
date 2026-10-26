@@ -514,6 +514,25 @@ def vehicles_seat_four_players_by_slot():
     L.execute('vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 1.000"); for i = 1, 3 do vehicles.tick(0.1) end')
     check(L.eval('vehicles.status():find("driving Vehicle_Van_C_1") ~= nil'), "and the host keeps driving")
 
+    # wheels: the driver's steering / throttle / brake travel with the car, the follower's wheels use them
+    L = setup("host", 0, 1)
+    L.execute('A.VehicleMovementComponent.RawSteeringInput = 0.3; A.VehicleMovementComponent.RawThrottleInput = 1.0;'
+              ' A.VehicleMovementComponent.RawBrakeInput = 0.0; CAR_PARENT = A; for i = 1, 3 do vehicles.tick(0.1) end')
+    check(" I 0.30 1.00 0.00" in (L.eval('vehicles.drive_line()') or ""), "the driver sends its inputs (%s)" % L.eval('vehicles.drive_line()'))
+    L = setup("guest", 1, 0)
+    L.execute(r'''
+        local m = A.VehicleMovementComponent
+        m.IdleBrakeInput = 0.4
+        m.SetSteeringInput = function(self, v) STEER = v end
+        m.SetThrottleInput = function(self, v) THROTTLE = v end
+        vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 500 0 0 1 0 1.000 I -0.60 0.80 0.00")
+        vehicles.drive_sample("D Vehicle_Van_C_1 50 0 0 0 0 0 500 0 0 1 0 1.100 I -0.60 0.80 0.00")
+        for i = 1, 5 do vehicles.tick(0.1) end
+    ''')
+    check(L.eval("STEER") == -0.6 and L.eval("THROTTLE") == 0.8, "the other player's car steers and drives its wheels (%s, %s)"
+          % (L.eval("STEER"), L.eval("THROTTLE")))
+    check(L.eval("A.VehicleMovementComponent.IdleBrakeInput") == 0.0, "and its idle brake is off while it follows")
+
 
 def vehicles_keep_this_worlds_fuel():
     print("vehicles_keep_this_worlds_fuel")
@@ -1369,6 +1388,125 @@ def loot_asks_the_host_again_on_every_reopen():
     check(L.eval("qs()") == 2, "an open right after (the redraw itself) doesn't ask again")
 
 
+def loot_take_without_a_uid_pairing_finds_the_item():
+    print("loot_take_without_a_uid_pairing_finds_the_item")
+    L = loot_guest()
+    L.execute(r"""
+        open()
+        ID = SENT[1] and SENT[1]:match("^Q (%S+)$")
+        TAKEN = {}
+        PUMP.BP_JigMultiplayer = COMP
+        package.loaded["mirror.jig"].contents_of = function()
+            return { { uid = "G1", da = "/Game/X.DA_Bandage", count = 3 }, { uid = "G2", da = "/Game/X.DA_Pills", count = 1 } }
+        end
+        package.loaded["mirror.jig"].take = function(comp, uid, n) TAKEN[#TAKEN + 1] = uid .. ":" .. n; return true end
+        INBOX.loot = { tostring(ID) .. " H9 1 5" }
+        loot.tick(0.1)
+        NO_DA = #TAKEN
+        INBOX.loot = { tostring(ID) .. " H9 1 6 /Game/X.DA_Bandage" }
+        loot.tick(0.1)
+    """)
+    check(L.eval("NO_DA") == 0, "an unknown uid without the item kind takes nothing (as before)")
+    check(L.eval("TAKEN[1]") == "G1:2", "with the item kind the same item is taken (%s) - it can't come back with the next list"
+          % L.eval("TAKEN[1]"))
+
+
+def loot_take_for_a_container_the_host_lacks_is_kept():
+    # a dropped take left the item in the host's container AND the guest's bag (car trunks, containers not loaded)
+    print("loot_take_for_a_container_the_host_lacks_is_kept")
+    L = loot_guest()
+    L.execute(r"""
+        package.loaded["mirror.loot"] = nil
+        loot = require("mirror.loot")
+        loot.init({}, "host", { in_world = function() return true end })
+        FOUND = false
+        util.find_by_id = function() return FOUND and PUMP or nil end
+        PUMP.BP_JigMultiplayer = COMP
+        TAKEN = {}
+        package.loaded["mirror.jig"].contents_of = function() return { { uid = "G1", da = "/Game/X.DA_Bandage", count = 3 } } end
+        package.loaded["mirror.jig"].take = function(comp, uid, n) TAKEN[#TAKEN + 1] = uid .. ":" .. n; return true end
+        ID = "Container_FuelLoot_GasPump_C@10,0,0"
+        INBOX.loot = { ID .. " G1 0 5 /Game/X.DA_Bandage" }
+        loot.tick(0.1)
+        for i = 1, 30 do loot.tick(0.1) end
+        BEFORE = #TAKEN
+        FOUND = true
+        for i = 1, 12 do loot.tick(0.1) end
+        AFTER = TAKEN[1]
+        for i = 1, 30 do loot.tick(0.1) end
+        ONCE = #TAKEN
+        -- a put-in for a container that never shows up: given up after 10 min, the guest told (R) so it keeps it
+        FOUND = false
+        SENT = {}
+        INBOX.loot = { "A " .. ID .. " G7 /Game/X.DA_Pills 1 0 0 6 -1:0:-1" }
+        loot.tick(0.1)
+        R0 = #SENT
+        for i = 1, 6100 do loot.tick(0.1) end
+        R1 = SENT[1]
+    """)
+    check(L.eval("BEFORE") == 0, "container not here: the take isn't lost, just waits")
+    check(L.eval("AFTER") == "G1:3", "the container shows up: the take is applied (%s)" % L.eval("AFTER"))
+    check(L.eval("ONCE") == 1, "and only once (%d)" % L.eval("ONCE"))
+    check(L.eval("R0") == 0 and (L.eval("R1") or "").startswith("R " + "Container_FuelLoot_GasPump_C@10,0,0 G7"),
+          "a put-in for a container that never comes is handed back after 10 min (%r)" % L.eval("R1"))
+
+
+def same_moment_container_takes_keep_one_copy():
+    # host and guest take the same item at once: both had it. The host's world decides, the guest gives it back.
+    print("same_moment_container_takes_keep_one_copy")
+    L = loot_guest()
+    L.execute(r"""
+        PUMP.BP_JigMultiplayer = COMP
+        INV = {}
+        package.loaded["mirror.jig"].contents_of = function(c) if c == COMP then return CONT end return INV end
+        CONT = { { uid = "G1", da = "/Game/X.DA_Bandage", count = 3 } }
+        open(); loot.tick(0.1)
+        ID = SENT[1] and SENT[1]:match("^Q (%S+)$")
+        INBOX.lootc = { "C " .. tostring(ID) .. " 0 one" }
+        loot.tick(0.1)
+        CONT = {}
+        INV = { { uid = "P5", da = "/Game/X.DA_Bandage", count = 3 } }
+        HOOKS["/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C:JigMP_OnItemRemoved"]({ get = function() return PUMP end }, { get = function() return "G1" end })
+        TAKE = nil
+        for _, p in ipairs(SENT) do if p:find("^" .. ID:gsub("%p", "%%%0") .. " G1 0") then TAKE = p end end
+        GAVE = {}
+        package.loaded["mirror.jig"].take = function(c, uid, n, total) GAVE[#GAVE + 1] = uid .. ":" .. n; return true end
+        ME.BP_JigMultiplayer = obj({})
+        INBOX.loot = { "L " .. ID .. " G1" }
+        loot.tick(0.1)
+    """)
+    check(L.eval("TAKE") is not None, "the guest's take went out (%r)" % L.eval("TAKE"))
+    check(L.eval("GAVE[1]") == "P5:3", "host had none of it: the guest gives the 3 bandages back (%s)" % L.eval("GAVE[1]"))
+    L.execute('GAVE = {}; INBOX.loot = { "L " .. ID .. " G1" }; loot.tick(0.1)')
+    check(L.eval("#GAVE") == 0, "...only once")
+    H = loot_guest()
+    H.execute(r"""
+        package.loaded["mirror.loot"] = nil
+        loot = require("mirror.loot")
+        loot.init({}, "host", { in_world = function() return true end })
+        PUMP.BP_JigMultiplayer = COMP
+        package.loaded["mirror.jig"].contents_of = function() return {} end
+        SENT = {}
+        INBOX.loot = { "Container_FuelLoot_GasPump_C@10,0,0 G1 0 5 /Game/X.DA_Bandage" }
+        loot.tick(0.1)
+    """)
+    check(any(m == "L Container_FuelLoot_GasPump_C@10,0,0 G1" for m in H.eval("SENT").values()),
+          "host: a take of an item it has none of is answered with L")
+
+
+def car_trunks_go_by_the_cars_name():
+    print("car_trunks_go_by_the_cars_name")
+    L = loot_guest()
+    L.execute(r"""
+        CAR = obj({ name = "Vehicle_Jeep_C_3" })
+        package.loaded["mirror.vehicles"] = { peer_name_of = function(a) return a == CAR and "Vehicle_Jeep_C_7" or nil end,
+                                               car_named = function(n) return n == "Vehicle_Jeep_C_7" and CAR or nil end }
+    """)
+    check(L.eval('package.loaded["mirror.vehicles"].car_named("Vehicle_Jeep_C_7") == CAR'), "fake car paired")
+    src = open(os.path.join(SCRIPTS, "mirror", "loot.lua"), encoding="utf-8").read()
+    check('"car:" .. n' in src and 'id:sub(1, 4) == "car:"' in src, "loot ids a car trunk by the host's car name and finds it by name")
+
+
 def loot_open_shows_the_hosts_items_at_once():
     print("loot_open_shows_the_hosts_items_at_once")
     L = loot_guest()
@@ -1765,9 +1903,20 @@ def loose_magazine_rounds_reach_the_picker():
           "the rounds go into the picked-up magazine in the picker's inventory")
     check(L.eval('FILLED and FILLED.list[2].da') == "/Game/Items/DA_45ACPAmmo.DA_45ACPAmmo"
           and L.eval('FILLED.list[2].count') == 25 and L.eval('FILLED.list[2].parent') == 1, "all 25 rounds, inside the mag")
-    check(any(m == "T 1_2_3_4" for m in L.eval('SENT').values()), "the other game is told it was taken (the original goes)")
+    check(any(m.split(" ")[:2] == ["T", "1_2_3_4"] for m in L.eval('SENT').values()), "the other game is told it was taken (the original goes)")
     L.execute('FILLED = nil; drops.tick(1.0)')
     check(L.eval('FILLED') is None, "the rounds are put in once")
+    # the same mag picked up at the same moment by a player with a lower slot: they keep it, this copy goes
+    L.execute(r"""
+        TAKEN = {}
+        package.loaded["mirror.jig"].take = function(c, uid, n, total) TAKEN[#TAKEN + 1] = uid; return c == PC end
+        package.loaded["mirror.peers"].my_slot = function() return 2 end
+        IN = { "T 1_2_3_4 1" }
+        drops.tick(0.1)
+    """)
+    check(L.eval('TAKEN[1]') == "9_9_9_9", "picked up at the same moment by a lower slot: taken back out here (%s)" % L.eval('TAKEN[1]'))
+    L.execute('TAKEN = {}; IN = { "T 1_2_3_4 1" }; drops.tick(0.1)')
+    check(L.eval('#TAKEN') == 0, "...only once")
 
 
 def loose_magazine_picked_up_without_hooks_still_gets_its_rounds():
@@ -1819,7 +1968,7 @@ def loose_magazine_picked_up_without_hooks_still_gets_its_rounds():
         drops.tick(0.6)
         drops.tick(0.4)
     """)
-    check(any(m == "T 1_2_3_4" for m in L.eval('SENT').values()), "the other game is told it was taken")
+    check(any(m.split(" ")[:2] == ["T", "1_2_3_4"] for m in L.eval('SENT').values()), "the other game is told it was taken")
     check(L.eval('FILLED and FILLED.uid') == "9_9_9_9", "the rounds go into the new mag, not the one carried before")
     check(L.eval('FILLED and FILLED.list[2].count') == 25, "all 25 rounds")
     L.execute('FILLED = nil; drops.tick(1.0); drops.tick(1.0)')
@@ -2186,10 +2335,11 @@ CORPSE_FAKES = FAKES + r"""
     util = require("mirror.util")
     HOOKS = {}
     util.ensure_hook = function(path, fn) HOOKS[path] = HOOKS[path] or {}; HOOKS[path][fn] = true; return true end
-    function fire_removed(z, da)
+    function fire_removed(z, da, n)
         for fn in pairs(HOOKS[MASTER .. ":JigMP_OnMainContainerItemRemoved"] or {}) do
             fn({ get = function() return z end }, nil, nil, nil, { get = function() return {
-                ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { ItemID_28_01CA27D84AF7D1014D9E2E83894C1848 = da } } end })
+                ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { ItemID_28_01CA27D84AF7D1014D9E2E83894C1848 = da,
+                                                                  Count_8_DD79AF2A46126A338C8DCCB4616D91CD = n } } end })
         end
     end
     package.loaded["mirror.ghost"] = { exists = function() return true end }
@@ -2326,6 +2476,54 @@ def corpse_loot_reaches_every_player():
     check(H.eval("count(GUN)") == 0 and G1.eval("count(GUN)") == 0, "guest 2's take reaches the host and guest 1")
     step(16)
     check(G2.eval("count(GUN)") == 0 and G1.eval("count(GUN)") == 0, "and stays taken")
+
+
+def corpse_looted_at_the_same_moment_keeps_one_copy():
+    print("corpse_looted_at_the_same_moment_keeps_one_copy")
+    H = lua()
+    H.execute(CORPSE_FAKES + r"""
+        STOCK = { { uid = "h1", da = AMMO, count = 3 } }
+        main = require("mirror.corpses")
+        main.init({}, ROLE, zfake(7), SESSION)
+        ALL = { main }
+        function tick() T = T + 0.3; main.tick(0.3) end
+    """, "host")
+    G = lua()
+    G.execute(CORPSE_FAKES + r"""
+        STOCK = {}
+        ZF = zfake(7)
+        PCI = obj({})
+        INV = {}
+        package.loaded["mirror.game"] = { player = function() return obj({ BP_JigMultiplayer = PCI }) end, on_world_reset = function() end }
+        corpses = require("mirror.corpses")
+        corpses.init({}, "guest", ZF, SESSION)
+        local jg = package.loaded["mirror.jig"]
+        local inner = jg.contents_of
+        jg.contents_of = function(c) if c == PCI then return INV end return inner(c) end
+        GAVE = {}
+        jg.take = function(c, uid, n, total) GAVE[#GAVE + 1] = uid .. ":" .. n; return c == PCI end
+        function tick() T = T + 0.3; if DEAD then ZF._copy.dead_at = ZF._copy.dead_at or T end; corpses.tick(0.3) end
+    """, "guest", 7)
+
+    def step(n=1):
+        for _ in range(n):
+            H.execute("tick()")
+            for k in list(H.eval("blobs_out").keys()):
+                G.eval("blobs_in")[k] = H.eval("blobs_out")[k]
+            G.execute("tick()")
+            for k in list(G.eval("blobs_out").keys()):
+                H.eval("blobs_in")[k] = G.eval("blobs_out")[k]
+
+    step(4)
+    H.execute("DEAD = true"); G.execute("DEAD = true")
+    step(6)
+    check(G.eval("count(AMMO)") == 3, "the guest's corpse holds the host's 3 ammo")
+    # both loot all 3 before hearing of the other's take
+    H.execute("STOCK[1].count = 0; fire_removed(TR, AMMO, 3)")
+    G.execute('STOCK[1].count = 0; INV = { { uid = "p9", da = AMMO, count = 3 } }; fire_removed(TR, AMMO, 3)')
+    step(4)
+    check(G.eval("GAVE[1]") == "p9:3", "the host had none left: the guest gives its 3 back (%s)" % G.eval("GAVE[1]"))
+    check(G.eval("#GAVE") == 1, "...once")
 
 
 def link_reads_only_blobs_the_index_says_changed():
@@ -2717,7 +2915,9 @@ def reliable_events_survive_pauses_and_restarts():
           "after the load only the messages since the host's join save are applied")
     # nobody reads: the history shrinks to the small keep after a while instead of growing to 512
     A2.execute('for i = 1, 200 do ch:send("M x") end; CLOCK = CLOCK + 400; ch:send("M y")')
-    check(A2.eval('#ch.recent') == 64, "an unread history shrinks to the small keep")
+    check(A2.eval('#ch.recent') > 200, "7 min unread (a guest waiting for its host): every take is still kept (%d)" % A2.eval('#ch.recent'))
+    A2.execute('CLOCK = CLOCK + 1500; ch:send("M z")')
+    check(A2.eval('#ch.recent') == 64, "an unread history shrinks to the small keep after 30 min")
 
 
 def jig_probe_names_what_a_patch_removed():
@@ -3067,7 +3267,86 @@ def settings_pages_cycle_save_and_follow_the_host():
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
-for t in (settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
+def mods_switch_restart_and_match_the_host():
+    print("mods_switch_restart_and_match_the_host")
+    d = tempfile.mkdtemp(prefix="mods-")
+    try:
+        w64 = os.path.join(d, "SurrounDead", "Binaries", "Win64")
+        mods = os.path.join(w64, "ue4ss", "Mods")
+        paks = os.path.join(d, "SurrounDead", "Content", "Paks")
+        for m in ("SurrounSync", "shared", "AimRun", "HeadshotBrains", "Keybinds", "SelfOn", "ConsoleEnablerMod"):
+            os.makedirs(os.path.join(mods, m))
+        open(os.path.join(mods, "SelfOn", "enabled.txt"), "w").close()
+        with open(os.path.join(mods, "mods.txt"), "w", newline="") as f:
+            f.write("SurrounSync : 1\r\nAimRun : 1\r\nHeadshotBrains : 0\r\nConsoleEnablerMod : 0\r\n"
+                    "; Built-in keybinds, do not move up!\r\nKeybinds : 1\r\n")
+        with open(os.path.join(mods, "mods.json"), "w") as f:
+            f.write('[\n    {\n        "mod_name": "AimRun",\n        "mod_enabled": true\n    }\n]\n')
+        os.makedirs(os.path.join(paks, "~mods"))
+        os.makedirs(os.path.join(paks, "LogicMods"))
+        for n in ("Cars_P.pak", "Cars_P.ucas", "Cars_P.utoc", "Old_P.pak.off"):
+            open(os.path.join(paks, "~mods", n), "w").close()
+        L = lua()
+        g = L.globals()
+
+        def listing(p, want_dir):
+            if not os.path.isdir(p):
+                return None
+            return L.table_from(sorted(x for x in os.listdir(p) if os.path.isdir(os.path.join(p, x)) == want_dir))
+        g.pydirs = lambda p: listing(p, True)
+        g.pyfiles = lambda p: listing(p, False)
+        g.W64, g.PAKS = w64, paks
+        L.execute('ml = require("mirror.modlist"); ml.configure{ io_root = W64 .. "\\\\", list_win64 = W64, list_paks = PAKS, reset = true,'
+                  ' lister = { dirs = function(p) return pydirs(p) end, files = function(p) return pyfiles(p) end } }; ml.init()')
+        L.execute('function rows(peer) local m = ml.model(peer); local t = {}; for _, r in ipairs(m.rows) do t[r.id] = r end; return m, t end')
+        m, r = L.eval('rows()')
+        ids = sorted(list(r.keys()))
+        check(ids == sorted(["AimRun", "ConsoleEnablerMod", "HeadshotBrains", "Keybinds", "SelfOn", "pak:Cars_P.pak", "pak:Old_P.pak"]),
+              "lists UE4SS and pak mods, not SurrounSync or shared (%s)" % ids)
+        check(r["AimRun"]["on"] and not r["HeadshotBrains"]["on"] and r["SelfOn"]["on"] and r["pak:Cars_P.pak"]["on"] and not r["pak:Old_P.pak"]["on"],
+              "on/off read from mods.txt, enabled.txt and .pak/.pak.off")
+        check(not m["restart"], "nothing changed: no restart")
+        loaded = L.eval('ml.loaded_ids()')
+        check(loaded["SelfOn"] and loaded["pak:Cars_P.pak"] and not loaded["HeadshotBrains"], "running set includes enabled.txt mods and paks")
+
+        L.execute('ml.toggle("HeadshotBrains"); ml.toggle("SelfOn"); ml.toggle("pak:Cars_P.pak"); ml.toggle("pak:Old_P.pak"); ml.toggle("AimRun")')
+        txt = open(os.path.join(mods, "mods.txt"), newline="").read()
+        check("HeadshotBrains : 1\r\n" in txt and "AimRun : 0\r\n" in txt and "SelfOn : 0\r\n; Built-in" in txt,
+              "mods.txt switched in place, CRLF kept, a new line goes above the keybinds block (%r)" % txt)
+        check(os.path.exists(os.path.join(mods, "SelfOn", "enabled.txt.off")) and not os.path.exists(os.path.join(mods, "SelfOn", "enabled.txt")),
+              "a self-enabled mod's enabled.txt is set aside")
+        check('"mod_enabled": false' in open(os.path.join(mods, "mods.json")).read(), "mods.json follows")
+        pk = sorted(os.listdir(os.path.join(paks, "~mods")))
+        check(pk == ["Cars_P.pak.off", "Cars_P.ucas.off", "Cars_P.utoc.off", "Old_P.pak"], "pak and its .ucas/.utoc renamed together (%s)" % pk)
+        m, r = L.eval('rows()')
+        check(m["restart"] and r["HeadshotBrains"]["note"] == "on after a restart" and r["AimRun"]["note"] == "off after a restart",
+              "changes wait for a restart and say so")
+        check(not L.eval('ml.loaded_ids()')["HeadshotBrains"], "what runs now doesn't change")
+        L.execute('ml.toggle("HeadshotBrains"); ml.toggle("AimRun"); ml.toggle("SelfOn"); ml.toggle("pak:Cars_P.pak"); ml.toggle("pak:Old_P.pak")')
+        check(not L.eval('ml.model().restart'), "switching back: no restart needed")
+        check(os.path.exists(os.path.join(mods, "SelfOn", "enabled.txt")), "enabled.txt comes back")
+
+        # the host runs HeadshotBrains and a pak I don't have, not AimRun; ConsoleEnablerMod is client-only
+        L.execute('KIND = { ConsoleEnablerMod = "client" }; peer = { set = { HeadshotBrains = true, ["pak:Cars_P.pak"] = true, ["pak:Map_P.pak"] = true,'
+                  ' ConsoleEnablerMod = true, SelfOn = true, Keybinds = true }, who = "Host", host = true,'
+                  ' kind = function(id) return KIND[id] or "unknown" end }')
+        m, r = L.eval('rows(peer)')
+        check(r["AimRun"]["differs"] and r["AimRun"]["note"] == "Host has it OFF" and r["HeadshotBrains"]["note"] == "Host has it ON",
+              "rows show the host's choice where it differs")
+        check(not r["ConsoleEnablerMod"]["differs"], "a client-only mod never needs to match")
+        check(r["pak:Map_P.pak"]["locked"] and r["pak:Map_P.pak"]["text"] == "MISSING", "a mod only the host has shows as MISSING")
+        check(m["can_match"] and m["missing"] == 1, "a guest can MATCH HOST")
+        n, missing = L.eval('ml.match(peer)')
+        check(n == 2 and list(missing.values()) == ["Map_P.pak"], "match switches 2 and names the missing one (%s, %s)" % (n, list(missing.values())))
+        m, r = L.eval('rows(peer)')
+        check(not r["AimRun"]["differs"] and not r["HeadshotBrains"]["differs"] and not r["ConsoleEnablerMod"]["on"] and m["restart"],
+              "after MATCH only the missing one differs, the client mod is left alone, restart asked")
+        check(not L.eval('ml.model({ set = {}, who = "G", host = false }).can_match'), "the host doesn't get MATCH")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, tactical_reads_only_lights_the_class_has,
           vehicles_keep_this_worlds_fuel, harvest_uses_up_nodes_once, zombie_copies_take_the_hosts_look,
           copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,

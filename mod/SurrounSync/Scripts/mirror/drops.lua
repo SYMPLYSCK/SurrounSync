@@ -128,6 +128,24 @@ local function item_of(actor)
 end
 
 local contents_of = jig.contents_of
+-- Both players picked up the same item before hearing of the other's pickup (the game picks up at once, here):
+-- both kept it. Now one keeps it - the host, else the lower player slot - and the other game takes its copy back
+-- out of the inventory. A pickup message carries the picker's slot (a relayed one would look like the host's).
+local mine, mine_w = {}, {}       -- drop uid / world items -> { item = inventory uid, da = asset, at = now }
+local RACE_S = 15
+local lost_race
+local function drop_da(uid)
+    local c = copies[uid]
+    if c and c.da then return c.da end
+    local a = tracked[uid]
+    local da
+    if a then pcall(function() da = item_of(a) end) end
+    return da
+end
+local function send_take(uid, item, da)
+    mine[uid] = { item = item, da = da or drop_da(uid), at = now }
+    channel:send("T " .. uid .. " " .. peers.my_slot())
+end
 local function describe(list)
     local out = {}
     for _, h in ipairs(list) do
@@ -444,9 +462,16 @@ end
 
 local function remove_world(payload)
     if not shared() then return end
-    local cls, x, y, z, da = payload:match("^W (%S+) (%S+) (%S+) (%S+) (%S+)$")
+    local cls, x, y, z, da, from = payload:match("^W (%S+) (%S+) (%S+) (%S+) (%S+) ?(%d*)$")
     if not cls then return end
     local at = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
+    for i, m in ipairs(mine_w) do
+        if m.da == da and now - m.at <= RACE_S and util.dist(m.loc, at) < 60 then
+            table.remove(mine_w, i)
+            if lost_race then lost_race(m, tonumber(from)) end
+            break
+        end
+    end
     local best, best_d = nil, 60
     for _, o in ipairs(FindAllOf(cls) or {}) do
         if on_ground(o) and not tracked_uid(o) then
@@ -469,7 +494,12 @@ local function remove_world(payload)
 end
 
 local function remove(payload)
-    local uid = payload:match("^T (%S+)$")
+    local uid, from = payload:match("^T (%S+) ?(%d*)$")
+    local m = uid and mine[uid]
+    if m then
+        mine[uid] = nil
+        if now - m.at <= RACE_S and lost_race then lost_race(m, tonumber(from)) end
+    end
     local a = uid and tracked[uid]
     if a and on_ground(a) then
         pcall(function() a:K2_DestroyActor() end)
@@ -518,6 +548,27 @@ local function queue_refill(uid, item, before)
                             at = now + 0.3 }
 end
 local function inventory() local c; pcall(function() c = game.player().BP_JigMultiplayer end); return util.valid(c) and c or nil end
+lost_race = function(m, from)
+    if not from or from >= peers.my_slot() then return end   -- (I'm the host / the lower slot: I keep it)
+    local pc = inventory()
+    if not pc then return end
+    local list = contents_of(pc)
+    local target
+    if m.item then for _, it in ipairs(list) do if it.uid == m.item then target = it; break end end end
+    if not target and m.da then for _, it in ipairs(list) do if it.da == m.da then target = it end end end
+    local name = ((m.da or "item"):match("([%w_]+)$") or "item"):gsub("^DA_", "")
+    if not target then
+        log.warn("drops: picked up " .. name .. " at the same moment as another player, who keeps it - couldn't find it here to give it back")
+        return
+    end
+    local ok, err = jig.take(pc, target.uid, target.count or 1, target.count or 1)
+    if ok then
+        log.warn("drops: picked up " .. name .. " at the same moment as another player, who keeps it - taken back out here (no duplicate)")
+        require("mirror.notify").show("Someone else picked up that " .. name .. " at the same moment - they keep it.", "info")
+    else
+        log.warn("drops: picked up " .. name .. " at the same moment as another player - couldn't take it back out (" .. tostring(err) .. ")")
+    end
+end
 local function do_refill(r)
     local pc = inventory()
     if not pc then return end
@@ -566,9 +617,10 @@ local function run_refills()
     end
     refill = keep
 end
-local function send_world(actor, cls, l, da)
+local function send_world(actor, cls, l, da, item)
     if not (cls and l and da) then return end
-    channel:send(string.format("W %s %.1f %.1f %.1f %s", cls, l.X, l.Y, l.Z, da))
+    mine_w[#mine_w + 1] = { loc = l, da = da, item = item, at = now }
+    channel:send(string.format("W %s %.1f %.1f %.1f %s %d", cls, l.X, l.Y, l.Z, da, peers.my_slot()))
     world_stats.sent = world_stats.sent + 1
     log.info("drops: picked up a world item (" .. (da:match("[^%.]+$") or da) .. ") - telling the other game")
 end
@@ -604,7 +656,7 @@ local function on_add_actor_post()
     if not p then return end
     if not p.added then return end
     if not p.uid then
-        if p.world then send_world(nil, p.world.cls, p.world.loc, p.world.da) end
+        if p.world then send_world(nil, p.world.cls, p.world.loc, p.world.da, p.item) end
         return
     end
     local uid, a = p.uid, tracked[p.uid]
@@ -615,9 +667,10 @@ local function on_add_actor_post()
     end
     log.info("drops: a dropped item was picked up here (" .. (copies[uid] and "copy" or "own drop")
         .. ", removed by the game) - telling the other game")
+    local da = drop_da(uid)
     queue_refill(uid, p.item, p.before)
     forget(uid)
-    channel:send("T " .. uid)
+    send_take(uid, p.item, da)
 end
 
 local function on_picked(self, Info, ItemUID)
@@ -646,9 +699,10 @@ local function on_picked(self, Info, ItemUID)
         stats.forced = stats.forced + 1
         log.warn("drops: picked up a copy that the game didn't remove - removed it (no duplicate)")
     end
+    local da2 = drop_da(key)
     queue_refill(key, u)
     forget(key)
-    channel:send("T " .. key)
+    send_take(key, u, da2)
 end
 
 local hook_fn = function(self, ItemUID, FromContainerUID, ActorRef)
@@ -683,9 +737,10 @@ local equipped_fn = function(self, ActorRef, ContainerName, ItemUID)
         for uid, a in pairs(tracked) do
             if util.same(a, actor) then
                 log.info("drops: a dropped item was picked up here (equipped) - telling the other game")
+                local da = drop_da(uid)
                 queue_refill(uid, item)
                 forget(uid)
-                channel:send("T " .. uid)
+                send_take(uid, item, da)
                 return
             end
         end
@@ -735,8 +790,9 @@ function drops.tick(dt)
             if not here and (why ~= "hidden" or seen[uid]) then
                 log.info("drops: a dropped item was picked up here (" .. why .. ") - telling the other game")
                 if held[uid] then queue_refill(uid, nil, held[uid]) end
+                local da = drop_da(uid)
                 forget(uid)
-                channel:send("T " .. uid)
+                send_take(uid, nil, da)
             end
         end
         -- after the check: a snapshot taken once the new mag is already in the inventory would hide it
@@ -778,15 +834,16 @@ function drops.cleanup_remove(actor)
     if not pcall(function() actor:K2_DestroyActor() end) then return false end
     if uid then
         forget(uid)
-        channel:send("T " .. uid)
+        channel:send("T " .. uid .. " " .. peers.my_slot())
     else
         ended[util.addr(actor) or 0] = true
-        if w then channel:send(string.format("W %s %.1f %.1f %.1f %s", w.cls, w.loc.X, w.loc.Y, w.loc.Z, w.da)) end
+        if w then channel:send(string.format("W %s %.1f %.1f %.1f %s %d", w.cls, w.loc.X, w.loc.Y, w.loc.Z, w.da, peers.my_slot())) end
     end
     return true
 end
 
 local function forget_world()
+    mine, mine_w = {}, {}
     tracked, finish, finished, ended, filled, picking, begun, rewards, unfilled, refill = {}, {}, {}, {}, {}, nil, {}, {}, {}, {}
     resend, sent_list, held = {}, {}, {}
 end

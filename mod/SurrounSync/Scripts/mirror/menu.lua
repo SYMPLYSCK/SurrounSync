@@ -54,6 +54,8 @@ local function host()
         notify.show("Leave the host's world first, then you can host.", "info")
         return
     end
+    -- hosting from a leftover co-op save would make the game save into it outside a session
+    if session.stray_coop() then session.offer_own_save(); return end
     p1().init(cfg, "host")
     set_accepted({})
     link.bridge_cmd("password " .. password)
@@ -172,6 +174,20 @@ local function status_text()
     return "Looking for the host..."
 end
 
+-- the MODS tab: the other side's running mods (a guest: the host's; the host: its first guest's)
+local function mods_peer()
+    local r = my_role()
+    if not r then return nil end
+    local compat = require("mirror.compat")
+    local set = compat.peer_mods and compat.peer_mods()
+    if not set then return nil end
+    return { set = set, who = link.peer_name() or (r == "guest" and "the host" or "your friend"), kind = compat.kind, host = r == "guest" }
+end
+local function mods_restart_note()
+    notify.show("Restart the game to load your mod changes (mods only load when the game starts)."
+        .. (my_role() and " You join again after it." or ""), "info", "mods_restart", true)
+end
+
 local function model()
     local l, r = link.lobby(), my_role()
     local steam = link.kind() == "steam"
@@ -197,6 +213,7 @@ local function model()
     m.show_voice = r ~= nil
     m.voice_label, m.voice_vol = require("mirror.voice").label()
     if l and l.voice == "talking" then m.voice_label = "VOICE: TALKING" end
+    m.in_coop = r ~= nil
     -- the host's KICK buttons: every guest the bridge knows
     m.guests = {}
     if r == "host" and l then
@@ -295,10 +312,9 @@ local function watch_release()
     if l and l.update and not upd.accepted and upd.player_since and os.clock() - upd.player_since > 5 then
         local names = require("mirror.names")
         if not names.asking() then
-            names.ask({ title = "SURROUNSYNC " .. l.update .. " IS OUT",
-                        message = "A new SurrounSync version is ready. ACCEPT opens the updater - it installs the update "
-                            .. "as soon as you close the game. Both players need the same version to play together.",
-                        ok = "ACCEPT", clear = false, cancel = false, cursor = true,
+            local i18n = require("mirror.i18n")
+            names.ask({ title = i18n.t("update_title", l.update), message = i18n.t("update_msg"),
+                        ok = i18n.t("update_ok"), clear = false, cancel = false, cursor = true,
                         done = function() upd.accepted = true; update() end })
         end
     end
@@ -518,6 +534,7 @@ function menu.init(c)
     cfg = c
     require("mirror.hostrules").init(my_role)
     require("mirror.mysettings").init(my_role)
+    require("mirror.modlist").init()
     require("mirror.itemclean").init(my_role)
     require("mirror.names").init()
     journal_tab.configure{
@@ -561,7 +578,30 @@ function menu.init(c)
             clear_allowed = function()
                 if link.bridge_cmd("clearallow") then notify.show("Nobody joins without asking any more.", "info") end
             end,
+            mod_toggle = function(id)
+                local ml = require("mirror.modlist")
+                if not ml.toggle(id) then notify.show("Couldn't switch that mod (is a file in use or read-only?).", "bad"); return end
+                if ml.restart_needed() then mods_restart_note() end
+            end,
+            mod_match = function()
+                local peer = mods_peer()
+                if not peer then return end
+                local n, missing = require("mirror.modlist").match(peer)
+                local msg = n > 0 and string.format("Switched %d mod%s like %s's.", n, n == 1 and "" or "s", peer.who) or ""
+                if #missing > 0 then
+                    msg = msg .. (msg ~= "" and " " or "") .. peer.who .. " also uses " .. table.concat(missing, ", ", 1, math.min(3, #missing))
+                        .. (#missing > 3 and (" +" .. (#missing - 3)) or "") .. " - install " .. (#missing == 1 and "it" or "them") .. " to match."
+                end
+                if msg ~= "" then notify.show(msg, #missing > 0 and "bad" or "good", nil, true) end
+                if require("mirror.modlist").restart_needed() then mods_restart_note() end
+            end,
         },
+        mods = function()
+            local m = require("mirror.modlist").model(mods_peer())
+            m.in_coop = my_role() ~= nil
+            m.host_side = my_role() == "guest"
+            return m
+        end,
         backups = page,
         can_restore = function() return p1().can_switch() and not require("mirror.slotguard").log_exists() end,
     }

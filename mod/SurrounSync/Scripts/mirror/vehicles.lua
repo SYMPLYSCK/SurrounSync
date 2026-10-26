@@ -122,6 +122,8 @@ local function peer_name(car)
     local n = name_of(car)
     return n and (rev[n] or n) or nil
 end
+-- the host's name of a car (the same on both games for cars from the save; loot ids car trunks by it)
+vehicles.peer_name_of = peer_name
 
 local function transform(a)
     local l, r
@@ -132,10 +134,26 @@ local function fmt(l, r) return string.format("%.1f %.1f %.1f %.2f %.2f %.2f", l
 local function place(car, l, r) pcall(function() car:K2_TeleportTo(l, r) end) end
 local function place_hard(car, l, r) pcall(function() car:K2_SetActorLocationAndRotation(l, r, false, {}, true) end) end
 -- Never switch a car's physics off: once switched back on, the vehicle can't be driven.
+-- (a module table: this file is near Lua's local-variable limit)
+local idle_brake = {}      -- car address -> its IdleBrakeInput before following
 local function follow_mode(car, on)
     pcall(function() car.VehicleMovementComponent:SetHandbrakeInput(not on) end)
     pcall(function() car.VehicleMovementComponent:SetBrakeInput(0) end)
     pcall(function() car.VehicleMovementComponent:SetThrottleInput(0) end)
+    pcall(function() car.VehicleMovementComponent:SetSteeringInput(0) end)
+    -- a car with no driver brakes its wheels when idle: they slid along instead of turning for the other
+    -- players; while it follows a driver, they roll
+    local a = util.addr(car) or 0
+    pcall(function()
+        local m = car.VehicleMovementComponent
+        if on then
+            if idle_brake[a] == nil then idle_brake[a] = m.IdleBrakeInput end
+            m.IdleBrakeInput = 0.0
+        elseif idle_brake[a] ~= nil then
+            m.IdleBrakeInput = idle_brake[a]
+            idle_brake[a] = nil
+        end
+    end)
     if not on then
         pcall(function() car.Mesh:SetPhysicsLinearVelocity({ X = 0, Y = 0, Z = 0 }, false, FName("None")) end)
         pcall(function() car.Mesh:SetPhysicsAngularVelocityInDegrees({ X = 0, Y = 0, Z = 0 }, false, FName("None")) end)
@@ -495,6 +513,15 @@ function vehicles.drive_line()
     pcall(function() lit = driving["LightsOn?"] == true end)
     local line = string.format("D %s %.0f %.0f %.0f %.1f %.1f %.1f %.0f %.0f %.0f %d %d %.3f", n, l.X, l.Y, l.Z, r.Pitch, r.Yaw, r.Roll,
         v.X, v.Y, v.Z, eng and 1 or 0, lit and 1 or 0, now)
+    -- the driver's steering / throttle / brake: the other games turn and spin the wheels with them
+    local st, th, br
+    pcall(function()
+        local m = driving.VehicleMovementComponent
+        st, th, br = m.RawSteeringInput, m.RawThrottleInput, m.RawBrakeInput
+    end)
+    if type(st) == "number" and type(th) == "number" then
+        line = line .. string.format(" I %.2f %.2f %.2f", st, th, type(br) == "number" and br or 0)
+    end
     local towed
     pcall(function()
         if driving["TowingVehicle?"] == true then towed = driving.PhysicsConstraintComp:GetOwner() end
@@ -704,6 +731,8 @@ local function apply_drive(body)
     local ts = nums[12] or now
     local q = peer.samples or {}
     peer.samples = q
+    local ist, ith, ibr = rest:match(" I (%S+) (%S+) (%S+)")
+    peer.input = ist and { st = tonumber(ist) or 0, th = tonumber(ith) or 0, br = tonumber(ibr) or 0 } or nil
     local tn, tx, ty, tz, tp, tyw, tro = rest:match(" T (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+)")
     local tow
     if tn then
@@ -824,6 +853,17 @@ local function follow(dt)
         pcall(function() car.VehicleMovementComponent:SetBrakeInput(0) end)
         pcall(function() car.VehicleMovementComponent:SetSteeringInput(0) end)
         pcall(function() car.VehicleMovementComponent:SetHandbrakeInput(false) end)
+    end
+    -- the driver's inputs: front wheels steer, wheels spin (the position is still set below each frame)
+    local inp = peer.input
+    if inp and not riding then
+        pcall(function()
+            local m = car.VehicleMovementComponent
+            m:SetSteeringInput(inp.st)
+            m:SetThrottleInput(inp.th)
+            m:SetBrakeInput(inp.br)
+            m:SetHandbrakeInput(false)
+        end)
     end
     local ok, moved = pcall(function() return car:K2_TeleportTo(l, r) end)
     if not (ok and moved ~= false) then

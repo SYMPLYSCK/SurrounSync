@@ -59,6 +59,8 @@ local APPLY = {
     latency_ms = function(cfg, v) cfg.netsim.latency_ms = tonumber(v); return cfg.netsim.latency_ms ~= nil end,
     jitter_ms = function(cfg, v) cfg.netsim.jitter_ms = tonumber(v); return cfg.netsim.jitter_ms ~= nil end,
     loss = function(cfg, v) cfg.netsim.loss = tonumber(v); return cfg.netsim.loss ~= nil end,
+    -- help messages: en, ru, de, es, fr, pt or auto (the Windows display language)
+    language = function(cfg, v) return require("mirror.i18n").set(v) end,
 }
 
 function settings.apply(cfg)
@@ -72,7 +74,7 @@ function settings.apply(cfg)
             local fn = k and APPLY[k:lower()]
             v = v and v:gsub('^"(.*)"$', "%1")
             if not fn then
-                log.warn(FILE .. ": unknown line '" .. line .. "' (keys: transport, peer, netsim, saved, linkdir, testnet, devtest, loglevel, latency_ms, jitter_ms, loss)")
+                log.warn(FILE .. ": unknown line '" .. line .. "' (keys: transport, peer, netsim, saved, linkdir, testnet, devtest, loglevel, latency_ms, jitter_ms, loss, language)")
             elseif not fn(cfg, v) then
                 log.warn(FILE .. ": bad value in '" .. line .. "' - ignored")
             else

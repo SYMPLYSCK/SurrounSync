@@ -14,6 +14,7 @@ local events = require("mirror.events")
 local ghost = require("mirror.ghost")
 local invdiag = require("mirror.invdiag")
 local notify = require("mirror.notify")
+local i18n = require("mirror.i18n")
 local jig = require("mirror.jig")
 local beds = require("mirror.beds")
 
@@ -82,7 +83,7 @@ end
 local inv_fix = nil
 local home_check = nil
 
-local function base() return (os.getenv("LOCALAPPDATA") or ".") .. "\\SurrounDead" end
+local function base() return require("mirror.localdir").get() end
 local function saves_dir()
     local d = cfg.phase2.saved_override or ((link.kind() == "steam") and "Saved" or cfg.phase2.saved_dir[role])
     return base() .. "\\" .. d .. "\\SaveGames"
@@ -359,14 +360,68 @@ restore_now = function(slot, folder)
     else say_later("Couldn't restore " .. slot .. " yet. Your save is unchanged, and the restore will be retried next time you start the game.", "bad") end
 end
 
+-- A session that can't be finished must not block co-op for good (every join and restore waits for an open
+-- session): the co-op character goes to Backups (restorable from J, CO-OP tab, BACKUPS), then the session log is
+-- archived. The own save is as it was before the join. Only if that backup fails is the session kept (quarantine).
+local function close_unfinishable(t, why)
+    local own = t and t.own
+    -- the session's co-op save; unknown (garbage log) -> every co-op save that holds a character
+    local coops = {}
+    if t and t.coop and slotguard.is_coop(t.coop) then coops[1] = t.coop
+    else
+        local names = { cfg.phase2.coop_slot }
+        for i = 1, cfg.phase2.coop_slots or 1 do names[#names + 1] = coop_name(i) end
+        local lb = cfg.phase2.legacy_coop_slot
+        if lb then names[#names + 1] = lb; for i = 1, cfg.phase2.coop_slots or 1 do names[#names + 1] = lb .. "_" .. i end end
+        for _, n in ipairs(names) do if slotguard.is_coop(n) then coops[#coops + 1] = n end end
+    end
+    local kept
+    for _, coop in ipairs(coops) do
+        if slotguard.has_character(coop) then
+            local key = (own and slotguard.is_own(own)) and own or coop
+            local f, e = backups.take{ slot = key, from = coop, kind = "character", reason = "co-op character rescued" }
+            if not f then
+                log.error("session: can't close the unfinished session (" .. why .. ") - no backup of " .. coop .. "'s character (" .. tostring(e) .. ")")
+                return false
+            end
+            kept = (kept and (kept .. ", ") or "") .. key .. "\\" .. f
+        end
+    end
+    if not slotguard.log_archive() then
+        log.error("session: can't archive the unfinished session's log (" .. why .. ")")
+        return false
+    end
+    log.warn("session: closed an unfinished co-op session (" .. why .. ")"
+        .. (kept and (" - the co-op character is kept in backup " .. kept) or " - no co-op character to keep"))
+    say_later(i18n.t(kept and "session_rescued" or "session_closed"), "bad")
+    return true
+end
+
+local recovered_own = nil
 function session.startup_restore()
     configure_store()
+    if slotguard.log_quarantined() and not slotguard.log_live() then
+        -- (a quarantine from an older version blocked joins for good)
+        if not close_unfinishable(slotguard.log_peek(), "kept from an earlier run") then
+            say_later(i18n.t("backup_failed"), "bad")
+        end
+    end
     local t, bad = slotguard.log_read()
+    -- (first put back files a crash left half-swapped: an own save caught mid copy looks like no save at all)
+    if t then repair_slot(t.own); repair_slot(t.coop) end
     if bad then
-        slotguard.log_quarantine()
-        say_later("Found a damaged co-op session file and left your saves untouched. Please report this with your SurrounSync log.", "bad")
+        if not close_unfinishable(slotguard.log_peek(), "damaged session file") then
+            slotguard.log_quarantine()
+            say_later("Found a damaged co-op session file and left your saves untouched. Please report this with your SurrounSync log.", "bad")
+        end
+    elseif t and (t.step == "joined" or t.step == "leaving") and not (slotguard.is_own(t.own) and slotguard.has_character(t.coop)) then
+        -- (the own save was renamed/deleted, or the co-op save has no character: retrying can never work)
+        if not close_unfinishable(t, not slotguard.is_own(t.own) and (tostring(t.own) .. " is no longer one of your saves")
+                or (tostring(t.coop) .. " has no character")) then
+            slotguard.log_quarantine()
+        end
     elseif t then
-        repair_slot(t.own); repair_slot(t.coop)
+        recovered_own = t.own
         if t.step == "building" then
             log.info("session: the last join stopped while building the co-op save - your save was never touched")
             slotguard.purge(t.coop)
@@ -388,9 +443,11 @@ function session.startup_restore()
             else
                 t.tries = tostring((tonumber(t.tries) or 0) + 1)
                 if tonumber(t.tries) >= 5 then
-                    slotguard.log_quarantine()
-                    say_later("Couldn't bring your co-op character home after 5 tries. Your saves are untouched and backed up. "
-                        .. "Please report this with your SurrounSync log.", "bad")
+                    if not close_unfinishable(t, "the character couldn't be copied home 5 times (" .. tostring(err) .. ")") then
+                        slotguard.log_quarantine()
+                        say_later("Couldn't bring your co-op character home after 5 tries. Your saves are untouched and backed up. "
+                            .. "Please report this with your SurrounSync log.", "bad")
+                    end
                 else
                     slotguard.log_write(t)
                     log.error("session: couldn't copy your co-op character home (" .. tostring(err) .. ") - will try again next start")
@@ -423,8 +480,10 @@ local function host_export(job)
         return false
     end
     log.info("session: host slot " .. slot .. " (" .. how .. ")")
-    if not backups.take{ slot = slot, reason = "a guest is joining" } then
-        notify.show("Couldn't back up your save, so " .. link.peer_name() .. " can't join right now. Check that your disk has free space.", "bad")
+    local backed, why = backups.take{ slot = slot, reason = "a guest is joining" }
+    if not backed then
+        log.error("session: no backup of " .. slot .. " - " .. link.peer_name() .. " can't join (" .. tostring(why) .. ")")
+        notify.show(i18n.t(session.backup_problem(why)), "bad")
         link.put_blob("world", "fail " .. job.nonce)
         return false
     end
@@ -491,7 +550,13 @@ local function build_coop_slot(own, files)
         slotguard.log_clear()
         return false
     end
-    slotguard.log_write(session_log("joined"))
+    -- (unrecorded, a crash in the co-op world would count as "still building" and drop the session's progress)
+    if not slotguard.log_write(session_log("joined")) then
+        log.error("session: could not record the session in the session log - not joining")
+        slotguard.purge(coop)
+        slotguard.log_clear()
+        return false
+    end
     log.info(string.format("session: built %s from the host's world + own %s character", coop, own))
     return true
 end
@@ -554,6 +619,68 @@ local restore_name = nil
 local cleared_world, discard_pending = false, false
 local function point_at(slot)
     return pcall(function() lib():SetCurrentSaveGameName(game.world(), slot) end)
+end
+
+-- A co-op save is only a place to be during a session. Outside one (a crash left the game's Continue
+-- pointing at it, or a leftover the purge must leave alone) the player gets their own save back.
+local stray_wait = nil
+local function own_newest()
+    local best, best_t
+    for _, n in ipairs(slot_names()) do
+        if slotguard.is_own(n) then
+            local t = slot_ticks(n) or 0
+            if not best or t > best_t then best, best_t = n, t end
+        end
+    end
+    return best
+end
+-- Only at the main menu or before any world: re-pointing the current save under a loaded world would send
+-- that world's next save into the player's own save.
+local function unstick_continue(at_menu)
+    if slotguard.log_exists() or (world_slot and not at_menu) then return end
+    local cur = ems_current_name()
+    if not is_coop(cur) then return end
+    local to = (recovered_own and slotguard.is_own(recovered_own) and recovered_own) or own_newest()
+    if not to then log.warn("session: the game's current save is the co-op save " .. cur .. " and no own save was found"); return end
+    local ok = point_at(to)
+    log.info(string.format("session: the game's current save was the co-op save %s outside a session - pointed it at %s (%s)",
+        cur, to, tostring(ok)))
+end
+-- The game's save system may not exist yet when the mod starts: the main menu's load is the second chance,
+-- still before the player can press Continue.
+local menu_hooked = false
+local function hook_main_menu()
+    if menu_hooked or not RegisterLoadMapPostHook then return end
+    menu_hooked = true
+    RegisterLoadMapPostHook(function(_, w)
+        local n
+        pcall(function() n = w:get():GetFullName() end)
+        if type(n) == "string" and n:find("MainMenu", 1, true) then util.safe(unstick_continue, "session.unstick_continue", true) end
+    end)
+end
+-- which help message a failed backup gets (the real cause, not always "disk space")
+function session.backup_problem(why)
+    why = tostring(why or ""):lower()
+    if require("mirror.localdir").broken() then return "path_broken" end
+    if why:find("no space", 1, true) or why:find("disk full", 1, true) then return "disk_full" end
+    if why:find("denied", 1, true) or why:find("permission", 1, true) or why:find("read-only", 1, true) then return "files_blocked" end
+    return "backup_failed"
+end
+
+function session.stray_coop()
+    return state == "idle" and is_coop(world_slot or ems_current_name()) and not slotguard.log_exists()
+end
+function session.offer_own_save()
+    local own = own_newest()
+    if not own then
+        notify.show(i18n.t("stray_none"), "bad")
+        return
+    end
+    local names = require("mirror.names")
+    if names.asking() then return end
+    log.info("session: leftover co-op save " .. tostring(world_slot) .. " - offering the own save " .. own)
+    names.ask({ title = i18n.t("stray_title"), message = i18n.t("stray_msg", own), ok = i18n.t("stray_ok"), cursor = true,
+                done = function() if session.stray_coop() then load_slot(own) end end })
 end
 -- Runs before every save. A save writes the world in memory into whatever slot EMS points at,
 -- so make sure that's the slot this world belongs to (the Save menu and the 'autosave to a
@@ -660,6 +787,7 @@ local function on_world_ready()
     level_loading, cleared_world = false, false
     world_slot = ems_current_name()
     log.info("session: this world is save " .. tostring(world_slot))
+    if session.stray_coop() then stray_wait = 3.0 end
     if role == "host" and hosted_slot and world_slot and world_slot ~= "" and world_slot ~= hosted_slot then
         log.warn("session: host loaded save " .. world_slot .. " while hosting " .. hosted_slot .. " - ending the session")
         hosted_slot = nil
@@ -826,9 +954,15 @@ local function guest_tick(dt)
     if want_toggle and not hold_leave then
         want_toggle = false
         if state == "idle" and not peer_connected() then
-            notify.show("No host is connected yet. Your friend needs to be in-game with SurrounSync and choose Host.", "bad")
+            notify.show(i18n.t("no_host"), "bad")
         elseif state == "idle" and slotguard.log_exists() then
-            notify.show("Your last co-op session hasn't finished yet. Restart the game to complete it, then join.", "bad")
+            notify.show(i18n.t("session_unfinished"), "bad")
+        elseif state == "idle" and require("mirror.localdir").broken() then
+            log.error("session: join refused - the save folder can't be reached from Lua (user name; Setup FIX makes the safe path)")
+            notify.show(i18n.t("path_broken"), "bad")
+        elseif state == "idle" and is_coop(ems_current_name()) then
+            log.warn("session: join refused before saving - this world is the co-op save " .. ems_current_name())
+            session.offer_own_save()
         elseif state == "idle" then
             notify.show("Joining " .. link.peer_name() .. "'s world...", "info")
             log.info("session: joining - saving my own world first")
@@ -869,23 +1003,24 @@ local function guest_tick(dt)
             if unchanged and wait < 8.0 then
             elseif unchanged then
                 log.error("session: your game did NOT save (saving may be blocked here) - not joining, so your save can't get mixed up")
-                notify.show("Your game couldn't be saved here, so you can't join yet. Move to a spot where saving works and try again.", "bad")
+                notify.show(i18n.t("cant_save_here"), "bad")
                 own_slot, state = nil, "idle"
             elseif is_coop(own_slot) then
                 log.error("session: you're playing the co-op slot itself (" .. own_slot .. ") - load one of your own saves, then join")
-                notify.show("Load one of your own saves first, then join.", "bad")
+                notify.show(i18n.t("load_own_first"), "bad")
                 own_slot, state = nil, "idle"
             elseif not slotguard.is_own(own_slot) then
                 log.error(string.format("session: can't tell which slot I'm on (%d slots visible); not joining", #slot_names()))
-                notify.show("Couldn't identify your current save, so you can't join. Please report this with your SurrounSync log.", "bad")
+                notify.show(i18n.t("cant_identify"), "bad")
                 state = "idle"
             else
                 log.info("session: my slot is " .. own_slot .. " (" .. how .. ")")
-                local backed = backups.take{ slot = own_slot, reason = "before joining" }
+                local backed, why = backups.take{ slot = own_slot, reason = "before joining" }
                 own_stamp = slotguard.stamp(own_slot)
                 if not backed or not own_stamp then
-                    log.error("session: no backup / fingerprint of " .. own_slot .. " - not joining")
-                    notify.show("Couldn't back up your save, so you can't join. Check that your disk has free space.", "bad")
+                    log.error("session: no backup / fingerprint of " .. own_slot .. " - not joining ("
+                        .. tostring(why or (own_stamp and "?" or "no fingerprint")) .. ")")
+                    notify.show(i18n.t(session.backup_problem(why)), "bad")
                     own_slot, state = nil, "idle"
                     return
                 end
@@ -949,7 +1084,8 @@ local function guest_tick(dt)
                     state = "joined"
                 else
                     log.error("session: could not build the co-op slot; staying in own world")
-                    notify.show("Couldn't prepare the co-op save, so you stayed in your own world. Reinstalling SurrounSync may help.", "bad")
+                    notify.show(require("mirror.localdir").broken() and i18n.t("path_broken")
+                        or "Couldn't prepare the co-op save, so you stayed in your own world. Your save is unchanged. Run SurrounSync Setup and click FIX, then try again.", "bad")
                     state = "idle"
                 end
             end
@@ -1162,6 +1298,13 @@ local function install_firewall()
             util.ensure_hook("/Game/Blueprints/SD_GameInstance.SD_GameInstance_C:Event_LoadLevel", on_load, nil, true)
         end
         util.safe(firewall_tick, "session.firewall_tick")
+        if stray_wait then
+            stray_wait = stray_wait - (dt or 0)
+            if stray_wait <= 0 then
+                stray_wait = nil
+                if session.stray_coop() then util.safe(session.offer_own_save, "session.offer_own_save") end
+            end
+        end
     end)
     if game.player() then on_world_ready() end
 end
@@ -1172,6 +1315,8 @@ function session.preinit(c)
     install_firewall()
     session.startup_restore()
     purge_all_coop_slots()
+    util.safe(unstick_continue, "session.unstick_continue")
+    hook_main_menu()
     game.player_hook("ActorLoaded", function(self) util.safe(on_actor_loaded, "session.actor_loaded", self) end)
     game.on_tick(function(dt)
         if not started then util.safe(function() flush_notes(); guest_tick(dt) end, "session.recover") end
@@ -1189,6 +1334,8 @@ function session.init(c, r, connected)
         if not preinit_done then
             session.startup_restore()
             purge_all_coop_slots()
+            util.safe(unstick_continue, "session.unstick_continue")
+            hook_main_menu()
             game.player_hook("ActorLoaded", function(self) util.safe(on_actor_loaded, "session.actor_loaded", self) end)
         end
         game.keybind("F10", { ModifierKey.CONTROL }, function()
@@ -1211,7 +1358,8 @@ function session.guest_in_world() return role == "host" and guest_in() end
 function session.on_any_save() cp_due, cp_last = nil, cp_clock end
 function session.checkpoint(reason)
     if not (cfg and cfg.save and cfg.save.checkpoints ~= false) then return end
-    if role == "host" and not guest_in() then return end
+    -- (the last guest just left: no guest in the world any more, but what they took must be saved)
+    if role == "host" and not guest_in() and reason ~= "guest left" then return end
     local delay = cfg.save.checkpoint_delay or 10.0
     cp_first = cp_due and cp_first or cp_clock
     cp_due = math.min(cp_clock + delay, cp_first + delay + 30.0)

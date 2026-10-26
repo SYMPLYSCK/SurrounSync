@@ -255,6 +255,12 @@ namespace SurrounSyncSetup
                 Progress(70);
 
                 Unblock(target); Unblock(ue); Unblock(Path.Combine(w64, "dwmapi.dll"));
+                {
+                    string how, alias = LocalAlias.Ensure(w64, out how);
+                    if (how != "plain")
+                        Log(alias != null ? "Your Windows user name has letters the mod can't use in file paths - it reaches your saves through " + alias + " (" + how + ")."
+                                          : "WARNING: your Windows user name has letters the mod can't use in file paths, and no safe path could be made (" + how + "). Send a bug report.");
+                }
 
                 string set = Path.Combine(w64, "mirror_settings.txt");
                 if (!File.Exists(set) || Regex.IsMatch(File.ReadAllText(set), "^\\s*transport\\s*=\\s*file", RegexOptions.Multiline) &&
@@ -371,6 +377,63 @@ namespace SurrounSyncSetup
             Log("Your saves (and their backups in " + bk + ") were kept.");
             Log("SurrounSync is uninstalled.");
             return true;
+        }
+
+        // SurrounSync's own UE4SS files again (when the record says this setup installed them and some are gone).
+        public bool ReinstallUe4ss(string game)
+        {
+            using (var z = Payload())
+            {
+                if (z == null) { Log("This setup has no UE4SS inside it (a broken download?)."); return false; }
+                Extract(z, "game/", Game.Win64(game), e => !N(e).StartsWith(ModPath));
+            }
+            Log("Put SurrounSync's UE4SS files back.");
+            return true;
+        }
+
+        // Another mod's UE4SS that can't attach to this game: keep it as ue4ss-old-<time>, unpack ours, copy the
+        // other mods (and their on/off lists) over. REPAIR afterwards puts SurrounSync in.
+        public bool SwapUe4ss(string game)
+        {
+            string w64 = Game.Win64(game), ue = Path.Combine(w64, "ue4ss");
+            string old = Path.Combine(w64, "ue4ss-old-" + DateTime.Now.ToString("yyyyMMdd-HHmmss"));
+            using (var z = Payload())
+            {
+                if (z == null) { Log("This setup has no UE4SS inside it (a broken download?)."); return false; }
+                MoveDir(ue, old);
+                string oldDwm = Path.Combine(w64, "dwmapi.dll");
+                if (File.Exists(oldDwm)) File.Copy(oldDwm, Path.Combine(old, "dwmapi.dll"), true);
+                try { Extract(z, "game/", w64, e => !N(e).StartsWith(ModPath)); }
+                catch
+                {
+                    if (Directory.Exists(ue)) DeleteDir(ue);
+                    MoveDir(old, ue);
+                    throw;
+                }
+            }
+            string om = Path.Combine(old, "Mods"), nm = Path.Combine(ue, "Mods");
+            Directory.CreateDirectory(nm);
+            if (Directory.Exists(om))
+            {
+                foreach (var d in Directory.GetDirectories(om))
+                {
+                    string n = Path.GetFileName(d);
+                    if (n == "SurrounSync" || n.StartsWith("SurrounSync.") || Directory.Exists(Path.Combine(nm, n))) continue;
+                    CopyDir(d, Path.Combine(nm, n));
+                }
+                foreach (var n in new[] { "mods.txt", "mods.json" })
+                    if (File.Exists(Path.Combine(om, n))) File.Copy(Path.Combine(om, n), Path.Combine(nm, n), true);
+            }
+            var rec = ReadRecord(); rec["ue4ss"] = "ours"; WriteRecord(rec);
+            Log("Swapped in SurrounSync's UE4SS. The old one is kept in " + old + " (your other mods were copied over).");
+            return true;
+        }
+
+        public static void CopyDir(string from, string to)
+        {
+            Directory.CreateDirectory(to);
+            foreach (var f in Directory.GetFiles(from)) File.Copy(f, Path.Combine(to, Path.GetFileName(f)), true);
+            foreach (var d in Directory.GetDirectories(from)) CopyDir(d, Path.Combine(to, Path.GetFileName(d)));
         }
 
         static List<string> OtherMods(string mods)
@@ -586,82 +649,240 @@ namespace SurrounSyncSetup
     {
         public string Kind;
         public string What, Fix;
+        public string Auto;                    // what FIX does about it, shown while it runs
+        public Func<Action<string>, bool> Do;  // the automatic fix (null: REPAIR or the player); true = fixed, false = started/half
+        public bool Repair;                    // REPAIR (Installer.Install) fixes it
         public Finding(string k, string w, string f) { Kind = k; What = w; Fix = f; }
+        public bool Fixable { get { return Do != null || Repair; } }
     }
 
     static class Doctor
     {
         public static readonly string[] Conflicts = { "SurrounDeadMP", "SurrounDeadMPInput", "SplitScreenMod" };
+        // %LOCALAPPDATA%\SurrounDead (a field so the setup test can point it at a fake folder)
+        public static string LocalDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SurrounDead");
+        static readonly Regex CoopSlot = new Regex("^(SurrounSync|MirrorCoop)_Session(_\\d+)?$", RegexOptions.IgnoreCase);
+        public static bool IsCoopSlot(string n) { return !string.IsNullOrEmpty(n) && CoopSlot.IsMatch(n); }
+        const string CoopMarker = "SurrounSync-coop.txt";
+        static string Stamp() { return DateTime.Now.ToString("yyyyMMdd-HHmmss"); }
+
+        static string ReadShared(string path)
+        {
+            try
+            {
+                using (var s = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (var r = new StreamReader(s)) return r.ReadToEnd();
+            }
+            catch { return ""; }
+        }
+
+        // ---- Steam's appmanifest_1645820.acf ----
+        static string Manifest(string game)
+        {
+            try { return ReadShared(Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(game)), "appmanifest_" + Game.AppId + ".acf")); }
+            catch { return ""; }
+        }
+        static string Acf(string acf, string key)
+        {
+            var m = Regex.Match(acf, "\"" + key + "\"\\s+\"([^\"]*)\"");
+            return m.Success ? m.Groups[1].Value : null;
+        }
+        // what Steam's Betas list shows for a branch key
+        public static string BranchName(string key)
+        {
+            if (key == null) return "None";
+            return key == "experimental" ? "Experimental 0.8" : key;
+        }
+        public static string BetaOf(string game) { string b = Acf(Manifest(game), "BetaKey"); return string.IsNullOrEmpty(b) || b == "public" ? null : b; }
+
+        // ---- UE4SS ----
+        static string Ue4ssLog(string ue) { return ReadShared(Path.Combine(ue, "UE4SS.log")); }
+        static string Ue4ssVersion(string log)
+        {
+            var m = Regex.Match(log, "UE4SS - v([0-9][^ \\r\\n]*)");
+            return m.Success ? m.Groups[1].Value : null;
+        }
+        static bool OursUe4ss(string ue)
+        {
+            long ours = Installer.PayloadLength("game/ue4ss/UE4SS.dll"), theirs = -1;
+            try { theirs = new FileInfo(Path.Combine(ue, "UE4SS.dll")).Length; } catch { }
+            return ours <= 0 || theirs <= 0 || ours == theirs;
+        }
+
+        // One line for the window: game build / beta / engine and the UE4SS that is in the game.
+        public static string Versions(string game)
+        {
+            if (!Game.IsGame(game)) return "";
+            string w64 = Game.Win64(game), ue = Path.Combine(w64, "ue4ss");
+            string build = Game.BuildId(game), beta = BetaOf(game), eng = Game.EngineOf(w64);
+            string s = "Game build " + build + (beta != null ? " (Steam beta \"" + beta + "\")" : "") + (eng != null && eng != "0.0.0" ? " · Unreal " + eng : "");
+            string want = Installer.PayloadText("made_for_build.txt");
+            if (!string.IsNullOrEmpty(want) && want != build) s += " · made for " + want;
+            if (!File.Exists(Path.Combine(ue, "UE4SS.dll")))
+                s += File.Exists(Path.Combine(w64, "UE4SS.dll")) ? "   ·   UE4SS 2 (too old)" : "   ·   UE4SS not installed";
+            else
+            {
+                string v = Ue4ssVersion(Ue4ssLog(ue));
+                s += "   ·   UE4SS " + (v ?? "3") + (OursUe4ss(ue) ? " (SurrounSync's)" : " (another mod's copy)");
+            }
+            return s;
+        }
+
+        static string Installed()
+        {
+            string v;
+            return Installer.ReadRecord().TryGetValue("installed", out v) ? v : null;
+        }
 
         public static List<Finding> Check(string game)
         {
             var f = new List<Finding>();
-            Action<string, string, string> add = (k, w, x) => f.Add(new Finding(k, w, x));
+            Func<string, string, string, Finding> add = (k, w, x) => { var n = new Finding(k, w, x); f.Add(n); return n; };
             if (!Game.IsGame(game))
             {
-                add("problem", "SurrounDead wasn't found in that folder.",
+                var nf = add("problem", "SurrounDead wasn't found in that folder.",
                     "Click Browse and pick the SurrounDead folder (the one with SurrounDead.exe in it). In Steam: right-click " +
                     "SurrounDead -> Manage -> Browse local files shows where it is.");
+                if (Game.Find() != null) nf.Auto = "Find the game in your Steam libraries";   // done by the window / FixAll
                 return f;
             }
             string w64 = Game.Win64(game), ue = Path.Combine(w64, "ue4ss"), mods = Path.Combine(ue, "Mods");
             string modDir = Path.Combine(mods, "SurrounSync");
-            string local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SurrounDead");
+            string local = LocalDir;
             string saves = Path.Combine(local, "Saved", "SaveGames");
+            bool running = Game.Running(game);
+            Func<Action<string>, bool> verify = log =>
+            {
+                Process.Start("steam://validate/" + Game.AppId);
+                log("Steam now checks SurrounDead's files and downloads what is missing or old (watch Steam's Downloads page).");
+                log("When Steam is done, click Check again.");
+                return false;
+            };
 
+            // ---- the game itself ----
+            string acf = Manifest(game), beta = BetaOf(game);
+            // the Steam branch this SurrounSync was built on (made_for_beta.txt, "" = the normal one; older setups: experimental)
+            string wantBeta = Installer.PayloadText("made_for_beta.txt") ?? "experimental";
+            if (wantBeta == "" || wantBeta == "public") wantBeta = null;
+            string betaNote = beta != null ? " You are on the Steam beta \"" + beta + "\"." : " You are on the normal (non-beta) branch.";
+            string betaFix = "In Steam: right-click SurrounDead -> Properties -> Betas -> pick \"" + BranchName(wantBeta) + "\". ";
+            if (beta != wantBeta)
+                add("problem", "Your SurrounDead is on the wrong Steam branch:" + betaNote + " SurrounSync is made for \"" + BranchName(wantBeta) +
+                    "\". The CO-OP tab may not show up, and players on different branches can't play together.",
+                    betaFix + "Steam then downloads that version. Click Check again when it's done.");
             string want = Installer.PayloadText("made_for_build.txt"), have = Game.BuildId(game);
             long a, b;
             if (!string.IsNullOrEmpty(want) && long.TryParse(want, out a) && long.TryParse(have, out b) && a != b)
             {
                 if (b < a)
-                    add("problem", "Your SurrounDead is an OLDER version (build " + have + ") than this SurrounSync was made for (build " + want + "). " +
-                        "The CO-OP tab may not show up, and the game can crash when joining.",
-                        "Update the game: in Steam, right-click SurrounDead -> Properties -> Betas -> pick \"None\", then Properties -> " +
-                        "Installed Files -> Verify integrity of game files. Then run this setup again (REPAIR).");
+                {
+                    var x = add("problem", "Your SurrounDead is an OLDER version (build " + have + ") than this SurrounSync was made for (build " + want + ")." + betaNote +
+                        " The CO-OP tab may not show up, and the game can crash when joining.",
+                        (beta != wantBeta ? betaFix : "") + "FIX makes Steam check and update the game files. Then click Check again.");
+                    x.Auto = "Ask Steam to update and verify SurrounDead"; x.Do = verify;
+                }
                 else
                     add("warning", "Your SurrounDead is NEWER (build " + have + ") than this SurrounSync was made for (build " + want + "). " +
                         "It usually works, but a game update can break parts of the mod.",
                         "If something doesn't work, check for a SurrounSync update (this window shows the newest release) and send a bug report.");
             }
             if (!Game.EngineOk(w64))
-                add("problem", "Your SurrounDead program is an old version (Unreal " + Game.EngineOf(w64) + ") - SurrounSync needs the current game (Unreal " +
-                    Game.Engine + "). Mods won't start, and pak mods made for the current game crash it while loading.",
-                    "In Steam: right-click SurrounDead -> Properties -> Betas -> pick \"None\", then Installed Files -> Verify integrity of game files. " +
-                    "Then run this setup again (REPAIR).");
-            if (Game.Running(game)) add("info", "SurrounDead is running.", "Close the game before you install, repair or uninstall.");
+            {
+                var x = add("problem", "Your SurrounDead program is an old version (Unreal " + Game.EngineOf(w64) + ") - SurrounSync needs the current game (Unreal " +
+                    Game.Engine + ")." + betaNote + " Mods won't start, and pak mods made for the current game crash it while loading.",
+                    (beta != wantBeta ? betaFix : "") + "FIX makes Steam check and update the game files. Then click Check again.");
+                x.Auto = "Ask Steam to update and verify SurrounDead"; x.Do = verify;
+            }
+            int flags;
+            string target = Acf(acf, "TargetBuildID"), buildid = Acf(acf, "buildid");
+            if (int.TryParse(Acf(acf, "StateFlags") ?? "", out flags) && (flags & (2 | 32 | 128 | 256 | 512 | 1024)) != 0 ||
+                !string.IsNullOrEmpty(target) && target != "0" && buildid != null && target != buildid)
+            {
+                var x = add("problem", "Steam hasn't finished updating SurrounDead (or found damaged game files).",
+                    "Let Steam finish the update (Steam -> Downloads). FIX asks Steam to verify the game files.");
+                x.Auto = "Ask Steam to finish and verify SurrounDead"; x.Do = verify;
+            }
+            string paks = Path.Combine(game, "SurrounDead", "Content", "Paks");
+            if (!File.Exists(Path.Combine(paks, "SurrounDead-Windows.pak")))
+            {
+                var x = add("problem", "The game's main data file (SurrounDead-Windows.pak) is missing.", "FIX asks Steam to verify the game files.");
+                x.Auto = "Ask Steam to verify SurrounDead"; x.Do = verify;
+            }
+            if (running) add("info", "SurrounDead is running.", "Close the game before you install, repair or uninstall (FIX waits for it).");
 
-            if (File.Exists(Path.Combine(w64, "UE4SS.dll")))
-                add("problem", "An old UE4SS (version 2) is in the game folder - SurrounSync needs UE4SS 3.",
-                    "In " + w64 + " delete UE4SS.dll, UE4SS-settings.ini, xinput1_3.dll and the old Mods folder next to them, then REPAIR.");
+            // ---- UE4SS ----
             bool hasUe = File.Exists(Path.Combine(ue, "UE4SS.dll"));
-            if (!hasUe) add("problem", "UE4SS (the mod loader) isn't installed.", "Click INSTALL / REPAIR.");
-            else
+            if (File.Exists(Path.Combine(w64, "UE4SS.dll")))
+            {
+                var x = add("problem", "An old UE4SS (version 2) is in the game folder - SurrounSync needs UE4SS 3.",
+                    "FIX moves the old UE4SS files into a backup folder next to the game (nothing is deleted) and installs UE4SS 3.");
+                x.Auto = "Move the old UE4SS 2 out of the way"; x.Repair = true;
+                bool v3 = hasUe;
+                x.Do = log => MoveOldUe4ss(w64, v3, log);
+            }
+            if (!hasUe) add("problem", "UE4SS (the mod loader) isn't installed.", "Click FIX (or INSTALL / REPAIR).").Repair = true;
+            string ulog = hasUe ? Ue4ssLog(ue) : "";
+            bool ours = hasUe && OursUe4ss(ue);
+            string mine; Installer.ReadRecord().TryGetValue("ue4ss", out mine);
+            // what the last game run's UE4SS.log says (only if it was written after this install)
+            DateTime inst, logT = DateTime.MinValue;
+            try { logT = File.GetLastWriteTime(Path.Combine(ue, "UE4SS.log")); } catch { }
+            bool fresh = ulog != "" && !running && (!DateTime.TryParseExact(Installed() ?? "", "yyyy-MM-dd HH:mm", null,
+                System.Globalization.DateTimeStyles.None, out inst) || logT > inst);
+            bool scanFail = fresh && ulog.IndexOf("Scan attempt", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                            ulog.IndexOf("scan successful", StringComparison.OrdinalIgnoreCase) < 0;
+            if (hasUe)
             {
                 if (!File.Exists(Path.Combine(w64, "dwmapi.dll")))
                     add("problem", "UE4SS's starter file (dwmapi.dll) is missing - no mods load at all.",
-                        "Click REPAIR. If it disappears again, your antivirus removed it: restore it from quarantine and allow it.");
-                long ours = Installer.PayloadLength("game/ue4ss/UE4SS.dll");
-                long theirs = -1;
-                try { theirs = new FileInfo(Path.Combine(ue, "UE4SS.dll")).Length; } catch { }
-                if (ours > 0 && theirs > 0 && ours != theirs)
-                    add("warning", "A different UE4SS version is installed (another mod brought it). SurrounSync was tested with its own.",
-                        "If the CO-OP tab is missing or the game crashes at start: rename the folder " + ue + " to ue4ss-old, click REPAIR, " +
-                        "then copy your other mods from ue4ss-old\\Mods back into the new Mods folder.");
+                        "Click FIX. If it disappears again, your antivirus removed it: restore it from quarantine and allow it.").Repair = true;
+                if (ours && mine == "ours" && (!File.Exists(Path.Combine(ue, "UE4SS-settings.ini")) ||
+                    Installer.PayloadHas("game/ue4ss/UE4SS_Signatures/") && !Directory.Exists(Path.Combine(ue, "UE4SS_Signatures"))))
+                {
+                    var x = add("problem", "Some of UE4SS's files are missing.", "FIX puts SurrounSync's UE4SS back.");
+                    x.Auto = "Reinstall UE4SS"; x.Do = log => new Installer { Log = log }.ReinstallUe4ss(game);
+                }
+                if (!ours)
+                {
+                    if (scanFail)
+                    {
+                        var x = add("problem", "UE4SS couldn't attach to the game in the last run - the UE4SS another mod brought doesn't fit this game version.",
+                            "FIX swaps in SurrounSync's UE4SS: the old folder is kept as ue4ss-old-..., your other mods are copied over.");
+                        x.Auto = "Swap in SurrounSync's UE4SS (the old one is kept)"; x.Repair = true;
+                        x.Do = log => new Installer { Log = log }.SwapUe4ss(game);
+                    }
+                    else
+                        add("warning", "A different UE4SS version is installed (another mod brought it). SurrounSync was tested with its own.",
+                            "If the CO-OP tab is missing or the game crashes at start: rename the folder " + ue + " to ue4ss-old, click REPAIR, " +
+                            "then copy your other mods from ue4ss-old\\Mods back into the new Mods folder. (FIX does this by itself once " +
+                            "UE4SS's log shows it failing.)");
+                }
+                else if (scanFail)
+                {
+                    var x = add("problem", "UE4SS couldn't attach to the game in the last run - the game program doesn't match.",
+                        "FIX asks Steam to verify the game files." + (beta != wantBeta ? " " + betaFix : ""));
+                    x.Auto = "Ask Steam to verify SurrounDead"; x.Do = verify;
+                }
             }
 
+            // ---- SurrounSync's files and switches ----
             if (hasUe)
             {
                 if (!File.Exists(Path.Combine(modDir, "Scripts", "main.lua")))
-                    add("problem", "SurrounSync's files aren't in the game.", "Click INSTALL / REPAIR.");
+                    add("problem", "SurrounSync's files aren't in the game.", "Click FIX (or INSTALL / REPAIR).").Repair = true;
+                else if (fresh && !scanFail && ulog.IndexOf("Starting Lua mod 'SurrounSync'", StringComparison.Ordinal) < 0)
+                    add("problem", "SurrounSync didn't start in the last game run.", "Click FIX - it reinstalls and switches it on.").Repair = true;
+                foreach (var left in new[] { Path.Combine(ue, "SurrounSync.new"), Path.Combine(ue, "SurrounSync.old"), Path.Combine(mods, "MirrorCoop") })
+                    if (Directory.Exists(left) && !Installer.IsLink(left))
+                        add("warning", "A half-finished update left " + left + " behind.", "Click FIX (it cleans it up).").Repair = true;
                 string list = Path.Combine(mods, "mods.txt");
-                string txt = "";
-                try { txt = File.ReadAllText(list); } catch { }
+                string txt = ReadShared(list);
                 if (txt != "" && !Regex.IsMatch(txt, "^\\s*SurrounSync\\s*:\\s*1\\s*$", RegexOptions.Multiline))
-                    add("problem", "SurrounSync is switched off in UE4SS's mods.txt.", "Click REPAIR (it switches it on).");
+                    add("problem", "SurrounSync is switched off in UE4SS's mods.txt.", "Click FIX (it switches it on).").Repair = true;
                 foreach (var c in Conflicts)
                     if (Regex.IsMatch(txt, "^\\s*" + c + "\\s*:\\s*1\\s*$", RegexOptions.Multiline))
                         add("problem", c + " is switched on - it's an older multiplayer mod and fights with SurrounSync.",
-                            "Click REPAIR (it switches it off), or open " + list + " in Notepad and change \"" + c + " : 1\" to \"" + c + " : 0\".");
+                            "Click FIX (it switches it off), or open " + list + " in Notepad and change \"" + c + " : 1\" to \"" + c + " : 0\".").Repair = true;
                 // mods that switch themselves on with an enabled.txt (they never show in mods.txt)
                 var self = new List<string>();
                 try
@@ -671,7 +892,15 @@ namespace SurrounSyncSetup
                         string n = Path.GetFileName(d);
                         if (n == "SurrounSync" || n == "shared" || !File.Exists(Path.Combine(d, "enabled.txt"))) continue;
                         if (Regex.IsMatch(txt, "^\\s*" + Regex.Escape(n) + "\\s*:", RegexOptions.Multiline)) continue;
-                        self.Add(n);
+                        if (Array.IndexOf(Conflicts, n) >= 0)
+                        {
+                            string en = Path.Combine(d, "enabled.txt");
+                            var x = add("problem", n + " switches itself on (enabled.txt) - it's an older multiplayer mod and fights with SurrounSync.",
+                                "FIX renames its enabled.txt to enabled.txt.off.");
+                            x.Auto = "Switch off " + n;
+                            x.Do = log => { File.Move(en, en + ".off"); log("Renamed " + en + " to enabled.txt.off."); return true; };
+                        }
+                        else self.Add(n);
                     }
                 }
                 catch { }
@@ -680,18 +909,42 @@ namespace SurrounSyncSetup
                         "If co-op crashes or behaves oddly, try once without them: rename their enabled.txt to enabled.txt.off.");
                 if (Directory.Exists(modDir) && !File.Exists(Path.Combine(modDir, "bridge", "SurrounSyncBridge.exe")))
                     add("problem", "The Steam connector (SurrounSyncBridge.exe) is missing - your antivirus probably removed it.",
-                        "Restore it from your antivirus' quarantine and add an exception for " + Path.Combine(modDir, "bridge") + ", then REPAIR.");
-                string role = "";
-                try { role = File.ReadAllText(Path.Combine(w64, "mirror_role.txt")).Trim(); } catch { }
-                if (role == "off") add("problem", "Co-op is switched off on this PC (mirror_role.txt says off).", "Click REPAIR.");
-                string set = "";
-                try { set = File.ReadAllText(Path.Combine(w64, "mirror_settings.txt")); } catch { }
-                if (Regex.IsMatch(set, "^\\s*transport\\s*=\\s*file", RegexOptions.Multiline))
-                    add("problem", "This PC is set to a one-PC test mode - it can't connect to friends over Steam.", "Click REPAIR (it sets Steam again).");
+                        "FIX puts it back. If it goes missing again, restore it from your antivirus' quarantine and add an exception for " +
+                        Path.Combine(modDir, "bridge") + ".").Repair = true;
+                string role = ReadShared(Path.Combine(w64, "mirror_role.txt")).Trim();
+                if (role == "off") add("problem", "Co-op is switched off on this PC (mirror_role.txt says off).", "Click FIX.").Repair = true;
+                string set = ReadShared(Path.Combine(w64, "mirror_settings.txt"));
+                if (Regex.IsMatch(set, "^\\s*transport\\s*=\\s*file", RegexOptions.Multiline) && !Regex.IsMatch(set, "^\\s*devtest\\s*=\\s*on", RegexOptions.Multiline))
+                    add("problem", "This PC is set to a one-PC test mode - it can't connect to friends over Steam.", "Click FIX (it sets Steam again).").Repair = true;
             }
 
+            // ---- pak mods ----
+            var pakMods = new List<string>();
+            foreach (var sub in new[] { "~mods", "LogicMods" })
+                try { foreach (var p in Directory.GetFiles(Path.Combine(paks, sub), "*.pak", SearchOption.AllDirectories)) pakMods.Add(sub + "\\" + p.Substring(Path.Combine(paks, sub).Length + 1)); }
+                catch { }
+            var tri = Report.Classify(w64);
+            bool pakCrash = false;
+            foreach (var r in tri.Reasons)
+                if (r.StartsWith("Game crashed") && Regex.IsMatch(r, "BulkData|\\.pak|\\.ucas|\\.utoc|IoStore|corrupt|Serial", RegexOptions.IgnoreCase)) pakCrash = true;
+            if (pakMods.Count > 0 && pakCrash && Game.EngineOk(w64))
+            {
+                var x = add("problem", "The last crash came from a game data file - most likely a pak mod made for another game version (" +
+                    string.Join(", ", pakMods.ToArray()) + ").",
+                    "FIX moves the pak mods into a folder next to them (nothing is deleted). Put them back one at a time to find the bad one.");
+                x.Auto = "Move the pak mods out of the game's way";
+                x.Do = log => MovePakMods(paks, log);
+            }
+            else if (pakMods.Count > 0)
+                add("info", "Pak mods installed: " + string.Join(", ", pakMods.ToArray()) + ".",
+                    "If the game crashes while loading after a game update, one of them is usually the cause.");
+
+            // ---- Steam, disk ----
             if (Process.GetProcessesByName("steam").Length == 0)
-                add("warning", "Steam isn't running.", "Start Steam and log in before you start SurrounDead - co-op goes through Steam.");
+            {
+                var x = add("warning", "Steam isn't running.", "Start Steam and log in before you start SurrounDead - co-op goes through Steam. FIX starts it.");
+                x.Auto = "Start Steam"; x.Do = log => { Process.Start("steam://open/main"); log("Started Steam - log in if it asks."); return true; };
+            }
             try
             {
                 var drive = new DriveInfo(Path.GetPathRoot(local));
@@ -701,19 +954,208 @@ namespace SurrounSyncSetup
             }
             catch { }
 
-            if (File.Exists(Path.Combine(saves, "mirror_coop_session.txt")))
+            // ---- saves ----
+            string session = Path.Combine(saves, "mirror_coop_session.txt");
+            bool open = File.Exists(session), bad = File.Exists(session + ".mirror-bad");
+            if (open)
                 add("info", "A co-op session wasn't finished (the game closed while you were in a friend's world).",
                     "Nothing to do: the next time you start the game, your character is brought home automatically.");
-            if (File.Exists(Path.Combine(saves, "mirror_coop_session.txt.mirror-bad")))
+            if (bad)
                 add("problem", "A damaged co-op session file was found, so SurrounSync left your co-op saves alone to be safe.",
                     "Click Bug report so the developer can help - your saves and their backups are untouched.");
+            string cur = EmsCurrent();
+            if (!open && !bad && IsCoopSlot(cur))
+            {
+                string own = NewestOwnSave(saves);
+                var x = add("problem", "The game's Continue opens a co-op session save (" + cur + ") instead of your own world.",
+                    own != null ? "FIX points Continue back at your newest own save (" + own + ")." : "Load your own save from Load Game once.");
+                if (own != null) { x.Auto = "Point Continue at your own save"; x.Do = log => SetEmsCurrent(own, log); }
+            }
+            string backups = Path.Combine(local, "Saved", "SurrounSyncBackups");
+            if (!open && !bad)
+                try
+                {
+                    foreach (var d in Directory.GetDirectories(saves))
+                    {
+                        string n = Path.GetFileName(d);
+                        if (!IsCoopSlot(n) || File.Exists(Path.Combine(d, CoopMarker))) continue;
+                        if (!File.Exists(Path.Combine(d, "Player.sav")) && !File.Exists(Path.Combine(d, "Level.sav")) && !File.Exists(Path.Combine(d, "Slot.sav"))) continue;
+                        bool kept = Directory.Exists(backups) && Directory.GetDirectories(backups, "rescued-" + n + "-*").Length > 0;
+                        var x = add("warning", "The game saved progress into the co-op slot " + n + " (outside a co-op session), so SurrounSync won't empty it.",
+                            (kept ? "A backup copy is in " + backups + ". " : "FIX makes a backup copy in " + backups + ". ") +
+                            "Send a bug report so the developer can help you move it to a normal save.");
+                        if (!kept) { string slot = n; x.Auto = "Back up the co-op slot " + n; x.Do = log => BackupSlot(saves, slot, backups, log); }
+                    }
+                }
+                catch { }
+            if (!LocalAlias.Ascii(local))
+            {
+                string alias = ReadShared(Path.Combine(w64, LocalAlias.FileName)).Trim();
+                if (alias == "" || !Directory.Exists(alias))
+                {
+                    var x = add("problem", "Your Windows user name has letters the mod can't use in file paths, and its safe path to your saves is missing - " +
+                        "saving, backups and joining fail.", "FIX makes the safe path again.");
+                    x.Auto = "Make a safe path to your save folder";
+                    x.Do = log =>
+                    {
+                        string how, made = LocalAlias.Ensure(w64, out how);
+                        log(made != null ? "Saves are reached through " + made + " (" + how + ")." : "Couldn't make one (" + how + ").");
+                        return made != null;
+                    };
+                }
+            }
+            var ro = ReadOnlyFiles(saves);
+            string ems = EmsIni();
+            if (File.Exists(ems) && (File.GetAttributes(ems) & FileAttributes.ReadOnly) != 0) ro.Add(ems);
+            if (ro.Count > 0)
+            {
+                var x = add("problem", ro.Count + " save file(s) are read-only - the game can't save over them (first: " + ro[0] + ").", "FIX makes them writable again.");
+                x.Auto = "Make the save files writable";
+                x.Do = log => { foreach (var p in ro) File.SetAttributes(p, File.GetAttributes(p) & ~FileAttributes.ReadOnly); log("Fixed " + ro.Count + " file(s)."); return true; };
+            }
 
-            var tri = Report.Classify(w64);
             if (tri.Level == "CRITICAL" || tri.Level == "ERROR")
                 add(tri.Level == "CRITICAL" ? "problem" : "warning", "Your last game run had trouble: " + string.Join("; ", tri.Reasons.ToArray()),
                     "Click Bug report - it goes straight to the developer. If the game crashed: close other big programs " +
                     "(browsers, Discord overlays), update your graphics driver, and verify the game files in Steam.");
             return f;
+        }
+
+        // ---- the automatic fixes ----
+        static bool MoveOldUe4ss(string w64, bool hasV3, Action<string> log)
+        {
+            string bk = Path.Combine(w64, "UE4SS-2-backup-" + Stamp());
+            Directory.CreateDirectory(bk);
+            var names = new List<string> { "UE4SS.dll", "UE4SS-settings.ini", "UE4SS.log", "xinput1_3.dll", "UE4SS_Signatures", "Mods" };
+            if (!hasV3) names.Add("dwmapi.dll");   // UE4SS 3 starts from its own dwmapi.dll; without it this one is UE4SS 2's
+            foreach (var n in names)
+            {
+                string p = Path.Combine(w64, n);
+                if (File.Exists(p)) File.Move(p, Path.Combine(bk, n));
+                else if (Directory.Exists(p)) Directory.Move(p, Path.Combine(bk, n));
+            }
+            log("Moved the old UE4SS 2 files to " + bk + " (nothing deleted; its Lua mods are in there too).");
+            return true;
+        }
+
+        static bool MovePakMods(string paks, Action<string> log)
+        {
+            string bk = Path.Combine(paks, "mods-off-" + Stamp());
+            int n = 0;
+            foreach (var sub in new[] { "~mods", "LogicMods" })
+            {
+                string from = Path.Combine(paks, sub);
+                if (!Directory.Exists(from)) continue;
+                foreach (var p in Directory.GetFiles(from, "*", SearchOption.AllDirectories))
+                {
+                    string ext = Path.GetExtension(p).ToLowerInvariant();
+                    if (ext != ".pak" && ext != ".ucas" && ext != ".utoc" && ext != ".sig") continue;
+                    string to = Path.Combine(bk, sub, p.Substring(from.Length + 1));
+                    Directory.CreateDirectory(Path.GetDirectoryName(to));
+                    File.Move(p, to);
+                    n++;
+                }
+            }
+            log("Moved " + n + " pak mod file(s) to " + bk + ".");
+            return true;
+        }
+
+        public static string EmsIni() { return Path.Combine(LocalDir, "Saved", "Config", "Windows", "EmsUser.ini"); }
+        public static string EmsCurrent()
+        {
+            var m = Regex.Match(ReadShared(EmsIni()), "^CurrentSaveGameName=(.*?)\\s*$", RegexOptions.Multiline);
+            return m.Success ? m.Groups[1].Value : null;
+        }
+        static bool SetEmsCurrent(string slot, Action<string> log)
+        {
+            string ini = EmsIni();
+            string s = File.ReadAllText(ini);
+            s = Regex.Replace(s, "^CurrentSaveGameName=.*?(\\r?)$", "CurrentSaveGameName=" + slot.Replace("$", "$$") + "$1", RegexOptions.Multiline);
+            File.WriteAllText(ini, s);
+            log("Continue now opens " + slot + ".");
+            return true;
+        }
+
+        // the own save (not a co-op slot) whose files were written last
+        public static string NewestOwnSave(string saves)
+        {
+            string best = null; DateTime bt = DateTime.MinValue;
+            try
+            {
+                foreach (var d in Directory.GetDirectories(saves))
+                {
+                    string n = Path.GetFileName(d);
+                    if (IsCoopSlot(n) || !File.Exists(Path.Combine(d, "Player.sav"))) continue;
+                    foreach (var p in Directory.GetFiles(d, "*.sav"))
+                    {
+                        var t = File.GetLastWriteTime(p);
+                        if (t > bt) { bt = t; best = n; }
+                    }
+                }
+            }
+            catch { }
+            return best;
+        }
+
+        static bool BackupSlot(string saves, string slot, string backups, Action<string> log)
+        {
+            string to = Path.Combine(backups, "rescued-" + slot + "-" + Stamp());
+            Installer.CopyDir(Path.Combine(saves, slot), Path.Combine(to, slot));
+            foreach (var p in Directory.GetFiles(saves, slot + "_*.sav")) File.Copy(p, Path.Combine(to, Path.GetFileName(p)));
+            log("Copied " + slot + " to " + to + ".");
+            return true;
+        }
+
+        static List<string> ReadOnlyFiles(string saves)
+        {
+            var l = new List<string>();
+            try
+            {
+                foreach (var p in Directory.GetFiles(saves, "*.sav", SearchOption.AllDirectories))
+                    if ((File.GetAttributes(p) & FileAttributes.ReadOnly) != 0 && p.IndexOf("SurrounSyncBackups", StringComparison.OrdinalIgnoreCase) < 0) l.Add(p);
+            }
+            catch { }
+            return l;
+        }
+
+        public static int FixableCount(List<Finding> f)
+        {
+            int n = 0;
+            foreach (var x in f) if (x.Kind != "info" && x.Fixable) n++;
+            return n;
+        }
+
+        // FIX: every automatic fix the check found, then one REPAIR if any finding needs it, then a fresh check.
+        public static List<Finding> FixAll(string game, Installer inst, Action<string, Color> say)
+        {
+            say("", UI.Text);
+            say("FIXING", UI.Dim);
+            if (Game.Running(game))
+            {
+                say("SurrounDead is running - close the game and FIX carries on by itself (nothing is changed while it runs)...", UI.Amber);
+                while (Game.Running(game)) Thread.Sleep(1000);
+                Thread.Sleep(3000);
+            }
+            bool repair = false; int tried = 0;
+            foreach (var x in Check(game))
+            {
+                if (x.Repair) repair = true;
+                if (x.Do == null) continue;
+                tried++;
+                say("> " + x.Auto, UI.Text);
+                try { x.Do(s => say("   " + s, UI.Text)); }
+                catch (Exception e) { say("   WARNING: that didn't work: " + e.Message, UI.Red); }
+            }
+            if (repair)
+            {
+                tried++;
+                say("> Repair SurrounSync's files and switches", UI.Text);
+                inst.Install(game);
+            }
+            if (tried == 0) say("Nothing here that FIX can do by itself.", UI.Dim);
+            var after = Check(game);
+            Print(after, say);
+            return after;
         }
 
         public static bool Print(List<Finding> f, Action<string, Color> say)
@@ -728,8 +1170,10 @@ namespace SurrounSyncSetup
                 say("   Fix: " + x.Fix, UI.Text);
                 if (x.Kind == "problem") fine = false;
             }
+            int n = FixableCount(f);
             if (f.Count == 0) say("Everything looks right.", UI.Green);
             else if (fine) say("Nothing stops co-op - see the notes above.", UI.Green);
+            if (n > 0) say("Click FIX and SurrounSync Setup takes care of " + (n == 1 ? "it" : "the " + n + " fixable ones") + " for you.", UI.Green);
             return fine;
         }
     }
@@ -842,7 +1286,7 @@ namespace SurrounSyncSetup
         string reportMessage;
         readonly string mode; readonly bool waitGame;
         readonly string thisVersion = Installer.ThisVersion();
-        TextBox gameBox; Label status, latestLabel; Flat primary, uninstall, check, report, browse; Bar bar; RichTextBox log;
+        TextBox gameBox; Label status, latestLabel, versions; Flat primary, uninstall, check, report, browse, fix; Bar bar; RichTextBox log;
         string latest; Release.Info latestInfo;
         static readonly Image logo = LoadLogo();
         static Image LoadLogo()
@@ -910,8 +1354,13 @@ namespace SurrounSyncSetup
                     if (d.ShowDialog(this) == DialogResult.OK) gameBox.Text = d.SelectedPath;
             };
             Controls.Add(browse);
-            status = L("", 28, 200, 704, UI.Text, 10.5f);
-            latestLabel = L("", 28, 226, 704, UI.Dim, 9f);
+            status = L("", 28, 200, 560, UI.Text, 10.5f);
+            latestLabel = L("", 28, 226, 560, UI.Dim, 9f);
+            versions = L("", 28, 250, 704, UI.Dim, 9f);
+            fix = new Flat("FIX", UI.Grey, UI.GreyHover) { Left = 600, Top = 202, Width = 132, Height = 42 };
+            fix.Font = new Font("Segoe UI Black", 10.5f);
+            fix.Click += delegate { Run("fix"); };
+            Controls.Add(fix);
 
             primary = new Flat("INSTALL", UI.Green, UI.GreenHover) { Left = 28, Top = 288, Width = 236, Fore = Color.FromArgb(14, 20, 15) };
             primary.Font = new Font("Segoe UI Black", 11.5f);
@@ -973,7 +1422,9 @@ namespace SurrounSyncSetup
             uninstall.Enabled = !busy && (inst != null || File.Exists(Installer.RecordFile));
             report.Enabled = !busy;
             check.Enabled = !busy;
+            fix.Enabled = !busy && (ok || Game.Find() != null);
             browse.Enabled = !busy;
+            versions.Text = ok ? Doctor.Versions(g) : "";
             ShowLatest(inst);
         }
 
@@ -1018,6 +1469,7 @@ namespace SurrounSyncSetup
                     MessageBoxButtons.OKCancel, MessageBoxIcon.Question) == DialogResult.OK) Run("uninstall");
             }
             else if (mode == "report") AskAndReport();
+            else if (mode == "fix") Run("fix");
             else if (mode == "update") Say("Checking for an update…", UI.Text);
         }
         void Auto2()
@@ -1052,10 +1504,16 @@ namespace SurrounSyncSetup
         {
             if (busy) return;
             string g = gameBox.Text.Trim();
-            if ((what == "install" || what == "update" || what == "repair") && !Installer.CanWrite(Game.Win64(g)))
+            if (what == "fix" && !Game.IsGame(g) && Game.Find() != null)
+            {
+                g = Game.Find();
+                gameBox.Text = g;
+                Say("Found SurrounDead in " + g + ".", UI.Text);
+            }
+            if ((what == "install" || what == "update" || what == "repair" || what == "fix") && Game.IsGame(g) && !Installer.CanWrite(Game.Win64(g)))
             {
                 // (the in-game UPDATE button: keep waiting for the game to close, or the install hits its locked files)
-                if (Program.Elevate("--install --game \"" + g + "\"" + (waitGame ? " --wait-game" : ""))) { Close(); return; }
+                if (Program.Elevate((what == "fix" ? "--fix" : "--install") + " --game \"" + g + "\"" + (waitGame ? " --wait-game" : ""))) { Close(); return; }
                 Say("No permission to write into the game folder, and administrator rights weren't given.", UI.Red);
                 return;
             }
@@ -1070,7 +1528,8 @@ namespace SurrounSyncSetup
                 {
                     if (what == "uninstall") ok = inst.Uninstall(Game.IsGame(g) ? g : null);
                     else if (what == "report") ok = MakeReport(g, inst.Log, reportMessage);
-                    else if (what == "check") ok = Doctor.Print(Doctor.Check(g), Say);
+                    else if (what == "check") { var found = Doctor.Check(g); ok = Doctor.Print(found, Say); ShowFixable(found); }
+                    else if (what == "fix") { var found = Doctor.FixAll(g, inst, Say); ShowFixable(found); ok = true; }
                     else if (what == "download") ok = DownloadAndRun(g, inst.Log, inst.Progress);
                     else
                     {
@@ -1081,7 +1540,7 @@ namespace SurrounSyncSetup
                             Thread.Sleep(2000);
                         }
                         ok = inst.Install(g);
-                        if (ok) Doctor.Print(Doctor.Check(g), Say);
+                        if (ok) { var found = Doctor.Check(g); Doctor.Print(found, Say); ShowFixable(found); }
                         if (ok) Say("Questions, help or a co-op partner: join the SurrounSync Discord - " + Discord, UI.Green);
                     }
                 }
@@ -1091,11 +1550,22 @@ namespace SurrounSyncSetup
                     busy = false; Refresh2();
                     if (what == "download" && ok) Close();
                     else if (what == "uninstall" && ok) { primary.Enabled = false; }
-                    if (!ok && what != "report" && what != "check") Say("Nothing more was changed.", UI.Dim);
+                    if (!ok && what != "report" && what != "check" && what != "fix") Say("Nothing more was changed.", UI.Dim);
                 });
             });
             th.IsBackground = true;
             th.Start();
+        }
+
+        // the FIX button turns amber with the number of problems it can fix
+        void ShowFixable(List<Finding> found)
+        {
+            if (InvokeRequired) { BeginInvoke((Action)delegate { ShowFixable(found); }); return; }
+            int n = Doctor.FixableCount(found);
+            fix.Text = n > 0 ? "FIX " + n + (n == 1 ? " PROBLEM" : " PROBLEMS") : "FIX";
+            fix.Back = n > 0 ? UI.Amber : UI.Grey; fix.Hover = n > 0 ? Color.FromArgb(244, 196, 100) : UI.GreyHover;
+            fix.Fore = n > 0 ? Color.FromArgb(20, 16, 8) : Color.White;
+            fix.Invalidate();
         }
 
         bool DownloadAndRun(string g, Action<string> say, Action<int> progress)
@@ -1145,7 +1615,7 @@ namespace SurrounSyncSetup
             for (int i = 0; i < args.Length; i++)
             {
                 string a = args[i].ToLowerInvariant();
-                if (a == "--install" || a == "--update" || a == "--uninstall" || a == "--report" || a == "--check") mode = a.Substring(2);
+                if (a == "--install" || a == "--update" || a == "--uninstall" || a == "--report" || a == "--check" || a == "--fix") mode = a.Substring(2);
                 else if (a == "--game" && i + 1 < args.Length) game = args[++i];
                 else if (a == "--quiet") quiet = true;
                 else if (a == "--wait-game") wait = true;
@@ -1173,6 +1643,7 @@ namespace SurrounSyncSetup
                 if (mode == "report") return SetupForm.MakeReport(game ?? "", inst.Log) ? 0 : 1;
                 if (mode == "check") return Doctor.Print(Doctor.Check(game ?? ""), (t, c) => inst.Log(t)) ? 0 : 1;
                 if (game == null) { inst.Log("SurrounDead wasn't found - pass --game <folder>."); return 2; }
+                if (mode == "fix") { var after = Doctor.FixAll(game, inst, (t, c) => inst.Log(t)); return Doctor.FixableCount(after) == 0 ? 0 : 1; }
                 if (wait) while (Game.Running(game)) Thread.Sleep(1000);
                 if (!inst.Install(game)) return 1;
                 Doctor.Print(Doctor.Check(game), (t, c) => inst.Log(t));

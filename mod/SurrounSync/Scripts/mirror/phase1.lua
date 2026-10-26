@@ -312,7 +312,9 @@ local function on_tick(dt)
         local was = peer_where
         peer_where = w
         log.info("phase1: the other game is " .. w)
-        if role == "host" and w == "loading" then loot.guest_arriving() end
+        -- (not on the arriving <-> loading flicker while the guest's game saves after its load: that dropped
+        -- the item pairings made a moment ago)
+        if role == "host" and w == "loading" and was ~= "arriving" then loot.guest_arriving() end
         if mate and w == "joined" and session.in_world() then notify.show(link.peer_name() .. " is here too.", "good") end
         if role == "host" then
             local who = link.peer_name()
@@ -425,7 +427,8 @@ local function on_tick(dt)
                 if v == PROTOCOL then
                     log.info("phase1: the other game runs the same SurrounSync protocol (" .. PROTOCOL .. ")")
                 else
-                    notify.show(link.peer_name() .. " is using a different version of SurrounSync. You both need the same version.", "bad")
+                    local key = not v and "version_differs" or v < PROTOCOL and "peer_older" or "me_older"
+                    notify.show(require("mirror.i18n").t(key, link.peer_name()), "bad")
                     log.error(string.format("phase1: PROTOCOL MISMATCH - this game %d, the other %s. Restart the game that wasn't "
                         .. "restarted after the last update; until then sync is unreliable.", PROTOCOL, tostring(v)))
                 end
@@ -435,6 +438,7 @@ local function on_tick(dt)
                 peer_build = b
                 if b and my_build and b ~= my_build then
                     notify.show(link.peer_name() .. " has a different version of SurrounDead. Update the game on both PCs in Steam.", "bad")
+                    notify.show(require("mirror.i18n").t("game_build", link.peer_name()), "bad")
                     log.error("phase1: GAME BUILD MISMATCH - this game " .. my_build .. ", the other " .. b
                         .. ". The joined world can break; both players need the same game update.")
                 elseif b and my_build then
@@ -446,6 +450,7 @@ local function on_tick(dt)
         if peer_protocol == nil and not hello_missing_logged and first_rx and now - first_rx > 30 then
             hello_missing_logged = true
             log.error("phase1: the other game sends poses but no protocol announcement - it runs an OLDER SurrounSync; restart it")
+            notify.show(require("mirror.i18n").t("peer_older", link.peer_name()), "bad")
         end
     end
     local theirs = link.get_blob("look")

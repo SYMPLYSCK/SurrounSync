@@ -1447,7 +1447,7 @@ function zombies.near_guest() return p8.near.d, now - p8.near.at end
 function zombies.own_count() return p8.count_own() end
 
 local selftest_in, selftest_copy = 0.0, nil
-local function selftest_file() return (os.getenv("LOCALAPPDATA") or ".") .. "\\SurrounDead\\mirror_selftest_" .. role .. ".txt" end
+local function selftest_file() return require("mirror.localdir").get() .. "\\mirror_selftest_" .. role .. ".txt" end
 
 local want_steamtest = false
 

@@ -17,7 +17,7 @@ local SHARED = {
     config = true, log = true, util = true, crumb = true, game = true, perf = true, settings = true, role = true,
     version = true, notify = true, menu = true, menu_backups = true, journal_tab = true, fs = true, savefs = true,
     slotguard = true, backups = true, beds = true, bedtags = true, names = true, jig = true, instance = true,
-    loader = true, hostrules = true, mysettings = true, itemclean = true, devtest = true, invdiag = true, probe = true, recorder = true,
+    loader = true, hostrules = true, mysettings = true, modlist = true, localdir = true, uepath = true, status = true, itemclean = true, devtest = true, invdiag = true, probe = true, recorder = true,
     phase0 = true, peers = true, xp = true,
 }
 -- What a mate instance (another guest, seen from a guest) gets its own copy of; the rest is the host link's.

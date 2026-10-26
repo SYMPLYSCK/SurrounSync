@@ -193,6 +193,14 @@ def main():
         check(wait_for(lambda: get_blob(B, "look", "host") is None, 10), "the switch cleared the host's files on the guest")
         check(wait_for(lambda: get_blob(B, "look", "host"), 15) == "host look", "...and the host resent its look")
         check(wait_for(lambda: get_blob(B, "hello", "host"), 15) == "host hello", "...and its hello")
+        # a world file at a join: bigger than one piece, sent deflated in one message
+        import base64
+        world = base64.b64encode(bytes(random.Random(5).choice(b"EMSH save data \x00\x01") for _ in range(420000))).decode()
+        put_blob(A, "file_world_Level.sav", "host", world)
+        check(wait_for(lambda: get_blob(B, "file_world_Level.sav", "host"), 20) == world, "a %d KB world file arrives whole" % (len(world) // 1024))
+        check("file_world_Level.sav to" in log_of(A, "mirror_bridge.log") and "B compressed" in
+              [l for l in log_of(A, "mirror_bridge.log").splitlines() if "file_world_Level.sav to" in l][0],
+              "...sent compressed, not raw in pieces")
 
         print("5. security: limits, kick, block, always-allow, decline")
         big = "x" * (9 * 1024 * 1024)

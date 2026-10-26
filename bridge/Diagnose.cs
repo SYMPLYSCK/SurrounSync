@@ -610,7 +610,7 @@ namespace SurrounSyncShared
                     What = "SurrounSync " + d.ModVersion + " was made for game build " + a + "; this game is build " + b + ".",
                     Affects = "Possibly nothing - but game updates can change things the mod relies on.",
                     Cause = "Possible only: a version difference is not proof of a problem.",
-                    PlayerTry = b > a ? "Check for a SurrounSync update." : "Update the game in Steam (Betas: None), then verify files.",
+                    PlayerTry = b > a ? "Check for a SurrounSync update." : "Update the game in Steam (Betas: Experimental 0.8), then verify files.",
                     DevLook = "Patch notes between builds " + Math.Min(a, b) + " and " + Math.Max(a, b) + "; hooks/properties the findings above touch.",
                     Evidence = { "made_for_build.txt " + a + ", appmanifest buildid " + b },
                 });

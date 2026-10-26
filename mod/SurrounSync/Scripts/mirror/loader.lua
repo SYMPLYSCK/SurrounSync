@@ -12,7 +12,7 @@ local guard, banned_file
 
 local function saved_dir()
     local name = (cfg and cfg.phase2 and cfg.phase2.saved_override) or "Saved"
-    return (os.getenv("LOCALAPPDATA") or ".") .. "\\SurrounDead\\" .. name
+    return require("mirror.localdir").get() .. "\\" .. name
 end
 
 local function read_lines(path)

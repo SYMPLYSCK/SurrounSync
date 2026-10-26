@@ -39,6 +39,10 @@ local stats = { sent = 0, applied = 0, missing = 0, put = 0, added = 0 }
 local alias = {}
 local rev = {}
 local added_once = {}
+-- uid -> item asset of what this game last saw in a shared container: a take carries it, so the other game
+-- can still find the item when the uid pairing isn't there yet (a fast take right after opening, before
+-- the host's list was taken over, was acked but never removed - the next list brought the item back)
+local da_of = {}
 local put_sent = {}
 local add_q, moved, move_q = {}, {}, {}
 local JIG_COMP = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
@@ -52,6 +56,17 @@ local PREFETCH = {
     "/Game/Inventory/Containers/Containers/Airdrop/Master_AirdropContainer.Master_AirdropContainer_C",
 }
 local jig = require("mirror.jig")
+-- uid -> count last seen in a shared container (what a take removed = that minus what's left)
+local count_seen = {}
+local function note_items(comp)
+    for _, it in ipairs(jig.contents_of(comp)) do
+        if it.uid and it.da then da_of[it.uid], count_seen[it.uid] = it.da, it.count or 1 end
+    end
+end
+-- Guest: what each take removed ("<id> <uid as sent>" -> { da, n, at }): the host answers "L" when its copy has
+-- none of it (the host took it at the same moment, or this game's copy had an item the host's world doesn't) and
+-- this game takes it back out of the inventory - else the item existed twice.
+local sent_takes = {}
 local game = require("mirror.game")
 local ghost = require("mirror.ghost")
 local crumb = require("mirror.crumb")
@@ -126,17 +141,44 @@ end
 
 local function shared() return role == "host" or (session and session.in_world()) end
 local function traded() if session and session.checkpoint and shared() then session.checkpoint("loot") end end
--- Only items moving between players need a save soon: put-ins, and takes from player-built storage.
--- World loot doesn't (a crash just puts it back).
+-- Every take and put-in needs a save soon on both sides: the guest's save keeps what it took, the host's
+-- save keeps the container without it. World loot only saved on the guest's side was a dupe: the host
+-- quit or crashed, its containers came back full and the guest still had the items.
+-- (Q asks, C is a full list, M a rearrange, R a rejection: nothing changed hands.)
 local function is_trade(p)
-    if p:find("^A ") then return true end
-    return p:find("^Buildable") ~= nil or p:find("^Vehicle") ~= nil
+    return p:find("^[QCMR] ") == nil
 end
 channel.send = function(self, p) if is_trade(p) then traded() end return events.send(self, p) end
 
 local uid_str, guid, full_path = jig.uid_str, jig.guid, jig.full_path
 
+-- A car's trunk is a container that moves: by position the host often didn't find the guest's car (parked a
+-- little differently, or driven since) and the take was lost - the item stayed in the host's trunk AND the
+-- guest's bag. Cars go by the host's car name (vehicles.lua pairs the names on both games).
+local VEHICLE = "/Game/Blueprints/Vehicles/BP_VehicleMaster.BP_VehicleMaster_C"
+local veh_cls, veh_miss, car_by_class = nil, 0, {}
+local function is_car(actor)
+    local cls
+    pcall(function() cls = actor:GetClass() end)
+    local a = util.addr(cls)
+    if a and car_by_class[a] ~= nil then return car_by_class[a] end
+    if not util.valid(veh_cls) and os.clock() >= veh_miss then
+        veh_cls = StaticFindObject(VEHICLE)
+        if not util.valid(veh_cls) then veh_cls, veh_miss = nil, os.clock() + 10 end
+    end
+    if not util.valid(veh_cls) then return false end
+    local yes = false
+    pcall(function() yes = actor:IsA(veh_cls) == true end)
+    if a then car_by_class[a] = yes end
+    return yes
+end
+
 local function id_of(actor)
+    if is_car(actor) then
+        local v = require("mirror.vehicles")
+        local n = v.peer_name_of and v.peer_name_of(actor)
+        if n and n ~= "" then return "car:" .. n end
+    end
     local cls = util.class_name(actor)
     local l = actor:K2_GetActorLocation()
     return string.format("%s@%d,%d,%d", cls, math.floor(l.X / 10 + 0.5), math.floor(l.Y / 10 + 0.5), math.floor(l.Z / 10 + 0.5))
@@ -193,7 +235,14 @@ local function on_removed(self, ItemUID)
     local ok, id = pcall(id_of, actor)
     if not ok then return end
     local left = count_of(comp, uid)
-    channel:send(string.format("%s %s %d %d", id, rev[uid] or uid, left, next_seq(id)))
+    local da = da_of[uid]
+    local sent_uid = rev[uid] or uid
+    if role ~= "host" and da then
+        local n = (count_seen[uid] or (left + 1)) - left
+        if n > 0 then sent_takes[id .. " " .. sent_uid] = { da = da, n = n, at = now } end
+    end
+    count_seen[uid] = left > 0 and left or nil
+    channel:send(string.format("%s %s %d %d", id, sent_uid, left, next_seq(id)) .. (da and (" " .. da) or ""))
     stats.sent = stats.sent + 1
     if left == 0 then release(id, uid) end
     mark_dirty(id, comp)
@@ -201,7 +250,26 @@ local function on_removed(self, ItemUID)
     log.debug(string.format("loot: took %s from %s (%d left there)", uid, id, left))
 end
 
-local function find(id) return util.find_by_id(id, 100) end
+local function find(id)
+    if id:sub(1, 4) == "car:" then
+        local v = require("mirror.vehicles")
+        return v.car_named and v.car_named(id:sub(5)) or nil
+    end
+    return util.find_by_id(id, 100)
+end
+
+-- Host: a guest's take / put-in for a container this game can't find right now (not loaded here, a car not
+-- paired yet) is kept and tried again - dropped, the item was in the host's container and the guest's bag.
+-- Not acked until it's applied, so the guest never takes over a host list that still holds what it took.
+local later, later_in = {}, 0.0
+local LATER_S = 600
+local function keep_for_later(kind, id, payload)
+    if role ~= "host" then return false end
+    for _, x in ipairs(later) do if x.p == payload then return true end end
+    later[#later + 1] = { k = kind, id = id, p = payload, t = now }
+    log.info(string.format("loot: %s for %s - container not found here yet, kept to apply when it is", kind == "A" and "put-in" or "take", id))
+    return true
+end
 
 local function acked(id, s, comp)
     s = tonumber(s)
@@ -212,17 +280,49 @@ end
 
 local function apply(payload)
     if not shared() then return end
-    local id, uid, left, s = payload:match("^(%S+) (%S+) (%d+) ?(%d*)$")
+    local id, uid, left, s, da = payload:match("^(%S+) (%S+) (%d+) ?(%d*) ?(%S*)$")
     if not id then return end
     list_take(id, uid, tonumber(left) or 0)
     local actor = find(id)
     local comp = actor and comp_of(actor)
-    if not comp then stats.missing = stats.missing + 1; return end
+    if not comp then
+        stats.missing = stats.missing + 1
+        keep_for_later("T", id, payload)
+        return
+    end
     acked(id, s, comp)
     local theirs = uid
+    if role == "host" then
+        -- (contents not rolled here yet: roll them first, or every take would look like one of an item not here)
+        local slots = 0
+        pcall(function() slots = comp.MainJigContainers:GetArrayNum() end)
+        if slots == 0 then pcall(jig.generate, comp) end
+    end
     local have = count_of(comp, uid)
     if have == 0 and alias[uid] then uid = alias[uid]; have = count_of(comp, uid) end
+    if have == 0 and da ~= "" then
+        -- no pairing for that uid: the same kind of item in that container (the biggest stack, which can give
+        -- what was taken)
+        local best
+        for _, it in ipairs(jig.contents_of(comp)) do
+            if it.da == da and not it.parent and (not best or (it.count or 1) > (best.count or 1)) then best = it end
+        end
+        if best then
+            alias[theirs], rev[best.uid] = best.uid, theirs
+            uid, have = best.uid, best.count or 1
+            log.info("loot: matched the other player's take in " .. id .. " by item (" .. (da:match("[%w_]+$") or da) .. ")")
+        end
+    end
     if tonumber(left) == 0 then forget(uid ~= theirs and uid or nil, theirs) end
+    if have == 0 and role == "host" then
+        -- none of it here: taken here at the same moment, or the guest's copy had it and this world doesn't.
+        -- The host's world decides: the guest gives it back.
+        channel:send("L " .. id .. " " .. theirs)
+        stats.lost = (stats.lost or 0) + 1
+        log.info("loot: the other player took " .. ((da ~= "" and da or "?"):match("[%w_]+$") or "?") .. " from " .. id
+            .. " - none of it here (taken here at the same moment?) - they give it back")
+        return
+    end
     local take = have - (tonumber(left) or 0)
     if take <= 0 then return end
     applying = true
@@ -323,6 +423,31 @@ local function player_jig()
 end
 local function local_uid(theirs) return alias[theirs] or theirs end
 
+local function give_back(p)
+    local id, uid = p:match("^L (%S+) (%S+)")
+    local t = id and sent_takes[id .. " " .. uid]
+    if not t or now - t.at > 120 then return end
+    sent_takes[id .. " " .. uid] = nil
+    local pc = player_jig()
+    if not pc then return end
+    local best
+    for _, it in ipairs(jig.contents_of(pc)) do
+        if it.da == t.da and not it.parent and (not best or (it.count or 1) > (best.count or 1)) then best = it end
+    end
+    local name = (t.da:match("([%w_]+)$") or "item"):gsub("^DA_", "")
+    if not best then
+        log.warn("loot: the host had no " .. name .. " left in " .. id .. " - couldn't find it here to give back")
+        return
+    end
+    local n = math.min(t.n, best.count or 1)
+    applying = true
+    local ok, err = jig.take(pc, best.uid, n, best.count or 1)
+    applying = false
+    log.warn(string.format("loot: the host had no %s left in %s (taken there at the same moment) - gave back %d%s", name, id, n,
+        ok and " (no duplicate)" or (" FAILED: " .. tostring(err))))
+    if ok then require("mirror.notify").show("Someone else took that " .. name .. " at the same moment - they keep it.", "info") end
+end
+
 -- Rearranging inside a shared container: send the whole layout (uids as the other game knows them).
 local function on_moved(self, ItemUID)
     if applying or not shared() then return end
@@ -383,8 +508,8 @@ local function apply_add(payload)
     if added_once[uid] then if comp then acked(id, s, comp) end return end
     if not comp then
         stats.missing = stats.missing + 1
+        if keep_for_later("A", id, payload) then return end
         log.info("loot: the other player put something into " .. id .. " - not here")
-        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
         return
     end
     if count_of(comp, uid) > 0 or (alias[uid] and count_of(comp, alias[uid]) > 0) then added_once[uid] = true; acked(id, s, comp); return end
@@ -438,6 +563,7 @@ local function sync_from_host(id, quiet)
     local ok, set, added, removed, missing, pairs_ = pcall(jig.apply_contents, comp, list)
     applying = false
     if not ok then log.warn("loot: couldn't take over the host's contents of " .. id .. ": " .. tostring(set)); return end
+    note_items(comp)
     for _, p in ipairs(pairs_) do
         if p.want.uid then alias[p.want.uid], rev[p.uid] = p.uid, p.want.uid end
     end
@@ -483,6 +609,7 @@ local function on_generated(comp, via)
     if not main then return end
     local ok, id = pcall(id_of, owner)
     if not ok then return end
+    note_items(comp)
     -- A fresh host list (asked while the player came near): take it over right here, inside the open, so the
     -- container never shows this game's copy first. "init" runs before the UI reads it; "request" just after, same frame.
     local fresh = role ~= "host" and host_list[id] and now - (list_at[id] or -100) < FRESH
@@ -681,6 +808,29 @@ local function repair_player_stats()
     if twins > 0 then log.warn("loot: " .. twins .. " bag compartment(s) in the inventory exist twice - items in them may not show (drop the bag and pick it up)") end
 end
 
+local function retry_later()
+    local list = later
+    later = {}
+    for _, x in ipairs(list) do
+        local actor = find(x.id)
+        if actor and comp_of(actor) then
+            log.info("loot: the container for a kept " .. (x.k == "A" and "put-in" or "take") .. " is here now (" .. x.id .. ") - applying it")
+            if x.k == "A" then apply_add(x.p) else apply(x.p) end
+        elseif now - x.t > LATER_S then
+            log.warn(string.format("loot: gave up on a kept %s for %s after %d s - that container never showed up here",
+                x.k == "A" and "put-in" or "take", x.id, LATER_S))
+            if x.k == "A" then
+                local id, uid, da = x.p:match("^A (%S+) (%S+) (%S+)")
+                if id then channel:send("R " .. id .. " " .. uid .. " " .. da) end
+            end
+        else
+            local dup = false
+            for _, y in ipairs(later) do if y.p == x.p then dup = true end end
+            if not dup then later[#later + 1] = x end
+        end
+    end
+end
+
 function loot.tick(dt)
     if repair_in then
         repair_in = repair_in - dt
@@ -688,6 +838,10 @@ function loot.tick(dt)
     end
     if role == "off" then return end
     now = now + dt
+    if role == "host" and later[1] then
+        later_in = later_in - dt
+        if later_in <= 0 then later_in = 1.0; crumb.at("loot: kept"); util.safe(retry_later, "loot.later") end
+    end
     crumb.at("loot: ui")
     util.safe(jig.flush_ui, "jig.ui")
     hook_in = hook_in - dt
@@ -713,7 +867,7 @@ function loot.tick(dt)
             alias, rev, added_once, put_sent, add_q, moved, move_q = {}, {}, {}, {}, {}, {}, {}
             pushed, push_q, host_list, opened, asked, synced, apply_q = {}, {}, {}, {}, {}, {}, {}
             pending, held, ack, main_by_class = {}, {}, {}, {}
-            host_ack, recheck, reopened, list_at, asked_at = {}, {}, {}, {}, {}
+            host_ack, recheck, reopened, list_at, asked_at, da_of = {}, {}, {}, {}, {}, {}
         end
     end
     crumb.at("loot: moves/adds")
@@ -769,6 +923,8 @@ function loot.tick(dt)
                         ". Take it back out, or it stays only on your screen.", "bad", "loot_rejected")
                 end
             end
+        elseif k == "L " then
+            if role ~= "host" and shared() then util.safe(give_back, "loot.give_back", p) end
         elseif k == "Q " then
             if role == "host" then
                 local id = p:match("^Q (%S+)$")
@@ -787,8 +943,9 @@ function loot.status()
         stats.fixed or 0, stats.rejected or 0, stats.missing > 0 and (", container not found " .. stats.missing) or "")
 end
 
+
 -- Respawn/reload: the old world's objects are freed - drop them without touching them.
-local function forget_world() main_cls, main_by_class, known, build = {}, {}, {}, nil; repair_in = 8.0 end
+local function forget_world() main_cls, main_by_class, known, build, da_of = {}, {}, {}, nil, {}; repair_in = 8.0 end
 function loot.init(c, r, s)
     game.on_world_reset(forget_world)
     cfg, role, session = c, r, s

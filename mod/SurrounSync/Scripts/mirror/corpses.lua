@@ -22,6 +22,7 @@ local LOOT_CLASSES = { MASTER,
     "/Game/AI/Animals/Dog/BP_AnimalDog.BP_AnimalDog_C" }
 local INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
 local ITEM_ID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"
+local COUNT = "Count_8_DD79AF2A46126A338C8DCCB4616D91CD"
 
 local cfg, role, zombies, session
 local channel = events.reliable("zloot")
@@ -273,9 +274,10 @@ local function on_removed(self, ItemRemovedInfo)
     local z = self:get()
     local id = role == "host" and zombies.host_id_of(z) or zombies.copy_id_of(z)
     if not id then return end
-    local da
+    local da, n
     pcall(function() da = jig.full_path(ItemRemovedInfo:get()[INFO][ITEM_ID]) end)
-    if da then takes[#takes + 1] = { z = z, id = id, da = da } end
+    pcall(function() n = tonumber(ItemRemovedInfo:get()[INFO][COUNT]) end)
+    if da then takes[#takes + 1] = { z = z, id = id, da = da, n = n } end
 end
 
 local function flush_takes()
@@ -284,7 +286,16 @@ local function flush_takes()
         local comp = util.valid(tk.z) and comp_of(tk.z)
         if comp then
             local left = jig.count_of_item(comp, tk.da)
-            channel:send(string.format("T %d %s %d", tk.id, tk.da, left))
+            -- what this take removed: the host's list said how many there were (the hook's count may be the stack's)
+            local took = tk.n
+            local l = lists[tk.id]
+            if role ~= "host" and l then
+                local before = 0
+                for _, w in ipairs(l.items or {}) do if w.da == tk.da then before = before + (w.count or 1) end end
+                took = math.min(took or math.huge, math.max(0, before - left))
+                if took == math.huge then took = nil end
+            end
+            channel:send(string.format("T %d %s %d", tk.id, tk.da, left) .. (took and took > 0 and (" " .. took) or ""))
             stats.took = stats.took + 1
             list_took(tk.id, tk.da, left, true)
             relay(function(m) m.relay_take(tk.z, tk.da) end)
@@ -293,11 +304,40 @@ local function flush_takes()
     takes = {}
 end
 
-local function apply_take(id, da, left)
+-- Host: the guest took more than this body still has (the host or another guest took it at the same moment):
+-- both had it. The host's world decides - the guest gives the surplus back ("G").
+local function give_back(da, n)
+    local pc
+    pcall(function() pc = require("mirror.game").player().BP_JigMultiplayer end)
+    if not util.valid(pc) then return end
+    local name = (da:match("([%w_]+)$") or "item"):gsub("^DA_", "")
+    local done = 0
+    for _, h in ipairs(jig.contents_of(pc)) do
+        if done >= n then break end
+        if h.da == da and not h.parent then
+            local k = math.min(n - done, h.count or 1)
+            set_applying(true)
+            local ok = jig.take(pc, h.uid, k, h.count or 1)
+            set_applying(false)
+            if ok then done = done + k end
+        end
+    end
+    log.warn(string.format("corpses: took %d %s from a body someone else looted at the same moment - gave back %d (no duplicate)", n, name, done))
+    if done > 0 then require("mirror.notify").show("Someone else took that " .. name .. " at the same moment - they keep it.", "info") end
+end
+
+local function apply_take(id, da, left, took)
     list_took(id, da, left)
     local z = corpse(id)
     local comp = z and comp_of(z)
     if not comp then return end
+    if role == "host" and took and took > 0 then
+        local have = jig.count_of_item(comp, da)
+        if have < took then
+            channel:send(string.format("G %d %s %d", id, da, took - have))
+            left = 0
+        end
+    end
     set_applying(true)
     local ok, n = pcall(jig.reduce_item, comp, da, left)
     set_applying(false)
@@ -437,8 +477,11 @@ function corpses.tick(dt)
                 replay_own(id)
             end
         elseif k == "T" then
-            local id, da, left = p:match("^T (%d+) (%S+) (%-?%d+)$")
-            if id then util.safe(apply_take, "corpses.take", tonumber(id), da, tonumber(left) or 0) end
+            local id, da, left, took = p:match("^T (%d+) (%S+) (%-?%d+) ?(%d*)$")
+            if id then util.safe(apply_take, "corpses.take", tonumber(id), da, tonumber(left) or 0, tonumber(took)) end
+        elseif k == "G" and role ~= "host" then
+            local _, da, n = p:match("^G (%d+) (%S+) (%d+)$")
+            if da then util.safe(give_back, "corpses.give_back", da, tonumber(n)) end
         elseif k == "A" then
             local id, uid, da, n, dx, dy, cell, rot, slot, inside =
                 p:match("^A (%d+) (%S+) (%S+) (%-?%d+) (%S+) (%S+) (%-?%d+):(%d):(%-?%d+) ?(%S*)$")

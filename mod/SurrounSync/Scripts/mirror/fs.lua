@@ -53,6 +53,7 @@ function fs.list_files(dir)
     local cdo = StaticFindObject and StaticFindObject("/Script/BlueprintFileUtils.Default__BlueprintFileUtilsBPLibrary")
     if not cdo then return nil end
     local out = {}
+    dir = require("mirror.uepath").of(dir)
     local ok = pcall(function() cdo:FindRecursive(dir, out, "*", true, false) end)
     if not ok then return nil end
     local arr = out.FoundPaths or out

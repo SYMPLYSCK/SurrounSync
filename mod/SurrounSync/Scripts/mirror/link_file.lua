@@ -10,13 +10,13 @@ local function path(name) return dir .. "\\mirror_link_" .. name .. ".txt" end
 
 local base_dir
 function link.configure(c)
-    local base = (os.getenv("LOCALAPPDATA") or ".") .. "\\SurrounDead"
+    local base = require("mirror.localdir").get()
     base_dir = (c and c.link_dir) and (base .. "\\" .. c.link_dir) or base
 end
 
 -- tags (more than two players): { out = "to2", inn = "from2" } - the file names of this one other player
 function link.open(my_role, tags)
-    dir = base_dir or ((os.getenv("LOCALAPPDATA") or ".") .. "\\SurrounDead")
+    dir = base_dir or (require("mirror.localdir").get())
     me = tags and tags.out or my_role
     peer = tags and tags.inn or ((my_role == "host") and "guest" or "host")
     last_seq = -1
