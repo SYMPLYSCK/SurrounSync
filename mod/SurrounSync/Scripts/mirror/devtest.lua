@@ -190,6 +190,29 @@ local function run(cmd)
         end
         log.info("devtest: putin " .. item.da:match("([%w_]+)$") .. " -> " .. container_name(a) .. ": "
             .. (moved and "done" or ("FAILED " .. tostring(err))) .. " - now " .. describe(fb))
+    elseif cmd == "takeout" then
+        -- like a player dragging the nearest container's first item into the inventory
+        local a = nearest_container(6)
+        local fa, fb
+        pcall(function() fa = a.BP_JigMultiplayer end)
+        pcall(function() fb = game.player().BP_JigMultiplayer end)
+        local item = fa and jig.contents_of(fa)[1]
+        if not (item and util.valid(fb)) then log.info("devtest: takeout - no item in a container within 6 m"); return end
+        local n0 = #jig.contents_of(fb)
+        local moved, err = false, nil
+        for c = 1, fb.MainJigContainers:GetArrayNum() do
+            local cont, cells = jig.container_arg(fb.MainJigContainers[c])
+            for idx = 0, cells - 1 do
+                local ok, e = pcall(function()
+                    fa:SERVER_RequestMoveItemToAnotherComp(fa, fb, jig.guid(item.uid), false, idx, cont[jig.REPUID], 0, {}, 0)
+                end)
+                if not ok then err = e; break end
+                if #jig.contents_of(fb) > n0 then moved = true; break end
+            end
+            if moved or err then break end
+        end
+        log.info("devtest: takeout " .. item.da:match("([%w_]+)$") .. " from " .. container_name(a) .. ": "
+            .. (moved and "done" or ("FAILED " .. tostring(err))) .. " - now " .. describe(fa))
     elseif cmd == "rearrange" or cmd == "rearrange r" then
         -- like a player dragging the container's first item to another free cell (rotated with "r")
         local a = nearest_container(6)
@@ -689,7 +712,7 @@ function devtest.watch(cfg)
         elseif cmd == "status" then
             log.info(string.format("devtest: state %s, where %s, playing %s, host_gone %s", tostring(session.state()),
                 tostring(session.where()), tostring(session.playing_slot()), tostring(session.host_gone())))
-        elseif cmd:find("^kill %d+$") or ({ open = 1, corpse = 1, dump = 1, dump2 = 1, move = 1, putin = 1, addtest = 1, rearrange = 1, ["rearrange r"] = 1 })[cmd] then
+        elseif cmd:find("^kill %d+$") or cmd:find("^eval ") or ({ open = 1, corpse = 1, dump = 1, dump2 = 1, move = 1, putin = 1, takeout = 1, addtest = 1, rearrange = 1, ["rearrange r"] = 1 })[cmd] then
             container_cmds(cmd)
         else log.info("devtest: unknown command") end
     end
@@ -703,16 +726,20 @@ function devtest.watch(cfg)
         end
     end)
     local empty_reads = 0
+    -- a command whose file couldn't be deleted (still locked) ran again every 250 ms: one "continue" became
+    -- 14 in-place loads, each leaving the old player body (with its gear) behind - the host came out naked
+    local stuck = nil
     LoopAsync(250, function()
         local f = io.open(path, "r")
-        if f then
-            local cmd = (f:read("*l") or ""):gsub("%s+$", "")
-            f:close()
-            if cmd == "" and empty_reads < 8 then empty_reads = empty_reads + 1; return false end
-            empty_reads = 0
-            os.remove(path)
-            ExecuteInGameThread(function() util.safe(run, "devtest.watch", cmd) end)
-        end
+        if not f then stuck = nil; return false end
+        local cmd = (f:read("*l") or ""):gsub("%s+$", "")
+        f:close()
+        if cmd == "" and empty_reads < 8 then empty_reads = empty_reads + 1; return false end
+        empty_reads = 0
+        local removed = os.remove(path)
+        if cmd == stuck then return false end
+        stuck = not removed and cmd or nil
+        ExecuteInGameThread(function() util.safe(run, "devtest.watch", cmd) end)
         return false
     end)
     log.info("devtest: watching " .. path)

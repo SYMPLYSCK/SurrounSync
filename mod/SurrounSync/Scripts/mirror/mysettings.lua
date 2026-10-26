@@ -2,6 +2,7 @@
 
 local log = require("mirror.log")
 local link = require("mirror.link")
+local util = require("mirror.util")
 
 local mysettings = {}
 
@@ -17,6 +18,7 @@ mysettings.LIST = {
     { key = "sounds", label = "SHARED SOUNDS", hint = "Hear zombies and tools from the other players' games.", default = "on" },
     { key = "joinsound", label = "JOIN ALERT SOUND", hint = "A whistle when someone asks to join you.", default = "on" },
     { key = "autotp", label = "AUTO-ACCEPT TELEPORTS", hint = "Say yes to /goto and /bring without asking.", default = "off" },
+    { key = "dmgnumbers", label = "DAMAGE NUMBERS", hint = "The numbers that pop up when you hit something.", default = "on" },
     { key = "perf", label = "GUEST PERFORMANCE", hint = "As a guest: zombies are copied to you within 150 / 100 / 60 m.",
       values = { { "full", "FULL" }, { "balanced", "BALANCED" }, { "low", "LOW" } }, default = "full" },
 }
@@ -83,8 +85,24 @@ function mysettings.rows()
     return out
 end
 
+-- DAMAGE NUMBERS off: every number widget is hidden as it's built (all sources - guns, melee, turrets -
+-- create it through GameFunctionLibrary SpawnDamageNumbers). Hidden, not removed: removing a widget while
+-- it starts crashed the game once (main menu).
+local DMG_UI = "/Game/UI/Widgets/Player/FloatingDamageNumbersUI.FloatingDamageNumbersUI_C:Construct"
+local hook_in = 0.0
+local function hide_number(self)
+    if mysettings.on("dmgnumbers") then return end
+    local w = util.obj(self)
+    if w then pcall(function() w:SetVisibility(1) end) end
+end
+
 -- A guest tells the host how far out it wants zombie copies (GUEST PERFORMANCE).
-function mysettings.tick()
+function mysettings.tick(dt)
+    hook_in = hook_in - (dt or 0.1)
+    if hook_in <= 0 then
+        hook_in = 2.0
+        if not mysettings.on("dmgnumbers") then util.ensure_hook(DMG_UI, hide_number) end
+    end
     if role_fn() == "guest" then
         local v = mysettings.value("perf")
         if v ~= sent_perf then sent_perf = v; link.put_blob("gperf", v) end

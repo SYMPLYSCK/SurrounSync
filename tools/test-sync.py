@@ -1494,6 +1494,145 @@ def same_moment_container_takes_keep_one_copy():
           "host: a take of an item it has none of is answered with L")
 
 
+def stacking_moves_reach_the_other_game():
+    # 2026-10-25: nails taken onto the bag's nails stack fired no removed event - the host kept them and
+    # every try copied 12 nails; a stack put onto a container's stack never reached the host
+    print("stacking_moves_reach_the_other_game")
+    L = loot_guest()
+    L.execute(r"""
+        PUMP.BP_JigMultiplayer = COMP
+        COMP.GetOwner = function() return PUMP end
+        BAG = obj({ GetOwner = function() return ME end })
+        package.loaded["mirror.jig"].contents_of = function(c) if c == COMP then return CONT end return {} end
+        CONT = { { uid = "G1", da = "/Game/X.DA_Nails", count = 12 } }
+        COUNT = 12
+        COMP.MainJigContainers = { GetArrayNum = function() return 1 end, ForEach = function(self, f)
+            f(1, { get = function() return { ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B = { ForEach = function(_, g)
+                if COUNT > 0 then g(1, { get = function() return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = "G1",
+                    ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { Count_8_DD79AF2A46126A338C8DCCB4616D91CD = COUNT } } end }) end
+            end } } end }) end }
+        open(); loot.tick(0.1)
+        ID = SENT[1]:match("^Q (%S+)$")
+        INBOX.lootc = { "C " .. ID .. " 0 one" }
+        loot.tick(0.1)
+        local S = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:SERVER_RequestStackItem"
+        function w(x) return { get = function() return x end } end
+        -- nails out of the container onto the bag's stack: all 12 gone from the container
+        COUNT = 0
+        HOOKS[S](nil, w(COMP), w(BAG), w("G1"), w("P7"), w(99))
+        loot.tick(0.1)
+        TAKE = nil
+        for _, p in ipairs(SENT) do if p:find(" G1 0 ", 1, true) then TAKE = p end end
+        -- back onto the container's stack: 12 -> 20
+        COUNT = 12
+        package.loaded["mirror.loot"].prefetch(PUMP)
+        CONT = { { uid = "G1", da = "/Game/X.DA_Nails", count = 12 } }
+        open(); loot.tick(3.0)
+        COUNT = 20
+        HOOKS[S](nil, w(BAG), w(COMP), w("P7"), w("G1"), w(99))
+        loot.tick(0.1)
+        N = nil
+        for _, p in ipairs(SENT) do if p:sub(1, 2) == "N " then N = p end end
+    """)
+    L.execute(r"""
+        -- the host takes 7 of the 20 (applied here), then this guest stacks 4 more onto the 13: N must say 4
+        local S = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:SERVER_RequestStackItem"
+        package.loaded["mirror.jig"].take = function(c, uid, n) COUNT = COUNT - n; return true end
+        SENT = {}
+        INBOX.loot = { ID .. " G1 13 99 /Game/X.DA_Nails" }
+        loot.tick(0.1)
+        COUNT = 17
+        HOOKS[S](nil, w(BAG), w(COMP), w("P8"), w("G1"), w(99))
+        loot.tick(0.1)
+        N2 = nil
+        for _, p in ipairs(SENT) do if p:sub(1, 2) == "N " then N2 = p end end
+    """)
+    check(" G1 4 " in (L.eval("N2") or ""), "after the other player's take the stacked amount is still right (%r)" % L.eval("N2"))
+    L.execute(r"""
+        -- split 5 of the 17 into the bag: the old stack's new count (12) goes to the host as a take
+        SENT = {}
+        COUNT = 12
+        HOOKS["/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:SERVER_RequestSplitItem"](
+            nil, w(COMP), w(BAG), w("G1"), w("C0"), w(0), w(5), w(false))
+        loot.tick(0.1)
+        SPLIT = nil
+        for _, p in ipairs(SENT) do if p:find(" G1 12 ", 1, true) then SPLIT = p end end
+    """)
+    check(L.eval("SPLIT") is not None, "a split out of the container tells the host what's left (%r)" % L.eval("SPLIT"))
+    check(L.eval("TAKE") is not None, "taken onto a stack in the bag: the take goes to the host (%r)" % L.eval("TAKE"))
+    check((L.eval("N") or "").startswith("N ") and " G1 8 " in (L.eval("N") or ""),
+          "stacked onto the container's stack: the 8 added go out as N (%r)" % L.eval("N"))
+    H = loot_guest()
+    H.execute(r"""
+        package.loaded["mirror.loot"] = nil
+        loot = require("mirror.loot")
+        loot.init({}, "host", { in_world = function() return true end })
+        PUMP.BP_JigMultiplayer = COMP
+        SET = nil
+        COMP.ServerUpdateCountByUID = function(self, g, n) SET = n end
+        COMP.ClientUpdateCount = function() end
+        COMP.MainJigContainers = { GetArrayNum = function() return 1 end, ForEach = function(self, f)
+            f(1, { get = function() return { ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B = { ForEach = function(_, g)
+                g(1, { get = function() return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = "1_2_3_4",
+                    ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { Count_8_DD79AF2A46126A338C8DCCB4616D91CD = 12 } } end })
+            end } } end }) end }
+        package.loaded["mirror.jig"].guid = function(u) return u end
+        INBOX.loot = { "N Container_FuelLoot_GasPump_C@10,0,0 1_2_3_4 8 5 /Game/X.DA_Nails" }
+        loot.tick(0.1)
+    """)
+    check(H.eval("SET") == 20, "host: N raises its stack by the count stacked (%r)" % H.eval("SET"))
+
+
+def one_take_fires_both_removed_hooks_and_is_sent_once():
+    # 2026-10-25 reports: the game fires JigMP_OnItemRemoved and JigMP_OnMainContainerItemRemoved for one take;
+    # the echo reached the host as a second take of an item already gone and it answered L - every take refunded
+    print("one_take_fires_both_removed_hooks_and_is_sent_once")
+    L = loot_guest()
+    L.execute(r"""
+        PUMP.BP_JigMultiplayer = COMP
+        package.loaded["mirror.jig"].contents_of = function(c) return CONT end
+        CONT = { { uid = "G1", da = "/Game/X.DA_Bandage", count = 1 } }
+        open(); loot.tick(0.1)
+        ID = SENT[1]:match("^Q (%S+)$")
+        INBOX.lootc = { "C " .. ID .. " 0 one" }
+        loot.tick(0.1)
+        CONT = {}
+        local C = "/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C"
+        local a, u = { get = function() return PUMP end }, { get = function() return "G1" end }
+        HOOKS[C .. ":JigMP_OnItemRemoved"](a, u)
+        HOOKS[C .. ":JigMP_OnMainContainerItemRemoved"](a, nil, u)
+        function takes() local n = 0; for _, p in ipairs(SENT) do if p:find(" G1 0 ", 1, true) then n = n + 1 end end; return n end
+        ONCE = takes()
+        loot.tick(1.0)
+        HOOKS[C .. ":JigMP_OnItemRemoved"](a, u)
+        LATER = takes()
+    """)
+    check(L.eval("ONCE") == 1, "both hooks for one take send it once (%d)" % L.eval("ONCE"))
+    check(L.eval("LATER") == 2, "a real take of it later (put back, taken again) still goes out")
+    H = loot_guest()
+    H.execute(r"""
+        package.loaded["mirror.loot"] = nil
+        loot = require("mirror.loot")
+        loot.init({}, "host", { in_world = function() return true end })
+        PUMP.BP_JigMultiplayer = COMP
+        HAVE = { { uid = "G1", da = "/Game/X.DA_Bandage", count = 1 } }
+        package.loaded["mirror.jig"].contents_of = function() return HAVE end
+        package.loaded["mirror.jig"].take = function() HAVE = {}; return true end
+        COMP.MainJigContainers = { GetArrayNum = function() return 1 end, ForEach = function(self, f)
+            f(1, { get = function() return { ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B = { ForEach = function(_, g)
+                for _, it in ipairs(HAVE) do g(1, { get = function() return {
+                    UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = it.uid,
+                    ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { Count_8_DD79AF2A46126A338C8DCCB4616D91CD = it.count } } end }) end
+            end } } end }) end }
+        SENT = {}
+        INBOX.loot = { "Container_FuelLoot_GasPump_C@10,0,0 G1 0 5 /Game/X.DA_Bandage",
+                       "Container_FuelLoot_GasPump_C@10,0,0 G1 0 6 /Game/X.DA_Bandage" }
+        loot.tick(0.1)
+    """)
+    check(not any(m.startswith("L ") for m in H.eval("SENT").values()),
+          "host: a repeat of a take it just applied isn't answered with L")
+
+
 def car_trunks_go_by_the_cars_name():
     print("car_trunks_go_by_the_cars_name")
     L = loot_guest()
@@ -3346,7 +3485,7 @@ def mods_switch_restart_and_match_the_host():
         shutil.rmtree(d, ignore_errors=True)
 
 
-for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
+for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, tactical_reads_only_lights_the_class_has,
           vehicles_keep_this_worlds_fuel, harvest_uses_up_nodes_once, zombie_copies_take_the_hosts_look,
           copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,

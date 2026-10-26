@@ -30,9 +30,33 @@ function save_guard.run_before_save() if before_save then before_save() end end
 
 function save_guard.busy() return pending end
 
+-- A player body nobody controls (left by a load) was saved with the world and came back on every load of
+-- it (2026-10-25: two extra guests, one in the void). Removed before the save, it never reaches a file.
+local stray_at = -100
+local function drop_stray_bodies()
+    -- one look per save (a save runs through several of the hooked entries in the same moment)
+    if os.clock() - stray_at < 2.0 then return end
+    stray_at = os.clock()
+    local me = require("mirror.game").player()
+    if not util.valid(me) then return end
+    local peers, n = require("mirror.peers"), 0
+    for _, p in ipairs(FindAllOf("BP_PlayerCharacter_C") or {}) do
+        local full, ctrl
+        local going = true
+        pcall(function() full = p:GetFullName(); ctrl = p.Controller; going = p:IsActorBeingDestroyed() end)
+        if full and not going and not full:find("Default__", 1, true) and not util.same(p, me) and not util.valid(ctrl)
+                and not peers.is_ghost(p) and pcall(function() p:K2_DestroyActor() end) then
+            n = n + 1
+        end
+    end
+    if n > 0 then log.info("save: removed " .. n .. " stray player body(ies) so the save doesn't keep them") end
+end
+
 local function on_save_start(path)
     log.info("save starting (" .. path:match(":(.+)$") .. ")")
     -- (a guest froze/crashed inside this hook once with no dump: the steps say which part next time)
+    crumb.at("save: stray bodies")
+    util.safe(drop_stray_bodies, "save_guard.stray")
     crumb.at("save: before_save")
     if before_save then before_save() end
     if not cfg.save.destroy_ghost_on_save then

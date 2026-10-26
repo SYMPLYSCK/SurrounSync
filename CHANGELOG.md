@@ -2,6 +2,23 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 0.13.2 (2026-10-25)
+
+A loot fix update. Everyone needs to update (it won't connect to 0.13.1).
+
+**🎒 Looting as a guest works again**
+- Taking an item from a container as a guest often made it vanish with "Someone else took that at the same moment", even when nobody else was near. Fixed.
+- Dropping an item onto a stack of the same item (nails, ammo, cloth...) didn't reach the other player: taken onto a stack in your bag the items were copied, put onto a stack in a container the other player never got them. Both directions now sync, also for zombie bodies.
+- Splitting a stack (the split slider) out of a container or inside one now syncs too - it used to copy the part you split off.
+
+**⚙️ New: DAMAGE NUMBERS setting**
+Handbook (J) → CO-OP → gear → MY SETTINGS. Turn the hit numbers off for your own game; each player chooses for themselves.
+
+**🔧 Fixes**
+- The other player's weapon laser no longer trails behind their gun when they move it.
+- Extra copies of a player's body could be saved into the world and show up after every load (one even floating in the void). They're removed before saving now.
+- The message when the other game stops sending for a moment now says it isn't responding (paused, loading or frozen) instead of always "paused".
+
 ## 0.13.1 (2026-10-25)
 
 A safety update: your saves, your loot and getting into a friend's world. Everyone needs to update (it won't connect to 0.13.0).

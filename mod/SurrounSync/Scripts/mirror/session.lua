@@ -854,7 +854,7 @@ local function watch_host(dt)
         paused_told = false
     elseif ps == "paused" and not paused_told then
         paused_told = true
-        notify.show(link.peer_name() .. " paused their game.", "info")
+        notify.show(link.peer_name() .. "'s game isn't responding (paused, loading or frozen).", "info")
     end
 end
 

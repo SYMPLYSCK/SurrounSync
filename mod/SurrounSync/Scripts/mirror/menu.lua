@@ -438,7 +438,7 @@ end
 
 local function tick(dt)
     util.safe(require("mirror.hostrules").tick, "hostrules.tick")
-    util.safe(require("mirror.mysettings").tick, "mysettings.tick")
+    util.safe(require("mirror.mysettings").tick, "mysettings.tick", dt)
     -- the rename / bug report box runs in single player too (it used to tick only in a co-op session,
     -- so SEND in a solo game did nothing)
     util.safe(require("mirror.names").tick, "names.tick", dt)

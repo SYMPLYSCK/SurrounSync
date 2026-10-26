@@ -349,6 +349,16 @@ local function apply_take(id, da, left, took)
     end
 end
 
+-- Taken from a body onto a stack in the bag (loot.lua's stack hook): the game fires no removed event for it,
+-- and the host's list put the ammo back on the copy - every merge duplicated it (same as the nails, 2026-10-25).
+function corpses.stack_take(z, da)
+    if not hooks_here() or not util.valid(z) then return false end
+    local id = role == "host" and zombies.host_id_of(z) or zombies.copy_id_of(z)
+    if not id then return false end
+    takes[#takes + 1] = { z = z, id = id, da = da, n = nil }
+    return true
+end
+
 -- Host, another guest's copy: a body changed (the host or a guest took from it) - tell my guest what's left.
 function corpses.relay_take(z, da)
     if role ~= "host" or not shared() then return end

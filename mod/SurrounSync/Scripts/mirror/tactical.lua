@@ -116,6 +116,31 @@ local function gear_with(mesh)
     return nil
 end
 
+-- The laser's frame: its location and axes (4 engine calls; only for a laser that is on).
+local function frame(a)
+    local l, fx, rx, ux
+    local ok = pcall(function()
+        l = a:K2_GetActorLocation(); fx = a:GetActorForwardVector(); rx = a:GetActorRightVector(); ux = a:GetActorUpVector()
+    end)
+    if not (ok and l and fx and rx and ux) then return nil end
+    return l, fx, rx, ux
+end
+-- a world point as an offset along the laser's axes, and back
+local function to_local(a, x, y, z)
+    local l, fx, rx, ux = frame(a)
+    if not l then return nil end
+    local dx, dy, dz = x - l.X, y - l.Y, z - l.Z
+    return { X = dx * fx.X + dy * fx.Y + dz * fx.Z, Y = dx * rx.X + dy * rx.Y + dz * rx.Z, Z = dx * ux.X + dy * ux.Y + dz * ux.Z }
+end
+local function to_world(a, rel, out)
+    local l, fx, rx, ux = frame(a)
+    if not l then return false end
+    out.X = l.X + fx.X * rel.X + rx.X * rel.Y + ux.X * rel.Z
+    out.Y = l.Y + fx.Y * rel.X + rx.Y * rel.Y + ux.Y * rel.Z
+    out.Z = l.Z + fx.Z * rel.X + rx.Z * rel.Y + ux.Z * rel.Z
+    return true
+end
+
 local function make_copy(short, mesh)
     local cls = StaticFindObject(class_path(short))
     local parent = gear_with(mesh)
@@ -151,8 +176,13 @@ local function apply(blob)
                     c.laser = laser
                 end
                 if laser and tonumber(x) then
-                    c.ends = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
-                    c.at = c.at or { X = c.ends.X, Y = c.ends.Y, Z = c.ends.Z }
+                    -- kept relative to the laser on the ghost's gun (the end point and the ghost's pose are about
+                    -- equally old): each frame it's placed from where the gun is now, so it no longer trails the gun
+                    local rel = to_local(a, tonumber(x), tonumber(y), tonumber(z))
+                    if rel then
+                        c.ends = rel
+                        c.at = c.at or { X = rel.X, Y = rel.Y, Z = rel.Z }
+                    end
                 end
             end
         end
@@ -160,6 +190,8 @@ local function apply(blob)
     for k in pairs(copies) do if not want[k] then destroy_copy(k) end end
 end
 
+local beam_end_name
+local world_end = { X = 0, Y = 0, Z = 0 }
 local function ease_beams(dt)
     local f = math.min(1.0, dt * 15)
     for _, c in pairs(copies) do
@@ -167,7 +199,10 @@ local function ease_beams(dt)
             c.at.X = c.at.X + (c.ends.X - c.at.X) * f
             c.at.Y = c.at.Y + (c.ends.Y - c.at.Y) * f
             c.at.Z = c.at.Z + (c.ends.Z - c.at.Z) * f
-            pcall(function() c.actor.NS_LaserSight:SetVectorParameter(FName("User.Beam End"), c.at) end)
+            if to_world(c.actor, c.at, world_end) then
+                beam_end_name = beam_end_name or FName("User.Beam End")
+                pcall(function() c.actor.NS_LaserSight:SetVectorParameter(beam_end_name, world_end) end)
+            end
         end
     end
 end

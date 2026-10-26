@@ -1290,7 +1290,7 @@ def hostgone_paused_and_wait(L, tmp):
     joined_session(L, tmp)
     host_state(L, "paused")
     L.execute('TICK(70)')
-    check(L.eval('note_has(...)', "Host paused their game.") and L.eval('session.state()') == "joined",
+    check(L.eval('note_has(...)', "Host's game isn't responding (paused, loading or frozen).") and L.eval('session.state()') == "joined",
           "paused host: a message, no countdown")
     host_state(L, "gone")
     L.execute('TICK(2); session.wait_for_host(); TICK(70)')
