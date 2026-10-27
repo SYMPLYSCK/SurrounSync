@@ -56,7 +56,7 @@ local function log_layer_radii(z)
     if layers_logged then return end
     local radii = {}
     pcall(function()
-        z.AIOSubject.OptimizationLayers:ForEach(function(_, layer)
+        util.each(z.AIOSubject.OptimizationLayers, function(_, layer)
             radii[#radii + 1] = string.format("%.0f m", layer:get().LayerRadius / 100)
         end)
     end)

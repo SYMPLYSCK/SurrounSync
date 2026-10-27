@@ -283,7 +283,7 @@ local function ems_share_player(coop, own)
     local c, o = "@cso@" .. coop:lower(), "@cso@" .. own:lower()
     local own_objs, coop_vals = {}, {}
     pcall(function()
-        ems.CachedCustomSaves:ForEach(function(k, v)
+        util.each(ems.CachedCustomSaves, function(k, v)
             local key = (to_str(k) or ""):lower()
             local file = key:match("^(.-)@cso@")
             if file and PLAYER_SAVES[file] then

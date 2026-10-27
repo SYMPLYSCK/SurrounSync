@@ -84,12 +84,16 @@ local function join(steamid, who)
             notify.show("You're already in co-op.", "info")
             return
         end
-        if (not steamid or steamid == "" or steamid == joined_peer) and password ~= sent_password then
+        -- same host again: re-ask unless they already let us in (after a decline or no answer the request was
+        -- dead, and entering their world without an accept would just wait on a link that isn't there)
+        local same = not steamid or steamid == "" or steamid == joined_peer
+        if same and (password ~= sent_password or not p1().connected()) then
             sent_password = password
             link.set_join_password(password)
             link.bridge_cmd("join " .. tostring(joined_peer or 0) .. (password ~= "" and (" " .. password) or ""))
             pending_join = true
-            notify.show("Asking " .. (who or link.peer_name()) .. " again...", "info")
+            wait_since, wait_told = os.clock(), nil
+            notify.show("Asking " .. (who or link.peer_name()) .. " again...", "info", "join_wait")
             return
         end
         if not steamid or steamid == "" or steamid == joined_peer then session.request_toggle(); return end
@@ -208,10 +212,13 @@ local function model()
         end
     end
     m.public_state = r == "host" and l and l.public or nil
-    m.show_voice = r ~= nil
+    -- a join request the host hasn't accepted (or declined) is not co-op yet: keep the friends list and the
+    -- code box so the player can ask again or join someone else (it used to switch to just the chat)
+    local asking = r == "guest" and session.state() == "idle" and not p1().connected()
+    m.show_voice = r ~= nil and not asking
     m.voice_label, m.voice_vol = require("mirror.voice").label()
     if l and l.voice == "talking" then m.voice_label = "VOICE: TALKING" end
-    m.in_coop = r ~= nil
+    m.in_coop = r ~= nil and not asking
     -- the host's KICK buttons: every guest the bridge knows
     m.guests = {}
     if r == "host" and l then
@@ -254,7 +261,7 @@ local function model()
     m.show_join_local = (not steam and r ~= "host") or (r == "guest" and session.state() == "idle")
     m.show_leave = r == "guest" and session.state() == "joined"
     m.show_stop = r == "host"
-    m.show_chat = r ~= nil
+    m.show_chat = m.in_coop
     m.password_on = r == "host" and l and l.password or false
     m.chat = require("mirror.chat").recent(3)
     m.tp = require("mirror.teleport").pending()

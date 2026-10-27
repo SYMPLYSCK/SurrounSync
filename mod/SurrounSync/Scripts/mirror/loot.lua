@@ -209,8 +209,8 @@ end
 local function count_of(comp, uid)
     local n = 0
     pcall(function()
-        comp.MainJigContainers:ForEach(function(_, c)
-            c:get()[ITEMS]:ForEach(function(_, it)
+        util.each(comp.MainJigContainers, function(_, c)
+            util.each(c:get()[ITEMS], function(_, it)
                 local item = it:get()
                 if uid_str(item[UID]) == uid then n = n + (item[INFO][COUNT] or 0) end
             end)
@@ -398,7 +398,13 @@ local function apply(payload)
             log.info("loot: matched the other player's take in " .. id .. " by item (" .. (da:match("[%w_]+$") or da) .. ")")
         end
     end
-    if tonumber(left) == 0 then forget(uid ~= theirs and uid or nil, theirs) end
+    if tonumber(left) == 0 then
+        -- the guest's own uid this item was added for (its put): the guest learned the host's uid from a list and
+        -- took it by that one - left paired, the same bag put back was "already added" and never arrived
+        local orig = rev[uid]
+        forget(uid ~= theirs and uid or nil, theirs)
+        if orig and orig ~= theirs then forget(uid, orig) end
+    end
     -- this same item was just taken out by this guest's own earlier message (an echo): nothing to give back
     if have == 0 and role == "host" and now - (emptied[id .. " " .. theirs] or -100) < 5.0 then return end
     if have == 0 and role == "host" then
@@ -478,34 +484,74 @@ local function flush_adds()
     moved = {}
 end
 
-local main_cls, main_miss = {}, {}
--- Answer per class (by class address): saves up to 12 IsA calls per actor.
-local main_by_class = {}
+-- is_main asks IsA of these only: Container, Display and BatteryCharger are children of Buildable_MASTER
+-- (object dump), their own entries in MAIN are there for their hooks.
+local MAIN_ROOTS = {}
+for _, p in ipairs(MAIN) do
+    if not (p:find("BuildableMaster_Container", 1, true) or p:find("BuildableMaster_Display", 1, true)
+            or p:find("Buildable_BatteryCharger", 1, true)) then MAIN_ROOTS[#MAIN_ROOTS + 1] = p end
+end
+local main_cls = {}
 local function is_main_uncached(actor)
-    for _, p in ipairs(MAIN) do
+    for _, p in ipairs(MAIN_ROOTS) do
         local c = main_cls[p]
-        if not util.valid(c) and os.clock() >= (main_miss[p] or 0) then
-            c = StaticFindObject(p)
-            if util.valid(c) then main_cls[p] = c else main_cls[p], main_miss[p] = nil, os.clock() + 10 end
-        end
         local yes = false
         if util.valid(c) then pcall(function() yes = actor:IsA(c) == true end) end
         if yes then return true end
     end
     return false
 end
+-- Answer per class (by class address, checked by name: a freed class's address can come back as another).
+-- Several MAIN classes are usually not loaded at all (tents, stations, lock/tool containers) and each
+-- StaticFindObject miss costs ~15 ms: they were looked up again every 10 s and "not a container" was never
+-- kept while one was missing - every pass over the ~3000 inventory components redid up to 12 IsA each and
+-- hitched 30-90 ms ("perf: loot took"). Now a class's "no" is final once the missing ones were looked up
+-- after that class was first seen (its parents load with it, so a later-loading MAIN class can't be one of
+-- them); until then it's "no for now" (as before) and one lookup round runs, one class per frame.
+local main_by_class, first_seen = {}, {}
+local round_at, round_q, round_due = -1, nil, false
+local function main_round_tick()
+    if not round_q then
+        if not round_due then return end
+        round_due = false
+        round_q = { at = os.clock(), i = 0 }
+    end
+    local i = round_q.i + 1
+    while MAIN_ROOTS[i] and util.valid(main_cls[MAIN_ROOTS[i]]) do i = i + 1 end
+    local p = MAIN_ROOTS[i]
+    if not p then round_at, round_q = round_q.at, nil; return end
+    round_q.i = i
+    local c = StaticFindObject(p)
+    if util.valid(c) then main_cls[p] = c end
+end
 local function is_main(actor)
+    if round_at < 0 then
+        -- The first round runs one class per frame from the tick after a load (all at once was a 433 ms freeze
+        -- right after joining, report 20261027-095623). Asked before it's done (a take/put in the first frames):
+        -- the rest is looked up here at once, as it always was - no answer comes from a half-done round.
+        local q = round_q or { at = os.clock(), i = 0 }
+        for i = q.i + 1, #MAIN_ROOTS do
+            local p = MAIN_ROOTS[i]
+            if not util.valid(main_cls[p]) then
+                local c = StaticFindObject(p)
+                if util.valid(c) then main_cls[p] = c end
+            end
+        end
+        round_at, round_q, round_due = q.at, nil, false
+    end
     local cls
     pcall(function() cls = actor:GetClass() end)
     local a = util.addr(cls)
     if not a then return is_main_uncached(actor) end
-    local r = main_by_class[a]
-    if r == nil then
-        r = is_main_uncached(actor)
-        local all_found = true
-        for _, p in ipairs(MAIN) do if not util.valid(main_cls[p]) then all_found = false; break end end
-        if r or all_found then main_by_class[a] = r end
-    end
+    local name = util.fname(cls)
+    local e = main_by_class[a]
+    if e and e.name == name then return e.yes end
+    if e then main_by_class[a], first_seen[a] = nil, nil end
+    local seen = first_seen[a] or os.clock()
+    first_seen[a] = seen
+    local r = is_main_uncached(actor)
+    if r or round_at >= seen then main_by_class[a], first_seen[a] = { name = name, yes = r }, nil
+    elseif not round_q then round_due = true end
     return r
 end
 
@@ -598,7 +644,16 @@ local function apply_add(payload)
     local place = { cell = tonumber(cell) >= 0 and tonumber(cell) or nil, rot = rot == "1", slot = tonumber(slot) >= 0 and tonumber(slot) or nil }
     local actor = find(id)
     local comp = actor and comp_of(actor)
-    if added_once[uid] then if comp then acked(id, s, comp) end return end
+    if added_once[uid] then
+        -- a repeat of a put already done: skip it while that item is still here, or when it's no newer than what
+        -- was acked (a replay). A newer put of an item gone from here is the same item put back: add it again.
+        local here = comp and (count_of(comp, alias[uid] or uid) > 0 or count_of(comp, uid) > 0)
+        if not comp or here or role ~= "host" or (tonumber(s) or 0) <= (ack[id] or 0) then
+            if comp then acked(id, s, comp) end
+            return
+        end
+        added_once[uid], alias[uid] = nil, nil
+    end
     if not comp then
         stats.missing = stats.missing + 1
         if keep_for_later("A", id, payload) then return end
@@ -816,9 +871,10 @@ local JIG = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigCompone
 local LIST_SLICE = 150
 local build
 local function list_containers()
+    -- (the container classes are still being looked up, one per frame: listing now would force them all at once)
+    if round_at < 0 then list_in = 0.1; return end
     local comps, walked = util.instances("BP_JigComponent_C", JIG)
     if not walked then list_in = 1.0; return end
-    main_by_class = {}
     build = { comps = comps, i = 1, out = {} }
 end
 local function list_step()
@@ -1044,11 +1100,13 @@ function loot.tick(dt)
         if not shared() then
             alias, rev, added_once, put_sent, add_q, moved, move_q = {}, {}, {}, {}, {}, {}, {}
             pushed, push_q, host_list, opened, asked, synced, apply_q = {}, {}, {}, {}, {}, {}, {}
-            pending, held, ack, main_by_class = {}, {}, {}, {}
+            pending, held, ack, main_by_class, first_seen = {}, {}, {}, {}, {}
             host_ack, recheck, reopened, list_at, asked_at, da_of = {}, {}, {}, {}, {}, {}
         end
     end
     crumb.at("loot: moves/adds")
+    if round_at < 0 and not round_q and shared() then round_due = true end
+    if round_due or round_q then util.safe(main_round_tick, "loot.main_classes") end
     util.safe(flush_stacks, "loot.stacks")
     util.safe(flush_eaten, "loot.consumed")
     util.safe(flush_moves, "loot.moves")
@@ -1126,7 +1184,11 @@ end
 
 
 -- Respawn/reload: the old world's objects are freed - drop them without touching them.
-local function forget_world() main_cls, main_by_class, known, build, da_of = {}, {}, {}, nil, {}; repair_in = 8.0 end
+local function forget_world()
+    main_cls, main_by_class, first_seen, known, build, da_of = {}, {}, {}, {}, nil, {}
+    round_at, round_q, round_due = -1, nil, false
+    repair_in = 8.0
+end
 function loot.init(c, r, s)
     game.on_world_reset(forget_world)
     cfg, role, session = c, r, s

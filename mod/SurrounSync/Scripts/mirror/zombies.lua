@@ -922,7 +922,8 @@ local function play_montage(c, path, pos)
 end
 
 local spawner_in = 0.0
-local volumes_stopped = {}
+-- the sweep's state (one table: this file is at Lua's 200-locals limit); volumes = spawn volumes stopped here
+local sweep = { q = nil, SLICE = 150, DESTROYS = 4, volumes = {} }
 local native_in = 0.0
 
 function p8.body_loc(z)
@@ -955,61 +956,92 @@ function p8.drained(z, a)
     return keep
 end
 
+-- The sweep's work goes in a queue that runs a slice per frame: walking all ~1100 spawners (and destroying a
+-- batch of own zombies) in one frame was a 110 ms hitch every 2 s for the first ~15 s after joining. Each
+-- object is still checked when its turn comes (valid, not a copy, not drained); a split stops the queue.
+function sweep.step()
+    local q = sweep.q
+    if not q then return end
+    if p8.on then sweep.q = nil; return end
+    local budget, destroys = sweep.SLICE, 0
+    while budget > 0 and destroys < sweep.DESTROYS and q.i < #q.items do
+        q.i = q.i + 1
+        budget = budget - 1
+        local it = q.items[q.i]
+        local o = it.o
+        -- (queued some frames ago: still that object - a freed one's address can come back as another)
+        if not (util.valid(o) and util.addr(o) == it.a and (not it.c or util.class_name(o) == it.c)) then
+            -- gone since: nothing to do
+        elseif it.k == "s" then
+            if util.valid(o) then
+                local stopped = false
+                pcall(function() stopped = o.IsSpawningStopped == true end)
+                if not stopped then
+                    pcall(function() o:SetIsSpawningStopped(true) end); q.n_sp = q.n_sp + 1
+                    p8.stopped[util.addr(o) or 0] = o
+                end
+            end
+        elseif it.k == "v" then
+            local a = util.addr(o) or 0
+            if util.valid(o) and not sweep.volumes[a] then
+                sweep.volumes[a] = true
+                pcall(function() local f = o["Stop Spawning"]; f(o) end)
+                q.n_sp = q.n_sp + 1
+            end
+        else
+            local a = util.addr(o) or 0
+            if util.valid(o) and not zombies.is_copy(o) and not (destroyed[a] and now - destroyed[a] < 120) and not p8.drained(o, a) then
+                destroyed[a] = now
+                pcall(function()
+                    local c = o.Controller
+                    destroy_holdables(o)
+                    o:K2_DestroyActor()
+                    if util.valid(c) then c:K2_DestroyActor() end
+                end)
+                q.n_z = q.n_z + 1
+                destroys = destroys + 1
+            end
+        end
+    end
+    if q.i < #q.items then return end
+    sweep.q = nil
+    if q.n_sp > 0 or q.n_z > 0 then
+        stats.spawners = stats.spawners + q.n_sp
+        stats.removed_native = stats.removed_native + q.n_z
+        log.info(string.format("zombies: stopped %d spawner(s), removed %d own zombie(s)", q.n_sp, q.n_z))
+    end
+end
+
 local function suppress_natives()
     for a, t in pairs(destroyed) do if now - t > 120 then destroyed[a] = nil end end
-    local n_sp = 0
+    -- (the last sweep still running: let it finish first)
+    if sweep.q then return end
+    local q = { items = {}, i = 0, n_sp = 0, n_z = 0 }
+    -- (zombies come and go: their class is checked again too; spawners stay with the level, a reset drops the queue)
+    local function add(k, o)
+        local a = util.addr(o)
+        if a then q.items[#q.items + 1] = { k = k, o = o, a = a, c = k == "z" and util.class_name(o) or nil } end
+    end
     spawner_in = spawner_in - 2.0
     local spawners_scanned = spawner_in <= 0
     if spawners_scanned then
         spawner_in = 10.0
         for _, cls in ipairs({ SPAWNER, "BP_AISpawner_Animals_C" }) do
             for _, s in ipairs(util.instances(cls, "/Game/AI/AISpawners/BP_AISpawner_Master.BP_AISpawner_Master_C")) do
-                util.pause()
-                if util.valid(s) then
-                    local stopped = false
-                    pcall(function() stopped = s.IsSpawningStopped == true end)
-                    if not stopped then
-                        pcall(function() s:SetIsSpawningStopped(true) end); n_sp = n_sp + 1
-                        p8.stopped[util.addr(s) or 0] = s
-                    end
-                end
+                add("s", s)
             end
         end
         for _, cls in ipairs({ "BP_AISpawningVolume_Prefab_C", "BP_AISpawningVolume_RandomChanceToSpawn_C" }) do
             for _, v in ipairs(util.instances(cls, "/Game/AI/Humans/" .. cls:gsub("_C$", "") .. "." .. cls)) do
-                util.pause()
-                local a = util.addr(v) or 0
-                if util.valid(v) and not volumes_stopped[a] then
-                    volumes_stopped[a] = true
-                    pcall(function() local f = v["Stop Spawning"]; f(v) end)
-                    n_sp = n_sp + 1
-                end
+                add("v", v)
             end
         end
     end
     native_in = native_in - 2.0
-    local n_z = 0
-    local sweep = native_in <= 0 and not spawners_scanned
-    if sweep then native_in = 2.0 end
-    for _, z in ipairs(sweep and zombies_cached(now) or {}) do
-        util.pause()
-        local a = util.addr(z) or 0
-        if not zombies.is_copy(z) and not (destroyed[a] and now - destroyed[a] < 120) and not p8.drained(z, a) then
-            destroyed[a] = now
-            pcall(function()
-                local c = z.Controller
-                destroy_holdables(z)
-                z:K2_DestroyActor()
-                if util.valid(c) then c:K2_DestroyActor() end
-            end)
-            n_z = n_z + 1
-        end
-    end
-    if n_sp > 0 or n_z > 0 then
-        stats.spawners = stats.spawners + n_sp
-        stats.removed_native = stats.removed_native + n_z
-        log.info(string.format("zombies: stopped %d spawner(s), removed %d own zombie(s)", n_sp, n_z))
-    end
+    local natives = native_in <= 0 and not spawners_scanned
+    if natives then native_in = 2.0 end
+    for _, z in ipairs(natives and zombies_cached(now) or {}) do if util.valid(z) then add("z", z) end end
+    if #q.items > 0 then sweep.q = q; sweep.step() end
 end
 
 local snap_count = 0
@@ -1105,7 +1137,12 @@ end
 zombies._look = { arch_hooks = arch_hooks, moon_hook = arch_hooks.moon.hook, arch_of = function(z, n) return arch_of(z, n) end, bones_of = function(z) return bones_of(z) end,
                   sync = function(id, c, e, x) xlooks[id] = x; sync_look(id, c, e) end }
 zombies._host = { tick = function(c, dt) cfg = cfg or c; now = now + dt; host_tick(dt) end }
-zombies._test = { setup = function(c, r) cfg, role = c, r end, sweep = function(dt) now = now + (dt or 0); suppress_natives() end }
+zombies._test = { setup = function(c, r) cfg, role = c, r end,
+    -- a whole sweep (all its frames); start/step: one frame's slice at a time
+    sweep = function(dt) now = now + (dt or 0); suppress_natives(); while sweep.q do sweep.step() end end,
+    start = function(dt) now = now + (dt or 0); suppress_natives() end,
+    step = function() sweep.step(); return sweep.q ~= nil end,
+    pending = function() return sweep.q and (#sweep.q.items - sweep.q.i) or 0 end }
 
 local function read_snapshot()
     local body = link.get_blob("zombies")
@@ -1350,14 +1387,16 @@ local function guest_tick(dt)
         else log.info("zombies: in the host's world - showing the host's zombies") end
         p8.on, p8.fighting, p8.drain, p8.stopped = false, false, {}, {}
         spawner_in = 0.0
-        volumes_stopped = {}
+        sweep.volumes = {}
         native_in = 0.0
         pass_in = 0.0
+        sweep.q = nil
         loot_ok, loot_wait_logged = false, -100
     end
     if not active then return end
     local busy = now - active_at < 20 or require("mirror.save_guard").busy()
     if not secondary then util.safe(loader.tick, "zombies.loader", dt, busy) end
+    if sweep.q and not secondary then perf.run("z.pass", function() util.safe(sweep.step, "zombies.sweep") end) end
     pass_in = pass_in - dt
     if pass_in <= 0 and not secondary then perf.run("z.pass", function()
         pass_in = 2.0
@@ -1866,7 +1905,8 @@ end
 local function forget_world()
     ids, by_id, statics, watch_dead = {}, {}, {}, nil
     zlist, zlist_set, zlist_addr, zlist_new, zlist_at, zlist_pruned = {}, {}, {}, {}, -100, -100
-    copies, copy_addr, destroyed, volumes_stopped, xlooks = {}, {}, {}, {}, {}
+    copies, copy_addr, destroyed, sweep.volumes, xlooks = {}, {}, {}, {}, {}
+    sweep.q = nil
     ANY_COPIES[zombies] = copy_addr
     p8.on, p8.fighting, p8.drain, p8.stopped, p8.follow = false, false, {}, {}, false
     arch_seen, arch_seen_n = {}, 0
@@ -1968,7 +2008,7 @@ function zombies.init(c, r, s, opts)
                 local who = zinfo(Actor, Ctx)
                 if not who then return end
                 local names = {}
-                pcall(function() Effects:get():ForEach(function(_, e) names[#names + 1] = (e:get():ToString():gsub(" ", "_")) end) end)
+                pcall(function() util.each(Effects:get(), function(_, e) names[#names + 1] = (e:get():ToString():gsub(" ", "_")) end) end)
                 meds:send(string.format("M %s %.3f %.3f %.3f %.3f %s", who, g(CB) or 0, g(CHB) or 0, g(CBB) or 0, g(CI) or 0,
                     #names > 0 and table.concat(names, ",") or "-"))
             end)

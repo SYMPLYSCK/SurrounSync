@@ -30,6 +30,10 @@ local notify = require("mirror.notify")
 local infest = {}
 
 local PATH = "/Game/Infestation/BP_Infestation.BP_Infestation_C"
+-- the five kinds are direct children of BP_Infestation (game files): one walk finds all six lists
+local GROUP = "BP_Infestation_C"
+util.instance_group(GROUP, { "BP_Infestation_Ceiling_C", "BP_Infestation_Corner_C", "BP_Infestation_Floor_C",
+                             "BP_Infestation_Wall_C", "BP_PrimaryInfestation_C" }, true)
 local SAI = "/Game/AI/SD_AIComponent.SD_AIComponent_C"
 local KSL = "/Script/Engine.Default__KismetSystemLibrary"
 local CLASSES = { "BP_Infestation_C", "BP_Infestation_Ceiling_C", "BP_Infestation_Corner_C", "BP_Infestation_Floor_C",
@@ -122,7 +126,7 @@ end
 -- One class per call (util.instances keeps the lists without walking every object in the game).
 local scan_idx = 0
 local function rescan_class(cls)
-    local objs, walked = util.instances(cls, PATH)
+    local objs, walked = util.instances(cls, PATH, GROUP)
     if not walked then return false end
     for k, n in pairs(nests) do
         if n.cls == cls then nests[k] = nil; by_addr[n.addr] = nil end
@@ -180,6 +184,28 @@ local function primary_locked(n)
     return primary and not can
 end
 
+-- Guest: the game opens a primary (CanDamagePrimary?) when a secondary's InfestationDestroyed broadcast reaches
+-- it; a nest the host destroyed is shown here with Event_OnDestroyed, which doesn't broadcast - the guest's
+-- primary stayed shut for the session ("destroy the others first" on every hit, player report 2026-10-27).
+-- Same check as the game's AreSecondariesDestroyed? (IsDestroyed? flips 0.2 s after Event_OnDestroyed).
+local function open_primaries()
+    for _, n in pairs(nests) do
+        if util.valid(n.obj) and primary_locked(n) and not read(n) then
+            local all = true
+            local ok = pcall(function()
+                util.each(n.obj.SecondaryInfestations, function(_, e)
+                    local s = e:get()
+                    if not (util.valid(s) and s["IsDestroyed?"] == true) then all = false end
+                end)
+            end)
+            if ok and all then
+                pcall(function() n.obj["CanDamagePrimary?"] = true end)
+                log.info("infest: " .. n.key .. " - its smaller nests are all destroyed, it can be damaged now")
+            end
+        end
+    end
+end
+
 -- Host: the guest's hit on its copy of a nest.
 local function apply_hit(payload)
     local k, amt = payload:match("^(%S+) (%S+)$")
@@ -221,8 +247,10 @@ local function apply_hit(payload)
 end
 
 local function on_guest_message(payload)
-    local kind = payload:match("^(%a) %S+$")
-    if kind == "B" then
+    local kind, k = payload:match("^(%a) (%S+)$")
+    local n = k and find(k)
+    -- (the copy here shut too: the game has said so itself)
+    if kind == "B" and not (n and primary_locked(n)) then
         notify.show("Destroy the smaller infestations around it first.", "info", "infest_primary")
     end
 end
@@ -251,7 +279,8 @@ local function on_damage(self, Damage)
     local amt = 0
     pcall(function() amt = Damage:get() end)
     amt = tonumber(amt) or 0
-    if amt <= 0 or shown_dead[n.key] or primary_locked(n) then return end
+    -- a primary that is still shut here goes to the host too: the host's own nest decides (it answers "B")
+    if amt <= 0 or shown_dead[n.key] then return end
     hits:send(string.format("%s %.3f", n.key, amt))
     stats.sent = stats.sent + 1
 end
@@ -406,6 +435,8 @@ function infest.tick(dt)
         hits:pump(on_guest_message)
         local b = link.get_blob("nests")
         if b then take_state(b) end
+        state_in = state_in - dt
+        if state_in <= 0 then state_in = STATE_EVERY; open_primaries() end
     end
 end
 
@@ -425,7 +456,7 @@ local function solo_tick(dt)
     if solo.left == nil then solo.wait = solo.wait + (dt or 0); if solo.wait < 5.0 then return end; solo.left = #CLASSES end
     if solo.left <= 0 then return end
     local cls = CLASSES[solo.left]
-    local objs, walked = util.instances(cls, PATH)
+    local objs, walked = util.instances(cls, PATH, GROUP)
     if not walked then return end
     solo.left = solo.left - 1
     for _, o in ipairs(objs or {}) do

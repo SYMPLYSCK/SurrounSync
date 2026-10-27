@@ -2,6 +2,43 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 0.13.7 (2026-10-27)
+
+Shared map pings, laptop scans and a pile of fixes. Works together with 0.13.2 - 0.13.6 (pings and laptop scans need both players on 0.13.7).
+
+**📍 New: map pings are shared**
+- Pings you put on the big map show on everyone's map, with your icon and colour. Removing one (double-click) removes it for everyone.
+- A friend's pings in your world are saved with your world.
+- Off for your own pings: J -> CO-OP -> gear -> MY SETTINGS -> SHARE MAP PINGS.
+
+**💻 New: military laptop scans are shared**
+- The bounty a laptop starts shows its map icon for everyone. For a "classified container" bounty the crate shows up for everyone too. The item inside and the quest stay with whoever scanned it; when they search it, the lid opens for everyone.
+
+**🪺 Fixed: a friend couldn't damage a big infestation after clearing the small ones**
+- As a guest, the main nest kept saying "destroy the smaller infestations first" for the rest of the session once the host's game had destroyed them. It now opens as soon as all of them are gone.
+
+**🎒 Fixed: items put into a bag in a shared cabinet could vanish**
+- Taking an item out of a container and putting it back in was ignored by the host's game. Later the item (or the bag) disappeared.
+
+**💥 Fixed: one grenade showed up as several**
+- A thrown grenade's copy near the thrower was sent back as a new throw - 2 to 8 grenades from one, each going off.
+
+**🚪 Fixed: keycard doors needed a keycard on each game**
+- Keycard and keypad doors opened by one player now open for everyone.
+
+**🎒 Backpacks**
+- The hint "Rename (F2)" shows on every backpack, and renamed backpacks keep their name in the inventory's backpack list (top right). F2 renames the backpack you're actually hovering.
+- Fixed a crash while items moved between containers (the mod read lists the game had already thrown away).
+
+**⚡ Smoother**
+- Joining stutters less (the mod finds the world's objects in a few big passes instead of dozens of small ones).
+- Some of the mod's hooks (animal hits, traders, loot) could take minutes to start working after a load. They now all start within a few seconds, without a freeze.
+- Fewer hitches from looking up game objects in power, doors and loot.
+
+**🛠️ Other**
+- The CO-OP tab keeps the friends list while you're asking to join someone.
+- The settings page fits all of MY SETTINGS.
+
 ## 0.13.6 (2026-10-27)
 
 A duplicate fix. Works together with 0.13.2 - 0.13.5 (update everyone to get the fix).

@@ -24,6 +24,15 @@ local KINDS = {
     BP_LargeBunkerEntrance_C       = { flag = "Open?", closed_when = false, toggle = "CallInteractOnObject" },
     BP_LargeBunkerEntrance_Small_C = { flag = "Open?", closed_when = false, toggle = "CallInteractOnObject" },
     BP_BunkerScanner_C             = { lock = "KeycardRequired?" },
+    -- Keycard doors (player report 2026-10-27: one area's doors took a keycard on each game). BP_KeycardDoor uses
+    -- up a keycard on every opening and closes itself 30 min later; MC_OpenDoor(actor) only plays the opening
+    -- (decompiled): the other game opens its copy with that, facing the other player, and never shuts it (each
+    -- closes on its own timer). The keypad door works the same way. The lab's secure doors keep an Unlocked flag
+    -- that the keycard sets: copied, the other player opens them for free.
+    BP_KeycardDoor_C               = { flag = "Open?", closed_when = false, toggle = "MC_OpenDoor", open_only = true, by_actor = true },
+    BP_KeycardDoor_Child_C         = { flag = "Open?", closed_when = false, toggle = "MC_OpenDoor", open_only = true, by_actor = true },
+    BP_KeypadDoor_C                = { flag = "Open?", closed_when = false, toggle = "MC_OpenDoor", open_only = true, by_actor = true },
+    BP_LaboratorySecureDoors_C     = { unlock = "Unlocked" },
 }
 
 local POLL = 0.25
@@ -89,6 +98,7 @@ local function read(d)
     pcall(function()
         if d.kind.flag then open = (d.obj[d.kind.flag] == true) ~= d.kind.closed_when end
         if d.kind.lock then unlocked = d.obj[d.kind.lock] ~= true end
+        if d.kind.unlock then unlocked = d.obj[d.kind.unlock] == true end
     end)
     return open, unlocked
 end
@@ -133,16 +143,19 @@ local function apply(id, e)
     if not d or not util.valid(d.obj) then return false end
     local open, unlocked = read(d)
     local want = { open = open, unlocked = unlocked, ["until"] = now + EXPECT }
-    if d.kind.lock and e.unlocked == true and unlocked == false then
-        local ok = pcall(function() d.obj[d.kind.lock] = false end)
+    if (d.kind.lock or d.kind.unlock) and e.unlocked == true and unlocked == false then
+        local ok = pcall(function()
+            if d.kind.lock then d.obj[d.kind.lock] = false else d.obj[d.kind.unlock] = true end
+        end)
         want.unlocked = true
         stats.unlocked = stats.unlocked + 1
         log.info("doors: unlocked " .. id .. " (the other player opened it)" .. (ok and "" or " - FAILED"))
     end
-    if d.kind.toggle and e.open ~= nil and open ~= nil and e.open ~= open then
+    if d.kind.toggle and e.open ~= nil and open ~= nil and e.open ~= open and (e.open or not d.kind.open_only) then
         local ex = expect[id]
         if not (ex and ex.open == e.open and now < ex["until"]) then
-            local ok, err = pcall(function() local f = d.obj[d.kind.toggle]; f(d.obj) end)
+            local by = d.kind.by_actor and require("mirror.ghost").get() or nil
+            local ok, err = pcall(function() local f = d.obj[d.kind.toggle]; if by then f(d.obj, by) else f(d.obj) end end)
             if ok and e.open and d.kind.dot and e.dot then pcall(function() d.obj.DotProduct = e.dot end) end
             want.open = e.open
             stats.applied = stats.applied + 1

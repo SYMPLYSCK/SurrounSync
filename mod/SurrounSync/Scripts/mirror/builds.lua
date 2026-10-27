@@ -190,6 +190,14 @@ local function place(payload)
     local cname
     pcall(function() cname = util.fname(cls) end)
     if cname and find(string.format("%s@%d,%d,%d", cname, grid(loc))) then return end
+    -- (diagnosis for "turrets stacking up", 2026-10-27: is a copy being built on top of one that's already here?)
+    local near = cname and find(string.format("%s@%d,%d,%d", cname, grid(loc)), 300)
+    if near then
+        local d
+        pcall(function() d = util.dist(util.vec(near:K2_GetActorLocation()), loc) end)
+        log.warn(string.format("builds: the other player's %s goes %s cm from one of the same kind already here",
+            da:match("[^%.]+$") or da, d and string.format("%.0f", d) or "?"))
+    end
     local actor
     log.info("builds: building the other player's " .. (da:match("[^%.]+$") or da) .. "...")
     applying = true

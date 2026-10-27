@@ -18,6 +18,7 @@ mysettings.LIST = {
     { key = "sounds", label = "SHARED SOUNDS", hint = "Hear zombies and tools from the other players' games.", default = "on" },
     { key = "joinsound", label = "JOIN ALERT SOUND", hint = "A whistle when someone asks to join you.", default = "on" },
     { key = "autotp", label = "AUTO-ACCEPT TELEPORTS", hint = "Say yes to /goto and /bring without asking.", default = "off" },
+    { key = "pings", label = "SHARE MAP PINGS", hint = "Your map pings and laptop scans show for the other players.", default = "on" },
     { key = "dmgnumbers", label = "DAMAGE NUMBERS", hint = "The numbers that pop up when you hit something.", default = "on" },
     { key = "perf", label = "GUEST PERFORMANCE", hint = "As a guest: zombies are copied to you within 150 / 100 / 60 m.",
       values = { { "full", "FULL" }, { "balanced", "BALANCED" }, { "low", "LOW" } }, default = "full" },

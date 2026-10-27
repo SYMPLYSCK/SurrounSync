@@ -83,7 +83,7 @@ local function capture_gear(player, fp, lines)
         if hidden_actor and not fp_ok then vis = false end
         local kids, any_visual = {}, (mesh ~= "-" and vis)
         pcall(function()
-            comp.AttachChildren:ForEach(function(_, c)
+            util.each(comp.AttachChildren, function(_, c)
                 local child = c:get()
                 if util.valid(child) then kids[#kids + 1] = child end
             end)
@@ -114,7 +114,7 @@ local function capture_gear(player, fp, lines)
 
     local root = player.Mesh
     pcall(function()
-        root.AttachChildren:ForEach(function(_, c)
+        util.each(root.AttachChildren, function(_, c)
             local child = c:get()
             if not util.valid(child) then return end
             local owner
@@ -285,7 +285,7 @@ function look.dump(g)
     local function walk(comp, depth)
         if depth > 5 then return end
         pcall(function()
-            comp.AttachChildren:ForEach(function(_, ch)
+            util.each(comp.AttachChildren, function(_, ch)
                 local c = ch:get()
                 if not util.valid(c) then return end
                 local k = kind_of(c)

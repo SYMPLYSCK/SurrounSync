@@ -69,8 +69,8 @@ local function ems_state(why)
     if not ems then log.info("invdiag[" .. why .. "]: no EMSObject"); return end
     local cur = str(ems.CurrentSaveGameName)
     local slots, customs = {}, {}
-    pcall(function() ems.CachedSaveSlots:ForEach(function(k, _) slots[#slots + 1] = str(k) end) end)
-    pcall(function() ems.CachedCustomSaves:ForEach(function(k, v) customs[#customs + 1] = str(k) .. "=" .. name_of(v:get()) end) end)
+    pcall(function() util.each(ems.CachedSaveSlots, function(k, _) slots[#slots + 1] = str(k) end) end)
+    pcall(function() util.each(ems.CachedCustomSaves, function(k, v) customs[#customs + 1] = str(k) .. "=" .. name_of(v:get()) end) end)
     local info = false
     pcall(function()
         local lib = util.cdo("/Script/EasyMultiSave.Default__EMSFunctionLibrary")

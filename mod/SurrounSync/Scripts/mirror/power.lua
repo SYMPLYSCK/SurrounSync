@@ -18,6 +18,9 @@ local SCAN = {}
 for kind, list in pairs(CLASSES) do for _, c in ipairs(list) do SCAN[#SCAN + 1] = { kind, c } end end
 -- Whose ReceiveBeginPlay tells util.instances about new ones (BP_PowerGenerator has none).
 local GEN_MASTER = "/Game/Blueprints/BuildingSystem/Actors/Generator/Buildable_GeneratorMaster.Buildable_GeneratorMaster_C"
+-- the three generators are direct children of it (game files): one walk finds all three
+local GEN_GROUP = "Buildable_GeneratorMaster_C"
+util.instance_group(GEN_GROUP, CLASSES.g)
 local function hooks_of(kind, cls)
     if kind == "g" then return GEN_MASTER end
     if kind == "l" then local n = cls:gsub("_C$", ""); return "/Game/Blueprints/BuildingSystem/Actors/Lights/" .. n .. "." .. cls end
@@ -56,7 +59,7 @@ end
 local function scan_step()
     scan_at = scan_at % #SCAN + 1
     local kind, cls = SCAN[scan_at][1], SCAN[scan_at][2]
-    local objs, walked = util.instances(cls, hooks_of(kind, cls))
+    local objs, walked = util.instances(cls, hooks_of(kind, cls), kind == "g" and GEN_GROUP or nil)
     if not walked then return end
     local seen = {}
     for _, a in ipairs(objs) do

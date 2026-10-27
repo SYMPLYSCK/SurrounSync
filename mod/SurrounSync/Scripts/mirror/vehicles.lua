@@ -13,6 +13,13 @@ local MASTER = "/Game/Blueprints/Vehicles/BP_VehicleMaster.BP_VehicleMaster_C"
 local TYPES = { "4x4Jeep", "APC", "Ambulance", "BigRig", "Buggy", "Charger", "DamagedSedan", "FlatbedTruck", "GolfCart",
                 "Humvee", "ModifiedPickupUtilityTruck", "PickupTruck", "RV", "SUV", "Sheriff", "SwatVan", "Truck",
                 "PickupUtilityTruck", "Van" }
+-- all 19 are direct children of BP_VehicleMaster (game files): one walk finds every type's cars
+local CAR_GROUP = "BP_VehicleMaster_C"
+do
+    local members = {}
+    for i, t in ipairs(TYPES) do members[i] = "Vehicle_" .. t .. "_C" end
+    util.instance_group(CAR_GROUP, members)
+end
 local SPAWNERS = { "BP_VehicleSpawner_C", "BP_VehicleUniqueSpawner_C" }
 local SIT = "/Game/Character/Anims/Interaction/Chr_SitInCar_Montage.Chr_SitInCar_Montage"
 local CLASS_EVERY = 1.0
@@ -84,7 +91,7 @@ end
 local function scan()
     local fresh, ready = {}, true
     for _, t in ipairs(TYPES) do
-        local list, walked = util.instances("Vehicle_" .. t .. "_C", MASTER)
+        local list, walked = util.instances("Vehicle_" .. t .. "_C", MASTER, CAR_GROUP)
         if not walked then ready = false end
         for _, v in ipairs(list) do
             if alive(v) then

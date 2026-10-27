@@ -269,6 +269,134 @@ def instances_walk_once_then_follow_beginplay():
     check(L.eval('WALKS') == L.eval('W0') + 1 and L.eval('R5') == 2 and L.eval('R6'), "and walks the class again in the new world")
 
 
+def grouped_classes_share_one_walk():
+    # join lag: ~50 class walks (30-110 ms each) in a row after a load; 19 car types are one walk now
+    print("grouped_classes_share_one_walk")
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        util = require("mirror.util")
+        HOOKS = {}
+        util.hook = function(p, fn) HOOKS[p] = fn; return true end
+        StaticFindObject = function(p) return obj({ GetFName = function() return { ToString = function() return p:match("([^:]+)$") end } end }) end
+        local function thing(c) local o = obj({ GetFullName = function() return c .. " /Game/L.L:P." .. c .. "_1" end }); o.GetClass = function() return cls(c) end; return o end
+        WORLD = { thing("Car_A_C"), thing("Car_A_C"), thing("Car_B_C") }
+        CDO = obj({ GetFullName = function() return "Car_A_C /Game/A.Default__Car_A_C" end }); CDO.GetClass = function() return cls("Car_A_C") end
+        CALLS = {}
+        -- like the engine: the parent's FindAllOf returns its children's objects; a child's only its own
+        FindAllOf = function(c)
+            CALLS[#CALLS + 1] = c
+            local out = {}
+            for _, o in ipairs(WORLD) do if c == "Car_C" or util.class_name(o) == c then out[#out + 1] = o end end
+            if c == "Car_C" or c == "Car_A_C" then out[#out + 1] = CDO end
+            return out
+        end
+        util.instance_group("Car_C", { "Car_A_C", "Car_B_C", "Car_D_C" }, true)
+        function frame() NOW = NOW + 0.016; util.new_frame() end
+        local M = "/Game/V.Car_C"
+        frame()
+        local a, wa = util.instances("Car_A_C", M, "Car_C")
+        frame()
+        local b, wb = util.instances("Car_B_C", M, "Car_C")
+        local d, wd = util.instances("Car_D_C", M, "Car_C")
+        local p = util.instances("Car_C", M, "Car_C")
+        R1 = { #CALLS, #a, wa, #b, wb, #d, wd, #p }
+        for i = 1, 100 do frame(); NOW = NOW + 1; util.instances("Car_A_C", M, "Car_C"); util.instances("Car_B_C", M, "Car_C") end
+        R2 = #CALLS
+        -- a new one after the walk: BeginPlay (the parent's hook) adds it to its own class's list, also for a class no one asked for yet
+        NEW = thing("Car_D_C"); HOOKS[M .. ":ReceiveBeginPlay"]({ get = function() return NEW end })
+        R3 = #util.instances("Car_D_C", M, "Car_C")
+        -- a world reset with a class outside the group (say a game update added Car_E as a child of Car_A): one by one
+        WORLD[#WORLD + 1] = thing("Car_E_C")
+        util.instances_reset()
+        local n0 = #CALLS
+        for i = 1, 6 do frame(); A2 = util.instances("Car_A_C", M, "Car_C"); B2 = util.instances("Car_B_C", M, "Car_C") end
+        SOLO = {}
+        for i = n0 + 1, #CALLS do SOLO[#SOLO + 1] = CALLS[i] end
+    """)
+    r = L.eval("R1")
+    check(r[1] == 1 and r[2] == 2 and r[3] and r[4] == 1 and r[5] and r[6] == 0 and r[7],
+          "one walk fills every type of the group (A 2 without the default object, B 1, D 0) - walks %d" % r[1])
+    check(r[8] == 3, "the parent's own list is all of them, from the same walk (FindAllOf(parent))")
+    check(L.eval("R2") == 1, "no walk again while BeginPlay keeps the lists (%d walks)" % L.eval("R2"))
+    check(L.eval("R3") == 1, "a type no one had asked for still gets its new ones through BeginPlay")
+    solo = list(L.eval("SOLO").values())
+    check(solo[:1] == ["Car_C"] and "Car_A_C" in solo and "Car_B_C" in solo, "an unknown child class: the types are walked one by one (%s)" % solo)
+    check(L.eval("#A2") == 2 and L.eval("#B2") == 1, "...with the same lists as before")
+
+
+def walk_skip_is_measured_after_a_load():
+    # measurement only: after a load, did BeginPlay (since the teardown burst) already find what the walk finds?
+    print("walk_skip_is_measured_after_a_load")
+    L = lua()
+    L.execute(FAKES + r"""
+        LOGS = {}
+        package.loaded["mirror.log"].info = function(s) LOGS[#LOGS + 1] = s end
+        NOW = 0; os.clock = function() return NOW end
+        util = require("mirror.util")
+        HOOKS = {}
+        util.hook = function(p, fn) HOOKS[p] = fn; return true end
+        StaticFindObject = function(p) return obj({ GetFName = function() return { ToString = function() return p:match("([^:]+)$") end } end }) end
+        local function thing(c) local o = obj({ GetFullName = function() return c .. " /Game/L.L:P." .. c .. "_1" end }); o.GetClass = function() return cls(c) end; return o end
+        WORLD = { thing("Door_C"), thing("Door_C") }
+        WALKS = 0
+        FindAllOf = function(c) WALKS = WALKS + 1; return WORLD end
+        function frame() NOW = NOW + 0.016; util.new_frame() end
+        frame(); util.instances("Door_C", "/Game/D.Door_C")
+        -- the old world ends (a burst of EndPlays), the new world's doors begin play (one is missed), then the reset
+        NOW = NOW + 10
+        for i = 1, 600 do HOOKS["/Script/Engine.Actor:ReceiveEndPlay"]({ get = function() return obj({}) end }) end
+        NOW = NOW + 1
+        WORLD = { thing("Door_C"), thing("Door_C"), thing("Door_C") }
+        HOOKS["/Game/D.Door_C:ReceiveBeginPlay"]({ get = function() return WORLD[1] end })
+        HOOKS["/Game/D.Door_C:ReceiveBeginPlay"]({ get = function() return WORLD[2] end })
+        util.instances_reset()
+        local w0 = WALKS
+        frame(); L1, W1 = util.instances("Door_C", "/Game/D.Door_C")
+        WALKED = WALKS - w0
+        LINE = nil
+        for _, s in ipairs(LOGS) do if s:find("after the load BeginPlay had found", 1, true) then LINE = s end end
+    """)
+    check(L.eval("WALKED") == 1 and L.eval("#L1") == 3 and L.eval("W1"), "the walk after a load still runs and finds all 3")
+    line = L.eval("LINE")
+    check(line is not None and "found 2 of 3" in line and "Door_C 2/3" in line, "and the log says BeginPlay alone had 2 of 3 (%s)" % line)
+
+
+def unloaded_tracked_classes_cost_few_lookups():
+    # "perf: power/doors took 30-45 ms": a tracked class nobody built (no lamp of that type) was looked up
+    # twice every 2 s, ~15 ms per miss
+    print("unloaded_tracked_classes_cost_few_lookups")
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        util = require("mirror.util")
+        HOOKS = {}
+        util.hook = function(p, fn) HOOKS[p] = fn; return true end
+        MISSES, HITS = 0, 0
+        LOADED = {}
+        StaticFindObject = function(p)
+            local c = p:match("^(.-):") or p
+            if not LOADED[c] then MISSES = MISSES + 1; NOW = NOW + 0.015; return nil end
+            HITS = HITS + 1
+            return obj({ GetFName = function() return { ToString = function() return p:match("([^:]+)$") end } end })
+        end
+        WALKS = 0
+        FindAllOf = function(c) WALKS = WALKS + 1; return { obj({ GetFullName = function() return c .. " /Game/L.L:P." .. c .. "_1" end }) } end
+        function frame(secs) NOW = NOW + (secs or 0.016); util.new_frame() end
+        for i = 1, 120 do frame(1.0); util.instances("Lamp_C", "/Game/L.Lamp_C") end
+        M120 = MISSES
+        LOADED["/Game/L.Lamp_C"] = true
+        for i = 1, 31 do frame(1.0); L1, W1 = util.instances("Lamp_C", "/Game/L.Lamp_C") end
+        H0 = HITS
+        for i = 1, 120 do frame(1.0); util.instances("Lamp_C", "/Game/L.Lamp_C") end
+        H120 = HITS - H0
+    """)
+    check(L.eval("M120") <= 9, "an unloaded class: few misses in 2 minutes (%d, was 120)" % L.eval("M120"))
+    check(L.eval("#L1") == 1 and L.eval("W1") and L.eval('HOOKS["/Game/L.Lamp_C:ReceiveBeginPlay"] ~= nil'),
+          "once it loads (within 30 s) it's hooked and walked")
+    check(L.eval("H120") == 0, "a standing hook needs no lookups (%d)" % L.eval("H120"))
+
+
 def hook_lookups_share_one_budget():
     print("hook_lookups_share_one_budget")
     L = lua()
@@ -303,6 +431,29 @@ def hook_lookups_share_one_budget():
     check(L.eval('R4') == 1, "an urgent hook skips the budget and the class miss")
     L.execute('LOOKS = {}; LOADED["/Game/B.B_C"] = true; for i = 1, 400 do frame(); NOW = NOW + 0.25; all() end; R5 = #HOOKED')
     check(L.eval('R5') == 10, "a class that loads later gets hooked")
+    # in-game 2026-10-27: a module late in the tick order asked each second in the frame where the earlier ones had
+    # spent the budget - its hooks never went in (host map pings off after 3 min)
+    L.execute(r"""
+        HOOKED, N = {}, 0
+        function second() frame()
+            for i = 1, 2 do N = N + 1; util.ensure_hook("/Game/A.A_C:Hog" .. N, function() end) end
+            util.ensure_hook("/Game/A.A_C:Late", F[1]); NOW = NOW + 1.0 end
+        function late() local n = 0; for _, p in ipairs(HOOKED) do if p:find("Late") then n = n + 1 end end; return n end
+        second(); S1 = late()
+        frame(); S2 = late()
+    """)
+    check(L.eval('S1') == 0 and L.eval('S2') == 1, "a hook that finds the budget spent is looked up in the next frame, not never")
+    L.execute(r"""
+        for i = 1, 20 do frame() end
+        LATE2 = {}; for i = 1, 6 do LATE2[i] = function() end end
+        frame(); for i = 1, 2 do N = N + 1; util.ensure_hook("/Game/A.A_C:Hog" .. N, function() end) end
+        for i = 1, 6 do util.ensure_hook("/Game/A.A_C:Many" .. i, LATE2[i]) end
+        function many() local n = 0; for _, p in ipairs(HOOKED) do if p:find("Many") then n = n + 1 end end; return n end
+        M0 = many(); frame(); M1 = many()
+        for i = 1, 5 do frame() end; M6 = many()
+    """)
+    check(L.eval('M0') == 0 and L.eval('M1') == 1 and L.eval('M6') == 6,
+          "waiting hooks go one per frame, not all at once (after a load ~200 at once = 300-600 ms) (%s, %s, %s)" % (L.eval('M0'), L.eval('M1'), L.eval('M6')))
 
 
 def find_remembers_misses():
@@ -591,12 +742,14 @@ def vehicles_keep_this_worlds_fuel():
                          K2_SetActorLocationAndRotation = function() end, VehicleEngineFX = function() end,
                          IsActorBeingDestroyed = function() return false end,
                          IsA = function() return true end,
+                         GetClass = function() return cls("Vehicle_Van_C") end,
                          GetFullName = function() return "Vehicle_Van_C /Game/L.L:P." .. name end,
                          GetFName = function() return { ToString = function() return name end } end })
         end
         A = car("Vehicle_Van_C_1", 60, 100)
         B = car("Vehicle_Van_C_2", 0, 0)
-        FindAllOf = function(c) if c == "Vehicle_Van_C" then return { A, B } end return {} end
+        -- (like the engine: FindAllOf of the parent class returns its children's objects too)
+        FindAllOf = function(c) if c == "Vehicle_Van_C" or c == "BP_VehicleMaster_C" then return { A, B } end return {} end
         vehicles = require("mirror.vehicles")
         vehicles.init({ mirror_vehicles = true }, "host", { guest_in_world = function() return true end })
         local tick = vehicles.tick
@@ -987,6 +1140,25 @@ def nests_keep_real_health():
     G.execute('blobs_in.nests = "BP_Infestation_C@0,0,0 1 0.0 3000.0"; infest.tick(0.1)')
     check(G.eval("A['IsDestroyed?']") is True, "guest: a nest destroyed on the host is destroyed here")
 
+    # player report 2026-10-27: after destroying the smaller nests the guest's primary kept saying "destroy the
+    # others first" - nests the host destroyed are shown with Event_OnDestroyed, which doesn't tell the primary
+    G3 = setup("guest")
+    G3.execute(r"""
+        P = nest(20000, 3000, 3000, 3000)
+        P["PrimaryInfestation?"], P["CanDamagePrimary?"] = true, false
+        P.GetClass = function() return obj({ GetFullName = function() return "BlueprintGeneratedClass /Game/Infestation/BP_PrimaryInfestation.BP_PrimaryInfestation_C" end,
+                                             GetFName = function() return { ToString = function() return "BP_PrimaryInfestation_C" end } end }) end
+        P.SecondaryInfestations = { items = { A, BAD }, ForEach = function(self, fn)
+            for i, v in ipairs(self.items) do fn(i, { get = function() return v end }) end end }
+        hook("Damage_Object", P, 50.0, PLAYER, nil)
+    """)
+    check(G3.eval("SENT[#SENT]") == "BP_PrimaryInfestation_C@2000,0,0 50.000",
+          "guest: a hit on a primary still shut here goes to the host (the host's nest decides)")
+    G3.execute('blobs_in.nests = "BP_Infestation_C@0,0,0 1 0.0 3000.0"; infest.tick(1.1)')
+    check(G3.eval("P['CanDamagePrimary?']") is False, "guest: the primary stays shut while one smaller nest is left")
+    G3.execute('blobs_in.nests = "BP_Infestation_C@0,0,0 1 0.0 3000.0\\nBP_Infestation_C@500,0,0 1 0.0 3000.0"; infest.tick(1.1)')
+    check(G3.eval("P['CanDamagePrimary?']") is True, "guest: once the host's kills of all its smaller nests show here, the primary opens")
+
 
 def horde_beacon_runs_only_on_the_host():
     print("horde_beacon_runs_only_on_the_host")
@@ -1174,7 +1346,20 @@ def backpack_tooltip_reads_the_item_once():
     L.execute("frames(60)")
     check(L.eval("WALKS") == 0 and L.eval("FULLNAMES") == 1, "60 frames on one backpack: item read once, inventory never walked (%s walks, %s names)"
           % (L.eval("WALKS"), L.eval("FULLNAMES")))
-    check(L.eval("SHOWN") == "Med bag" and "(F2: rename)" in L.eval("DESCR"), "its name and the F2 hint still show")
+    check(L.eval("SHOWN") == "Med bag" and "Rename (F2)" in L.eval("DESCR"), "its name and the F2 hint still show")
+    # backpacks have no description: the game's Update collapses descr + Divider and leaves stale text in descr
+    L.execute('DESCR = "Designer placeholder"; DVIS = 1; DIVVIS = 1; '
+              'TIP.descr.GetVisibility = function() return DVIS end; TIP.descr.SetVisibility = function(_, v) DVIS = v end; '
+              'TIP.Divider = obj({ SetVisibility = function(_, v) DIVVIS = v end }); frames(1)')
+    check(L.eval("DESCR") == "Rename (F2)" and L.eval("DVIS") == 4 and L.eval("DIVVIS") == 4,
+          "a bag without a description: the collapsed text is shown with just the hint (%s, vis %s/%s)"
+          % (L.eval("DESCR"), L.eval("DVIS"), L.eval("DIVVIS")))
+    L.execute('DESCR = "Holds things"; DVIS = 0')
+    L.execute('ROWTXT = {}; function row(a) local t = obj({ SetText = function(_, s) ROWTXT[a] = s end }) '
+              'return obj({ UID = { A = a, B = 2, C = 3, D = 4 }, ItemName = t }) end; '
+              'HOOKS.Construct(P(row(1))); HOOKS.Construct(P(row(7)))')
+    check(L.eval("ROWTXT[1]") == "Med bag" and L.eval("ROWTXT[7]") is None,
+          "backpack list (top right): a named bag's row shows its name, other rows keep the game's")
     check(L.eval("STALE") is None, "the tooltip's previous item (self.ItemRef, maybe freed) is never read")
     L.execute("names.set('1_2_3_4', 'Ammo bag'); frames(1)")
     check(L.eval("SHOWN") == "Ammo bag" and L.eval("WALKS") == 0, "a rename shows at once without a new walk")
@@ -1185,9 +1370,75 @@ def backpack_tooltip_reads_the_item_once():
     check(L.eval("REFREADS") > L.eval("R0") and L.eval("WALKS") == 0, "after the pause it looks at the item once more, still no walk")
     L.execute("NOW = NOW + 1.0; KEYS.F2()")
     check(L.eval("names.asking()") is False, "F2 on a tooltip that stopped updating opens nothing (no widget kept)")
+    # the slot's tooltip binding only runs Update when the tooltip opens: F2 while the slot is still hovered works
+    # (player report: F2 only worked right after clicking the bag)
+    # (the box itself needs real widgets: count the rename box asking for the bag's current name instead)
+    L.execute("ITEM.GetClass = function() return cls('JSI_Slot_C') end; HOOKS.Update(P(obj({})), REF); "
+              "local get = names.get; OPENS = 0; names.get = function(u) if NOW > 0 and IN_F2 then OPENS = OPENS + 1 end return get(u) end; "
+              "local function f2() IN_F2 = true; KEYS.F2(); IN_F2 = false; return OPENS > 0 end; "
+              "frames(1); NOW = NOW + 2.0; HOV = false; ITEM.IsHovered = function() return HOV end; A1 = f2(); "
+              "frames(1); NOW = NOW + 2.0; HOV = true; A2 = f2(); names.get = get")
+    check(L.eval("A1") is False and L.eval("A2") is True,
+          "F2 seconds after the last tooltip Update: opens while the bag's slot is hovered, not after the mouse left (%s/%s)"
+          % (L.eval("A1"), L.eval("A2")))
     L.execute('package.loaded["mirror.names"] = nil; HOOKS = {}; names = require("mirror.names"); '
               'names.init({ backpack_names = false }); names.tick(1)')
     check(L.eval("next(HOOKS) == nil"), "backpack_names = off: no inventory hooks at all")
+
+
+def foreach_keeps_temporary_arrays_alive():
+    # DBG-20261026-001: UE4SS's ForEach takes the array off the Lua stack before it loops, so a temporary
+    # (comp.MainJigContainers:ForEach) can be collected by Lua mid-loop -> freed memory read -> native crash (big bags).
+    print("foreach_keeps_temporary_arrays_alive")
+    L = lua()
+    L.execute(FAKES + r"""
+        util = require("mirror.util")
+        jig = require("mirror.jig")
+        FREED = 0
+        -- a fresh array object per property read, like UE4SS; its ForEach lets go of it the way UE4SS does
+        function arr(elems)
+            return { ForEach = function(self, fn)
+                local w = setmetatable({ self }, { __mode = "v" })
+                self = nil
+                for i, e in ipairs(elems) do
+                    collectgarbage("collect")
+                    if w[1] == nil then FREED = FREED + 1 end
+                    fn(i, { get = function() return e end })
+                end
+            end }
+        end
+        local function item(n)
+            return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = { A = n, B = 0, C = 0, D = 0 },
+                     ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = {
+                         ItemID_28_01CA27D84AF7D1014D9E2E83894C1848 = obj({ GetFullName = function() return "X /Game/I.I" end }),
+                         Count_8_DD79AF2A46126A338C8DCCB4616D91CD = 1,
+                         Durability_22_A3557C454274D193D47AB9B71FB0C0CA = { X = 1, Y = 1 } } }
+        end
+        local function cont(first, n)
+            local items = {}
+            for i = 1, n do items[i] = item(first + i) end
+            return setmetatable({ InContainerUID_24_D1504ED7438699C73EA046AD734E79BF = { A = 0, B = 0, C = 0, D = 0 },
+                                  ContainerIndex_22_9A211B86466A9D1C57E1FC839A5B0896 = 0 },
+                { __index = function(_, k) if k == "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B" then return arr(items) end end })
+        end
+        CONTS = { cont(0, 40), cont(100, 40), cont(200, 40) }
+        COMP = setmetatable(obj({}), { __index = function(_, k) if k == "MainJigContainers" then return arr(CONTS) end end })
+    """)
+    L.execute("COMP.MainJigContainers:ForEach(function() end)")
+    check(L.eval("FREED") > 0, "the fake reproduces it: a temporary array is collected mid-ForEach")
+    L.execute("FREED = 0; N = #jig.contents_of(COMP)")
+    check(L.eval("FREED") == 0 and L.eval("N") == 120,
+          "jig.contents_of keeps every array alive for its whole loop (%d freed, %d items)" % (L.eval("FREED"), L.eval("N")))
+    import re
+    bad = []
+    for base, _, files in os.walk(SCRIPTS):
+        for f in files:
+            if f.endswith(".lua"):
+                for i, line in enumerate(open(os.path.join(base, f), encoding="utf-8"), 1):
+                    code = line.split("--", 1)[0]
+                    if re.search(r"(\.\w+|\]|\))\s*:ForEach\(", code):
+                        bad.append("%s:%d" % (f, i))
+    check(not bad, "no :ForEach on a temporary anywhere in the mod %s" % (bad or ""))
 
 
 def backpack_names_travel_with_the_item():
@@ -1742,6 +1993,162 @@ def item_used_out_of_a_container_is_a_take():
     """)
     check(L.eval("SAME_FRAME") == 0, "a consume is looked at the next frame (the pre-hook runs before the count changes)")
     check(L.eval("AFTER") == 1, "an item used up inside a shared container is sent as a take (%d)" % L.eval("AFTER"))
+    # a guest disassembling at a crafted bench: the bench consumes the input via SERVER_RequestConsumeItem and
+    # Buildable_DisassemblyWorkbench inherits Buildable_MASTER's JigMP_OnItemConsumed (output + input kept on 0.13.2)
+    check(L.eval('HOOKS["/Game/Blueprints/BuildingSystem/Actors/Buildable_MASTER.Buildable_MASTER_C:JigMP_OnItemConsumed"] ~= nil'),
+          "a disassembly bench's consumed input is hooked (Buildable_MASTER)")
+
+
+def unanswered_join_keeps_the_friends_list():
+    # player report: asking to join someone who never accepts switched the CO-OP tab to just the chat - the
+    # friends list and code box were gone (role was "guest" from the moment of asking)
+    print("unanswered_join_keeps_the_friends_list")
+    L = lua()
+    L.execute(r"""
+        local any = { __index = function() return function() end end }
+        local function stub(t) return setmetatable(t or {}, any) end
+        for _, n in ipairs({ "util", "game", "notify", "menu_backups", "instance", "hostrules", "mysettings",
+                             "modlist", "itemclean", "names", "voice", "chat", "teleport", "compat", "version" }) do
+            package.loaded["mirror." .. n] = stub()
+        end
+        CMDS = {}
+        ROLE, CONNECTED, STATE = nil, false, "idle"
+        package.loaded["mirror.link"] = stub({ kind = function() return "steam" end, peer_name = function() return "Bob" end,
+            lobby = function() return { hosts = { { id = "765", name = "Bob" } } } end,
+            bridge_cmd = function(c) CMDS[#CMDS + 1] = c; return true end })
+        package.loaded["mirror.session"] = stub({ state = function() return STATE end })
+        package.loaded["mirror.phase1"] = stub({ started = function() return ROLE end, connected = function() return CONNECTED end,
+            init = function(c, r) ROLE = r end })
+        package.loaded["mirror.journal_tab"] = stub({ configure = function(t) TAB = t end })
+        ModifierKey = { CONTROL = 1 }
+        menu = require("mirror.menu")
+        menu.init({})
+        TAB.act.join("765", "Bob")
+        M1 = TAB.model()
+        CONNECTED = true
+        M2 = TAB.model()
+        CONNECTED = false
+        TAB.act.join("765", "Bob")
+    """)
+    check(L.eval("ROLE") == "guest", "asking to join makes this game a guest")
+    check(L.eval("M1.in_coop") is False and L.eval("M1.show_chat") is False,
+          "while the host hasn't accepted, the tab keeps the friends list and hides the chat")
+    check(L.eval("M2.in_coop") is True and L.eval("M2.show_chat") is True, "once connected it shows the co-op rows")
+    check(L.eval("CMDS[#CMDS]") == "join 765", "asking the same host again re-sends the request (%s)" % L.eval("CMDS[#CMDS]"))
+
+
+def bag_put_back_after_a_take_reaches_the_host():
+    # report 20261027-095623 (0.13.2): guest put a duffle bag in a cupboard, took it out (sent by the host's uid,
+    # learned from the host's list), filled it, put it back: the host still had "G1 already added" and only acked
+    # it, its next list lacked the bag and the guest's copy removed it with its 15 items ("0 added, 16 removed")
+    print("bag_put_back_after_a_take_reaches_the_host")
+    H = loot_guest()
+    H.execute(r"""
+        package.loaded["mirror.loot"] = nil
+        loot = require("mirror.loot")
+        loot.init({}, "host", { in_world = function() return true end })
+        PUMP.BP_JigMultiplayer = COMP
+        HCONT, ADDS = {}, 0
+        local J = package.loaded["mirror.jig"]
+        J.contents_of = function() return HCONT end
+        J.add_item = function(c, da, n) ADDS = ADDS + 1; local u = "H" .. ADDS; HCONT[#HCONT + 1] = { uid = u, da = da, count = n }; return u end
+        J.take = function(c, uid) for i, it in ipairs(HCONT) do if it.uid == uid then table.remove(HCONT, i); break end end; return true end
+        J.fill = function() return 0, 0 end
+        COMP.MainJigContainers = { GetArrayNum = function() return 1 end, ForEach = function(self, f)
+            f(1, { get = function() return { ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B = { ForEach = function(_, g)
+                for i, it in ipairs(HCONT) do g(i, { get = function() return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = it.uid,
+                    ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { Count_8_DD79AF2A46126A338C8DCCB4616D91CD = it.count } } end }) end
+            end } } end }) end }
+        ID = "Container_FuelLoot_GasPump_C@10,0,0"
+        local function put(seq) INBOX.loot = { "A " .. ID .. " G1 /Game/X.DA_DuffleBag 1 0 0 " .. seq .. " -1:0:-1" }; loot.tick(0.1) end
+        put(1)
+        A1 = ADDS
+        put(1)                       -- the same message again (replayed): still one bag
+        A_REPLAY = ADDS
+        INBOX.loot = { ID .. " H1 0 2 /Game/X.DA_DuffleBag" }; loot.tick(0.1)
+        LEFT = #HCONT
+        put(3)                       -- the same bag put back
+        A2, N2 = ADDS, #HCONT
+        put(1)                       -- an old message replayed after all that: no extra bag
+        A3 = ADDS
+    """)
+    check(H.eval("A1") == 1 and H.eval("A_REPLAY") == 1, "a put is added once, a replay of it is ignored")
+    check(H.eval("LEFT") == 0, "the guest's take (by the host's uid) removed it")
+    check(H.eval("A2") == 2 and H.eval("N2") == 1, "the same bag put back is added again (adds %s, here %s)" % (H.eval("A2"), H.eval("N2")))
+    check(H.eval("A3") == 2, "an old put replayed later adds nothing")
+
+
+def container_class_checks_are_cached():
+    # "perf: loot took 30-90 ms": with some MAIN classes not loaded (tents, stations...) "not a container" was
+    # never kept, so every inventory component redid up to 12 IsA, and the missing classes were looked up
+    # again (~15 ms per miss) every 10 s
+    print("container_class_checks_are_cached")
+    L = loot_guest()
+    L.execute(r"""
+        NOW = 100; os.clock = function() return NOW end
+        local B = "/Game/Blueprints/BuildingSystem/Actors/"
+        CRATE = "/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C"
+        TENT = B .. "Tents/BuildableMaster_Tent.BuildableMaster_Tent_C"
+        LOADED = { [CRATE] = true, [B .. "Buildable_MASTER.Buildable_MASTER_C"] = true }
+        ROOT = {}
+        MISSES, ISA = 0, 0
+        StaticFindObject = function(p)
+            -- (only container-class misses count: the vehicle class is is_car's, other paths other modules')
+            local main = (p:find("/Containers/", 1, true) or p:find("/BuildingSystem/", 1, true) or p:find("Station", 1, true))
+                and not p:find(":", 1, true)
+            if not LOADED[p] then if main then MISSES = MISSES + 1 end; return nil end
+            ROOT[p] = ROOT[p] or cls(p:match("[^.]+$"))
+            return ROOT[p]
+        end
+        local function actor(name, parent)
+            local c = cls(name)
+            local a = obj({ GetClass = function() return c end })
+            a.IsA = function(_, r) ISA = ISA + 1; return parent ~= nil and ROOT[parent] == r end
+            return a
+        end
+        -- a fresh loot module: the harness's own ticks already found every class (its fake finds anything)
+        package.loaded["mirror.loot"] = nil
+        loot = require("mirror.loot")
+        loot.init({}, "guest", { in_world = function() return true end })
+        local zombies = {}
+        for i = 1, 30 do zombies[i] = actor("Zombie" .. (i % 6) .. "_C") end
+        local crate = actor("Crate_C", CRATE)
+        -- after a load the first round runs from the tick, one class a frame (it was one 433 ms freeze at join)
+        PER_FRAME = 0
+        for f = 1, 2 do local m = MISSES; NOW = NOW + 0.016; loot.tick(0.016); PER_FRAME = math.max(PER_FRAME, MISSES - m) end
+        -- asked in the middle of it (a take in the first frames): the rest is looked up then, the answer is right
+        MID_CRATE = loot.is_shared(crate)
+        package.loaded["mirror.loot"] = nil
+        loot = require("mirror.loot")
+        loot.init({}, "guest", { in_world = function() return true end })
+        for f = 1, 12 do local m = MISSES; NOW = NOW + 0.016; loot.tick(0.016); PER_FRAME = math.max(PER_FRAME, MISSES - m) end
+        local m0 = MISSES
+        loot.is_shared(zombies[1])
+        AFTER_ROUND = MISSES - m0
+        local m0 = MISSES
+        for f = 1, 600 do
+            NOW = NOW + 0.1
+            loot.tick(0.1)
+            for _, z in ipairs(zombies) do loot.is_shared(z) end
+        end
+        MISSES_60S, ISA0 = MISSES - m0, ISA
+        for f = 1, 10 do for _, z in ipairs(zombies) do loot.is_shared(z) end end
+        ISA_CACHED = ISA - ISA0
+        CRATE_OK = loot.is_shared(crate)
+        LOADED[TENT] = true
+        local tent = actor("MyTent_C", TENT)
+        TENT_NOW = loot.is_shared(tent)
+        for f = 1, 12 do NOW = NOW + 0.016; loot.tick(0.016) end
+        TENT_LATER = loot.is_shared(tent)
+    """)
+    check(L.eval("MISSES_60S") <= 6, "6 missing container classes: one lookup round in a minute, not one every 10 s (%d misses)" % L.eval("MISSES_60S"))
+    check(L.eval("ISA_CACHED") == 0, "a known class needs no IsA (%d)" % L.eval("ISA_CACHED"))
+    check(L.eval("PER_FRAME") <= 1 and L.eval("AFTER_ROUND") == 0,
+          "after a load: the classes are looked up one a frame, none left when the first question comes (%d/frame, %d after)"
+          % (L.eval("PER_FRAME"), L.eval("AFTER_ROUND")))
+    check(L.eval("MID_CRATE") is True, "a container asked about mid-round is still known as one")
+    check(L.eval("CRATE_OK") is True, "a loot crate is a container")
+    check(L.eval("TENT_NOW") is False and L.eval("TENT_LATER") is True, "a tent whose class loads later is a container within a few frames")
 
 
 def car_trunks_go_by_the_cars_name():
@@ -1976,6 +2383,60 @@ def audio_spatializes_and_shares_without_echo():
     check(L.eval('#SENT') == 1, "a sound of something the player uses nearby is shared")
 
 
+def keycard_doors_open_on_both_games():
+    # player report: one area's keycard doors took a keycard on each game (BP_KeycardDoor / secure lab doors
+    # weren't synced at all)
+    print("keycard_doors_open_on_both_games")
+    L = lua()
+    L.execute(FAKES + r"""
+        GHOST = obj({})
+        package.loaded["mirror.ghost"] = { get = function() return GHOST end }
+        BLOB = nil
+        package.loaded["mirror.link"].get_blob = function(n) local b = n == "doors" and BLOB or nil; BLOB = nil; return b end
+        PUT = nil
+        package.loaded["mirror.link"].put_blob = function(n, s) if n == "doors" then PUT = s end end
+        util = require("mirror.util")
+        function door(c, props)
+            local d = obj(props)
+            d.GetClass = function() return cls(c) end
+            d.K2_GetActorLocation = function() return { X = 100, Y = 200, Z = 0 } end
+            d.GetFullName = function() return c .. " /Game/L.L:P." .. c .. "_1" end
+            return d
+        end
+        CARD = door("BP_KeycardDoor_C", { ["Open?"] = false })
+        CARD.MC_OpenDoor = function(self, by) OPENED_BY = by; self["Open?"] = true end
+        SECURE = door("BP_LaboratorySecureDoors_C", { Unlocked = false })
+        util.instances = function(c)
+            if c == "BP_KeycardDoor_C" then return { CARD }, true elseif c == "BP_LaboratorySecureDoors_C" then return { SECURE }, true end
+            return {}, true
+        end
+        doors = require("mirror.doors")
+        doors.init({}, "guest", { in_world = function() return true end })
+        for i = 1, 40 do doors.tick(0.3) end
+        BLOB = "BP_KeycardDoor_C@10,20,0 1 1 -1 0\nBP_LaboratorySecureDoors_C@10,20,0 1 -1 1 0"
+        doors.tick(0.3)
+        OPEN1, UNLOCKED1 = CARD["Open?"], SECURE.Unlocked
+        for i = 1, 3 do doors.tick(0.3) end
+        ECHO = PUT
+        -- it closed on their side first (each closes on its own timer): this one isn't shut from here
+        CARD.MC_OpenDoor = function() CALLED_AGAIN = true end
+        BLOB = "BP_KeycardDoor_C@10,20,0 2 0 -1 0"
+        doors.tick(0.3)
+        -- and the other way: closed here by its timer, then opened here with my keycard -> told to the other game
+        CARD["Open?"] = false; for i = 1, 25 do doors.tick(0.3) end
+        PUT = nil
+        CARD["Open?"] = true; for i = 1, 3 do doors.tick(0.3) end
+        MINE_SENT = PUT
+    """)
+    sent = L.eval("MINE_SENT") or ""
+    check("BP_KeycardDoor_C@10,20,0" in sent and " 1 -1 " in sent, "a keycard door opened here is told to the other game (%r)" % sent)
+    check(L.eval("OPEN1") is True and L.eval("OPENED_BY == GHOST"), "the other player's keycard door opens here too, facing them, no keycard")
+    check(L.eval("UNLOCKED1") is True, "a secure lab door they unlocked is unlocked here")
+    echo = L.eval("ECHO")
+    check(not echo or "BP_KeycardDoor_C" not in echo, "opening it here is not sent back as my own (%r)" % echo)
+    check(L.eval("CALLED_AGAIN") is None, "their door closing doesn't shut (or reopen) this one")
+
+
 def throws_and_mines_reach_the_other_game():
     print("throws_and_mines_reach_the_other_game")
     L = lua()
@@ -2017,6 +2478,19 @@ def throws_and_mines_reach_the_other_game():
           "a hotbar molotov (no owner) thrown by the player is sent")
     L.execute('SENT = {}; FAR = actor("BP_Throwable_Frag_C", 5000); HOOKS["BP_Throwable_Frag_C:ReceiveBeginPlay"](P(FAR)); throwables.tick(0.1)')
     check(not any("Frag" in m for m in L.eval('SENT').values()), "an unowned throwable far from the player is not ours")
+    # player report: one throw showed as 2-8 grenades. The copy's BeginPlay runs inside SpawnActor (like the
+    # engine here), standing next to the thrower it looked like our own throw and went back
+    L.execute(r"""
+        SENT = {}
+        WORLD = { SpawnActor = function(self, cls, loc) local a = actor("BP_Throwable_Frag_C", loc.X)
+            HOOKS["BP_Throwable_Frag_C:ReceiveBeginPlay"](P(a)); return a end }
+        package.loaded["mirror.game"].world = function() return WORLD end
+        INBOX.throws = { "S 7 BP_Throwable_Frag 100 0 0" }
+        for i = 1, 3 do throwables.tick(0.1) end
+    """)
+    check(not any(m.startswith("throws:S ") for m in L.eval('SENT').values()),
+          "the other player's grenade shown next to me is not sent back as mine (%s)" % list(L.eval('SENT').values()))
+    check("flying 1" in L.eval('throwables.status()'), "...and it is shown once")
     # Land mines: one placed in each game; ours goes off -> the other game shows it and loses its copy.
     L.execute(r"""
         builds = require("mirror.builds")
@@ -2037,6 +2511,163 @@ def throws_and_mines_reach_the_other_game():
         builds.tick(0.1)
     """)
     check(L.eval('COPY.dead') and L.eval('BOOMS') == 1, "the other game's mine shows the explosion and is removed")
+
+
+def map_pings_reach_the_other_game():
+    print("map_pings_reach_the_other_game")
+    L = lua()
+    L.execute(FAKES + r"""
+        TEX = "MarkerTexture_10_217A4B4A49F28BE075685196E3EC66CD"
+        COL = "MarkerColor_52_AB92BD2E4886BEC45F39A59226A8B872"
+        SIZE = "TextureSize_30_0FC614D34939DCCA4077899925344EDF"
+        CMP = "CompassMarker?_45_173EEC314B156D67370A86A9FF973EA4"
+        function texture(p) return obj({ GetFullName = function() return "Texture2D " .. p end }) end
+        SKULL, POINT = texture("/Game/T/T_Skull.T_Skull"), texture("/Game/T/T_Point.T_Point")
+        function data(t, r) return { [TEX] = t, [COL] = { R = r, G = 0, B = 0, A = 1 }, [SIZE] = { X = 32, Y = 32 }, [CMP] = true } end
+        HOOKS = {}
+        function P(v) return { get = function() return v end } end
+        MARKERS = {}
+        function marker(x, d)
+            local m = obj({ ["Marker Data"] = d, gone = false })
+            m.IsValid = function() return not m.gone end
+            m.K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end
+            MARKERS[#MARKERS + 1] = m
+            return m
+        end
+        -- the game: placing runs Event_AddMarker with the picker's data; removing runs ReceiveDestroyed inside
+        COMP = obj({ DefaultPlayerMarkerData = data(POINT, 1) })
+        ADD, DESTROYED, REMOVE = "BP_PlayerMarker_C:Event_AddMarker", "BP_PlayerMarker_C:ReceiveDestroyed", "BPC_MinimapSystem_C:Remove Player Marker"
+        COMP.Svr_SpawnPlayerMarker = function(self, l, ok)
+            local d = self.DefaultPlayerMarkerData
+            SPAWNED = marker(l.X, { [TEX] = d[TEX], [COL] = { R = d[COL].R }, [SIZE] = d[SIZE], [CMP] = d[CMP] })
+            HOOKS[ADD](P(SPAWNED))
+        end
+        COMP["Remove Player Marker"] = function(self, m)
+            HOOKS[DESTROYED](P(m)); m.gone = true; HOOKS[REMOVE](P(self), P(m))
+        end
+        -- laptop scans: quest marker class + defaults, the crate class, a world that spawns
+        QM_CDO = { IsValid = function() return true end, ["Marker Texture"] = POINT, Color = { R = 1, G = 1, B = 1, A = 1 },
+                   Text = { ToString = function() return "Default" end }, ["Underground?"] = false }
+        QM_CLS, CRATE_CLS = obj({}), obj({ GetFName = function() return { ToString = function() return "BP_GuaranteedSpawner_Classified_C" end } end,
+            GetFullName = function() return "BlueprintGeneratedClass /Game/Inv/BP_GuaranteedSpawner_Classified.BP_GuaranteedSpawner_Classified_C" end })
+        OBJS = { ["/Game/T/T_Skull.T_Skull"] = SKULL, ["/Game/Quests/Blueprints/Objects/BP_QuestMarker.BP_QuestMarker_C"] = QM_CLS,
+                 ["/Game/Quests/Blueprints/Objects/BP_QuestMarker.Default__BP_QuestMarker_C"] = QM_CDO,
+                 ["/Game/Inv/BP_GuaranteedSpawner_Classified.BP_GuaranteedSpawner_Classified_C"] = CRATE_CLS }
+        CRATES, WORLD_SPAWNED = {}, {}
+        WORLD = { SpawnActor = function(self, c, l, r)
+            local a = obj({ gone = false, cls = c, rot = r })
+            a.IsValid = function() return not a.gone end
+            a.K2_GetActorLocation = function() return l end
+            a.K2_DestroyActor = function() a.gone = true end
+            if c == QM_CLS then a.tex, a.color, a.text, a.ug = QM_CDO["Marker Texture"], QM_CDO.Color.R, QM_CDO.Text, QM_CDO["Underground?"] end
+            if c == CRATE_CLS then
+                a.GetClass = function() return CRATE_CLS end
+                a.MC_CrateOpen = function() a.lid = true end
+                CRATES[#CRATES + 1] = a
+            end
+            WORLD_SPAWNED[#WORLD_SPAWNED + 1] = a
+            return a
+        end }
+        HAS_COMP = true
+        PLAYER = obj({ GetComponentByClass = function() return HAS_COMP and COMP or nil end })
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+                                          world = function() return WORLD end }
+        SHARE = true
+        package.loaded["mirror.mysettings"] = { on = function(k) return k == "pings" and SHARE end }
+        RELAYED = 0
+        package.loaded["mirror.peers"] = { shared = function(n, init) return init end,
+                                           relay = function(n, self, fn) RELAYED = RELAYED + 1 end }
+        SENT, INBOX = {}, {}
+        package.loaded["mirror.events"] = evmock { new = function(name) return {
+            send = function(self, m) SENT[#SENT + 1] = m end,
+            pump = function(self, fn) local q = INBOX[name] or {}; INBOX[name] = {}; for _, m in ipairs(q) do fn(m) end end } end }
+        StaticFindObject = function(p) return OBJS[p] or obj({}) end
+        FindAllOf = function(c) if c == "BP_GuaranteedSpawner_Classified_C" then return CRATES end return MARKERS end
+        util = require("mirror.util")
+        util.ensure_hook = function(path, fn) HOOKS[path:match("([%w_]+:[^:]+)$")] = fn; return true end
+        IN_WORLD = true
+        pings = require("mirror.pings")
+        pings.init({}, "guest", { in_world = function() return IN_WORLD end })
+        pings.tick(1.1)
+        function place(x, d) local m = marker(x, d); HOOKS[ADD](P(m)); return m end
+    """)
+    L.execute('MINE = place(500, data(SKULL, 1))')
+    check(list(L.eval('SENT').values()) == ["A 500 0 0 /Game/T/T_Skull.T_Skull 1.000 0.000 0.000 1.000 32.0 32.0 1"],
+          "a ping I place is sent with its place and look (%s)" % list(L.eval('SENT').values()))
+    L.execute('SENT = {}; INBOX.pings = { "A 2000 0 0 /Game/T/T_Skull.T_Skull 0.500 0.000 0.000 1.000 32.0 32.0 0" }; pings.tick(0.1)')
+    check(L.eval('SPAWNED and SPAWNED["Marker Data"]["%s"] == SKULL and SPAWNED["Marker Data"]["%s"].R == 0.5' % (
+        "MarkerTexture_10_217A4B4A49F28BE075685196E3EC66CD", "MarkerColor_52_AB92BD2E4886BEC45F39A59226A8B872")),
+        "the other player's ping is placed here with its own look")
+    check(L.eval('COMP.DefaultPlayerMarkerData[TEX] == POINT and COMP.DefaultPlayerMarkerData[COL].R == 1 and COMP.DefaultPlayerMarkerData[CMP] == true'),
+          "...and my marker picker keeps my own choice")
+    check(L.eval('#SENT') == 0, "...and it is not sent back")
+    check(L.eval('RELAYED') == 1, "...and the host passes it on to the other guests")
+    L.execute('INBOX.pings = { "A 2000 0 0 - 1 1 1 1 0 0 0" }; N = #MARKERS; pings.tick(0.1)')
+    check(L.eval('#MARKERS == N'), "a ping already there isn't placed twice")
+    L.execute('THEIRS = SPAWNED; INBOX.pings = { "R 2010 0 0" }; pings.tick(0.1)')
+    check(L.eval('THEIRS.gone') and L.eval('#SENT') == 0, "the other player's removal removes it here, without echo")
+    L.execute('COMP["Remove Player Marker"](COMP, MINE)')
+    check(list(L.eval('SENT').values()) == ["R 500 0 0"], "removing my ping is sent (%s)" % list(L.eval('SENT').values()))
+    # a ping that came with the world (loaded before the hooks stood) is still found for a removal
+    L.execute('SENT = {}; OLD = marker(9000, data(POINT, 1)); INBOX.pings = { "R 9000 0 0" }; pings.tick(0.1)')
+    check(L.eval('OLD.gone'), "a removal finds a ping loaded with the world")
+    L.execute('SHARE = false; place(700, data(SKULL, 1))')
+    check(L.eval('#SENT') == 0, "SHARE MAP PINGS off: my pings stay mine")
+    L.execute('SHARE = true; IN_WORLD = false; place(800, data(SKULL, 1))')
+    check(L.eval('#SENT') == 0, "a guest at home doesn't send its own world's pings")
+    L.execute('IN_WORLD = true; HAS_COMP = false; N = #MARKERS; INBOX.pings = { "A 4000 0 0 - 1 1 1 1 0 0 0" }; pings.tick(0.1)')
+    check(L.eval('#MARKERS == N') and "waiting 1" in L.eval('pings.status()'), "no map yet (respawning): the ping waits")
+    L.execute('HAS_COMP = true; pings.tick(2.1)')
+    check(L.eval('#MARKERS == N + 1') and "waiting" not in L.eval('pings.status()'), "...and is placed once the map is back")
+    # military laptop scans: the bounty quest's map icon and its crate reach the other game
+    L.execute(r"""
+        SENT = {}
+        function event(path, tag) return obj({ GetFullName = function() return "Quest_Event_SpawnMarker_C " .. path end,
+            Location = { X = 100, Y = 200, Z = 300 }, ["Marker Texture"] = SKULL, Color = { R = 0.25, G = 0.5, B = 0, A = 1 },
+            ["Underground?"] = true, ActorTag = { ToString = function() return tag end }, Text = "Classified container" }) end
+        BOUNTY = event("/Game/Quests/Quests/Bounties/FindClassifiedContainer/Quest_Bounty_ClassifiedContainer001.Default__Quest_Bounty_ClassifiedContainer001_C:QuestTemplate.Event_SpawnMarker_C_0", "Bounty01")
+        STORY = event("/Game/Quests/Quests/Main/Quest_Main_FindRadio.Default__Quest_Main_FindRadio_C:QuestTemplate.Event_SpawnMarker_C_0", "Radio")
+        HOOKS["Quest_Event_SpawnMarker_C:ExecuteEvent"](P(BOUNTY))
+        HOOKS["Quest_Event_SpawnMarker_C:ExecuteEvent"](P(STORY))
+    """)
+    check(list(L.eval('SENT').values()) == ["Q 100 200 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 Bounty01 Classified container"],
+          "a laptop scan's map icon is sent, a story quest's isn't (%s)" % list(L.eval('SENT').values()))
+    L.execute('SENT = {}; INBOX.pings = { "Q 100 200 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 Bounty01 Classified container" }; pings.tick(0.1)')
+    check(L.eval('#WORLD_SPAWNED == 1 and WORLD_SPAWNED[1].cls == QM_CLS and WORLD_SPAWNED[1].tex == SKULL and WORLD_SPAWNED[1].color == 0.25 '
+                 'and WORLD_SPAWNED[1].text == "Classified container" and WORLD_SPAWNED[1].ug == true'),
+          "the other player's scan icon is shown here with its look")
+    check(L.eval('QM_CDO["Marker Texture"] == POINT and QM_CDO.Color.R == 1 and QM_CDO.Text == "Default" and QM_CDO["Underground?"] == false'),
+          "...and the quest marker class keeps its own defaults")
+    L.execute('INBOX.pings = { "Q 100 200 300 - 1 1 1 1 0 Bounty01 x" }; pings.tick(0.1)')
+    check(L.eval('#WORLD_SPAWNED') == 1, "...shown once")
+    L.execute('HOOKS["Quest_Event_RemoveMarker_C:ExecuteEvent"](P(BOUNTY))')
+    check(list(L.eval('SENT').values()) == ["X Bounty01"], "the scan's icon going away is sent")
+    L.execute('SENT = {}; INBOX.pings = { "X Bounty01" }; pings.tick(0.1)')
+    check(L.eval('WORLD_SPAWNED[1].gone'), "...and the copy goes away here")
+    L.execute(r"""
+        function spawner(cls, tag) return obj({ ObjectToSpawn = cls, QuestTag = { ToString = function() return tag end },
+            K2_GetActorLocation = function() return { X = 5000, Y = 0, Z = 10 } end,
+            K2_GetActorRotation = function() return { Pitch = 0, Yaw = 90, Roll = 0 } end }) end
+        HOOKS["BP_Quest_Spawner_Object_C:Quest_Spawn"](P(spawner(CRATE_CLS, "Quest_Main_Radio")))
+        HOOKS["BP_Quest_Spawner_Object_C:Quest_Spawn"](P(spawner(CRATE_CLS, "Quest_Bounty_ClassifiedContainer004")))
+    """)
+    check(list(L.eval('SENT').values()) == ["C /Game/Inv/BP_GuaranteedSpawner_Classified.BP_GuaranteedSpawner_Classified_C 5000.0 0.0 10.0 0.00 90.00 0.00"],
+          "a bounty quest's crate is sent, a story quest's spawn isn't (%s)" % list(L.eval('SENT').values()))
+    L.execute('SENT = {}; INBOX.pings = { "C /Game/Inv/BP_GuaranteedSpawner_Classified.BP_GuaranteedSpawner_Classified_C 5000.0 0.0 10.0 0.00 90.00 0.00" }; pings.tick(0.1)')
+    check(L.eval('#CRATES == 1 and CRATES[1].rot.Yaw == 90 and CRATES[1].K2_GetActorLocation().X == 5000'),
+          "the other player's laptop crate is placed here at the same spot")
+    L.execute('INBOX.pings = { "C /Game/Inv/BP_GuaranteedSpawner_Classified.BP_GuaranteedSpawner_Classified_C 5000.0 0.0 10.0 0.00 90.00 0.00" }; pings.tick(0.1)')
+    check(L.eval('#CRATES') == 1 and L.eval('#SENT') == 0, "...once, and nothing goes back")
+    check(L.eval('CRATES[1].Opened') is True, "...already searched here: the item and the quest stay the scanner's")
+    L.execute('HOOKS["BP_GuaranteedSpawner_C:Svr_CrateOpen"](P(CRATES[1]))')
+    check(L.eval('#SENT') == 0, "searching the copy sends nothing")
+    L.execute(r"""
+        MINE_CRATE = obj({ GetClass = function() return CRATE_CLS end, K2_GetActorLocation = function() return { X = 9000, Y = 0, Z = 0 } end })
+        HOOKS["BP_GuaranteedSpawner_C:Svr_CrateOpen"](P(MINE_CRATE))
+    """)
+    check(list(L.eval('SENT').values()) == ["O BP_GuaranteedSpawner_Classified_C 9000.0 0.0 0.0"], "searching my own scan's crate is sent (%s)" % list(L.eval('SENT').values()))
+    L.execute('SENT = {}; INBOX.pings = { "O BP_GuaranteedSpawner_Classified_C 5000.0 0.0 10.0" }; pings.tick(0.1)')
+    check(L.eval('CRATES[1].lid') is True and L.eval('#SENT') == 0, "the scanner searching theirs opens the copy's lid here, no echo")
 
 
 def horde_rewards_reach_the_other_game():
@@ -3105,6 +3736,44 @@ def load_split_hands_the_ai_to_the_guest():
     L.execute('HOST = { X = 90000, Y = 0, Z = 0 }; zombies.set_split(true); E = zombie("Late", 2000); LIST = { E }; '
               'zombies.set_split(false); zombies._test.sweep(10); zombies._test.sweep(95)')
     check(L.eval('E.gone') is True, "guest: a kept zombie goes after drain_s")
+    # join lag: ~1100 spawners and a batch of own zombies were one 110 ms frame every 2 s - now a slice per frame
+    L.execute(r"""
+        zombies.set_split(false); zombies._test.sweep(10)
+        -- (spawner passes come every 10 s, native passes in between: start passes until one queues something)
+        local function until_queued() for i = 1, 8 do zombies._test.start(10); if zombies._test.pending() > 0 then return end end end
+        LIST = {}
+        SPAWNERS = {}; for i = 1, 1100 do SPAWNERS[i] = spawner() end
+        until_queued()
+        FRAMES, MAXDONE, prev = 1, 0, 0
+        local function stopped() local n = 0; for _, s in ipairs(SPAWNERS) do if s.IsSpawningStopped then n = n + 1 end end; return n end
+        MAXDONE = stopped(); prev = MAXDONE
+        while zombies._test.step() do FRAMES = FRAMES + 1; local n = stopped(); MAXDONE = math.max(MAXDONE, n - prev); prev = n end
+        SP_ALL = stopped()
+        SPAWNERS = {}
+        LIST = {}; for i = 1, 10 do LIST[i] = zombie("Own" .. i, 100000) end
+        until_queued()
+        local gone = 0; for _, z in ipairs(LIST) do if z.gone then gone = gone + 1 end end
+        FIRST_GONE = gone
+        while zombies._test.step() do end
+        ALL_GONE = 0; for _, z in ipairs(LIST) do if z.gone then ALL_GONE = ALL_GONE + 1 end end
+        -- a split in the middle of a queue stops it: the spawners it didn't reach keep running
+        LIST = {}
+        SPAWNERS = {}; for i = 1, 600 do SPAWNERS[i] = spawner() end
+        until_queued()
+        QUEUED = zombies._test.pending()
+        zombies.set_split(true); zombies._test.step()
+        LEFT_ON = 0; for _, s in ipairs(SPAWNERS) do if not s.IsSpawningStopped then LEFT_ON = LEFT_ON + 1 end end
+        AFTER_SPLIT = zombies._test.pending()
+        zombies.set_split(false)
+    """)
+    check(L.eval('SP_ALL') == 1100 and L.eval('FRAMES') >= 7 and L.eval('MAXDONE') <= 150,
+          "1100 spawners: all stopped over %d frames, at most 150 a frame (%d)" % (L.eval('FRAMES'), L.eval('MAXDONE')))
+    check(L.eval('FIRST_GONE') <= 4 and L.eval('ALL_GONE') == 10,
+          "own zombies: at most 4 removed a frame (%d), all 10 in the end" % L.eval('FIRST_GONE'))
+    # (the split itself turns back on the 150 the first slice stopped)
+    check(L.eval('QUEUED') == 450 and L.eval('AFTER_SPLIT') == 0 and L.eval('LEFT_ON') == 600,
+          "a split mid-sweep drops the rest of it (%d queued, %d left after, %d of 600 on)"
+          % (L.eval('QUEUED'), L.eval('AFTER_SPLIT'), L.eval('LEFT_ON')))
 
 def reliable_events_survive_pauses_and_restarts():
     print("reliable_events_survive_pauses_and_restarts")
@@ -3596,14 +4265,14 @@ def mods_switch_restart_and_match_the_host():
         shutil.rmtree(d, ignore_errors=True)
 
 
-for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
+for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, unanswered_join_keeps_the_friends_list, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, tactical_reads_only_lights_the_class_has,
           vehicles_keep_this_worlds_fuel, harvest_uses_up_nodes_once, zombie_copies_take_the_hosts_look,
-          copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_tooltip_reads_the_item_once, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
+          copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_tooltip_reads_the_item_once, foreach_keeps_temporary_arrays_alive, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
           ghost_swims_without_its_own_water_detection, ghost_never_blocks_cars, audio_spatializes_and_shares_without_echo,
-          throws_and_mines_reach_the_other_game, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, loose_magazine_picked_up_without_hooks_still_gets_its_rounds, ground_weapon_attachments_reach_the_other_game, ghost_gun_in_hand_is_known, missing_zombie_looks_get_loaded,
+          throws_and_mines_reach_the_other_game, map_pings_reach_the_other_game, keycard_doors_open_on_both_games, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, loose_magazine_picked_up_without_hooks_still_gets_its_rounds, ground_weapon_attachments_reach_the_other_game, ghost_gun_in_hand_is_known, missing_zombie_looks_get_loaded,
           random_and_debug_weather_is_shared,
-          trader_stock_is_the_hosts, instances_walk_once_then_follow_beginplay,
+          trader_stock_is_the_hosts, instances_walk_once_then_follow_beginplay, grouped_classes_share_one_walk, walk_skip_is_measured_after_a_load, unloaded_tracked_classes_cost_few_lookups,
           link_reads_only_blobs_the_index_says_changed, corpse_loot_reaches_every_player, host_settled_corpses_cost_almost_nothing,
           standing_hooks_skip_the_lookup, hook_lookups_share_one_budget, find_remembers_misses, container_items_keep_their_cell_and_rotation, loot_skips_containers_gone_since_listed, bags_are_never_consumed_and_twin_grids_are_counted,
           load_split_switches_only_when_both_agree, load_split_hands_the_ai_to_the_guest):

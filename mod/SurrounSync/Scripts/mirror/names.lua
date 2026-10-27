@@ -456,12 +456,13 @@ local function on_right_click(self) pending_menu = self end
 local noted_at = -100.0
 local hovered = nil   -- { uid, at }: the backpack under the mouse and when its tooltip last updated (F2 renames it)
 -- the hint goes at the end of the small description text, not next to the name
-local HINT = "(F2: rename)"
+local HINT = "Rename (F2)"
+local COLLAPSED, SHOWN = 1, 4   -- ESlateVisibility Collapsed / SelfHitTestInvisible
 -- The tooltip's Update runs every frame while an item is hovered, also in the frames where the game is moving
--- items around. Crash reports (DBG-20261026-001, 4 of 4 runs) all died inside this hook while a player moved
--- backpack items, when it read the item, its data asset and walked the whole inventory every frame. Now a frame
--- only compares the tooltip and item addresses; the item (and whether it's mine) is looked at once per newly
--- hovered item and never in the moment after a move.
+-- items around. Crash reports (DBG-20261026-001) all died inside this hook while it walked a big inventory: the
+-- cause was UE4SS's ForEach letting Lua collect a temporary array mid-loop (fixed for the whole mod: util.each).
+-- The hook stays cheap anyway: a frame only compares the tooltip and item addresses; the item is looked at once
+-- per newly hovered item and never in the moment after a move.
 -- Update(ItemRef) is hooked before it runs: the widget's own ItemRef then still holds the item it showed last,
 -- which a move may have destroyed already - reading it was the native crash 0.13.3 still had (property lookup on
 -- freed memory, IsValid can't tell). Only the item the game passes in now is read.
@@ -492,10 +493,20 @@ local function on_tooltip(self, ref)
         if title then pcall(function() title:SetText(FText(name)) end) end
     end
     if info.bag then
-        hovered = hovered or { uid = info.uid }
+        -- (the game passes the inventory slot as ItemRef: F2 later asks that slot whether it's still hovered)
+        hovered = hovered or { uid = info.uid, slot = item, slot_at = at, slot_cls = util.class_name(item) }
         hovered.at = os.clock()
         local descr = child(self, "descr")
-        if descr then pcall(function()
+        local vis
+        if descr then pcall(function() vis = descr:GetVisibility() end) end
+        if descr and vis == COLLAPSED then
+            -- no description (every backpack): the game collapses the text and its divider and leaves stale
+            -- text in it, so the hint becomes the whole text and both are shown
+            pcall(function() descr:SetText(FText(HINT)) end)
+            pcall(function() descr:SetVisibility(SHOWN) end)
+            local divider = child(self, "Divider")
+            if divider then pcall(function() divider:SetVisibility(SHOWN) end) end
+        elseif descr then pcall(function()
             local d = descr:GetText():ToString() or ""
             if not d:find(HINT, 1, true) then descr:SetText(FText(d == "" and HINT or (d .. "\n" .. HINT))) end
         end) end
@@ -507,14 +518,44 @@ local function my_comp()
     pcall(function() comp = p.BP_JigComponent end)
     return util.valid(comp) and comp or nil
 end
+-- The slot's tooltip binding runs Update only when Slate asks for the tooltip (when it opens, after a click),
+-- not every frame: F2 while just hovering found the last Update too old and did nothing - it only worked
+-- right after clicking the bag (player report 2026-10-27). So a stale Update still counts while the same slot
+-- (same address, class and name check: a freed one's address can come back as another) says it's hovered.
+local function still_hovered(h)
+    if os.clock() - (h.at or 0) <= 0.3 then return true end
+    local s = h.slot
+    if not (util.valid(s) and util.addr(s) == h.slot_at and h.slot_cls and util.class_name(s) == h.slot_cls) then return false end
+    local yes = false
+    pcall(function() yes = s:IsHovered() == true end)
+    return yes
+end
 local function rename_hovered()
     local h = hovered
-    -- (no widget is kept between frames: a tooltip that stopped updating is closed or torn down)
-    if not h or os.clock() - (h.at or 0) > 0.3 then hovered = nil; return end
+    if not h or not still_hovered(h) then hovered = nil; return end
     open_popup(h.uid, nil)
 end
 
--- the inventory widgets load the first time the inventory opens: keep asking until both hooks took
+-- The inventory's backpack list (top right button): the game creates one 2_ContainerListTitle row per bag with
+-- the bag's UID set, and the row's Construct writes the asset's name into ItemName. UE4SS runs a Blueprint
+-- hook after the function body, so a named bag gets its own name written over that.
+local LIST_ROW = "/Game/Inventory/Widgets/ContainerViewer/2_ContainerListTitle.2_ContainerListTitle_C:Construct"
+local function on_list_row(row)
+    if not loaded then load_file() end
+    if count == 0 then return end
+    local uid
+    pcall(function()
+        local g = row.UID
+        uid = string.format("%d_%d_%d_%d", g.A, g.B, g.C, g.D)
+    end)
+    local name = uid and store[uid]
+    if not name then return end
+    local text = child(row, "ItemName")
+    if text then pcall(function() text:SetText(FText(name)) end) end
+end
+local list_row_fn = function(self) util.safe(on_list_row, "names.list_row", self:get()) end
+
+-- the inventory widgets load the first time the inventory opens: keep asking until the hooks took
 local hook_in = 0.0
 local tooltip_fn = function(self, ItemRef) util.safe(on_tooltip, "names.tooltip", self:get(), ItemRef) end
 local move_fn = function(self, From, To, ItemUID, FinalRotation, ToIndex, ToContainer)
@@ -539,6 +580,7 @@ function names.tick(dt)
         hook_in = 1.0
         util.ensure_hook(TOOLTIP, tooltip_fn)
         util.ensure_hook(COMP_MOVE, move_fn)
+        util.ensure_hook(LIST_ROW, list_row_fn)
     end
     -- where my named items sit (names.moved needs it), refreshed while I'm handling my backpacks - from the tick,
     -- not from inside the tooltip's Update

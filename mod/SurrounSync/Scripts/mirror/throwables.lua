@@ -53,10 +53,15 @@ local function loc_of(a)
 end
 local function fmt(l) return string.format("%.0f %.0f %.0f", l.X, l.Y, l.Z) end
 
+-- A copy's BeginPlay runs inside SpawnActor, before make_copy can mark it as made: standing within OWN_REACH
+-- of the thrower, the copy (no owner) passed as our own throw and was sent back - the thrower's game did the
+-- same with that one: 2-8 grenades from one throw, each going off, only the real one hurting (player report
+-- 2026-10-27; logs show copies reaching on_begin: "a BP_Throwable_Frag began - not ours? owner nil").
+local making = false
 -- (more than two players: a copy another player's link made isn't ours either)
-function throwables.made_here(addr) return made[addr] == true end
+function throwables.made_here(addr) return made[addr] == true or making end
 local function made_anywhere(addr)
-    if made[addr] then return true end
+    if made[addr] or making then return true end
     local hit = false
     require("mirror.peers").each("mirror.throwables", function(m) if not hit and m ~= throwables and m.made_here(addr) then hit = true end end)
     return hit
@@ -200,7 +205,9 @@ local function make_copy(n, cls, loc)
     local uc = StaticFindObject(class_path(cls))
     if not util.valid(uc) then log.info("throwables: the other player threw a " .. cls .. " - not loaded here, not shown"); return end
     local a
+    making = true
     local ok, err = pcall(function() a = game.world():SpawnActor(uc, loc, { Pitch = 0, Yaw = 0, Roll = 0 }) end)
+    making = false
     if not (ok and util.valid(a)) then log.warn("throwables: couldn't show the other player's " .. cls .. ": " .. tostring(err)); return end
     made[util.addr(a) or 0] = true
     pcall(function() a.Capsule:SetSimulatePhysics(false) end)

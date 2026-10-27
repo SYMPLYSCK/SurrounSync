@@ -27,7 +27,7 @@ local LIST_WIDTH = 560.0
 local GEAR_TEX = "/Game/UI/Textures/over_250_survival_flat_icons/gear.gear"
 local CLOSE_TEX = "/Game/UI/Textures/CrossX.CrossX"
 local INK = { R = 0.12, G = 0.08, B = 0.06, A = 1.0 }
-local SETTING_ROWS = 8
+local SETTING_ROWS = 9
 local MOD_ROWS = 9
 local REALM_ROWS = 3   -- per page on the lined note (more Realms: < PREV / NEXT >)
 -- the MODS tab: one ribbon below CO-OP (label spot found in-game; the ribbon art is yellow, so a tint can only
@@ -364,7 +364,8 @@ local function build_settings(page)
     u.gear, u.gear_img = icon_button(page, GEAR_TEX, "SETTINGS", 827.0, 932.0, 96.0, 6)
     u.set_box = new("VerticalBox", S.tree, "Settings")
     tilt(u.set_box, TILT.list)
-    place(page, u.set_box, 420.0, 230.0, 580.0, 760.0, 6)
+    -- (9 rows: from 230 the last one ran off the page, screenshot 2026-10-27)
+    place(page, u.set_box, 420.0, 150.0, 580.0, 840.0, 6)
     u.set_title = text("SETTINGS", 58, DARK_RED); vadd(u.set_box, u.set_title)
     -- two pages: the host's rules for the shared world, and this PC's own settings
     local tabs = new("HorizontalBox", S.tree, "SettingTabs"); vadd(u.set_box, tabs, 2)
@@ -376,14 +377,15 @@ local function build_settings(page)
     u.set_sub = text("", 16, GREY, 560); vadd(u.set_box, u.set_sub, 4)
     u.set_rows = {}
     for i = 1, SETTING_ROWS do
-        local row = new("HorizontalBox", S.tree, "SettingRow"); vadd(u.set_box, row, i == 1 and 16 or 12)
+        local row = new("HorizontalBox", S.tree, "SettingRow"); vadd(u.set_box, row, i == 1 and 16 or 6)
         local label = text("", 26)
         local b, bt = button("OFF", 26, DARK_RED)
         hadd(row, label); hadd(row, b, 24)
         local hint = text("", 16, GREY, 560); vadd(u.set_box, hint, 2)
         u.set_rows[i] = { row = row, label = label, btn = b, btn_t = bt, hint = hint }
     end
-    u.set_close, u.set_close_img = icon_button(page, CLOSE_TEX, "X", 930.0, 215.0, 72.0, 7)
+    -- (moved up with the box: at 215 it covered the MODS tab)
+    u.set_close, u.set_close_img = icon_button(page, CLOSE_TEX, "X", 930.0, 135.0, 72.0, 7)
     vis_hit(u.set_box, false); vis_hit(u.set_close, false); vis(u.set_close_img, false)
     u.settings_mode = false
 end

@@ -45,6 +45,17 @@ function util.valid(obj)
     return ok and v == true
 end
 
+-- arr:ForEach(fn), with arr kept alive. UE4SS's ForEach takes the array off the Lua stack before it loops
+-- (LuaTArray.cpp: get_userdata without preserve_stack), so an array that only exists as a temporary
+-- (comp.MainJigContainers:ForEach(...)) can be garbage-collected by Lua while fn runs; the next element is then
+-- read through freed memory: a native crash pcall can't catch (DBG-20261026-001, big backpacks, UE4SS's own
+-- "TODO: Fix crash that occurs here"). Never call :ForEach on a temporary; use this or a local.
+function util.each(arr, fn)
+    local keep = arr
+    keep:ForEach(fn)
+    return keep
+end
+
 -- Object-typed hook parameter -> valid object or nil.
 function util.obj(param)
     local t = type(param)
@@ -210,9 +221,24 @@ local RECHECK, LOOKUP_MS, MAX_BACKOFF = 15.0, 2.0, 60   -- 60: a class that load
 local lookup_ms, lookup_frame, frame_no = 0, -1, 0
 local lookup_count = {}
 local class_miss, class_hit = {}, {}
-function util.recheck_hooks() next_check, backoff, class_miss, class_hit = {}, {}, {}, {} end
-function util.new_frame() frame_no = frame_no + 1 end
--- urgent: look it up now, outside the budget (a hook that must stand before the next level load)
+-- Modules ask on 1 s timers that started together, so they ask in the same frame each time: one late in the
+-- tick order found the budget spent every time and never got a lookup (in-game 2026-10-27: the host's map ping
+-- hooks were still off after 3 min, the guest's were on). A hook that finds the budget spent waits in a queue
+-- instead; each frame looks up the first one (after a load ~200 wait: all hooked in ~3 s, one lookup a frame -
+-- letting them all go at once was 300-600 ms).
+local starved_q, starved_in, starved_n = {}, {}, 0
+function util.starved_lookups() return starved_n, #starved_q end
+function util.recheck_hooks() next_check, backoff, class_miss, class_hit = {}, {}, {}, {}; starved_q, starved_in = {}, {} end
+function util.new_frame()
+    frame_no = frame_no + 1
+    local e = table.remove(starved_q, 1)
+    if e then
+        starved_in[e.hk], starved_n = nil, starved_n + 1
+        util.ensure_hook(e.path, e.pre, e.post, "budget")
+    end
+end
+-- urgent: look it up now, outside the budget (a hook that must stand before the next level load);
+-- "budget" = outside the budget only
 function util.ensure_hook(path, pre, post, urgent)
     local t = os.clock()
     local hk = path .. "|" .. tostring(pre)
@@ -227,9 +253,16 @@ function util.ensure_hook(path, pre, post, urgent)
     end
     local cls = path:match("^(.-):[^:]+$") or path
     local cm = class_miss[cls]
-    if cm and t < cm and not urgent then return hooked_fn[hk] ~= nil end
+    -- ("budget": a waiting hook's turn - past the budget, but an unloaded class still costs one miss, not one each)
+    if cm and t < cm and urgent ~= true then return hooked_fn[hk] ~= nil end
     if lookup_frame ~= frame_no then lookup_frame, lookup_ms = frame_no, 0 end
-    if lookup_ms >= LOOKUP_MS and not urgent then return hooked_fn[hk] ~= nil end
+    if lookup_ms >= LOOKUP_MS and not urgent then
+        if not starved_in[hk] then
+            starved_in[hk] = true
+            starved_q[#starved_q + 1] = { hk = hk, path = path, pre = pre, post = post }
+        end
+        return hooked_fn[hk] ~= nil
+    end
     lookup_count[path] = (lookup_count[path] or 0) + 1
     local fn = StaticFindObject(path)
     lookup_ms = lookup_ms + (os.clock() - t) * 1000
@@ -266,7 +299,9 @@ util.on_end(function(a)
     local id = id_of_addr[a]
     if id then by_id[id], id_of_addr[a] = nil, nil end
 end)
+local teardown_mark
 local function on_end_play(self)
+    teardown_mark()
     local o
     pcall(function() o = self:get() end)
     local a = util.addr(o)
@@ -292,7 +327,11 @@ local function on_begin(self)
     pcall(function() o = self:get() end)
     if not util.valid(o) then return end
     local t = tracked[util.class_name(o) or ""]
-    if t then track_add(t, o) end
+    if t then
+        track_add(t, o)
+        local a = util.addr(o)
+        if a then t.born = t.born or {}; t.born[a] = os.clock() end
+    end
 end
 -- Hooked, whether the first class is loaded at all, and a count of (re)hooks.
 local function track_hooked(paths, clock)
@@ -300,11 +339,33 @@ local function track_hooked(paths, clock)
     for i, p in ipairs(paths) do
         local h = track_hooks[p]
         if not h then h = { check = 0, on = false, loaded = false }; track_hooks[p] = h end
-        if clock >= h.check then
+        -- the hooked BeginPlay is still the live function of that name: the hook stands, no lookup (~1.7 ms)
+        local held = h.on and clock >= h.check and h.fn
+        if held and util.valid(held) and util.addr(held) == h.addr and util.fname(held) == "ReceiveBeginPlay" then
+            h.check = clock + 15.0
+        end
+        -- lookups share ensure_hook's per-frame budget (a miss ~15 ms; ~20 classes are often not loaded)
+        if lookup_frame ~= frame_no then lookup_frame, lookup_ms = frame_no, 0 end
+        -- (the first check of a path runs at once: until then "not loaded" would hand out an empty list)
+        if clock >= h.check and (lookup_ms < LOOKUP_MS or not h.seen) then
+            h.seen = true
+            local t0 = os.clock()
             h.check = clock + (h.on and 15.0 or 2.0)
-            local fn = StaticFindObject(p .. ":ReceiveBeginPlay")
-            local a = util.valid(fn) and util.addr(fn) or nil
-            h.loaded = a ~= nil or util.valid(StaticFindObject(p))
+            -- the class first: while it isn't loaded that's one miss instead of two, asked again 2 s
+            -- after the first miss, doubling to 30 s (it was two misses every 2 s, a 30 ms frame each:
+            -- "perf: power/doors took 30-45 ms" for lamp/door types nobody built)
+            local fn, a = nil, nil
+            h.loaded = util.valid(StaticFindObject(p))
+            if h.loaded then
+                h.wait = nil
+                fn = StaticFindObject(p .. ":ReceiveBeginPlay")
+                a = util.valid(fn) and util.addr(fn) or nil
+            else
+                h.wait = math.min((h.wait or 1.0) * 2, 30.0)
+                h.check = clock + h.wait
+            end
+            h.fn = a and fn or nil
+            lookup_ms = lookup_ms + (os.clock() - t0) * 1000
             -- loaded without a BeginPlay of its own: it won't get one, and each miss costs ~15 ms
             if not a and h.loaded then h.check = clock + 30.0 end
             if not a then h.on, h.addr = false, nil
@@ -324,13 +385,77 @@ local function track_hooked(paths, clock)
     end
     return on, loaded, gen
 end
-function util.instances(cls, hooks)
+-- Walk groups: classes that are all direct children of one parent (checked in the game files: no member is a
+-- child of another member) are walked together - FindAllOf(parent) also returns its children's objects, sorted
+-- here by class. After a load each class was its own 30-110 ms walk, one per frame: ~50 in a row was most of
+-- the lag right after joining. A member's list is exactly what FindAllOf(member) gave; when the parent walk
+-- turns up a class outside the group (a child of a member, say after a game update), the members go back to
+-- walking one by one.
+local groups, groups_solo, groups_parent = {}, {}, {}
+-- parent_too: the parent class is tracked as well (its list = FindAllOf(parent), all of them)
+function util.instance_group(parent, members, parent_too)
+    local set = {}
+    for _, m in ipairs(members) do set[m] = true end
+    groups[parent], groups_parent[parent] = set, parent_too == true
+end
+local function not_cdo(o)
+    local cdo = false
+    pcall(function() cdo = o:GetFullName():find("Default__", 1, true) ~= nil end)
+    return not cdo
+end
+local function group_walk(parent)
+    local found = {}
+    pcall(function() found = FindAllOf(parent) or {} end)
+    local g = { all = {}, buckets = {}, unknown = nil }
+    local members = groups[parent] or {}
+    for _, o in ipairs(found) do
+        if not_cdo(o) then
+            g.all[#g.all + 1] = o
+            local c = util.class_name(o) or "?"
+            local b = g.buckets[c]
+            if not b then b = {}; g.buckets[c] = b end
+            b[#b + 1] = o
+            if c ~= parent and not members[c] then g.unknown = c end
+        end
+    end
+    return g
+end
+-- Measurement only (nothing skips a walk yet): could the walks after a load be skipped because BeginPlay
+-- already found the new world's objects? A world teardown ends thousands of actors at once (an EndPlay burst);
+-- objects whose BeginPlay came after it belong to the new world. After the reset, each class's first walk is
+-- compared with them; one summary line per load says how much BeginPlay alone would have had.
+local teardown_at, burst_at, burst_n = nil, -100, 0
+local fresh_sum = nil
+local function fresh_flush()
+    if not fresh_sum then return end
+    local s = fresh_sum
+    fresh_sum = nil
+    log.info(string.format("instances: after the load BeginPlay had found %d of %d objects (%d of %d classes complete%s)",
+        s.found, s.total, s.complete, s.classes, #s.partial > 0 and ("; short: " .. table.concat(s.partial, ", ", 1, math.min(#s.partial, 8))) or ""))
+end
+local function fresh_report(cls, hit, n)
+    fresh_sum = fresh_sum or { found = 0, total = 0, complete = 0, classes = 0, partial = {} }
+    local s = fresh_sum
+    s.found, s.total, s.classes = s.found + hit, s.total + n, s.classes + 1
+    if hit >= n then s.complete = s.complete + 1 else s.partial[#s.partial + 1] = string.format("%s %d/%d", cls, hit, n) end
+    for _, t in pairs(tracked) do if t.fresh then return end end
+    fresh_flush()
+end
+teardown_mark = function()
+    local c = os.clock()
+    if c - burst_at > 2.0 then burst_at, burst_n = c, 0 end
+    burst_n = burst_n + 1
+    if burst_n == 500 then teardown_at = burst_at end
+end
+util.walks = 0
+function util.instances(cls, hooks, group)
     local t = tracked[cls]
     if not t then
         t = { list = {}, set = {}, due = 0, walked = false, pruned = 0,
               hooks = type(hooks) == "string" and { hooks } or hooks or {} }
         tracked[cls] = t
     end
+    if group and groups[group] and (groups[group][cls] or cls == group) then t.group = group end
     local clock = os.clock()
     hook_end_play()
     local loaded, gen = true, 0
@@ -341,22 +466,58 @@ function util.instances(cls, hooks)
     elseif clock >= t.due and track_frame ~= frame_no and (not t.walked or clock - track_rewalk_at >= TRACK_GAP) then
         track_frame = frame_no
         if t.walked then track_rewalk_at = clock end
-        local found = {}
-        pcall(function() found = FindAllOf(cls) or {} end)
-        t.list, t.set = {}, {}
-        for _, o in ipairs(found) do
-            local cdo = false
-            pcall(function() cdo = o:GetFullName():find("Default__", 1, true) ~= nil end)
-            if not cdo then track_add(t, o) end
+        local function fill(u, name, src)
+            u.list, u.set = {}, {}
+            for _, o in ipairs(src) do track_add(u, o) end
+            if u.fresh then
+                -- (measurement for skipping this walk after a load: had BeginPlay already found these?)
+                local hit = 0
+                for _, o in ipairs(u.list) do if u.fresh[util.addr(o) or 0] then hit = hit + 1 end end
+                u.fresh = nil
+                fresh_report(name, hit, #u.list)
+            end
+            if not u.logged then
+                u.logged = true
+                log.info(string.format("instances: %s - %d here, %s", name, #u.list,
+                    #u.hooks > 0 and "new ones via BeginPlay" or "re-walked every " .. TRACK_NO_HOOK .. " s"))
+            end
+            u.walked, u.walked_gen = true, gen
+            u.due = clock + (t.hooked and TRACK_HOOKED or #t.hooks > 0 and TRACK_UNHOOKED or TRACK_NO_HOOK)
+            u.pruned = clock
         end
-        if not t.logged then
-            t.logged = true
-            log.info(string.format("instances: %s - %d here, %s", cls, #t.list,
-                #t.hooks > 0 and "new ones via BeginPlay" or "re-walked every " .. TRACK_NO_HOOK .. " s"))
+        local grp = t.group and not groups_solo[t.group] and t.group
+        local g = grp and group_walk(grp)
+        if g and g.unknown then
+            groups_solo[grp] = true
+            log.info("instances: " .. grp .. " has a child class outside its group (" .. g.unknown
+                .. ") - its classes are walked one by one")
         end
-        t.walked, t.walked_gen = true, gen
-        t.due = clock + (t.hooked and TRACK_HOOKED or #t.hooks > 0 and TRACK_UNHOOKED or TRACK_NO_HOOK)
-        t.pruned = clock
+        util.walks = util.walks + 1
+        if g and not g.unknown then
+            -- every member at once (created now if no one asked for it yet: BeginPlay keeps it from here on)
+            local key = table.concat(t.hooks, "|")
+            for m in pairs(groups[grp]) do
+                local u = tracked[m]
+                if not u then
+                    u = { list = {}, set = {}, due = 0, walked = false, pruned = 0, hooks = t.hooks, group = grp }
+                    tracked[m] = u
+                end
+                if table.concat(u.hooks, "|") == key then u.hooked = t.hooked; fill(u, m, g.buckets[m] or {}) end
+            end
+            -- the parent itself, when tracked: FindAllOf(parent) is all of them
+            local p = tracked[grp]
+            if not p and groups_parent[grp] then
+                p = { list = {}, set = {}, due = 0, walked = false, pruned = 0, hooks = t.hooks, group = grp }
+                tracked[grp] = p
+            end
+            if p and (p == t or table.concat(p.hooks, "|") == key) then p.hooked = t.hooked; fill(p, grp, g.all) end
+        elseif not g then
+            local found, src = {}, {}
+            pcall(function() found = FindAllOf(cls) or {} end)
+            for _, o in ipairs(found) do if not_cdo(o) then src[#src + 1] = o end end
+            fill(t, cls, src)
+        end
+        -- (a group that turned out mixed: this class walks on its own next frame)
     elseif t.gone or clock - t.pruned >= 1.0 then
         t.pruned, t.gone = clock, nil
         -- A freed object's address can come back as a different object: keep only the same class.
@@ -367,13 +528,30 @@ function util.instances(cls, hooks)
             if c and not set[a] and (c == true or util.class_name(o) == c) then set[a] = c; list[#list + 1] = o end
         end
         t.list, t.set = list, set
+        if t.born then
+            local born = {}
+            for a in pairs(set) do born[a] = t.born[a] end
+            t.born = born
+        end
     end
     return t.list, t.walked
 end
 -- World reset: the old objects are freed - drop them untouched; every class is walked again.
 function util.instances_reset()
     forget_ids()
-    for _, t in pairs(tracked) do t.list, t.set, t.due, t.walked = {}, {}, 0, false end
+    fresh_flush()
+    for _, t in pairs(tracked) do
+        -- (addresses only, never touched: which objects BeginPlay reported since the teardown)
+        t.fresh = nil
+        if teardown_at and t.hooked then
+            t.fresh = {}
+            for a, at in pairs(t.born or {}) do if at >= teardown_at then t.fresh[a] = true end end
+        end
+        t.born = {}
+        t.list, t.set, t.due, t.walked = {}, {}, 0, false
+    end
+    teardown_at = nil
+    for _, h in pairs(track_hooks) do h.check, h.wait, h.seen = 0, nil, nil end
 end
 function util.instances_status()
     local n, hooked, walked = 0, 0, 0

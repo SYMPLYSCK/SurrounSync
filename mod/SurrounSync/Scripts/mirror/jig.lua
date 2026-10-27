@@ -56,7 +56,7 @@ local function raw_stats(asset)
     if not raw then
         raw = { fixed = {}, random = {}, max = 0 }
         pcall(function()
-            asset.ItemStats:ForEach(function(_, e)
+            util.each(asset.ItemStats, function(_, e)
                 local s = e:get()
                 raw.fixed[#raw.fixed + 1] = { tag = name_str(s[S_TAG].TagName), prefix = name_str(s[S_PREFIX]),
                                               min = tonumber(s[S_MIN]) or 0, max = tonumber(s[S_MAX]) or 0, txt = name_str(s[S_TXT]) }
@@ -65,7 +65,7 @@ local function raw_stats(asset)
         pcall(function()
             local rc = asset.RandomStats
             raw.max = tonumber(rc[RS_MAXN]) or 0
-            rc[RS_LIST]:ForEach(function(_, e)
+            util.each(rc[RS_LIST], function(_, e)
                 local s = e:get()
                 raw.random[#raw.random + 1] = { tag = name_str(s[RS_TAG].TagName), txt = name_str(s[RS_TXT]),
                     min = tonumber(s[RS_MIN]) or 0, max = tonumber(s[RS_MAX]) or 0, chance = tonumber(s[RS_CHANCE]) or 0,
@@ -133,11 +133,11 @@ end
 function jig.contents_of(comp)
     local out, in_of, slot_of = {}, {}, {}
     pcall(function()
-        comp.MainJigContainers:ForEach(function(_, c)
+        util.each(comp.MainJigContainers, function(_, c)
             local ct = c:get()
             local holder, slot = nil, nil
             pcall(function() holder = jig.uid_str(ct[C_IN]); slot = ct[C_INDEX] end)
-            ct[ITEMS]:ForEach(function(_, el)
+            util.each(ct[ITEMS], function(_, el)
                 pcall(function()
                     local it = el:get()
                     local d = it[INFO][DURABILITY]
@@ -183,7 +183,7 @@ local function containers_of(comp, holder_uid, items)
     for _, h in ipairs(items or jig.contents_of(comp)) do is_item[h.uid] = true end
     local out = {}
     pcall(function()
-        comp.MainJigContainers:ForEach(function(_, c)
+        util.each(comp.MainJigContainers, function(_, c)
             local ct = c:get()
             local holder, slot = nil, nil
             pcall(function() holder = jig.uid_str(ct[C_IN]); slot = ct[C_INDEX] end)
@@ -429,7 +429,7 @@ function jig.twin_grids(comp)
     local is_item, seen, twins = {}, {}, 0
     for _, h in ipairs(jig.contents_of(comp)) do is_item[h.uid] = true end
     pcall(function()
-        comp.MainJigContainers:ForEach(function(_, c)
+        util.each(comp.MainJigContainers, function(_, c)
             local ct = c:get()
             local holder, slot
             pcall(function() holder = jig.uid_str(ct[C_IN]); slot = ct[C_INDEX] end)
@@ -714,7 +714,7 @@ function jig.probe(comp)
         has(first, C_REPUID); has(first, C_IN); has(first, C_INDEX)
         local items = has(first, ITEMS)
         if items then pcall(function() conts:ForEach(function(_, c)
-            if not item then c:get()[ITEMS]:ForEach(function(_, el) item = item or el:get() end) end
+            if not item then util.each(c:get()[ITEMS], function(_, el) item = item or el:get() end) end
         end) end) end
     end
     if item then

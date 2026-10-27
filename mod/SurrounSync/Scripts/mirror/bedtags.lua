@@ -150,7 +150,7 @@ end
 
 local function select_row(w, row, on)
     if on then
-        pcall(function() w.Options:ForEach(function(_, e) e:get():SetSelected(false) end) end)
+        pcall(function() util.each(w.Options, function(_, e) e:get():SetSelected(false) end) end)
     end
     pcall(function() row:SetSelected(on) end)
 end
