@@ -373,6 +373,12 @@ local removed_fn = function(self, FromContainerUID, ItemUID, ContainerName, Item
     util.safe(on_removed, "corpses.removed", self, ItemRemovedInfo)
 end
 
+-- Used straight off a body (rip clothing, eat...): the game fires only JigMP_OnItemConsumed. ConsumedItem is the
+-- same item struct as ItemRemovedInfo; flush_takes works out how many went from the host's list.
+local consumed_fn = function(self, ConsumedItem)
+    util.safe(on_removed, "corpses.consumed", self, ConsumedItem)
+end
+
 local item_removed_fn = function(self, ItemUID, FromUID, ToContainer, To)
     util.safe(function()
         if not hooks_here() then return end
@@ -465,6 +471,7 @@ function corpses.tick(dt)
         for _, cl in ipairs(LOOT_CLASSES) do
             util.ensure_hook(cl .. ":JigMP_OnMainContainerItemRemoved", removed_fn)
             util.ensure_hook(cl .. ":JigMP_OnItemRemoved", item_removed_fn)
+            util.ensure_hook(cl .. ":JigMP_OnItemConsumed", consumed_fn)
             util.ensure_hook(cl .. ":JigMP_OnItemAdded", item_added_fn)
         end
         if not shared() then lists, gate_since, checked = {}, {}, {} end

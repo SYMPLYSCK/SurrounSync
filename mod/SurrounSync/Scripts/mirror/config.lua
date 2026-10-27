@@ -39,9 +39,9 @@ local config = {
         teleport_tolerance = 2000,
     },
 
-    -- Realms (shared worlds kept on the Realms server between sessions): unfinished, off until released
+    -- Realms (shared worlds kept on the Realms server between sessions); "realms = off" in mirror_settings.txt hides them
     realms = {
-        enabled = false,
+        enabled = true,
     },
 
     zombies = {

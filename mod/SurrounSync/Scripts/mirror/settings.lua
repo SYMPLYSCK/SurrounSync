@@ -52,7 +52,7 @@ local APPLY = {
         cfg.backpack_names = b
         return true
     end,
-    -- on: the unfinished Realms (REALMS tab instead of MODS; needs a Realms server)
+    -- Realms (on by default: REALMS tab instead of MODS); off hides them
     realms = function(cfg, v)
         local b = onoff(v)
         if b == nil then return false end

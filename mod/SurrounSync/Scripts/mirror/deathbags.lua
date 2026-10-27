@@ -343,6 +343,8 @@ function deathbags.tick(dt)
     if hook_in <= 0 then
         hook_in = 1.0
         util.ensure_hook(BAG .. ":JigMP_OnMainContainerItemRemoved", removed_fn)
+        -- used out of the bag (rip, eat...): consumed fires no removed event
+        util.ensure_hook(BAG .. ":JigMP_OnItemConsumed", removed_fn)
     end
     util.safe(watch_tick, "deathbags.watch", dt)
     if relabel_at and clock >= relabel_at then relabel_at = nil; util.safe(relabel, "deathbags.relabel") end

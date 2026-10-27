@@ -1718,6 +1718,32 @@ def one_take_fires_both_removed_hooks_and_is_sent_once():
           "host: a repeat of a take it just applied isn't answered with L")
 
 
+def item_used_out_of_a_container_is_a_take():
+    # report 20261027-171134: ripping clothes in a shared trash bag fires only JigMP_OnItemConsumed - the host
+    # kept the clothes and its next list put them back on the guest's copy (rags + clothes, every rip)
+    print("item_used_out_of_a_container_is_a_take")
+    L = loot_guest()
+    L.execute(r"""
+        PUMP.BP_JigMultiplayer = COMP
+        package.loaded["mirror.jig"].contents_of = function(c) return CONT end
+        CONT = { { uid = "G1", da = "/Game/X.DA_BlackShirt", count = 1 } }
+        open(); loot.tick(0.1)
+        ID = SENT[1]:match("^Q (%S+)$")
+        INBOX.lootc = { "C " .. ID .. " 0 one" }
+        loot.tick(0.1)
+        CONT = {}
+        local C = "/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C"
+        function takes() local n = 0; for _, p in ipairs(SENT) do if p:find(" G1 0 ", 1, true) then n = n + 1 end end; return n end
+        HOOKS[C .. ":JigMP_OnItemConsumed"]({ get = function() return PUMP end },
+            { get = function() return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = "G1" } end })
+        SAME_FRAME = takes()
+        loot.tick(0.1)
+        AFTER = takes()
+    """)
+    check(L.eval("SAME_FRAME") == 0, "a consume is looked at the next frame (the pre-hook runs before the count changes)")
+    check(L.eval("AFTER") == 1, "an item used up inside a shared container is sent as a take (%d)" % L.eval("AFTER"))
+
+
 def car_trunks_go_by_the_cars_name():
     print("car_trunks_go_by_the_cars_name")
     L = loot_guest()
@@ -3570,7 +3596,7 @@ def mods_switch_restart_and_match_the_host():
         shutil.rmtree(d, ignore_errors=True)
 
 
-for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
+for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, tactical_reads_only_lights_the_class_has,
           vehicles_keep_this_worlds_fuel, harvest_uses_up_nodes_once, zombie_copies_take_the_hosts_look,
           copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_tooltip_reads_the_item_once, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,

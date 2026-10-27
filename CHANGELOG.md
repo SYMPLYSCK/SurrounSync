@@ -2,6 +2,16 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 0.13.6 (2026-10-27)
+
+A duplicate fix. Works together with 0.13.2 - 0.13.5 (update everyone to get the fix).
+
+**👕 Fixed: ripping clothes inside a shared container duplicated them**
+- Ripping clothing (or eating, drinking, reading, opening a loot box, repairing...) straight out of a container, zombie body or death bag never told the other game. You kept the rags and the clothes came back in the container. Using an item there now counts as taking it.
+
+**🌍 Realms are on for everyone**
+- The REALMS tab is in the handbook (J) without editing any settings. The MODS list moved to the settings page. Put `realms = off` in mirror_settings.txt to hide Realms.
+
 ## 0.13.5 (2026-10-27)
 
 A crash fix. Works together with 0.13.2 - 0.13.4.

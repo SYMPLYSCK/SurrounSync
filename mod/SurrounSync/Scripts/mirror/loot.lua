@@ -918,6 +918,27 @@ local request_fn = function(self, JigMpCompRef)
     util.safe(function() on_generated(JigMpCompRef:get(), "request") end, "loot.request")
 end
 local hook_fn = function(self, ItemUID) util.safe(on_removed, "loot.removed", self, ItemUID) end
+-- Using an item straight out of a container (rip clothing, eat, drink, read, open a loot box...) consumes it:
+-- the game fires only JigMP_OnItemConsumed, no removed event. The host kept the item and its next list put
+-- it back on the guest's copy - every rip left the rags AND the clothes (report 20261027-171134). Sent the
+-- next frame like a stack (the pre-hook may run before the count changes).
+local eaten = {}
+local consumed_fn = function(self, ConsumedItem)
+    util.safe(function()
+        if applying or not shared() then return end
+        local actor, uid = self:get(), nil
+        pcall(function() uid = uid_str(ConsumedItem:get()[UID]) end)
+        if uid and util.valid(actor) then eaten[#eaten + 1] = { actor = actor, uid = uid } end
+    end, "loot.consumed")
+end
+local function flush_eaten()
+    if not eaten[1] then return end
+    local list = eaten
+    eaten = {}
+    for _, e in ipairs(list) do
+        if util.valid(e.actor) and is_main(e.actor) then removed(e.actor, e.uid) end
+    end
+end
 -- Dropping an item out of a container (all of it or part of a stack) fires no "removed" event on the
 -- container: the drop request on its component is the only sign.
 local drop_fn = function(self, ItemUID)
@@ -1015,6 +1036,7 @@ function loot.tick(dt)
         util.ensure_hook(JIG_COMP .. ":SERVER_RequestSplitItem", split_fn)
         for _, c in ipairs(MAIN) do
             util.ensure_hook(c .. ":JigMP_OnItemRemoved", hook_fn)
+            util.ensure_hook(c .. ":JigMP_OnItemConsumed", consumed_fn)
             util.ensure_hook(c .. ":JigMP_OnItemAdded", item_added_fn)
             util.ensure_hook(c .. ":JigMP_OnMainContainerItemRemoved", main_removed_fn)
             util.ensure_hook(c .. ":JigMP_OnMainContainerItemAdded", main_added_fn)
@@ -1028,6 +1050,7 @@ function loot.tick(dt)
     end
     crumb.at("loot: moves/adds")
     util.safe(flush_stacks, "loot.stacks")
+    util.safe(flush_eaten, "loot.consumed")
     util.safe(flush_moves, "loot.moves")
     util.safe(flush_adds, "loot.adds")
     if role == "host" then
