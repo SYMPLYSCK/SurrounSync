@@ -1,0 +1,14 @@
+{
+  "name": "surrounsync-realms",
+  "private": true,
+  "description": "SurrounSync Realms backend (Cloudflare Worker + D1 + R2)",
+  "scripts": {
+    "dev": "wrangler dev --local --port 8787 --persist-to .wrangler/test-state",
+    "db:local": "wrangler d1 execute surrounsync-realms --local --persist-to .wrangler/test-state --file schema.sql",
+    "db:remote": "wrangler d1 execute surrounsync-realms --remote --file schema.sql",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.148.0"
+  }
+}

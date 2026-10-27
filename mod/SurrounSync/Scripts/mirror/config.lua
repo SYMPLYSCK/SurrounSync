@@ -39,9 +39,14 @@ local config = {
         teleport_tolerance = 2000,
     },
 
+    -- Realms (shared worlds kept on the Realms server between sessions): unfinished, off until released
+    realms = {
+        enabled = false,
+    },
+
     zombies = {
         enabled = true,
-        radius = 15000,              -- host sends zombies within this range of the guest
+        radius = 15000,             -- host sends zombies within this range of the guest
         send_hz = 15,
         interp_delay = 0.12,
         despawn_after = 3.0,

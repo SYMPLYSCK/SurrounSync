@@ -30,10 +30,14 @@ local cycled_down = false  -- set by the CycleOptions hook, handled in the next 
 local interacted = false   -- set by the TryInteract hook
 local want_box = nil       -- { loc, kind, name } - the rename box opens from the tick, never inside a hook
 
+local records_of = nil     -- the file `records` came from (a Realm has its own)
+local function file() return path and path() end
+
 local function read()
-    if records then return records end
-    records = {}
-    for line in ((path and fs.read(path)) or ""):gmatch("[^\r\n]+") do
+    local p = file()
+    if records and records_of == p then return records end
+    records, records_of = {}, p
+    for line in ((p and fs.read(p)) or ""):gmatch("[^\r\n]+") do
         local x, y, z, name = line:match("^(%S+) (%S+) (%S+)|(.+)$")
         if name and tonumber(x) then
             records[#records + 1] = { loc = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }, name = name }
@@ -43,11 +47,12 @@ local function read()
 end
 
 local function write(list)
-    records = list
-    if not path then return end
+    local p = file()
+    records, records_of = list, p
+    if not p then return end
     local out = {}
     for _, r in ipairs(list) do out[#out + 1] = string.format("%.0f %.0f %.0f|%s", r.loc.X, r.loc.Y, r.loc.Z, r.name) end
-    fs.write(path, table.concat(out, "\n") .. "\n")
+    fs.write(p, table.concat(out, "\n") .. "\n")
 end
 
 local function find(loc)
@@ -228,7 +233,7 @@ function bedtags.tick(dt)
 end
 
 function bedtags.init(session, send_fn, shared_fn)
-    path = session and session.data_file and session.data_file("mirror_coop_bed_names.txt")
+    path = session and session.data_file and function() return session.data_file("mirror_coop_bed_names.txt") end
     send, shared = send_fn, shared_fn
 end
 

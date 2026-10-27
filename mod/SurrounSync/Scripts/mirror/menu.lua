@@ -65,6 +65,7 @@ end
 local joined_peer = nil
 local sent_password = ""
 local function join(steamid, who)
+    session.realm_guest(nil)   -- (menu.realm_join arms the Realm again after this)
     local r = my_role()
     if r == "host" then
         if not p1().can_switch() then
@@ -103,14 +104,14 @@ local function join(steamid, who)
 end
 
 local stopping = nil
-local function stop_hosting()
+local function stop_hosting(message)
     if my_role() ~= "host" then notify.show("You're not hosting.", "info"); return end
     if stopping then notify.show("Stopping - one moment.", "info"); return end
     stopping = { t = 0.0 }
     p1().say_bye()
     session.save_now()
     log.info("menu: stop hosting - guest told, world saving")
-    notify.show("Stopping the session: saving your world and sending your friend home...", "info")
+    notify.show(message or "Stopping the session: saving your world and sending your friend home...", "info")
 end
 local function stopping_tick(dt)
     if not stopping then return end
@@ -134,11 +135,8 @@ end
 
 local function copy_code(code)
     if not code then return end
-    local ok = pcall(function()
-        local h = io.popen("clip", "w")
-        h:write(code)
-        h:close()
-    end)
+    -- the bridge runs clip.exe off the game thread (io.popen("clip") here froze the game for a second)
+    local ok = link.bridge_cmd("clip " .. code)
     notify.show(ok and ("Your friend code " .. code .. " was copied. Send it to your friend.") or
         ("Your friend code: " .. code), "good")
 end
@@ -496,6 +494,15 @@ local function tick(dt)
     journal_tab.tick(dt)
 end
 
+-- Realms (realmplay.lua) host, join and stop through the same paths as the CO-OP tab
+function menu.realm_host() host() end
+function menu.realm_join(steamid, who) join(steamid, who) end
+function menu.realm_stop(why)
+    -- (the co-op text said "sending your friend home" even when hosting a Realm alone)
+    stop_hosting("Ending the Realm: saving it and sending everyone home...")
+    if stopping then stopping.why = why end
+end
+function menu.role() return my_role() end
 function menu.dev_host() host() end
 function menu.dev_join() join(nil, nil) end
 function menu.dev_stop() stop_hosting() end
@@ -536,7 +543,7 @@ function menu.init(c)
     require("mirror.mysettings").init(my_role)
     require("mirror.modlist").init()
     require("mirror.itemclean").init(my_role)
-    require("mirror.names").init()
+    require("mirror.names").init(c)
     journal_tab.configure{
         model = model,
         act = {
@@ -595,7 +602,25 @@ function menu.init(c)
                 if msg ~= "" then notify.show(msg, #missing > 0 and "bad" or "good", nil, true) end
                 if require("mirror.modlist").restart_needed() then mods_restart_note() end
             end,
+            -- the REALMS tab (realmplay.lua, realmmembers.lua)
+            realm_list = function(force) require("mirror.realmplay").refresh_list(force) end,
+            realm_open = function(id, how) require("mirror.realmplay").open(id, how) end,
+            realm_invite = function(id) require("mirror.realmmembers").invite(id) end,
+            realm_key = function(id) require("mirror.realmmembers").copy_key(id) end,
+            realm_create = function(name) require("mirror.realmplay").create(name) end,
+            realm_add = function(text)
+                text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                if text == "" then return false end
+                local rm = require("mirror.realmmembers")
+                if text:upper():sub(1, 6) == "SSRK1." then rm.use_key(text) else rm.redeem(text) end
+                return true
+            end,
+            realm_friends = function() require("mirror.realmplay").add_members(nil) end,
+            realm_end = function() require("mirror.realmplay").leave() end,
+            realm_cancel = function() require("mirror.realmplay").cancel_create() end,
         },
+        realms_on = function() return require("mirror.realm").enabled() end,
+        realms = function() return require("mirror.realmplay").model() end,
         mods = function()
             local m = require("mirror.modlist").model(mods_peer())
             m.in_coop = my_role() ~= nil

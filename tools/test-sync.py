@@ -58,6 +58,36 @@ def posepack_recovers_lost_packets():
     check(len(first) == 1 and first[0]["live"] and first[0]["line"] == "pose1", "a packet without history still works")
 
 
+def link_blob_comes_back_after_reset():
+    """The link hands out a blob once; an unchanged one stays hidden even after link.open again (what phase1 does
+    on stop + host again) - only reset_blob shows it again. phase1's reset_link_state resets hello + look: without
+    that the other game's unchanged hello never came back -> false "it runs an OLDER SurrounSync" (in-game)."""
+    print("link_blob_comes_back_after_reset")
+    L = lua()
+    d = tempfile.mkdtemp()
+    try:
+        L.execute('local d = ...; package.loaded["mirror.localdir"] = { get = function() return d end }', d)
+        with open(os.path.join(d, "mirror_hello_guest.txt"), "wb") as f:
+            f.write(b"SurrounSync protocol 54 role guest\nEND\n")
+        L.execute('lf = require("mirror.link_file"); lf.configure({}); lf.open("host")')
+        check(L.eval('lf.get_blob("hello")') == "SurrounSync protocol 54 role guest", "first read hands out the hello")
+        L.execute('lf.open("host")')
+        check(L.eval('lf.get_blob("hello")') is None, "unchanged hello after a new open: hidden (the false alarm's cause)")
+        L.execute('lf.reset_blob("hello")')
+        check(L.eval('lf.get_blob("hello")') == "SurrounSync protocol 54 role guest", "after reset_blob: handed out again")
+        src = open(os.path.join(SCRIPTS, "mirror", "phase1.lua"), encoding="utf-8").read()
+        body = src[src.index("local function reset_link_state"):]
+        body = body[:body.index("\nend\n")]
+        check('link.reset_blob("hello")' in body and 'link.reset_blob("look")' in body,
+              "phase1 reset_link_state resets the hello + look blobs")
+        bye = src[src.index('local bye = link.get_blob("bye")'):]
+        bye = bye[:bye.index('" stopped hosting."')]
+        check(bye.index('session.state() == "joined"') < bye.index("said < opened_at"),
+              "an old goodbye only skips the 'stopped hosting' note - a joined guest still goes home first")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def clockmap_quiet_places_without_stats():
     print("clockmap_quiet_places_without_stats")
     L = lua()
@@ -1103,6 +1133,61 @@ def goto_and_bring_move_only_your_own_player():
     check(B.eval("P.at.X") > 9000 and B.eval("SENT[3]") == "Y", "accepted: the asked game moves its own player")
     B.execute('INBOX = { "Q G" }; tp.tick(0.1); tp.tick(31)')
     check(B.eval("tp.pending()") is None and B.eval("SENT[4]") == "X", "an unanswered request times out")
+
+
+def backpack_tooltip_reads_the_item_once():
+    # DBG-20261026-001: the per-frame tooltip hook read the item, its data asset and walked the inventory every
+    # frame - all four crash runs died there while items moved. Now: once per hovered item, nothing right after a move.
+    print("backpack_tooltip_reads_the_item_once")
+    import tempfile
+    d = tempfile.mkdtemp()
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        FText = function(s) return s end
+        KEYS, HOOKS, WALKS, FULLNAMES, REFREADS = {}, {}, 0, 0, 0
+        COMP = obj({})
+        PLAYER = obj({ BP_JigComponent = COMP })
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+                                          keybind = function(k, _, fn) KEYS[k] = fn end, on_ready = function() end }
+        package.loaded["mirror.jig"] = { contents_of = function(c) WALKS = WALKS + 1; return { { uid = "1_2_3_4" } } end }
+        util = require("mirror.util")
+        util.ensure_hook = function(path, fn) HOOKS[path:match(":(.+)$")] = fn; return true end
+        ITEM = obj({ ItemUniqueID = { A = 1, B = 2, C = 3, D = 4 },
+                     JigDataAsset = obj({ GetFullName = function() FULLNAMES = FULLNAMES + 1
+                                          return "JigDataAsset /Game/Equipment/Backpacks/DA_Bag.DA_Bag" end }) })
+        DESCR, SHOWN = "Holds things", nil
+        TIP = setmetatable(obj({ NameText = obj({ SetText = function(_, t) SHOWN = t end }),
+                                 descr = obj({ GetText = function() return { ToString = function() return DESCR end } end,
+                                               SetText = function(_, t) DESCR = t end }) }),
+                           { __index = function(_, k) if k == "ItemRef" then STALE = true; return ITEM end end })
+        P = function(v) return { get = function() return v end } end
+        -- Update(ItemRef) is hooked before it runs: TIP.ItemRef is the item shown last (maybe freed), the param is live
+        REF = { get = function() REFREADS = REFREADS + 1; return ITEM end }
+        function frames(n) for _ = 1, n do NOW = NOW + 0.016; HOOKS.Update(P(TIP), REF) end end
+    """)
+    L.execute('local d = ...; local io_open = io.open; io.open = function(p, m) return io_open(d .. "/" .. p, m) end; '
+              'local rn, rm = os.rename, os.remove; os.rename = function(a, b) return rn(d .. "/" .. a, d .. "/" .. b) end; '
+              'os.remove = function(a) return rm(d .. "/" .. a) end', d.replace("\\", "/"))
+    L.execute('names = require("mirror.names"); names.init({}); names.tick(1); names.set("1_2_3_4", "Med bag")')
+    check(L.eval("HOOKS.Update ~= nil and HOOKS['Handle Comp to Comp Move'] ~= nil"), "tooltip and move hooks registered")
+    L.execute("frames(60)")
+    check(L.eval("WALKS") == 0 and L.eval("FULLNAMES") == 1, "60 frames on one backpack: item read once, inventory never walked (%s walks, %s names)"
+          % (L.eval("WALKS"), L.eval("FULLNAMES")))
+    check(L.eval("SHOWN") == "Med bag" and "(F2: rename)" in L.eval("DESCR"), "its name and the F2 hint still show")
+    check(L.eval("STALE") is None, "the tooltip's previous item (self.ItemRef, maybe freed) is never read")
+    L.execute("names.set('1_2_3_4', 'Ammo bag'); frames(1)")
+    check(L.eval("SHOWN") == "Ammo bag" and L.eval("WALKS") == 0, "a rename shows at once without a new walk")
+    L.execute("R0 = REFREADS; HOOKS['Handle Comp to Comp Move'](P(COMP), P(COMP), P(COMP), P({ A = 9, B = 9, C = 9, D = 9 }), P(0), P(0), P({}))")
+    L.execute("frames(20)")  # 0.32 s
+    check(L.eval("REFREADS") == L.eval("R0"), "right after a move the tooltip hook doesn't touch the item")
+    L.execute("frames(10)")
+    check(L.eval("REFREADS") > L.eval("R0") and L.eval("WALKS") == 0, "after the pause it looks at the item once more, still no walk")
+    L.execute("NOW = NOW + 1.0; KEYS.F2()")
+    check(L.eval("names.asking()") is False, "F2 on a tooltip that stopped updating opens nothing (no widget kept)")
+    L.execute('package.loaded["mirror.names"] = nil; HOOKS = {}; names = require("mirror.names"); '
+              'names.init({ backpack_names = false }); names.tick(1)')
+    check(L.eval("next(HOOKS) == nil"), "backpack_names = off: no inventory hooks at all")
 
 
 def backpack_names_travel_with_the_item():
@@ -3144,19 +3229,19 @@ def tooltip_never_calls_into_null_objects():
             return setmetatable({ IsValid = function() return false end },
                                 { __index = function(_, k) TOUCHED = what .. "." .. k; return function() TOUCHED = what .. ":" .. k end end })
         end
-        function hover(tip) HOOKS.Update({ get = function() return tip end }) end
+        function hover(tip, item) HOOKS.Update({ get = function() return tip end }, { get = function() return item end }) end
         local uid = { A = 1, B = 2, C = 3, D = 4 }
         ITEM_NO_DA = obj({ ItemUniqueID = uid, JigDataAsset = null("JigDataAsset") })
         TIP = obj({ ItemRef = ITEM_NO_DA, NameText = null("NameText"), descr = null("descr") })
     """)
     check(L.eval('HOOKS.Update ~= nil'), "the tooltip hook is installed")
-    L.execute('hover(TIP)')
+    L.execute('hover(TIP, ITEM_NO_DA)')
     check(L.eval('TOUCHED') is None, "an item without a data asset is left alone (touched %s)" % L.eval('TOUCHED'))
-    L.execute('names.set("1_2_3_4", "Bag"); hover(TIP)')
+    L.execute('names.set("1_2_3_4", "Bag"); hover(TIP, ITEM_NO_DA)')
     check(L.eval('TOUCHED') is None, "a named item whose title text isn't built is left alone (touched %s)" % L.eval('TOUCHED'))
     L.execute('hover(null("tooltip"))')
     check(L.eval('TOUCHED') is None, "a torn-down tooltip is left alone (touched %s)" % L.eval('TOUCHED'))
-    L.execute('TIP.ItemRef = null("ItemRef"); hover(TIP)')
+    L.execute('hover(TIP, null("ItemRef"))')
     check(L.eval('TOUCHED') is None, "a tooltip whose item is gone is left alone (touched %s)" % L.eval('TOUCHED'))
 
 
@@ -3485,10 +3570,10 @@ def mods_switch_restart_and_match_the_host():
         shutil.rmtree(d, ignore_errors=True)
 
 
-for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
+for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, tactical_reads_only_lights_the_class_has,
           vehicles_keep_this_worlds_fuel, harvest_uses_up_nodes_once, zombie_copies_take_the_hosts_look,
-          copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
+          copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_tooltip_reads_the_item_once, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
           ghost_swims_without_its_own_water_detection, ghost_never_blocks_cars, audio_spatializes_and_shares_without_echo,
           throws_and_mines_reach_the_other_game, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, loose_magazine_picked_up_without_hooks_still_gets_its_rounds, ground_weapon_attachments_reach_the_other_game, ghost_gun_in_hand_is_known, missing_zombie_looks_get_loaded,
           random_and_debug_weather_is_shared,

@@ -43,6 +43,11 @@ local function has_saves(slot)
     return savefs.exists(dir(slot) .. "\\Level.sav") or savefs.exists(dir(slot) .. "\\Player.sav")
         or savefs.exists(dir(slot) .. "\\Slot.sav")
 end
+-- a save slot on disk (EMS slots are folders); names with path characters are never slots
+function slotguard.on_disk(slot)
+    return type(slot) == "string" and slot ~= "" and not slot:find("[\\/:]") and not slot:find("%.%.")
+        and saves_dir ~= nil and has_saves(slot)
+end
 local function adopt(slot)
     if slotguard.is_coop(slot) and has_saves(slot) and not marked(slot) then
         savefs.write(dir(slot) .. "\\" .. MARKER, "SurrounSync co-op session save - emptied when the session ends.\n")
@@ -74,7 +79,7 @@ end
 function slotguard.repair(slot, file) if slotguard.valid_name(slot) then savefs.repair(dir(slot) .. "\\" .. file) end end
 function slotguard.repair_sidecar(slot, suffix) if slotguard.valid_name(slot) then savefs.repair(saves_dir .. "\\" .. slot .. suffix) end end
 
-local FIELDS = { "step", "own", "coop", "folder", "home", "own_stamp", "host", "time", "version" }
+local FIELDS = { "step", "own", "coop", "folder", "home", "own_stamp", "host", "time", "version", "realm", "gen", "realm_role" }
 local STEPS = { building = "coop", joined = "coop", leaving = "coop", home = "coop", restoring = "folder" }
 local function log_path() return saves_dir .. "\\mirror_coop_session.txt" end
 
@@ -166,6 +171,13 @@ local function check_files(files)
     return true
 end
 
+-- world files from outside (a Realm download): names, sizes and save-file headers
+function slotguard.check_world(files)
+    local ok, why = check_files(files)
+    if not ok then return refuse("world", why) end
+    return true
+end
+
 function slotguard.validate_world(files, ready)
     if not ready or ready.nonce ~= ready.expect_nonce then return refuse("host world", "not the answer to our join request") end
     if not slotguard.valid_name(ready.slot) then return refuse("host world", "bad host save name") end
@@ -223,9 +235,56 @@ function slotguard.seed_character(own, coop)
     return savefs.write_set(set)
 end
 
+-- ---- Realms: the co-op save holds a Realm's world and my Realm character (never my own save's) ----
+-- character files by name: Player.sav, PlayerInfo.sav, and the slot sidecars by suffix (_SDQuests.sav ...)
+local function realm_character_paths(coop)
+    local list = {}
+    for _, f in ipairs(L.player) do list[#list + 1] = { f, dir(coop) .. "\\" .. f } end
+    for _, x in ipairs(L.sidecars) do list[#list + 1] = { x, saves_dir .. "\\" .. coop .. x } end
+    return list
+end
+
+-- world = { [file] = data } (checked), character = { [name] = data } or nil for a fresh character
+function slotguard.build_realm(coop, world, character)
+    local t, err = session_coop("build_realm", coop)
+    if not t then return nil, err end
+    if not t.realm then return refuse("build_realm", "the session log isn't a Realm session") end
+    local ok, why = check_files(world)
+    if not ok then return refuse("build_realm", why) end
+    if not savefs.write(dir(coop) .. "\\" .. MARKER, "SurrounSync co-op session save - emptied when the session ends.\n") then
+        return refuse("build_realm", "can't mark " .. coop)
+    end
+    local set = {}
+    for name, data in pairs(world) do set[#set + 1] = { path = dir(coop) .. "\\" .. name, data = data } end
+    if character then
+        if not character["Player.sav"] then return refuse("build_realm", "the Realm character has no Player.sav") end
+        for _, c in ipairs(realm_character_paths(coop)) do
+            if character[c[1]] then set[#set + 1] = { path = c[2], data = character[c[1]] } end
+        end
+    end
+    return savefs.write_set(set)
+end
+
+-- what a Realm session's co-op save holds now: its world files and the character, read only
+function slotguard.read_realm(coop)
+    local t, err = session_coop("read_realm", coop)
+    if not t then return nil, err end
+    local world, character = {}, {}
+    for name in pairs(IMPORTABLE) do
+        local data, e, missing = savefs.read_file(dir(coop) .. "\\" .. name)
+        if data then world[name] = data elseif not missing then return nil, "can't read " .. name .. ": " .. tostring(e) end
+    end
+    for _, c in ipairs(realm_character_paths(coop)) do
+        local data, e, missing = savefs.read_file(c[2])
+        if data then character[c[1]] = data elseif not missing then return nil, "can't read " .. c[1] .. ": " .. tostring(e) end
+    end
+    return world, character["Player.sav"] and character or nil
+end
+
 function slotguard.copy_character_home(coop, own)
     local t, err = session_coop("copy_character_home", coop)
     if not t then return nil, err end
+    if t.realm then return refuse("copy_character_home", "a Realm character never goes into your own save") end
     if t.own ~= own then return refuse("copy_character_home", tostring(own) .. " is not this session's own save") end
     if not slotguard.is_own(own) then return refuse("copy_character_home", tostring(own) .. " is not one of your saves") end
     if not savefs.exists(dir(coop) .. "\\Player.sav") then return refuse("copy_character_home", coop .. " has no character") end

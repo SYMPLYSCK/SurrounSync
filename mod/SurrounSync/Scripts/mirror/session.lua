@@ -21,6 +21,7 @@ local beds = require("mirror.beds")
 local session = {}
 
 local carry = { join = nil, leave = nil }
+local armed_realm, realm_id = nil, nil   -- Realm of the next join / of this join (nil = a normal co-op join)
 local function carried()
     local n = -1
     pcall(function() n = #jig.contents_of(game.player().BP_JigMultiplayer) end)
@@ -88,7 +89,13 @@ local function saves_dir()
     local d = cfg.phase2.saved_override or ((link.kind() == "steam") and "Saved" or cfg.phase2.saved_dir[role])
     return base() .. "\\" .. d .. "\\SaveGames"
 end
-function session.data_file(name) return saves_dir():gsub("\\SaveGames$", "") .. "\\" .. name end
+-- (while a Realm is hosted, its world-scoped files live in the Realm: realmplay.lua)
+local data_dir = function() return nil end
+function session.set_data_dir(fn) data_dir = fn end
+function session.data_file(name)
+    local d = data_dir()
+    return (d or saves_dir():gsub("\\SaveGames$", "")) .. "\\" .. name
+end
 local world_in, world_ready = {}, nil
 local world_shown, world_poll = 0, 0
 local JOIN_TIMEOUT = 120
@@ -105,9 +112,13 @@ local coop_used = 0
 local coop = nil
 local function coop_name(i) return cfg.phase2.coop_slot .. "_" .. i end
 local function is_coop(name) return name ~= nil and slotguard.is_coop(name) end
-local function next_coop_slot()
+-- fresh_only: a Realm needs a slot EMS hasn't cached this run (a reused one keeps the last session's PlayerInfo)
+local function next_coop_slot(fresh_only)
     local n = cfg.phase2.coop_slots or 1
-    if coop_used >= n then
+    if coop_used >= n and fresh_only then
+        log.warn(string.format("session: all %d co-op slots used this run - a Realm needs an unused one", n))
+        return nil
+    elseif coop_used >= n then
         log.warn(string.format("session: all %d co-op slots used this run - reusing; world settings (weather, difficulty) may be stale until you restart the game", n))
     end
     coop_used = coop_used + 1
@@ -182,7 +193,9 @@ end
 local function slot_exists(name)
     local ok = false
     pcall(function() ok = lib():DoesSaveSlotExist(game.world(), name) end)
-    return ok == true
+    -- (in-game it never said yes for the folder slots, so current_slot always fell back to the newest save -
+    -- after a Realm that was the Realm's co-op slot, and START refused "load one of your own saves")
+    return ok == true or slotguard.on_disk(name)
 end
 
 local function slot_names()
@@ -409,6 +422,11 @@ function session.startup_restore()
     local t, bad = slotguard.log_read()
     -- (first put back files a crash left half-swapped: an own save caught mid copy looks like no save at all)
     if t then repair_slot(t.own); repair_slot(t.coop) end
+    if t and t.realm then
+        -- a Realm session: its character belongs to the Realm, never to the own save (realmplay.recover)
+        log.info("session: the last Realm session didn't finish - Realms takes care of it")
+        return
+    end
     if bad then
         if not close_unfinishable(slotguard.log_peek(), "damaged session file") then
             slotguard.log_quarantine()
@@ -531,19 +549,29 @@ local function session_log(step)
     return {
         step = step, own = own_slot, coop = coop, home = home and pose_str(home) or nil, own_stamp = own_stamp,
         host = link.peer_name(), time = os.date("%Y-%m-%d %H:%M:%S"), version = V.VERSION,
+        realm = realm_id, realm_role = realm_id and "guest" or nil,
     }
 end
 
 local function build_coop_slot(own, files)
-    coop = next_coop_slot()
+    coop = next_coop_slot(realm_id ~= nil)
     if not coop then
         log.error("session: no co-op slot folder " .. coop_name(1) .. " in " .. saves_dir() .. " (run tools\\setup-guest.ps1)")
         return false
     end
     slotguard.purge(coop)
     if not slotguard.log_write(session_log("building")) then return false end
-    local ok, err = slotguard.seed_character(own, coop)
-    if ok then ok, err = slotguard.import_world(coop, files) end
+    local ok, err
+    if realm_id then
+        -- my Realm character (none yet = the game makes a fresh one), never the own save's
+        local rm = require("mirror.realm")
+        local character = rm.character(realm_id) or rm.starter(realm_id)
+        log.info("session: Realm " .. realm_id .. " - " .. (character and "my Realm character" or "a fresh character"))
+        ok, err = slotguard.build_realm(coop, files, character)
+    else
+        ok, err = slotguard.seed_character(own, coop)
+        if ok then ok, err = slotguard.import_world(coop, files) end
+    end
     if not ok then
         log.error("session: could not build " .. coop .. ": " .. tostring(err))
         slotguard.purge(coop)
@@ -557,8 +585,20 @@ local function build_coop_slot(own, files)
         slotguard.log_clear()
         return false
     end
-    log.info(string.format("session: built %s from the host's world + own %s character", coop, own))
+    log.info(string.format("session: built %s from the host's world + %s character", coop, realm_id and "Realm" or ("own " .. own)))
     return true
+end
+
+-- leaving: the co-op character goes into the own save, or a Realm character back into the Realm's store
+local function character_home(t)
+    if not t.realm then return slotguard.copy_character_home(t.coop, t.own) end
+    local world, character = slotguard.read_realm(t.coop)
+    if not world then return nil, character end
+    if not character then return nil, t.coop .. " has no character" end
+    local ok, err = require("mirror.realm").store_character(t.realm, character)
+    if not ok then return nil, err end
+    log.info("session: Realm character stored in Realm " .. t.realm)
+    return "copied"
 end
 
 local exit_check = 0.0
@@ -570,7 +610,7 @@ local function unplanned_exit(cur, before_load)
     if not t or not t.coop then return end
     t.step = "leaving"
     slotguard.log_write(t)
-    local r, err = slotguard.copy_character_home(t.coop, t.own)
+    local r, err = character_home(t)
     if r == "copied" or r == "empty" then
         slotguard.purge(t.coop)
         if cur == t.own then
@@ -582,7 +622,7 @@ local function unplanned_exit(cur, before_load)
             if not before_load then home_reload = { slot = t.own, t = 0.0 } end
         else
             slotguard.log_clear()
-            notify.show("Your co-op character was saved to " .. t.own .. ".", "good")
+            notify.show(t.realm and "Your Realm character is saved." or ("Your co-op character was saved to " .. t.own .. "."), "good")
         end
     elseif r == "kept" then
         notify.show("Your own save changed during co-op, so it was not overwritten. Your co-op character is kept in "
@@ -685,11 +725,23 @@ end
 -- Runs before every save. A save writes the world in memory into whatever slot EMS points at,
 -- so make sure that's the slot this world belongs to (the Save menu and the 'autosave to a
 -- new slot' option both switch slots first).
+-- realmplay.lua: (the Realm save while the player is in it, the Realm session's co-op save at any step)
+local realm_slot = function() return nil, nil end
+function session.set_realm_slot(fn) realm_slot = fn end
 local function firewall(why)
     if keep_coop_slot(why) then return end
     local cur = ems_current_name()
     if not cur or cur == "" then return end
-    local my_session = role == "guest" and coop == cur and state ~= "idle"
+    -- in a Realm every save goes into its co-op save (the Save menu's "new save" picks another slot first)
+    local rs, realm_coop = realm_slot()
+    if rs and not level_loading then
+        if cur ~= rs then
+            local ok = point_at(rs)
+            log.warn(string.format("session: firewall - a save picked %s in a Realm; it goes to the Realm's save %s (%s)", cur, rs, tostring(ok)))
+        end
+        return
+    end
+    local my_session = (role == "guest" and coop == cur and state ~= "idle") or (realm_coop ~= nil and realm_coop == cur)
     if is_coop(cur) and not my_session and world_slot and world_slot ~= cur and not is_coop(world_slot) then
         local ok = point_at(world_slot)
         log.warn(string.format("session: firewall - a save pointed at the co-op save %s outside its session; sent to %s (%s)",
@@ -969,16 +1021,21 @@ local function guest_tick(dt)
             home = home_now()
             home_bed = beds.read()
             if cfg.diagnostics then util.safe(invdiag.snapshot, "invdiag", "before join") end
-            carry.join = carried()
-            log.info("session: carrying " .. carry.join .. " item stack(s) into the co-op world")
+            realm_id, armed_realm = armed_realm, nil
+            -- (the spawn preset edits the own save's cached PlayerInfo, which a Realm join doesn't use)
+            if realm_id then shared_save = nil end
+            -- (a Realm character has its own items: nothing of mine to count in or out)
+            carry.join = not realm_id and carried() or nil
+            log.info(realm_id and ("session: joining Realm " .. realm_id .. " with my Realm character")
+                or ("session: carrying " .. carry.join .. " item stack(s) into the co-op world"))
             join_slot, join_stamp = ems_current_name(), nil
             if join_slot then join_stamp = fs.read(saves_dir() .. "\\" .. join_slot .. "\\Slot.sav") end
             save_now()
             state, wait = "saving_own", 0.0
         elseif state == "joined" then
             log.info("session: leaving - saving into the co-op slot")
-            carry.leave = carried()
-            log.info("session: taking " .. carry.leave .. " item stack(s) home")
+            carry.leave = not realm_id and carried() or nil
+            if carry.leave then log.info("session: taking " .. carry.leave .. " item stack(s) home") end
             notify.show("Leaving " .. link.peer_name() .. "'s world...", "info")
             local hb = own_slot and beds.get(beds.home_key(own_slot))
             if hb then
@@ -1073,7 +1130,8 @@ local function guest_tick(dt)
                     notify.show("The world from " .. link.peer_name() .. " arrived damaged. Please try again.", "bad")
                     state = "idle"
                 elseif own and not is_coop(own) and build_coop_slot(own, world_in) then
-                    ems_share_player(coop, own)
+                    -- (a Realm character's PlayerInfo is read from its file: the slot is unused this run)
+                    if not realm_id then ems_share_player(coop, own) end
                     if home_bed then beds.set(beds.home_key(own), home_bed) end
                     host_world = beds.world_key(link.peer_name(), host_slot, own)
                     tp = { goal = "host", settle = 0.0, tries = 0, host_pos = peer_locator() or ghost.location() }
@@ -1085,6 +1143,7 @@ local function guest_tick(dt)
                 else
                     log.error("session: could not build the co-op slot; staying in own world")
                     notify.show(require("mirror.localdir").broken() and i18n.t("path_broken")
+                        or realm_id and not coop and "Every co-op save was used this game run. Restart the game, then join the Realm."
                         or "Couldn't prepare the co-op save, so you stayed in your own world. Your save is unchanged. Run SurrounSync Setup and click FIX, then try again.", "bad")
                     state = "idle"
                 end
@@ -1111,7 +1170,7 @@ local function guest_tick(dt)
                     leave_try.n, leave_try.wait = leave_try.n + 1, 0.5
                     t.step = "leaving"
                     slotguard.log_write(t)
-                    local r, err = slotguard.copy_character_home(t.coop, t.own)
+                    local r, err = character_home(t)
                     if r then
                         leave_try = nil
                         beds.set(beds.home_key(t.own), nil)
@@ -1272,6 +1331,8 @@ local function on_actor_loaded(self)
         tp.goal == "host" and "next to the host" or "back home", target.X, target.Y, target.Z, tostring(ok)))
 end
 
+local on_main_menu = function() end
+function session.on_main_menu(fn) on_main_menu = fn end
 local firewall_on = false
 local function install_firewall()
     if firewall_on then return end
@@ -1285,6 +1346,7 @@ local function install_firewall()
         -- (only another save's load did; at the menu the lobby stayed open and friends could still "join")
         local lv
         pcall(function() lv = LevelName:get():ToString() end)
+        if lv == "MainMenu" then util.safe(on_main_menu, "session.on_main_menu") end
         if lv == "MainMenu" and role == "host" and on_host_world_change then
             log.info("session: host went to the main menu - ending the session")
             hosted_slot = nil
@@ -1392,6 +1454,18 @@ end
 
 function session.state() return state end
 function session.save_now() return save_now() end
+-- for Realms (realmplay.lua): the same slot tools the join uses
+function session.saving() return saving() end
+function session.load_slot(slot) return load_slot(slot) end
+function session.current_name() return ems_current_name() end
+function session.current_slot() return current_slot(nil) end
+function session.next_coop_slot() configure_store(); return next_coop_slot(true) end
+-- the next join (menu.realm_join) is into this Realm: it plays the Realm character, not the own save's
+function session.realm_guest(id) armed_realm = id end
+function session.realm_joined() return state ~= "idle" and realm_id or nil end
+function session.loading() return level_loading end
+function session.saves_dir() return saves_dir() end
+function session.point_at(slot) return point_at(slot) end
 function session.playing_slot()
     local cur = ems_current_name()
     if not cur or cur == "" or is_coop(cur) then return nil end

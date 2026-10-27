@@ -40,9 +40,14 @@ local function valid(o, v)
     return false
 end
 
+-- my own settings file, or a hosted Realm's (hostrules.use_file)
+local own_file = function() return link.dir and (link.dir() .. FILE) end
+local file = own_file
+
 local function load()
     for _, o in ipairs(hostrules.LIST) do mine[o.key] = o.default end
-    local f = link.dir and io.open(link.dir() .. FILE, "rb")
+    local p = file()
+    local f = p and io.open(p, "rb")
     local s = f and f:read("*a") or ""
     if f then f:close() end
     for k, v in s:gmatch("(%w+)%s+(%w+)") do
@@ -53,7 +58,8 @@ local function load()
 end
 
 local function save()
-    local f = link.dir and io.open(link.dir() .. FILE, "wb")
+    local p = file()
+    local f = p and io.open(p, "wb")
     if not f then return end
     for _, o in ipairs(hostrules.LIST) do f:write(o.key, " ", mine[o.key], "\n") end
     f:close()
@@ -135,6 +141,14 @@ function hostrules.tick()
         sent, sent_to = nil, {}
     end
 end
+
+-- path = a Realm's settings file while hosting it (realmplay.lua), nil = my own again
+function hostrules.use_file(path)
+    file = path and function() return path end or own_file
+    load()
+    log.info("hostrules: " .. (path and "the Realm's" or "my") .. " settings: " .. encode(mine))
+end
+function hostrules.own_file() return own_file() end
 
 function hostrules.init(role_getter)
     role_fn = role_getter or role_fn

@@ -587,7 +587,11 @@ def structure_only_guard_uses_savefs(L, tmp):
     mods = os.path.join(SCRIPTS, "mirror")
     users = sorted(f[:-4] for f in os.listdir(mods) if f.endswith(".lua")
                    and re.search(r'require\("mirror\.savefs"\)', open(os.path.join(mods, f), encoding="utf-8").read()))
-    check(users == ["backups", "devtest", "slotguard"], "only backups, slotguard (and devtest's probe) require savefs: %s" % users)
+    # (realm: atomic writes in its own SurrounSyncRealms folder only; Realm saves go through slotguard)
+    check(users == ["backups", "devtest", "realm", "slotguard"],
+          "only backups, slotguard, realm (and devtest's probe) require savefs: %s" % users)
+    realm_src = open(os.path.join(mods, "realm.lua"), encoding="utf-8").read()
+    check("SaveGames" not in realm_src and "saves_dir" not in realm_src, "realm.lua never names a save folder")
 
 
 @test
@@ -1116,6 +1120,605 @@ def session_recovery_by_step(L, tmp):
     check(results["joined"] == (True, False, True), "joined: co-op character copied home, co-op emptied %s" % (results["joined"],))
     check(results["leaving"] == (True, False, True), "leaving (died mid copy): whole set redone, no leftovers %s" % (results["leaving"],))
     check(results["home"] == (True, False, True), "home: nothing copied again %s" % (results["home"],))
+
+
+REALM = "4R5BJRNGWF"
+
+
+def realm_character(tag=b"realmchar"):
+    return {"Player.sav": EMSH + tag + b" player" * 20, "PlayerInfo.sav": EMSH + tag + b" info",
+            "_SDQuests.sav": EMSH + tag + b" quests", "_SkillTree.sav": EMSH + tag + b" skills"}
+
+
+@test
+def guard_realm_build_read_and_never_home(L, tmp):
+    """A Realm session's co-op save: world + Realm character in, read back out; the character never goes into the own save."""
+    guard(L, tmp)
+    make_slot(tmp, "S1")
+    own0 = snapshot(tmp, "S1")
+    hw, ch = world_files(b"realm"), realm_character()
+    log_write(L, step="building", own="S1", coop=COOP, realm=REALM, gen="3", own_stamp="x")
+    r = L.eval('slotguard.build_realm(...)', COOP, lua_files(L, hw), lua_files(L, ch))
+    check(first(r) is True, "Realm save built: %s" % (r,))
+    coop = snapshot(tmp, COOP)
+    check(all(coop.get(k) == v for k, v in hw.items()), "co-op save holds the Realm's world")
+    check(all(coop.get(k) == v for k, v in ch.items()), "co-op save holds the Realm character + sidecars")
+    t = L.eval('{ slotguard.read_realm(...) }', COOP)
+    w2, c2 = t[1], t[2]
+    check(w2 is not None and all(w2[k] == v.decode("latin-1") or w2[k] == v for k, v in hw.items() if k != "Thumb.sav"),
+          "read_realm returns the world")
+    check(c2 is not None and c2["_SDQuests.sav"] is not None, "read_realm returns the character")
+    r = L.eval('slotguard.copy_character_home(...)', COOP, "S1")
+    check(first(r) is None, "copy_character_home refuses a Realm session")
+    check(snapshot(tmp, "S1") == own0, "own save untouched")
+    L.eval('slotguard.purge(...)', COOP)
+    r = L.eval('slotguard.build_realm(...)', COOP, lua_files(L, hw), None)
+    check(first(r) is True and "Player.sav" not in snapshot(tmp, COOP), "no Realm character yet: world only (fresh character)")
+    log_write(L, step="joined", own="S1", coop=COOP, own_stamp="x")
+    r = L.eval('slotguard.build_realm(...)', COOP, lua_files(L, hw), None)
+    check(first(r) is None, "build_realm refuses a log that isn't a Realm session")
+    log_write(L, step="building", own="S1", coop=COOP, realm=REALM, own_stamp="x")
+    r = L.eval('slotguard.build_realm(...)', COOP, lua_files(L, {"Level.sav": b"junk"}), None)
+    check(first(r) is None, "a broken world isn't built")
+
+
+@test
+def session_startup_leaves_realm_session_to_realms(L, tmp):
+    """A crash in a Realm: the session code must not copy the Realm character into the own save or purge it."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    guard(L, tmp)
+    own0 = snapshot(tmp, "S1")
+    log_write(L, step="joined", own="S1", coop=COOP, realm=REALM, gen="2", own_stamp="x")
+    L.eval('slotguard.build_realm(...)', COOP, lua_files(L, world_files(b"realm")), lua_files(L, realm_character()))
+    L.execute('session.preinit(CFG)')
+    check(snapshot(tmp, "S1") == own0, "own save untouched")
+    check(os.path.exists(os.path.join(saves(tmp), "mirror_coop_session.txt")), "the Realm session log is kept")
+    check(snapshot(tmp, COOP).get("Player.sav") == realm_character()["Player.sav"], "the Realm save is kept")
+
+
+REALM_FAKES = r'''
+local dir = ...
+REALM_ID = "4R5BJRNGWF"
+SENT, ROLE, HOSTED, RESPAWNS = {}, nil, 0, 0
+local lk = package.loaded["mirror.link"]
+lk.dir = function() return dir end
+lk.bridge_cmd = function(t) SENT[#SENT + 1] = t; return true end
+package.loaded["mirror.menu"] = { role = function() return ROLE end, realm_host = function() HOSTED = HOSTED + 1 end,
+    realm_join = function(s, w) JOINED = s end, realm_stop = function() ROLE = nil end }
+PC.Svr_RequestRespawn_Random = function() RESPAWNS = RESPAWNS + 1 end
+CFG.realms = { enabled = true }
+realmplay = require("mirror.realmplay")
+OPS = {}
+function ANSWER(verb, text)
+    for i = #SENT, 1, -1 do
+        local seq, v = SENT[i]:match("^realm (%d+) (%S+)")
+        if v == verb and not OPS[seq] then
+            OPS[seq] = verb .. " " .. text
+            local out = { "realms on 1", "lease " .. REALM_ID .. " held" }
+            for s, x in pairs(OPS) do out[#out + 1] = "op " .. s .. " " .. x end
+            out[#out + 1] = "END\n"
+            local f = REAL.open(dir .. "\\mirror_realms.txt", "wb")
+            f:write(table.concat(out, "\n"))
+            f:close()
+            return true
+        end
+    end
+    return false
+end
+function LAST(verb) for i = #SENT, 1, -1 do if SENT[i]:match("^realm %d+ (%S+)") == verb then return SENT[i] end end end
+function RTICK(n, dt)
+    for _ = 1, n or 1 do
+        for _, fn in ipairs(TICKS) do fn(dt or 0.5) end
+        session.tick(dt or 0.5)
+        if SAVING > 0 then SAVING = SAVING - 1 end
+    end
+end
+'''
+
+
+@test
+def realmplay_host_session(L, tmp):
+    """Open a Realm nobody hosts: claim, download, own save kept, Realm save built and loaded, fresh character
+    respawned, saves uploaded with the Realm character stored, firewall keeps saves in the Realm, leave goes home."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.preinit(CFG)')
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    L.execute('realmplay.init(CFG)')
+    rdir = os.path.join(link_dir, "Saved", "SurrounSyncRealms", REALM)
+    L.execute('realmplay.start(...)', REALM)
+    check(L.eval('LAST("claim")') is not None, "lease claimed")
+    L.eval('ANSWER("claim", "ok won 2")')
+    L.execute('RTICK(1)')
+    check(L.eval('LAST("download")') is not None, "newest world asked for")
+    hw = world_files(b"realm")
+    for n, d in hw.items():
+        write(os.path.join(rdir, "down", n), d)
+    write(os.path.join(rdir, "down", "mirror_coop_bed_names.txt"), b"1 2 3|Realm bed\n")
+    write(os.path.join(rdir, "down", "mirror_host_settings.txt"), b"pvp on\n")
+    L.eval('ANSWER("download", "ok 2 5")')
+    L.execute('RTICK(1)')
+    check(L.eval('SAVES') == 1 and L.eval('CURRENT') == "S1", "own world saved first")
+    own_after_save = snapshot(tmp, "S1")
+    L.execute('RTICK(5)')
+    coop = snapshot(tmp, COOP)
+    check(L.eval('LOADS[#LOADS]') == COOP and L.eval('CURRENT') == COOP, "the Realm save was loaded")
+    check(all(coop.get(k) == v for k, v in hw.items() if k != "Slot.sav"), "Realm save holds the Realm's world")
+    check("Player.sav" not in coop, "no Realm character yet: fresh")
+    t = first(L.eval('require("mirror.slotguard").log_read()'))
+    check(t is not None and t["realm"] == REALM and t["gen"] == "2" and t["own"] == "S1", "session log names the Realm + generation")
+    L.execute('RTICK(8)')
+    check(L.eval('RESPAWNS') == 1 and L.eval('HOSTED') == 1, "fresh character respawned, hosting started")
+    check(L.eval('(realmplay.state())') == "playing", "playing (%s)" % L.eval('(realmplay.state())'))
+    os.makedirs(os.path.join(saves(tmp), "MenuSlot"), exist_ok=True)
+    L.execute('CURRENT = "MenuSlot"; require("mirror.save_guard").run_before_save(); PC:SaveGameToSlot()')
+    check(L.eval('CURRENT') == COOP and os.listdir(os.path.join(saves(tmp), "MenuSlot")) == [], "firewall: saves stay in the Realm save")
+    live = os.path.join(rdir, "live")
+    bags = L.eval('session.data_file("mirror_coop_bags.txt")')
+    check(os.path.normcase(bags) == os.path.normcase(os.path.join(live, "mirror_coop_bags.txt")), "bag owners go to the Realm: %s" % bags)
+    check(read(os.path.join(live, "mirror_coop_bed_names.txt")) == b"1 2 3|Realm bed\n", "the Realm's bed names are in use")
+    check(L.eval('require("mirror.hostrules").my_value("pvp")') == "on", "the Realm's host rules apply")
+    write(bags, b"4 5 6|Ann's bag\n")
+    L.execute('RTICK(130)')
+    up = L.eval('LAST("upload")')
+    check(up is not None and up.endswith(" 3"), "an upload of generation 3 after a save: %s" % up)
+    staged = {n: read(os.path.join(rdir, "up", n)) for n in os.listdir(os.path.join(rdir, "up"))}
+    check(staged.get("Level.sav") == hw["Level.sav"] and "Player.sav" not in staged, "upload holds the world, not the character")
+    check(staged.get("mirror_coop_bags.txt") == b"4 5 6|Ann's bag\n" and staged.get("mirror_host_settings.txt", b"").startswith(b"pvp on"),
+          "upload carries the Realm's sidecars")
+    stored = os.path.join(rdir, "character", "Player.sav")
+    check(os.path.exists(stored) and read(stored).startswith(b"EMSH Player.sav of " + COOP.encode()),
+          "Realm character stored from the Realm save")
+    L.eval('ANSWER("upload", "ok 3 1234")')
+    L.execute('RTICK(1)')
+    t = first(L.eval('require("mirror.slotguard").log_read()'))
+    check(t["gen"] == "3", "session log follows the generation")
+    L.execute('realmplay.leave()')
+    L.execute('RTICK(6)')
+    check(L.eval('LAST("upload")').endswith(" 4"), "final upload at the end")
+    L.eval('ANSWER("upload", "ok 4 1234")')
+    L.execute('RTICK(2)')
+    check(L.eval('LAST("release")') is not None, "lease released")
+    check(L.eval('LOADS[#LOADS]') == "S1", "back in the own save")
+    check(not os.path.exists(os.path.join(saves(tmp), "mirror_coop_session.txt")), "session log gone")
+    check("Player.sav" not in snapshot(tmp, COOP), "Realm save emptied")
+    check(snapshot(tmp, "S1") == own_after_save, "own save untouched after its pre-Realm save")
+    L.execute('RTICK(4)')
+    check(L.eval('(realmplay.state())') == "idle", "Realm session over")
+    check(read(os.path.join(rdir, "world", "head.txt")) == b"gen=4\n", "local world copy at generation 4")
+    check(read(os.path.join(rdir, "world", "mirror_coop_bags.txt")) == b"4 5 6|Ann's bag\n", "local world copy keeps the sidecars")
+    check("SurrounSyncRealms" not in L.eval('session.data_file("mirror_coop_bags.txt")'), "home: the own files again")
+    check(L.eval('require("mirror.hostrules").my_value("pvp")') == "off", "home: my own host rules again")
+
+
+@test
+def realmplay_tab_model(L, tmp):
+    """The REALMS tab's model: one row per listed Realm with the right button (OPEN / JOIN / START / none) and info,
+    free only without a Realm or co-op session; inside a Realm the current one with its step text."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.preinit(CFG)')
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    L.execute('realmplay.init(CFG)')
+    write(os.path.join(link_dir, "mirror_realms.txt"), (
+        "realms on 1\n"
+        "realm 4R5BJRNGWF owner - 3 2 - Our Farm\n"
+        "realm 7K2M9P4Q1Z member 76561197960266730 5 3 Ann_B Ann's Base\n"
+        "realm 8ABCDEFGHJ owner - 0 1 - Empty One\n"
+        "realm 9ABCDEFGHK offline - 0 0 - Old Copy\n"
+        "END\n").encode())
+    L.execute('RTICK(5)')
+    L.execute('M = realmplay.model()')
+    check(L.eval('#M.rows') == 4 and L.eval('M.service') == "on" and L.eval('M.free') is True, "4 rows, service on, free")
+    check(L.eval('M.rows[1].open') == "OPEN" and "2 members" in L.eval('M.rows[1].info') and "save" not in L.eval('M.rows[1].info'),
+          "nobody hosts: OPEN (%s)" % L.eval('M.rows[1].info'))
+    check(L.eval('M.rows[2].open') == "JOIN" and L.eval('M.rows[2].live') is True and "Ann B is playing" in L.eval('M.rows[2].info'),
+          "hosted: JOIN + live (%s)" % L.eval('M.rows[2].info'))
+    check(L.eval('M.rows[3].open') == "START", "owner of an empty Realm: START")
+    check(L.eval('M.rows[4].open') is None and "out of reach" in L.eval('M.rows[4].info'), "offline copy: no button")
+    check(L.eval('M.current') is None and L.eval('M.hosting') is False, "no current Realm")
+    L.execute('ROLE = "host"; M = realmplay.model()')
+    check(L.eval('M.free') is False, "hosting co-op: not free to open a Realm")
+    L.execute('ROLE = nil; realmplay.start(REALM_ID); M = realmplay.model()')
+    check(L.eval('M.current and M.current.name') == "Our Farm" and L.eval('M.free') is False, "opening: current Realm shown")
+    check(L.eval('M.state') == "Asking the Realm who's playing..." and L.eval('M.rows[1].here') is True, "step text + here mark")
+    n = L.eval('#SENT')
+    L.execute('realmplay.refresh_list(false)')
+    check(L.eval('#SENT') == n, "list refresh rate-limited")
+
+
+@test
+def realmplay_card_name_from_late_list(L, tmp):
+    """Opened before the list came in (dev/KEY path): the card shows the code, then the Realm's name once listed."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.preinit(CFG)')
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    L.execute('realmplay.init(CFG)')
+    L.execute('realmplay.start(REALM_ID); M = realmplay.model()')
+    code = L.eval('require("mirror.realm").code(REALM_ID)')
+    check(L.eval('M.current.name') == code, "no list yet: card shows the code (%s)" % L.eval('M.current.name'))
+    write(os.path.join(link_dir, "mirror_realms.txt"), b"realms on 1\nrealm 4R5BJRNGWF owner - 3 2 - Our Farm\nEND\n")
+    L.execute('RTICK(5); M = realmplay.model()')
+    check(L.eval('M.current.name') == "Our Farm", "list arrived: card shows the name (%s)" % L.eval('M.current.name'))
+
+
+@test
+def realmplay_members_and_left_guest(L, tmp):
+    """A guest who left a world (link role still "guest", session idle) may open Realms; a visiting member gets the
+    card with every member listed, the ones playing first (hosting / here)."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.preinit(CFG)')
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    L.execute('realmplay.init(CFG)')
+    write(os.path.join(link_dir, "mirror_realms.txt"), (
+        "realms on 1\n"
+        "realm 7K2M9P4Q1Z member 76561197960266730 5 3 Ann_B Ann's Base\n"
+        "member 7K2M9P4Q1Z member - 0 Cy\n"
+        "member 7K2M9P4Q1Z owner 76561197960266730 1790000000 Ann B\n"
+        "member 7K2M9P4Q1Z member 76561197960266731 1790000000 Test-guest\n"
+        "member 4R5BJRNGWF owner - 0 Stray\n"
+        "END\n").encode())
+    L.execute('RTICK(5)')
+    L.execute('ROLE = "guest"; M = realmplay.model()')
+    check(L.eval('M.free') is True and L.eval('M.current') is None, "left guest (role guest, idle): free to open")
+    L.execute('package.loaded["mirror.link"].lobby = function() return { name = "Test-guest", peer = { name = "Ann B", connected = true } } end')
+    L.execute('session.realm_joined = function() return "7K2M9P4Q1Z" end; M = realmplay.model()')
+    check(L.eval('M.visiting') is True and L.eval('M.current.id') == "7K2M9P4Q1Z", "visiting member: card shown")
+    people = L.eval('M.current.people')
+    check(people == "Ann B (owner) - hosting     Test-guest - here     Cy", "who's in, playing first: %r" % people)
+    check(L.eval('#require("mirror.realm").find("7K2M9P4Q1Z").people') == 3, "a member line of another Realm is not attached")
+    L.execute('ROLE = "host"; session.realm_joined = function() return nil end; M = realmplay.model()')
+    check(L.eval('M.free') is False, "hosting: not free")
+
+
+@test
+def realmplay_first_list_waits_for_the_bridge(L, tmp):
+    """The bridge deletes its command file at start: the first list waits until its Realms file was written this
+    run (an old file doesn't count), then goes once; the page asking early doesn't lose it."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.preinit(CFG)')
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    write(os.path.join(link_dir, "mirror_realms.txt"), b"realms on 1\nEND\n")   # last run's file
+    L.execute('realmplay.init(CFG); RTICK(5); realmplay.refresh_list(true); RTICK(3)')
+    lists = lambda: L.eval('(function() local n = 0; for _, s in ipairs(SENT) do if s:match("^realm %d+ list") then n = n + 1 end end; return n end)()')
+    check(lists() == 0, "bridge not up yet (old Realms file): no list sent (%d)" % lists())
+    write(os.path.join(link_dir, "mirror_realms.txt"), ("realms on %d\nEND\n" % int(time.time())).encode())
+    L.execute('RTICK(5)')
+    check(lists() == 1, "bridge wrote its file this run: the waiting list goes once (%d)" % lists())
+
+
+@test
+def current_slot_when_ems_never_confirms(L, tmp):
+    """In-game EMS DoesSaveSlotExist never said yes: the current save must still count (its folder is on disk),
+    not the newest save - after a Realm that was the Realm's co-op slot and START refused."""
+    make_slot(tmp, "S1")
+    make_slot(tmp, "SurrounSync_Session_1", b"coop")
+    session_rt(L, tmp)
+    L.execute('EMSLIB.DoesSaveSlotExist = function() return false end; CURRENT = "S1"; session.preinit(CFG)')
+    cur = L.eval('(session.current_slot())')
+    check(cur == "S1", "current slot = the EMS current save on disk (%s)" % cur)
+    L.execute('CURRENT = "..\\\\x"')
+    check(L.eval('require("mirror.slotguard").on_disk(CURRENT)') is False, "a name with path characters is never a slot")
+
+
+@test
+def realmplay_hosted_realm_joins_host(L, tmp):
+    """Someone already hosts the Realm: the claim answer sends us to them as a normal join; nothing is saved or built."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.preinit(CFG)')
+    L.execute(REALM_FAKES, os.path.join(tmp, "SurrounDead"))
+    L.execute('realmplay.init(CFG)')
+    L.execute('realmplay.start(...)', REALM)
+    L.eval('ANSWER("claim", "ok hosted 76561197960266730 Ann B")')
+    L.execute('RTICK(2)')
+    check(L.eval('LAST("download")') is not None and L.eval('JOINED') is None, "first visit: the world (with its starter) comes first")
+    L.eval('ANSWER("download", "ok none")')
+    L.execute('RTICK(2)')
+    check(L.eval('JOINED') == "76561197960266730", "joined the lease holder")
+    check(L.eval('SAVES') == 0 and L.eval('(realmplay.state())') == "idle", "nothing saved, no Realm session")
+
+
+@test
+def realmplay_crash_rescue(L, tmp):
+    """A crash inside a Realm: next start stores the Realm character and keeps the world for the next upload."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    guard(L, tmp)
+    own0 = snapshot(tmp, "S1")
+    log_write(L, step="joined", own="S1", coop=COOP, realm=REALM, gen="5", own_stamp="x")
+    L.eval('slotguard.build_realm(...)', COOP, lua_files(L, world_files(b"crash")), lua_files(L, realm_character(b"crashchar")))
+    L.execute('session.preinit(CFG)')
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    L.execute('realmplay.init(CFG)')
+    rdir = os.path.join(link_dir, "Saved", "SurrounSyncRealms", REALM)
+    check(read(os.path.join(rdir, "character", "Player.sav")) == realm_character(b"crashchar")["Player.sav"], "Realm character rescued")
+    check(read(os.path.join(rdir, "pending", "base.txt")) == b"gen=5\n" and
+          read(os.path.join(rdir, "pending", "Level.sav")) == world_files(b"crash")["Level.sav"], "world kept as pending on generation 5")
+    check(not os.path.exists(os.path.join(saves(tmp), "mirror_coop_session.txt")), "session log cleared")
+    check("Player.sav" not in snapshot(tmp, COOP), "Realm save emptied")
+    check(snapshot(tmp, "S1") == own0, "own save untouched")
+
+
+def create_rt(L, tmp):
+    """own save S1, Realms on; the New Game Play hook and the main-menu callback captured for the test"""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.preinit(CFG)')
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    L.execute('HOOKS = {}; require("mirror.util").ensure_hook = function(p, pre) HOOKS[p] = pre; return true end; '
+              'session.on_main_menu = function(fn) MAIN_MENU = fn end')
+    L.execute('realmplay.init(CFG)')
+    L.execute('realmplay.create("Our Realm")')
+    check(L.eval('LAST("create")').endswith(" create Our Realm"), "Realm created on the server: %s" % L.eval('LAST("create")'))
+    L.eval('ANSWER("create", "ok %s Our Realm")' % REALM)
+    L.execute('RTICK(1)')
+    check(L.eval('(realmplay.state())') == "armed", "waiting for a New Game (%s)" % L.eval('(realmplay.state())'))
+    return os.path.join(link_dir, "Saved", "SurrounSyncRealms", REALM)
+
+
+def press_play(L):
+    L.execute('MAIN_MENU(); WORLD_PLAYER = PLAYER; PLAYER = nil')
+    L.execute('for p, fn in pairs(HOOKS) do if p:find("PlayButton", 1, true) then fn() end end')
+
+
+@test
+def realmplay_create_new_world(L, tmp):
+    """CREATE: the New Game's world saves only into a fresh co-op save, becomes generation 1, its character the starter."""
+    rdir = create_rt(L, tmp)
+    own0 = snapshot(tmp, "S1")
+    press_play(L)
+    check(L.eval('(realmplay.state())') == "new_game" and L.eval('CURRENT') == COOP, "Play: EMS points at the co-op save")
+    t = first(L.eval('require("mirror.slotguard").log_read()'))
+    check(t is not None and t["realm"] == REALM and t["gen"] == "0" and t["own"] == "S1", "session log: Realm at generation 0")
+    nw = world_files(b"newgame")
+    for n in ("Level.sav", "General.sav", "Difficulties.sav"):
+        write(os.path.join(saves(tmp), COOP, n), nw[n])
+    L.execute('PLAYER = WORLD_PLAYER; CURRENT = "S1"')   # (a stale current save, as in experiment E8)
+    L.execute('RTICK(16)')
+    check(L.eval('LAST("claim")') is not None, "lease claimed after the first save")
+    check(snapshot(tmp, "S1") == own0, "the new world never saved into the own save")
+    L.eval('ANSWER("claim", "ok won 0")')
+    L.execute('RTICK(1)')
+    check(L.eval('(realmplay.state())') == "playing" and L.eval('HOSTED') == 1, "hosting the new Realm")
+    up = L.eval('LAST("upload")')
+    check(up is not None and up.endswith(" 1"), "generation 1 uploaded: %s" % up)
+    staged = {n: read(os.path.join(rdir, "up", n)) for n in os.listdir(os.path.join(rdir, "up"))}
+    coop_player = read(os.path.join(saves(tmp), COOP, "Player.sav"))
+    check(staged.get("Level.sav") == nw["Level.sav"] and staged.get("starter_Player.sav") == coop_player,
+          "the upload holds the new world + the starter character")
+    check(read(os.path.join(rdir, "character", "Player.sav")) == coop_player, "creator's Realm character stored")
+
+
+AUTO_FAKES = r'''
+LEVELS, ASYNC, PRESSED_NEW = {}, nil, 0
+function ExecuteInGameThread(fn) fn() end
+function LoopAsync(ms, fn) ASYNC = fn end
+function FName(s) return s end
+local gi_load = GI.Event_LoadLevel
+GI.Event_LoadLevel = function(self, l) LEVELS[#LEVELS + 1] = l; return gi_load(self, l) end
+MENU_UP = false
+MENU_W = { IsValid = function() return true end, IsInViewport = function() return MENU_UP end,
+    BndEvt__Play_K2Node_ComponentBoundEvent_11_OnButtonClickedEvent__DelegateSignature = function() PRESSED_NEW = PRESSED_NEW + 1 end }
+KEY_UP, KEY_RUN = false, nil
+KEY_W = { IsValid = function() return true end, IsInViewport = function() return KEY_UP end,
+    ExecuteUbergraph_PressAnyKeyWidget = function(_, at) KEY_RUN = at; KEY_UP = false; MENU_UP = true end }
+-- (in-game the main menu from the game's start is still around, off the screen: it comes first)
+STALE_MENU = { IsValid = function() return true end, IsInViewport = function() return false end }
+local ffo, fao = FindFirstOf, FindAllOf
+function FindFirstOf(c)
+    if c == "MenuWidget_C" then return STALE_MENU end
+    if c == "PressAnyKeyWidget_C" then return KEY_W end
+    return ffo(c)
+end
+function FindAllOf(c) if c == "MenuWidget_C" then return { STALE_MENU, MENU_W } end return fao(c) end
+function POLL(n) for _ = 1, n do if ASYNC and ASYNC() then ASYNC = nil end end end
+'''
+
+
+@test
+def realmplay_create_takes_player_to_new_game(L, tmp):
+    """CREATE goes to the main menu by itself after a moment, waits there until the menu is up, then presses NEW
+    GAME once; CANCEL before leaving keeps the player in their world."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.preinit(CFG)')
+    L.execute(REALM_FAKES, os.path.join(tmp, "SurrounDead"))
+    L.execute(AUTO_FAKES)
+    L.execute('HOOKS = {}; require("mirror.util").ensure_hook = function(p, pre) HOOKS[p] = pre; return true end; '
+              'session.on_main_menu = function(fn) MAIN_MENU = fn end')
+    L.execute('realmplay.init(CFG)')
+    L.execute('realmplay.create("Our Realm")')
+    L.eval('ANSWER("create", "ok %s Our Realm")' % REALM)
+    L.execute('RTICK(2)')
+    check(L.eval('(realmplay.state())') == "armed" and L.eval('#LEVELS') == 0, "armed, still in the world for a moment (CANCEL)")
+    L.execute('RTICK(6)')
+    check(L.eval('LEVELS[1]') == "MainMenu", "then to the main menu: %s" % L.eval('LEVELS[1]'))
+    L.execute('RTICK(6)')
+    check(L.eval('#LEVELS') == 1, "only once")
+    # (session.loading() stays true at the main menu in-game: no world player clears it)
+    L.execute('MAIN_MENU(); PLAYER = nil; local real = session.loading; session.loading = function() return true end; UNLOAD = real')
+    L.execute('POLL(20)')
+    check(L.eval('PRESSED_NEW') == 0, "the menu isn't up yet: nothing pressed")
+    L.execute('KEY_UP = true; POLL(4)')
+    check(L.eval('KEY_RUN') is None, "PRESS ANY KEY just faded in: waits")
+    L.execute('POLL(5)')
+    check(L.eval('KEY_RUN') == 167, "then runs what a key press does (ubergraph 167): %s" % L.eval('KEY_RUN'))
+    L.execute('POLL(5)')
+    check(L.eval('PRESSED_NEW') == 0, "menu just came up: waits for its fade-in")
+    L.execute('POLL(20)')
+    check(L.eval('PRESSED_NEW') == 1 and L.eval('ASYNC') is None, "NEW GAME pressed once, polling stopped")
+    check(L.eval('(realmplay.state())') == "armed", "still waiting for the New Game's PLAY")
+    # CANCEL in the world before leaving
+    L.execute('realmplay.cancel_create(); PLAYER = PC; session.loading = UNLOAD')
+    L.execute('realmplay.create("Second")')
+    L.eval('ANSWER("create", "ok %s Second")' % REALM)
+    L.execute('RTICK(2); realmplay.cancel_create(); RTICK(10)')
+    check(L.eval('#LEVELS') == 1 and L.eval('(realmplay.state())') == "idle", "CANCEL: stays in the world")
+
+
+@test
+def realmplay_create_cancelled_by_a_load(L, tmp):
+    create_rt(L, tmp)
+    L.execute('MAIN_MENU(); RTICK(1)')
+    check(L.eval('(realmplay.state())') == "armed", "the world being left ticks once more: still armed (in-game bug)")
+    # a save loaded from the menu: a new player of that world
+    L.execute('PLAYER = setmetatable({ addr = 99, GetAddress = function() return 99 end }, { __index = PLAYER }); RTICK(2)')
+    check(L.eval('(realmplay.state())') == "idle", "a save loaded instead of New Game: nothing made")
+    check(not os.path.exists(os.path.join(saves(tmp), "mirror_coop_session.txt")), "no session log")
+
+
+@test
+def realm_starter_travels_and_is_used(L, tmp):
+    """The starter character comes in the bundle (a damaged one is left out, not the world) and is a newcomer's first."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    rdir = os.path.join(link_dir, "Saved", "SurrounSyncRealms", REALM)
+    sc = realm_character(b"starter")
+    for n, d in world_files(b"w").items():
+        write(os.path.join(rdir, "down", n), d)
+    write(os.path.join(rdir, "down", "starter_Player.sav"), b"junk that is no save")
+    check(L.eval('require("mirror.realm").accept_download(...)', REALM, 3) == 3, "a damaged starter doesn't sink the world")
+    check(L.eval('require("mirror.realm").starter(...)', REALM) is None, "damaged starter left out")
+    for n, d in sc.items():
+        write(os.path.join(rdir, "down", "starter_" + n), d)
+    L.eval('require("mirror.realm").accept_download(...)', REALM, 4)
+    check(L.eval('require("mirror.realm").starter(...)', REALM) is not None, "starter kept with the world")
+    L.execute('session.init(CFG, "guest", function() return true end)')
+    L.execute('session.realm_guest(...); session.request_toggle(); TICK(6)', REALM)
+    host_answers(L, world_files(b"realmhost"))
+    L.execute('TICK(2)')
+    check(snapshot(tmp, COOP).get("Player.sav") == sc["Player.sav"], "first visit: the starter character")
+
+
+@test
+def realm_add_to_realm_over_the_link(L, tmp):
+    """ADD TO REALM: the host's bridge makes an invite code, it crosses the co-op link, the friend's bridge redeems it once."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute(REALM_FAKES, os.path.join(tmp, "SurrounDead"))
+    L.execute('package.loaded["mirror.link"].peer_state = function() return "ok" end; realmplay.init(CFG)')
+    L.execute('require("mirror.realmmembers").add(...)', REALM, "Our Realm")
+    check(L.eval('LAST("invite")') is not None, "host asks its bridge for an invite code")
+    L.eval('ANSWER("invite", "ok ABCDEFGHJKMNPQRS")')
+    L.execute('RTICK(1)')
+    sent = L.eval('BLOBS_OUT["realm_invite"]')
+    check(sent == REALM + " ABCDEFGHJKMNPQRS Our Realm", "the code goes over the link: %s" % sent)
+    L.execute('ROLE = "guest"; BLOBS_IN["realm_invite"] = BLOBS_OUT["realm_invite"]; RTICK(3)')
+    check((L.eval('LAST("redeem")') or "").endswith(" redeem ABCDEFGHJKMNPQRS"), "the guest redeems it")
+    L.eval('ANSWER("redeem", "ok %s Our Realm")' % REALM)
+    L.execute('RTICK(3)')
+    check(L.eval('note_has("member of the Realm Our Realm")') is True, "the guest is told")
+    n = L.eval('(function() local n = 0 for _, s in ipairs(SENT) do if s:find(" redeem ", 1, true) then n = n + 1 end end return n end)()')
+    check(n == 1, "redeemed once, not every poll (%d)" % n)
+
+
+def realm_guest_session(L, tmp, character=None):
+    """own save S1, Realm member (with this stored Realm character or none), joins the Realm's host"""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    rdir = os.path.join(link_dir, "Saved", "SurrounSyncRealms", REALM)
+    if character:
+        check(first(L.eval('require("mirror.realm").store_character(...)', REALM, lua_files(L, character))) is True,
+              "Realm character stored before the visit")
+    L.execute('session.init(CFG, "guest", function() return true end)')
+    L.execute('session.realm_guest(...)', REALM)
+    L.execute('session.request_toggle()')
+    L.execute('TICK(6)')
+    before = snapshot(tmp, "S1")
+    host_answers(L, world_files(b"realmhost"))
+    L.execute('TICK(2)')
+    return before, rdir
+
+
+@test
+def realm_guest_plays_realm_character(L, tmp):
+    """Joining a Realm's host: the co-op save gets my Realm character (never my own), leaving stores it in the Realm."""
+    rc = realm_character(b"member")
+    before, rdir = realm_guest_session(L, tmp, rc)
+    coop = snapshot(tmp, COOP)
+    check(L.eval('session.state()') == "joined", "joined (%s)" % L.eval('session.state()'))
+    check(coop.get("Player.sav") == rc["Player.sav"] and coop.get("Player.sav") != before["Player.sav"],
+          "co-op save holds the Realm character, not the own one")
+    check(coop.get("Level.sav") == world_files(b"realmhost")["Level.sav"], "co-op save holds the host's world")
+    t = first(L.eval('require("mirror.slotguard").log_read()'))
+    check(t is not None and t["realm"] == REALM and t["realm_role"] == "guest", "session log: Realm guest")
+    check(L.eval('session.realm_joined()') == REALM, "session reports the Realm")
+    L.execute('session.request_toggle()')
+    L.execute('TICK(6)')
+    stored = read(os.path.join(rdir, "character", "Player.sav"))
+    check(stored.startswith(b"EMSH Player.sav of " + COOP.encode()), "the played Realm character went back to the Realm store")
+    check(snapshot(tmp, "S1") == before, "own save untouched by the Realm visit")
+    check(L.eval('LOADS[#LOADS]') == "S1" and L.eval('session.state()') == "idle", "own save loaded, idle")
+    check("Player.sav" not in snapshot(tmp, COOP), "co-op save emptied")
+    # the next join is a normal one again (after the trip home)
+    L.execute('TICK(30)')
+    L.execute('session.request_toggle()')
+    L.execute('TICK(6)')
+    host_answers(L)
+    L.execute('TICK(2)')
+    t = first(L.eval('require("mirror.slotguard").log_read()'))
+    check(t is not None and t["realm"] is None, "normal session log has no Realm")
+    check(t is not None and snapshot(tmp, t["coop"]).get("Player.sav") == snapshot(tmp, "S1")["Player.sav"],
+          "a later normal join carries the own character")
+
+
+@test
+def realm_guest_first_visit_is_fresh(L, tmp):
+    """No Realm character yet: the co-op save has none (the game makes one); leaving stores the new one."""
+    before, rdir = realm_guest_session(L, tmp)
+    check(L.eval('session.state()') == "joined", "joined (%s)" % L.eval('session.state()'))
+    check("Player.sav" not in snapshot(tmp, COOP), "no character in the co-op save: fresh")
+    L.execute('session.request_toggle()')
+    L.execute('TICK(6)')
+    check(os.path.exists(os.path.join(rdir, "character", "Player.sav")), "the new Realm character is stored")
+    check(snapshot(tmp, "S1") == before, "own save untouched")
+
+
+@test
+def realm_guest_crash_rescue(L, tmp):
+    """A crash while visiting a Realm: the character is rescued into the Realm, the guest's world copy is not uploaded."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    guard(L, tmp)
+    own0 = snapshot(tmp, "S1")
+    log_write(L, step="joined", own="S1", coop=COOP, realm=REALM, realm_role="guest", own_stamp="x")
+    L.eval('slotguard.build_realm(...)', COOP, lua_files(L, world_files(b"visit")), lua_files(L, realm_character(b"visitchar")))
+    L.execute('session.preinit(CFG)')
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    L.execute('CFG.realms.enabled = false')   # (rescued even with Realms off: the log would block joins)
+    L.execute('realmplay.init(CFG)')
+    rdir = os.path.join(link_dir, "Saved", "SurrounSyncRealms", REALM)
+    check(read(os.path.join(rdir, "character", "Player.sav")) == realm_character(b"visitchar")["Player.sav"], "Realm character rescued")
+    check(not os.path.exists(os.path.join(rdir, "pending")), "the guest's world copy is never kept for upload")
+    check(not os.path.exists(os.path.join(saves(tmp), "mirror_coop_session.txt")), "session log cleared")
+    check(snapshot(tmp, "S1") == own0, "own save untouched")
+
+
+@test
+def realm_needs_an_unused_coop_slot(L, tmp):
+    session_rt(L, tmp)
+    L.execute('session.init(CFG, "guest", function() return true end)')
+    n = L.eval('CFG.phase2.coop_slots or 1')
+    names = [L.eval('session.next_coop_slot()') for _ in range(n)]
+    check(all(names) and len(set(names)) == n, "each slot once: %s" % names)
+    check(L.eval('session.next_coop_slot()') is None, "no reuse for a Realm (EMS keeps its cache)")
 
 
 @test

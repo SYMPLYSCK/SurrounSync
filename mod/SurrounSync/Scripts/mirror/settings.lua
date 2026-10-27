@@ -45,6 +45,21 @@ local APPLY = {
         return true
     end,
     devtest = function(cfg, v) cfg.devtest = (v == "on" or v == "true"); return true end,
+    -- off: no backpack names at all (none of names.lua's inventory hooks are registered)
+    backpack_names = function(cfg, v)
+        local b = onoff(v)
+        if b == nil then return false end
+        cfg.backpack_names = b
+        return true
+    end,
+    -- on: the unfinished Realms (REALMS tab instead of MODS; needs a Realms server)
+    realms = function(cfg, v)
+        local b = onoff(v)
+        if b == nil then return false end
+        cfg.realms = cfg.realms or {}
+        cfg.realms.enabled = b
+        return true
+    end,
     loglevel = function(cfg, v)
         v = v:upper()
         if not ({ ERROR = 1, WARN = 1, INFO = 1, DEBUG = 1 })[v] then return false end

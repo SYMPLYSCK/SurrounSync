@@ -1,0 +1,17 @@
+name = "surrounsync-realms"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# Daily cleanup of expired invites and rate-limit buckets.
+[triggers]
+crons = ["17 4 * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "surrounsync-realms"
+# Filled in by `npx wrangler d1 create surrounsync-realms` (see README.md). Local dev works without it.
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[[r2_buckets]]
+binding = "WORLDS"
+bucket_name = "surrounsync-realms"

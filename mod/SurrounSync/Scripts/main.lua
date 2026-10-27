@@ -49,6 +49,7 @@ if role == "auto" then
     link.start_lobby()
     require("mirror.session").preinit(cfg)
     menu.init(cfg)
+    util.safe(function() require("mirror.realmplay").init(cfg) end, "realmplay.init")
 elseif role == "host" or role == "guest" then
     require("mirror.phase1").init(cfg, role)
     menu.init(cfg)

@@ -877,6 +877,8 @@ class Bridge
     readonly Voice voice = new Voice();
     long voiceCfgAt = 0;
     bool answered = false;
+    Realms realms;
+    string realmsUrl = null;
 
     static long Now() { return Environment.TickCount; }
 
@@ -1029,6 +1031,7 @@ class Bridge
             else if (args[i] == "--test-net" && i + 1 < args.Length) int.TryParse(args[++i], out testPort);
             else if (args[i] == "--no-game-check") gameCheck = false;
             else if (args[i] == "--test-id" && i + 1 < args.Length) ulong.TryParse(args[++i], out testId);
+            else if (args[i] == "--realms-url" && i + 1 < args.Length) realmsUrl = args[++i];
             else if (args[i] == "--lobby-smoke") return LobbySmoke();
             else if (args[i] == "--voice-smoke") return VoiceSmoke();
             else if (args[i] == "--list-smoke") return ListSmoke();
@@ -1079,7 +1082,11 @@ class Bridge
                 return 0;
             }
             ClearPeerFiles();
-            if (auto) StartUpdateCheck();
+            if (auto)
+            {
+                StartUpdateCheck();
+                realms = new Realms(dir, Realms.ResolveUrl(realmsUrl), ModDir(), SurrounSyncShared.Game.EngineOf(Win64Dir()), Log);
+            }
             StartWriter();
             StartWatchdog();
             try { Loop(); }
@@ -1467,6 +1474,23 @@ class Bridge
         }
         else if (c == "update") StartUpdater();
         else if (c == "report" || c.StartsWith("report ")) StartReport(c.Length > 7 ? c.Substring(7) : null);
+        else if (c.StartsWith("realm ") && realms != null)
+        {
+            // the test network's ids are tiny; the Realms server wants a SteamID64 (base + account id)
+            const ulong STEAM64 = 76561197960265728UL;
+            realms.Command(c.Substring(6), me < STEAM64 ? STEAM64 + me : me, net.MyName);
+        }
+        else if (c.StartsWith("clip "))
+        {
+            // CO-OP COPY: clip.exe runs here, off the game thread (the mod's own io.popen froze the game)
+            string text = c.Substring(5).Trim();
+            if (text.Length == 0 || text.Length > 64 || !System.Text.RegularExpressions.Regex.IsMatch(text, "^[A-Za-z0-9-]+$")) { Log("clip: refused"); return; }
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try { if (!Realms.Clip(text)) Console.Error.WriteLine("clip: clip.exe failed"); }
+                catch (Exception e) { Console.Error.WriteLine("clip: " + e.Message); }
+            });
+        }
         else if (c == "clearallow") { try { File.Delete(AllowFile()); } catch { } Log("always-allowed list cleared"); WriteLobby(); }
         else Log("unknown command '" + c + "'");
     }

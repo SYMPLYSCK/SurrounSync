@@ -233,6 +233,7 @@ local started = false
 local cur_peer = nil
 function phase1.started() return started and role or nil end
 local bye_seen = nil
+local opened_at = nil          -- os.time() when this link opened (phase1.init)
 local function on_tick(dt)
     if not started then return end
     if not tags then perf.frame_begin(); peers.tick(dt) end
@@ -292,9 +293,15 @@ local function on_tick(dt)
         local bye = link.get_blob("bye")
         if bye and bye ~= bye_seen then
             bye_seen = bye
+            local said = tonumber(bye:match("^stop (%d+)") or "")
             if session.state() == "joined" then
                 notify.show(link.peer_name() .. " ended the session. Taking you home with your character...", "info")
                 session.go_home_now()
+            elseif said and opened_at and said < opened_at then
+                -- the host's goodbye from before this link (it stopped earlier, then hosted again): old news.
+                -- (in-game: "Test-host stopped hosting." while joining their Realm. Only this message is skipped;
+                -- a joined guest always goes home, whatever the two PCs' clocks say)
+                log.info("phase1: an old goodbye from " .. link.peer_name() .. " - ignored")
             else
                 notify.show(link.peer_name() .. " stopped hosting.", "info")
             end
@@ -557,6 +564,10 @@ local function reset_link_state()
     last_rx, first_rx, rx_count = -math.huge, nil, 0
     my_look, peer_look, applied_to, look_dirty = nil, nil, nil, false
     my_where, peer_where, guest_announced = nil, nil, false
+    -- the link remembers blobs it handed out: the other game's unchanged hello/look after a stop + host again
+    -- never came back -> "it runs an OLDER SurrounSync" 30 s later (in-game, a Realm opened after stop hosting)
+    link.reset_blob("hello")
+    link.reset_blob("look")
     netq.reset()
     compat.reset()
     pose_gaps.seq = nil
@@ -607,6 +618,7 @@ function phase1.init(c, r, peer_id, t)
     if tags then ghost.configure(cfg) end
     link.configure(cfg)
     local mine, theirs = link.open(role, peer_id, tags)
+    opened_at = os.time()
     link.put_blob("hello", "SurrounSync protocol " .. PROTOCOL .. " role " .. role .. (my_build and (" build " .. my_build) or ""))
     notify.configure(cfg)
     if mate then

@@ -99,7 +99,7 @@ local MAX_OWNERS = 40
 
 local function read_owners()
     local out = {}
-    for line in ((owners_path and fs.read(owners_path)) or ""):gmatch("[^\r\n]+") do
+    for line in ((owners_path and fs.read(owners_path())) or ""):gmatch("[^\r\n]+") do
         local x, y, z, text = line:match("^(%S+) (%S+) (%S+)|(.+)$")
         if text then out[#out + 1] = { loc = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }, text = text } end
     end
@@ -114,7 +114,7 @@ local function remember_owner(l, text)
     while #list > MAX_OWNERS do table.remove(list, 1) end
     local out = {}
     for _, o in ipairs(list) do out[#out + 1] = string.format("%.0f %.0f %.0f|%s", o.loc.X, o.loc.Y, o.loc.Z, o.text) end
-    fs.write(owners_path, table.concat(out, "\n") .. "\n")
+    fs.write(owners_path(), table.concat(out, "\n") .. "\n")
 end
 
 local function label(bag, text, remember)
@@ -382,7 +382,8 @@ function deathbags.init(c, r, s, same_world)
     cfg, role, session = c, r, s
     together = same_world or together
     if cfg.death_bag_sync ~= true then role = "off" end
-    owners_path = s and s.data_file and s.data_file("mirror_coop_bags.txt")
+    -- (a function: a hosted Realm keeps its own file)
+    owners_path = s and s.data_file and function() return s.data_file("mirror_coop_bags.txt") end
     game.on_new_player(function() relabel_at = clock + 5.0 end)
     game.player_hook("SpawnDeadPlayerLoot", function(self) util.safe(on_spawn_loot, "deathbags.died", self) end)
     log.info("deathbags: " .. (role == "off" and "off" or "a player's death bag shows up in both worlds"))

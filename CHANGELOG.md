@@ -2,6 +2,28 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 0.13.5 (2026-10-27)
+
+A crash fix. Works together with 0.13.2 - 0.13.4.
+
+**🎒 Fixed: crash when opening a backpack while hovering it**
+- Hovering a backpack made the mod check your whole inventory from inside the game's tooltip code; opening the backpack at that moment crashed the game. Hovering no longer reads your inventory at all. (The F2 rename hint now shows on any backpack you hover.)
+
+## 0.13.4 (2026-10-27)
+
+A crash fix. Works together with 0.13.2 and 0.13.3.
+
+**🎒 Fixed: crash while moving and hovering backpack items (for real this time)**
+- 0.13.3 didn't stop it. The real cause: when you hovered a new item, the backpack-name tooltip looked at the item it showed *before* - and if you had just moved that item, the game had already deleted it. It now only looks at the item you're hovering.
+
+## 0.13.3 (2026-10-27)
+
+A crash fix. Works together with 0.13.2, so friends don't have to update at the same time.
+
+**🎒 Fixed: crash while moving items between backpacks**
+- The game could close (access violation in UE4SS) while you moved or hovered items in your backpacks, even playing alone. The mod's backpack-name tooltip did too much work every frame while the inventory was changing. It now looks at a hovered item only once, and leaves the inventory alone right after a move.
+- If you ever need it: `backpack_names = off` in `mirror_settings.txt` (next to the game's .exe) switches custom backpack names off completely.
+
 ## 0.13.2 (2026-10-25)
 
 A loot fix update. Everyone needs to update (it won't connect to 0.13.1).

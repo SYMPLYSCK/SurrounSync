@@ -17,17 +17,24 @@ local MARKERS = { InfoMarker = { -189.0, -540.0 }, SkillsMarker = { -192.0390625
 local RIBBON_TINT = { R = 0.45, G = 1.0, B = 0.45, A = 1.0 }
 local TILT = { paper = 5.0, ribbon = 6.0, piece = 5.0, list = 3.5, banner = -2.0 }
 local RIBBON_STEP = { X = -13.0, Y = 150.0 }
-local LABEL_PAD = { Left = 98.0, Bottom = -287.0 }
+-- The handbook's own tab labels (JournalUI asset): each Button sits in the same Overlay, centred, angle -80,
+-- text size 34 (QUESTS), slot padding INFO 156,193 -> SKILLS 130,36 -> QUESTS 112,-125. Ours are set up the
+-- same way; their paddings were MEASURED in-game (scratchpad ribbons.py: label middle vs ribbon middle in a
+-- screenshot) so they sit on their ribbons like QUESTS does: 4 px below the middle, ~1 px right.
+-- (CO-OP at Bottom -287 sat 12 px low; 1 Bottom unit = 0.75 px, 1 Left unit = ~1.15 px at 960 px wide)
+local LABEL_PAD = { Left = 98.0, Bottom = -279.0 }
 local LIST_WIDTH = 560.0
 local GEAR_TEX = "/Game/UI/Textures/over_250_survival_flat_icons/gear.gear"
 local CLOSE_TEX = "/Game/UI/Textures/CrossX.CrossX"
 local INK = { R = 0.12, G = 0.08, B = 0.06, A = 1.0 }
 local SETTING_ROWS = 8
 local MOD_ROWS = 9
+local REALM_ROWS = 3   -- per page on the lined note (more Realms: < PREV / NEXT >)
 -- the MODS tab: one ribbon below CO-OP (label spot found in-game; the ribbon art is yellow, so a tint can only
 -- darken it: orange, not blue)
 local MODS_TINT = { R = 1.0, G = 0.5, B = 0.35, A = 1.0 }
-local MODS_PAD = { Left = LABEL_PAD.Left + RIBBON_STEP.X, Bottom = LABEL_PAD.Bottom - RIBBON_STEP.Y }
+-- (REALMS at Left 85 / Bottom -423 sat 10 px right and 2 px above where QUESTS sits; MODS uses the same spot)
+local MODS_PAD = { Left = 79.0, Bottom = -426.0 }
 -- The game fades the handbook in/out over 0.5 s (JournalUI "Fade", after a 0.25 s double-tap wait for
 -- the clock); playing that fade 8x faster makes J feel ~0.45 s quicker.
 local FADE_SPEED = 8.0
@@ -363,6 +370,8 @@ local function build_settings(page)
     local tabs = new("HorizontalBox", S.tree, "SettingTabs"); vadd(u.set_box, tabs, 2)
     u.set_tab_host, u.set_tab_host_t = button("HOST RULES", 28, DARK_RED); hadd(tabs, u.set_tab_host)
     u.set_tab_mine, u.set_tab_mine_t = button("MY SETTINGS", 28, GREY); hadd(tabs, u.set_tab_mine, 30)
+    -- (with Realms on, the REALMS tab takes the MODS ribbon: the mods list opens from here)
+    if S.realms_on then u.set_tab_mods = button("MODS", 28, GREY); hadd(tabs, u.set_tab_mods, 30) end
     u.set_tab = "host"
     u.set_sub = text("", 16, GREY, 560); vadd(u.set_box, u.set_sub, 4)
     u.set_rows = {}
@@ -408,7 +417,170 @@ local function build_mods(page)
     vis_hit(u.mods_box, false)
 end
 
--- nil = the CO-OP page, "settings" (gear), "mods" (MODS tab). The other two hide the CO-OP widgets; X goes back.
+-- The REALMS tab's page (Realms on: it takes the MODS ribbon, MODS moves to a tab of the settings), made of the
+-- handbook's own paper pieces so it looks like the rest of the book:
+--   the lined note taped to the page (info page "Note")       = MY REALMS, each with OPEN/JOIN/START, INVITE, KEY
+--   the survivor's license card with its paperclip ("License") = the Realm I'm in right now (replaces the note)
+--   the pink folder (quests page "ActiveQuests")               = START A NEW REALM / GOT AN INVITE?, or this
+--                                                                 Realm's member tools while I'm in one
+-- Everything sits on one canvas, so the tab shows and hides as one piece. The paper art is 1920x1080 with the
+-- piece in the middle: sizes and offsets below put the visible paper where the text goes.
+local REALM_NAME_W = 185.0   -- (the handbook's font is all capitals and wide: at 235 KEY ran past the note)
+local LIVE_GREEN = { R = 0.06, G = 0.30, B = 0.08, A = 1.0 }
+local TAPE_WHITE = { R = 0.93, G = 0.90, B = 0.82, A = 1.0 }
+local TAPE_ORANGE = { R = 1.0, G = 0.55, B = 0.12, A = 1.0 }
+local function sized(w, width)
+    local sb = new("SizeBox", S.tree, "Size")
+    pcall(function() sb:SetWidthOverride(width) end)
+    pcall(function() sb:SetClipping(1) end)
+    pcall(function() sb:SetContent(w) end)
+    return sb
+end
+
+local function build_realms(page, qtree, qpage, itree, ipage)
+    local u = S.ui
+    local cv = new("CanvasPanel", S.tree, "RealmsCanvas")
+    place(page, cv, 0.0, 0.0, 1400.0, 1100.0, 2)
+    u.realms_canvas = cv
+    local function art(tree, owner, name, x, y, w, h, z)
+        local src = find(tree, name, owner)
+        local t = src and texture_of(src)
+        if not t then log.warn("journal_tab: no " .. name .. " art for the REALMS page"); return nil end
+        local img = image_from(t, S.tree, "Realm" .. name)
+        tilt(img, TILT.piece)
+        place(cv, img, x, y, w, h, z)
+        return img
+    end
+
+    -- title over the page, like the handbook's own headings
+    local title = text("REALMS", 58, DARK_RED); tilt(title, TILT.banner)
+    place(cv, title, 420.0, 18.0)
+    -- (one line between the title and the note's tape)
+    u.realms_sub = text("Shared worlds that live on, even when you're away.", 16, GREY, 520)
+    tilt(u.realms_sub, TILT.piece)
+    place(cv, u.realms_sub, 425.0, 108.0, 520.0, 24.0)
+
+    -- MY REALMS on the taped, lined note
+    u.realms_note = art(itree, ipage, "Note", 132.0, 103.0, 1054.0, 529.0, 3)
+    -- the mod's name written on the note's grey tape: worn white + orange, shadowed, at the tape's slant
+    -- (centre measured in-game at about 678,185; the tape slopes ~9 degrees)
+    local brand = new("HorizontalBox", S.tree, "RealmBrand")
+    tilt(brand, 9.0)
+    for _, part in ipairs({ { "SURROUN", TAPE_WHITE }, { "SYNC", TAPE_ORANGE } }) do
+        local t = text(part[1], 32, part[2])
+        pcall(function() t:SetShadowOffset({ X = 2.0, Y = 2.0 }) end)
+        pcall(function() t:SetShadowColorAndOpacity({ R = 0.0, G = 0.0, B = 0.0, A = 0.65 }) end)
+        hadd(brand, t)
+    end
+    place(cv, brand, 572.0, 165.0, nil, nil, 6)
+    u.realms_brand = brand
+    local list = new("VerticalBox", S.tree, "RealmList")
+    tilt(list, TILT.piece)
+    place(cv, list, 428.0, 240.0, 465.0, 340.0, 6)   -- (below the tape)
+    u.realms_list = list
+    local head = new("HorizontalBox", S.tree, "RealmListHead"); vadd(list, head)
+    hadd(head, text("MY REALMS", 30, DARK_RED))
+    u.realms_refresh = button("REFRESH", 16, GREY); hadd(head, u.realms_refresh, 22)
+    u.realms_state = text("", 16, DARK_RED, 460); vadd(list, u.realms_state, 2)
+    u.realms_rows = {}
+    for i = 1, REALM_ROWS do
+        local row = new("HorizontalBox", S.tree, "RealmRow"); vadd(list, row, i == 1 and 8 or 6)
+        local name = text("", 22, INK)
+        local open, open_t = button("OPEN", 22, DARK_RED)
+        local inv = button("INVITE", 16, GREY)
+        local key = button("KEY", 16, GREY)
+        hadd(row, sized(name, REALM_NAME_W)); hadd(row, open, 10); hadd(row, inv, 14); hadd(row, key, 10)
+        local info = text("", 14, GREY, 460); vadd(list, info, 0)
+        u.realms_rows[i] = { row = row, name = name, open = open, open_t = open_t, invite = inv, key = key, info = info }
+    end
+    u.realms_none = text("No Realms yet. Start one in the folder below, or add one with a friend's invite code.", 16, GREY, 440)
+    vadd(list, u.realms_none, 14)
+    local nav = new("HorizontalBox", S.tree, "RealmNav"); vadd(list, nav, 8)
+    u.realms_prev = button("< PREV", 18); hadd(nav, u.realms_prev)
+    u.realms_page_t = text("", 16, GREY); hadd(nav, u.realms_page_t, 12)
+    u.realms_next = button("NEXT >", 18); hadd(nav, u.realms_next, 12)
+
+    -- the Realm I'm in, on the license card (the paperclip holds it to the page)
+    u.realms_card = art(itree, ipage, "License", 294.0, 93.0, 724.0, 408.0, 3)
+    local card = new("VerticalBox", S.tree, "RealmCard")
+    tilt(card, TILT.piece)
+    place(cv, card, 436.0, 225.0, 450.0, 220.0, 6)   -- (below the paperclip)
+    u.realms_cardbox = card
+    u.realms_cur_kind = text("YOUR REALM", 16, GREY); vadd(card, u.realms_cur_kind)
+    u.realms_cur_name = text("", 40, DARK_RED, 450); vadd(card, u.realms_cur_name, 0)
+    u.realms_cur_info = text("", 16, INK, 450); vadd(card, u.realms_cur_info, 2)
+    u.realms_cur_state = text("", 17, BLACK, 440); vadd(card, u.realms_cur_state, 10)
+    -- (below the card: inside it a two-line state pushed them onto the card's bottom edge; measured in-game,
+    -- the edge ends near canvas y 470 under these buttons)
+    local here = new("HorizontalBox", S.tree, "RealmHere")
+    tilt(here, TILT.piece)
+    place(cv, here, 440.0, 472.0, nil, nil, 6)
+    u.realms_here = here
+    u.realms_friends = button("ADD FRIENDS HERE", 20, DARK_RED); hadd(here, u.realms_friends)
+    u.realms_end, u.realms_end_t = button("END REALM", 20, DARK_RED); hadd(here, u.realms_end, 24)
+    u.realms_cancel = button("CANCEL", 20, DARK_RED); hadd(here, u.realms_cancel, 24)
+    -- (two lines: a third ran into the folder's tab; measured in-game it starts under END REALM's bottom)
+    u.realms_hint = text("Saved to its server after your saves and at END REALM. Everyone keeps their own Realm "
+        .. "character; your own saves stay untouched.", 14, GREY, 500)
+    tilt(u.realms_hint, TILT.piece)
+    place(cv, u.realms_hint, 440.0, 530.0, 510.0, 50.0, 6)
+
+    -- the folder: start or add a Realm, or this Realm's member tools
+    u.realms_folder = art(qtree, qpage, "ActiveQuests", 21.0, 465.0, 1280.0, 720.0, 1)
+    u.realms_tab_t = text("NEW REALM", 20, INK); tilt(u.realms_tab_t, TILT.piece)
+    place(cv, u.realms_tab_t, 419.0, 586.0, nil, nil, 2)
+    local fresh = new("VerticalBox", S.tree, "RealmNew")
+    tilt(fresh, TILT.piece)
+    place(cv, fresh, 380.0, 652.0, 560.0, 380.0, 6)
+    u.realms_new = fresh
+    vadd(fresh, text("START A NEW REALM", 26, DARK_RED))
+    vadd(fresh, text("A brand-new world from the game's New Game screen, with the settings you pick there. Everyone "
+        .. "starts it with a fresh character.", 15, GREY, 540), 2)
+    local mk = new("HorizontalBox", S.tree, "RealmCreate"); vadd(fresh, mk, 6)
+    u.realms_name = input("RealmName", "name your Realm", 22, 300); hadd(mk, u.realms_name)
+    u.realms_create = button("CREATE", 22, DARK_RED); hadd(mk, u.realms_create, 18)
+    vadd(fresh, text("GOT AN INVITE?", 26, DARK_RED), 22)
+    vadd(fresh, text("Paste a friend's invite code, or your own Realm key from another PC.", 15, GREY, 540), 2)
+    local add = new("HorizontalBox", S.tree, "RealmAdd"); vadd(fresh, add, 6)
+    u.realms_code = input("RealmCode", "XXXX-XXXX-XXXX-XXXX", 22, 300); hadd(add, u.realms_code)
+    u.realms_add = button("ADD REALM", 22, DARK_RED); hadd(add, u.realms_add, 18)
+    -- the last INVITE code, selectable (clicking selects it all, then Ctrl+C) - the clipboard copy can fail
+    local function code_box(box, pad)
+        local col = new("VerticalBox", S.tree, "RealmInviteBox"); vadd(box, col, pad)
+        local row = new("HorizontalBox", S.tree, "RealmInviteRow"); vadd(col, row)
+        hadd(row, text("INVITE CODE:", 22, DARK_RED))
+        local e = input("RealmInviteCode", "", 22, 330)
+        -- (set before the box joins the page: Slate builds the widget then)
+        pcall(function() e.IsReadOnly = true end)
+        pcall(function() e.SelectAllTextWhenFocused = true end)
+        hadd(row, e, 14)
+        pcall(function() e:SetIsReadOnly(true) end)
+        vadd(col, text("Click the code, then Ctrl+C. It works once, for 7 days.", 14, GREY, 540), 2)
+        return col, e
+    end
+    u.realms_inv_new, u.realms_inv_new_t = code_box(fresh, 18)
+    local tools = new("VerticalBox", S.tree, "RealmTools")
+    tilt(tools, TILT.piece)
+    place(cv, tools, 380.0, 652.0, 560.0, 380.0, 6)
+    u.realms_tools = tools
+    -- every member, the ones playing first ("- hosting" / "- here")
+    vadd(tools, text("WHO'S IN", 26, DARK_RED))
+    u.realms_people = text("", 16, INK, 540); vadd(tools, u.realms_people, 2)
+    vadd(tools, text("BRING FRIENDS", 26, DARK_RED), 14)
+    local tr = new("HorizontalBox", S.tree, "RealmToolRow"); vadd(tools, tr, 8)
+    u.realms_cur_invite = button("INVITE CODE", 22, DARK_RED); hadd(tr, u.realms_cur_invite)
+    u.realms_cur_key = button("COPY MY KEY", 22, DARK_RED); hadd(tr, u.realms_cur_key, 30)
+    vadd(tools, text("INVITE CODE copies a one-time code for a friend who isn't here (it works for 7 days). Friends "
+        .. "playing with you right now join with ADD FRIENDS HERE.", 15, GREY, 540), 8)
+    vadd(tools, text("COPY MY KEY copies your membership, to play this Realm from another PC. Keep it private.", 15, GREY, 540), 6)
+    u.realms_inv_tools, u.realms_inv_tools_t = code_box(tools, 18)
+
+    u.realms_page = 1
+    vis_hit(cv, false)
+end
+
+-- nil = the CO-OP page, "settings" (gear), "mods" (MODS tab), "realms" (REALMS tab). The others hide the CO-OP
+-- widgets; X goes back.
 local function set_view(v)
     local u = S.ui
     if u.view == v then return end
@@ -428,8 +600,13 @@ local function set_view(v)
     end
     vis_hit(u.gear, not v); vis(u.gear_img, not v)
     vis_hit(u.set_box, v == "settings")
-    vis_hit(u.set_close, v ~= nil); vis(u.set_close_img, v ~= nil)
+    -- (no X on the REALMS page: its own ribbon tab and CO-OP's switch pages)
+    local x = v ~= nil and v ~= "realms"
+    vis_hit(u.set_close, x); vis(u.set_close_img, x)
     if u.mods_box then vis_hit(u.mods_box, v == "mods") end
+    -- (4 = SelfHitTestInvisible: the canvas itself never takes a click, its buttons do. 3 = HitTestInvisible
+    -- took every child out of hit testing too - no REALMS button could be pressed)
+    if u.realms_canvas then pcall(function() u.realms_canvas:SetVisibility(v == "realms" and 4 or 1) end) end
 end
 local function set_mode(on) set_view(on and "settings" or nil) end
 
@@ -463,6 +640,63 @@ local function refresh_mods()
     vis_hit(u.mods_prev, pages > 1); vis_hit(u.mods_next, pages > 1); vis(u.mods_page_t, pages > 1)
     set(u.mods_page_t, u.mods_page .. " / " .. pages)
     vis_hit(u.mods_match, m.can_match == true)
+end
+
+local function refresh_realms()
+    local u = S.ui
+    local m = ctx.realms and ctx.realms() or { rows = {} }
+    S.realms_model = m
+    local rows = m.rows or {}
+    local pages = math.max(1, math.ceil(#rows / REALM_ROWS))
+    if u.realms_page > pages then u.realms_page = pages end
+    local cur, on = m.current, m.service == "on"
+    -- the license card while I'm in a Realm, else the list note
+    vis(u.realms_note, not cur); vis(u.realms_brand, not cur); vis_hit(u.realms_list, not cur)
+    vis(u.realms_card, cur ~= nil); vis_hit(u.realms_cardbox, cur ~= nil); vis_hit(u.realms_here, cur ~= nil)
+    vis(u.realms_hint, m.hosting == true)
+    vis_hit(u.realms_new, not cur); vis_hit(u.realms_tools, cur ~= nil and cur.id ~= nil)
+    set(u.realms_tab_t, cur and "MEMBERS" or "NEW REALM")
+    -- (the code's text only changes with the code: setting it every refresh would drop the player's selection)
+    local inv = m.invite and m.invite.code or nil
+    vis_hit(u.realms_inv_new, inv ~= nil and not cur); vis_hit(u.realms_inv_tools, inv ~= nil and cur ~= nil)
+    if inv ~= u.realms_inv_shown then
+        u.realms_inv_shown = inv
+        set(u.realms_inv_new_t, inv or ""); set(u.realms_inv_tools_t, inv or "")
+    end
+    if cur then
+        set(u.realms_cur_kind, m.hosting and "YOU'RE HOSTING" or (m.armed and "NEW REALM")
+            or (m.visiting and "YOU'RE VISITING") or "YOUR REALM")
+        set(u.realms_people, cur.people or "Loading the member list...")
+        set(u.realms_cur_name, cur.name or "")
+        set(u.realms_cur_info, (cur.code or "") .. (cur.info and ("   |   " .. cur.info) or ""))
+        set(u.realms_cur_state, m.state or "")
+        vis_hit(u.realms_friends, m.hosting == true)
+        vis_hit(u.realms_end, m.hosting == true)
+        vis_hit(u.realms_cancel, m.armed == true)
+        if u.realms_end_armed and clock > u.realms_end_armed + 4 then u.realms_end_armed = nil end
+        set(u.realms_end_t, u.realms_end_armed and "SURE? END IT" or "END REALM")
+        return
+    end
+    local line = m.state or m.note or ""
+    set(u.realms_state, line); vis(u.realms_state, line ~= "")
+    for i, r in ipairs(u.realms_rows) do
+        local o = rows[(u.realms_page - 1) * REALM_ROWS + i]
+        vis_hit(r.row, o ~= nil); vis(r.info, o ~= nil)
+        if o then
+            local name = o.name or ""
+            if #name > 15 then name = name:sub(1, 14) .. "..." end
+            set(r.name, (o.here and "> " or "") .. name)
+            style_text(r.name, 22, o.here and DARK_RED or INK)
+            set(r.info, o.info or "")
+            style_text(r.info, 14, o.live and LIVE_GREEN or GREY)
+            vis_hit(r.open, o.open ~= nil and m.free == true)
+            set(r.open_t, o.open or "OPEN")
+        end
+    end
+    vis(u.realms_none, #rows == 0 and on)
+    vis_hit(u.realms_prev, pages > 1); vis_hit(u.realms_next, pages > 1); vis(u.realms_page_t, pages > 1)
+    set(u.realms_page_t, u.realms_page .. " / " .. pages)
+    vis_hit(u.realms_create, on); vis_hit(u.realms_add, on)
 end
 
 local function settings_list(m)
@@ -560,9 +794,14 @@ local function inject(jui)
     step("content")
     build_content(page, qtree, jui.Journal_QuestsUI)
     step("settings")
+    S.realms_on = ctx.realms_on ~= nil and ctx.realms_on() == true
     build_settings(page)
     step("mods")
     build_mods(page)
+    if S.realms_on then
+        step("realms")
+        build_realms(page, qtree, jui.Journal_QuestsUI, jui.Journal_InfoUI.WidgetTree, jui.Journal_InfoUI)
+    end
     vis_hit(page, false)
 
     step("tab")
@@ -577,15 +816,19 @@ local function inject(jui)
         local ts = overlay:AddChildToOverlay(tab)
         pcall(function()
             ts:SetPadding({ Left = pad.Left, Top = 0.0, Right = 0.0, Bottom = pad.Bottom })
-            ts:SetHorizontalAlignment(2)
+            ts:SetHorizontalAlignment(2)   -- (2 = centred in UMG, like INFO / SKILLS / QUESTS)
             ts:SetVerticalAlignment(2)
         end)
         pcall(function() tab:SetRenderTransformAngle(-80.0) end)
         return tab, label
     end
     S.tab, S.tab_text = make_tab("CoopTab", "CO-OP", LABEL_PAD)
-    S.mods_tab, S.mods_tab_text = make_tab("ModsTab", "MODS", MODS_PAD)
-    log.info("journal_tab: CO-OP and MODS tabs added to the handbook")
+    if S.realms_on then
+        S.mods_tab, S.mods_tab_text = make_tab("ModsTab", "REALMS", MODS_PAD)
+    else
+        S.mods_tab, S.mods_tab_text = make_tab("ModsTab", "MODS", MODS_PAD)
+    end
+    log.info("journal_tab: CO-OP and " .. (S.realms_on and "REALMS" or "MODS") .. " tabs added to the handbook")
 end
 
 local function journal()
@@ -664,6 +907,7 @@ local function refresh()
     S.model = m
     if u.view == "settings" then refresh_settings(m); return end
     if u.view == "mods" then refresh_mods(); return end
+    if u.view == "realms" then refresh_realms(); return end
     set(u.headline, m.headline or "")
     set(u.detail, m.detail or "")
     set(u.me, m.me or "")
@@ -754,7 +998,11 @@ function journal_tab.tick(dt)
     hover(S.tab, S.tab_text)
     hover(S.mods_tab, S.mods_tab_text)
     if clicked(S.tab) then click_sound(); show(true) end
-    if clicked(S.mods_tab) then click_sound(); show(true); set_view("mods"); refresh() end
+    if clicked(S.mods_tab) then
+        click_sound(); show(true)
+        if S.realms_on then ctx.act.realm_list(true); set_view("realms") else set_view("mods") end
+        refresh()
+    end
     for _, b in ipairs(S.originals) do
         if clicked(b) and S.shown then show(false) end
     end
@@ -776,8 +1024,54 @@ function journal_tab.tick(dt)
         if refresh_in <= 0 or ctx.refresh_now then refresh_in, ctx.refresh_now = 1.0, false; refresh() end
         return
     end
+    if u.view == "realms" then
+        if clicked(u.set_close) then set_view(nil); ctx.refresh_now = true; return end
+        local rm = S.realms_model or { rows = {} }
+        local rows = rm.rows or {}
+        local pages = math.max(1, math.ceil(#rows / REALM_ROWS))
+        if clicked(u.realms_prev) then u.realms_page = (u.realms_page - 2) % pages + 1; ctx.refresh_now = true end
+        if clicked(u.realms_next) then u.realms_page = u.realms_page % pages + 1; ctx.refresh_now = true end
+        if clicked(u.realms_refresh) then a.realm_list(true); ctx.refresh_now = true end
+        -- (every button is checked every frame: clicked() follows each one's press state)
+        for i, r in ipairs(u.realms_rows) do
+            local o = rows[(u.realms_page - 1) * REALM_ROWS + i]
+            local c_open, c_inv, c_key = clicked(r.open), clicked(r.invite), clicked(r.key)
+            if o and c_open and o.open and rm.free then a.realm_open(o.id, o.open); ctx.refresh_now = true end
+            if o and c_inv then a.realm_invite(o.id) end
+            if o and c_key then a.realm_key(o.id) end
+        end
+        local cur = rm.current
+        local c_fr, c_end, c_cancel = clicked(u.realms_friends), clicked(u.realms_end), clicked(u.realms_cancel)
+        local c_inv, c_key = clicked(u.realms_cur_invite), clicked(u.realms_cur_key)
+        if rm.hosting and c_fr then a.realm_friends() end
+        if rm.hosting and c_end then
+            -- END REALM sends everyone home: the first press asks
+            if u.realms_end_armed then u.realms_end_armed = nil; a.realm_end() else u.realms_end_armed = clock end
+            ctx.refresh_now = true
+        end
+        if rm.armed and c_cancel then a.realm_cancel(); ctx.refresh_now = true end
+        if cur and cur.id and c_inv then a.realm_invite(cur.id) end
+        if cur and cur.id and c_key then a.realm_key(cur.id) end
+        local function typed(box)
+            local txt = ""
+            pcall(function() txt = box:GetText():ToString() end)
+            return txt
+        end
+        if clicked(u.realms_create) then
+            local name = typed(u.realms_name):gsub("^%s+", ""):gsub("%s+$", "")
+            if name ~= "" then a.realm_create(name); pcall(function() u.realms_name:SetText(FText("")) end) end
+            ctx.refresh_now = true
+        end
+        if clicked(u.realms_add) and a.realm_add(typed(u.realms_code)) then
+            pcall(function() u.realms_code:SetText(FText("")) end)
+        end
+        a.realm_list(false)
+        if refresh_in <= 0 or ctx.refresh_now then refresh_in, ctx.refresh_now = 0.5, false; refresh() end
+        return
+    end
     if u.settings_mode then
         if clicked(u.set_close) then set_mode(false); ctx.refresh_now = true end
+        if u.set_tab_mods and clicked(u.set_tab_mods) then set_view("mods"); refresh(); return end
         if clicked(u.set_tab_host) then u.set_tab = "host"; ctx.refresh_now = true end
         if clicked(u.set_tab_mine) then u.set_tab = "mine"; ctx.refresh_now = true end
         local opts = S.model and settings_list(S.model) or {}
@@ -867,6 +1161,14 @@ end
 
 function journal_tab.dev_mods(on)
     if S and S.ui and S.ui.mods_box then set_view(on and "mods" or nil); ctx.refresh_now = true end
+end
+
+function journal_tab.dev_realms(on)
+    if not (S and S.ui and S.ui.realms_canvas) then return false end
+    -- (like the REALMS tab click: the mod's page has to be shown first, else the game's own page stays up)
+    if on and is_open() then show(true); ctx.act.realm_list(true) end
+    set_view(on and "realms" or nil); ctx.refresh_now = true
+    return true
 end
 
 function journal_tab.dev_settings(on, tab)

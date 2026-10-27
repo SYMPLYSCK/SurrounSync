@@ -27,6 +27,7 @@ local menu = nil      -- { uid, canvas, w, btn, bg }: our RENAME row while the g
 local popup = nil     -- { w, box, save, clear, cancel, uid }
 local clicks = {}
 local where = {}      -- named item uid -> { holder, slot, cell, da }: where it last sat (see names.moved)
+local last_move = -100.0  -- os.clock() of the last inventory move (the tooltip hook stays out of the frames after it)
 
 local function clean(s)
     s = tostring(s or ""):gsub("[%c|;,%%]", " "):gsub("^%s+", ""):gsub("%s+$", "")
@@ -131,6 +132,7 @@ end
 
 -- Handle Comp to Comp Move ran (UE4SS calls this after it): the item now sits in To at ToContainer/ToIndex
 local function on_comp_move(From, To, ItemUID, ToIndex, ToContainer)
+    last_move = os.clock()
     if count == 0 then return end
     local old, dest, cell
     pcall(function() old = string.format("%d_%d_%d_%d", ItemUID.A, ItemUID.B, ItemUID.C, ItemUID.D) end)
@@ -452,26 +454,46 @@ local pending_menu = nil   -- the JigContextMenuComp that just got a right-click
 local function on_right_click(self) pending_menu = self end
 
 local noted_at = -100.0
-local hovered = nil   -- { tip = the tooltip widget, uid }: my backpack under the mouse (F2 renames it)
+local hovered = nil   -- { uid, at }: the backpack under the mouse and when its tooltip last updated (F2 renames it)
 -- the hint goes at the end of the small description text, not next to the name
 local HINT = "(F2: rename)"
-local function on_tooltip(self)
-    if not util.valid(self) then return end
-    local item = child(self, "ItemRef")
-    if not item then return end
-    local uid = uid_of(item)
-    local name = names.get(uid)
-    local title = name and child(self, "NameText")
-    if title then pcall(function() title:SetText(FText(name)) end) end
-    if uid and is_backpack(item) and mine(uid) then
-        hovered = { tip = self, uid = uid }
-        if count > 0 and os.clock() - noted_at > 2.0 then
-            noted_at = os.clock()
-            local p = game.player()
-            local comp
-            pcall(function() comp = p.BP_JigComponent end)
-            names.note(comp)
-        end
+-- The tooltip's Update runs every frame while an item is hovered, also in the frames where the game is moving
+-- items around. Crash reports (DBG-20261026-001, 4 of 4 runs) all died inside this hook while a player moved
+-- backpack items, when it read the item, its data asset and walked the whole inventory every frame. Now a frame
+-- only compares the tooltip and item addresses; the item (and whether it's mine) is looked at once per newly
+-- hovered item and never in the moment after a move.
+-- Update(ItemRef) is hooked before it runs: the widget's own ItemRef then still holds the item it showed last,
+-- which a move may have destroyed already - reading it was the native crash 0.13.3 still had (property lookup on
+-- freed memory, IsValid can't tell). Only the item the game passes in now is read.
+local QUIET_AFTER_MOVE = 0.4
+local seen = { tip = nil, item = nil, info = nil }   -- info = { uid, bag } of the hovered item
+local function forget_hover() seen.tip, seen.item, seen.info, hovered = nil, nil, nil, nil end
+local function on_tooltip(self, ref)
+    if os.clock() - last_move < QUIET_AFTER_MOVE then forget_hover(); return end
+    local tip = util.addr(self)
+    if not tip or not ref then return end
+    local item
+    pcall(function() item = ref:get() end)
+    local at = item and util.addr(item) or nil
+    if tip ~= seen.tip or at ~= seen.item then
+        seen.tip, seen.item, seen.info, hovered = tip, at, nil, nil
+        local uid = at and uid_of(item)
+        -- (no "is it mine" inventory walk here: it read every container from inside the game's tooltip Update,
+        -- and opening a backpack while hovering it crashed there every time - any hovered backpack gets the hint)
+        if uid then seen.info = { uid = uid, bag = is_backpack(item) } end
+    end
+    local info = seen.info
+    if not info then return end
+    -- (the game's Update writes the item's own name and description again every frame; the name is a plain
+    -- table lookup, so a rename shows at once)
+    local name = names.get(info.uid)
+    if name then
+        local title = child(self, "NameText")
+        if title then pcall(function() title:SetText(FText(name)) end) end
+    end
+    if info.bag then
+        hovered = hovered or { uid = info.uid }
+        hovered.at = os.clock()
         local descr = child(self, "descr")
         if descr then pcall(function()
             local d = descr:GetText():ToString() or ""
@@ -479,40 +501,51 @@ local function on_tooltip(self)
         end) end
     end
 end
+local function my_comp()
+    local p, comp = game.player(), nil
+    if not util.valid(p) then return nil end
+    pcall(function() comp = p.BP_JigComponent end)
+    return util.valid(comp) and comp or nil
+end
 local function rename_hovered()
     local h = hovered
-    if not (h and util.valid(h.tip)) then return end
-    -- (the tooltip is never "in the viewport" - it lives in the inventory's hover layer)
-    local shown = true
-    pcall(function() shown = h.tip:IsVisible() end)
-    if not shown then log.info("names: F2 - the backpack tooltip is closed"); hovered = nil; return end
-    local item
-    pcall(function() item = h.tip.ItemRef end)
-    if not (util.valid(item) and uid_of(item) == h.uid) then log.info("names: F2 - hovering another item now"); return end
+    -- (no widget is kept between frames: a tooltip that stopped updating is closed or torn down)
+    if not h or os.clock() - (h.at or 0) > 0.3 then hovered = nil; return end
     open_popup(h.uid, nil)
 end
 
 -- the inventory widgets load the first time the inventory opens: keep asking until both hooks took
 local hook_in = 0.0
-local tooltip_fn = function(self) util.safe(on_tooltip, "names.tooltip", self:get()) end
+local tooltip_fn = function(self, ItemRef) util.safe(on_tooltip, "names.tooltip", self:get(), ItemRef) end
 local move_fn = function(self, From, To, ItemUID, FinalRotation, ToIndex, ToContainer)
     util.safe(function() on_comp_move(From:get(), To:get(), ItemUID:get(), ToIndex:get(), ToContainer:get()) end, "names.move")
 end
 local COMP_MOVE = JIG_COMP .. ":Handle Comp to Comp Move"
 local menu_fn = function(self) util.safe(on_right_click, "names.menu", self:get()) end
 
-function names.init()
+local enabled = true
+function names.init(c)
+    enabled = not (c and c.backpack_names == false)
+    if not enabled then log.info("names: backpack names off (mirror_settings.txt) - no inventory hooks"); return end
     game.keybind("RETURN", nil, function() if popup and not popup.raw then commit(nil) end end, function() return popup ~= nil end)
     game.keybind("F2", nil, function() if not popup then util.safe(rename_hovered, "names.f2") end end,
         function() return hovered ~= nil end)
 end
 
 function names.tick(dt)
+    if not enabled then return end
     hook_in = hook_in - (dt or 0)
     if hook_in <= 0 then
         hook_in = 1.0
         util.ensure_hook(TOOLTIP, tooltip_fn)
         util.ensure_hook(COMP_MOVE, move_fn)
+    end
+    -- where my named items sit (names.moved needs it), refreshed while I'm handling my backpacks - from the tick,
+    -- not from inside the tooltip's Update
+    if count > 0 and hovered and os.clock() - (hovered.at or 0) < 1.0 and os.clock() - noted_at > 2.0
+            and os.clock() - last_move >= QUIET_AFTER_MOVE then
+        noted_at = os.clock()
+        names.note(my_comp())
     end
     if pending_menu then
         local comp = pending_menu
@@ -528,7 +561,7 @@ function names.tick(dt)
 end
 
 names._open = function(uid) open_popup(uid) end  -- devtest
-function names.forget() close_menu(); pending_menu, clicks, hovered, where = nil, {}, nil, {}; close_popup() end
+function names.forget() close_menu(); pending_menu, clicks, where = nil, {}, {}; forget_hover(); close_popup() end
 game.on_world_reset(names.forget)
 
 return names

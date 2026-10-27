@@ -698,6 +698,39 @@ function devtest.watch(cfg)
         elseif cmd == "coopmods" then
             require("mirror.journal_tab").dev_mods(true)
             log.info("devtest: coopmods")
+        elseif cmd:match("^realmcreate ") then
+            require("mirror.realmplay").create(cmd:sub(13))
+            log.info("devtest: realmcreate -> " .. tostring((require("mirror.realmplay").state())))
+        elseif cmd == "realmcancel" then
+            require("mirror.realmplay").cancel_create()
+            log.info("devtest: realmcancel -> " .. tostring((require("mirror.realmplay").state())))
+        -- (the REALMS buttons' own actions, for the unattended two-game kit)
+        elseif cmd:match("^realmopen ") then
+            require("mirror.realmplay").open(cmd:match("^realmopen (%S+)"), cmd:match("^realmopen %S+ (%u+)$") or "OPEN")
+            log.info("devtest: realmopen -> " .. tostring((require("mirror.realmplay").state())))
+        elseif cmd == "realmend" then
+            require("mirror.realmplay").leave()
+            log.info("devtest: realmend -> " .. tostring((require("mirror.realmplay").state())))
+        elseif cmd == "realmfriends" then
+            require("mirror.realmplay").add_members(nil)
+            log.info("devtest: realmfriends sent")
+        elseif cmd:match("^realminvite ") then
+            require("mirror.realmmembers").invite(arg)
+            log.info("devtest: realminvite " .. tostring(arg))
+        elseif cmd:match("^realmadd ") then
+            local code = cmd:sub(10)
+            local rm = require("mirror.realmmembers")
+            if code:upper():sub(1, 6) == "SSRK1." then rm.use_key(code) else rm.redeem(code) end
+            log.info("devtest: realmadd sent")
+        elseif cmd == "realmstate" then
+            local rp = require("mirror.realmplay")
+            local m = rp.model() or {}
+            local rows = {}
+            for _, r in ipairs(m.rows or {}) do rows[#rows + 1] = tostring(r.id) .. ":" .. tostring(r.open) .. ":" .. tostring(r.info) end
+            log.info(string.format("devtest: realmstate %s %s, service %s, free %s, hosting %s | %s", tostring((rp.state())),
+                tostring(select(2, rp.state())), tostring(m.service), tostring(m.free), tostring(m.hosting), table.concat(rows, " ; ")))
+        elseif cmd == "cooprealms" then
+            log.info("devtest: cooprealms -> " .. tostring(require("mirror.journal_tab").dev_realms(true)))
         elseif cmd == "mods" then
             local peer = require("mirror.compat").peer_mods()
             local m = require("mirror.modlist").model(peer and { set = peer, who = "peer", kind = require("mirror.compat").kind, host = true })
