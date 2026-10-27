@@ -10,7 +10,7 @@ crons = ["17 4 * * *"]
 binding = "DB"
 database_name = "surrounsync-realms"
 # Filled in by `npx wrangler d1 create surrounsync-realms` (see README.md). Local dev works without it.
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "5c8c6c2f-8ebc-4339-9f4d-9cc9e119de15"
 
 [[r2_buckets]]
 binding = "WORLDS"

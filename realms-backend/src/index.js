@@ -21,7 +21,9 @@ const MAX_OPEN_INVITES = 20;
 const LIMITS = {                      // per IP: [requests, window seconds]
     create: [5, 24 * 3600],
     redeem: [20, 3600],
-    auth: [600, 3600],
+    // every member call (list, heartbeat, uploads): only an abuse guard. 600 was hit in one evening by two games
+    // on one connection (each list = one call per known Realm) - the host's heartbeat got refused, its lease lapsed
+    auth: [10000, 3600],
 };
 
 const B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"; // Crockford: no I, L, O, U

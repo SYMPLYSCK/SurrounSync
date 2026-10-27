@@ -170,7 +170,8 @@ function realmplay.refresh_list(force)
     local now = os.time()
     if not realm.enabled() then return end
     if not bridge_up() then list_wanted = true; return end
-    if now - listed_at < (force and 3 or 10) then return end
+    -- (the open page asks every refresh: 30 s keeps one game near 120 server calls an hour per known Realm)
+    if now - listed_at < (force and 3 or 30) then return end
     listed_at, list_wanted = now, false
     realm.send("list", "")
 end

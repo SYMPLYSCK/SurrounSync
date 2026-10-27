@@ -20,7 +20,7 @@ using System.Web.Script.Serialization;
 
 class Realms
 {
-    public const string DefaultUrl = "";            // set once the Cloudflare Worker is deployed
+    public const string DefaultUrl = "https://surrounsync-realms.surrounsync-realms.workers.dev";   // realms-backend, deployed 2026-10-26
     const int FORMAT = 1;                           // bundle layout version (the server keeps it per Realm)
     const int HEARTBEAT_MS = 60000;
     const int MAX_FILES = 32;
