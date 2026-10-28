@@ -20,12 +20,8 @@ local MAIN = {
     "/Game/Blueprints/Other/BP_CraftingStation.BP_CraftingStation_C",
     "/Game/Blueprints/Vehicles/BP_VehicleMaster.BP_VehicleMaster_C",
 }
-local ITEMS = "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"
-local ITEM_ID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"
-local DURABILITY = "Durability_22_A3557C454274D193D47AB9B71FB0C0CA"
-local INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
-local COUNT = "Count_8_DD79AF2A46126A338C8DCCB4616D91CD"
-local UID = "UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"
+local F = require("mirror.fields")
+local ITEMS, ITEM_ID, DURABILITY, INFO, COUNT, UID = F.ITEMS, F.ITEM_ID, F.DURABILITY, F.INFO, F.COUNT, F.UID
 
 local cfg, role, session
 -- Taken/put-in events must not expire: replaying a full contents list over a lost one dupes or loses items.
@@ -56,6 +52,7 @@ local PREFETCH = {
     "/Game/Inventory/Containers/Containers/Airdrop/Master_AirdropContainer.Master_AirdropContainer_C",
 }
 local jig = require("mirror.jig")
+local uiremove = require("mirror.uiremove")
 -- uid -> count last seen in a shared container (what a take removed = that minus what's left)
 local count_seen = {}
 local function note_items(comp)
@@ -150,7 +147,7 @@ local function is_trade(p)
 end
 channel.send = function(self, p) if is_trade(p) then traded() end return events.send(self, p) end
 
-local uid_str, guid, full_path = jig.uid_str, jig.guid, jig.full_path
+local uid_str, full_path = jig.uid_str, jig.full_path
 
 -- A car's trunk is a container that moves: by position the host often didn't find the guest's car (parked a
 -- little differently, or driven since) and the take was lost - the item stayed in the host's trunk AND the
@@ -251,12 +248,15 @@ local function removed(actor, uid)
     if left == 0 then forget(uid, rev[uid]) end
     log.debug(string.format("loot: took %s from %s (%d left there)", uid, id, left))
 end
+-- Sent the next frame (flush_eaten): the game's UI removing an item it couldn't place fires these events too,
+-- and the hook that says so (uiremove) runs only after them - UE4SS runs a Blueprint "pre" hook after the body.
+local eaten = {}
 local function on_removed(self, ItemUID)
     if applying or not shared() then return end
     local actor = self:get()
     local uid
     pcall(function() uid = uid_str(ItemUID:get()) end)
-    if uid then removed(actor, uid) end
+    if uid and util.valid(actor) then eaten[#eaten + 1] = { actor = actor, uid = uid } end
 end
 
 -- Dropping an item onto a stack of the same item (SERVER_RequestStackItem) moves the count with no
@@ -344,11 +344,18 @@ end
 -- Host: a guest's take / put-in for a container this game can't find right now (not loaded here, a car not
 -- paired yet) is kept and tried again - dropped, the item was in the host's container and the guest's bag.
 -- Not acked until it's applied, so the guest never takes over a host list that still holds what it took.
+-- A put-in is refunded after LATER_S. A take has no refund (the guest already has the item), so it waits until
+-- the container shows up; only the cap drops the oldest one.
 local later, later_in = {}, 0.0
 local LATER_S = 600
+local LATER_MAX = 200
 local function keep_for_later(kind, id, payload)
     if role ~= "host" then return false end
     for _, x in ipairs(later) do if x.p == payload then return true end end
+    if #later >= LATER_MAX then
+        local x = table.remove(later, 1)
+        log.warn(string.format("loot: too many kept changes - dropped the oldest %s for %s", x.k == "A" and "put-in" or "take", x.id))
+    end
     later[#later + 1] = { k = kind, id = id, p = payload, t = now }
     log.info(string.format("loot: %s for %s - container not found here yet, kept to apply when it is", kind == "A" and "put-in" or "take", id))
     return true
@@ -950,10 +957,23 @@ function loot.guest_arriving()
     log.info("loot: a guest is arriving - container contents will be sent again ahead of time")
 end
 
+-- host: which containers a guest asked for that aren't loaded here (the guest sees them empty until they are) -
+-- only a counter before, so a report couldn't say which (audit N11); one line per 10 s at most
+local miss_ids, miss_log_at = {}, -100
+local function note_miss(id)
+    stats.missing = stats.missing + 1
+    miss_ids[#miss_ids + 1] = id
+    if now - miss_log_at < 10 then return end
+    miss_log_at = now
+    log.info(string.format("loot: %d container(s) a guest opened aren't loaded in this world (they stay empty there until I come near): %s",
+        #miss_ids, table.concat(miss_ids, ", ", 1, math.min(#miss_ids, 8))))
+    miss_ids = {}
+end
+
 local function answer(id)
     local actor = find(id)
     local comp = actor and comp_of(actor)
-    if not comp then stats.missing = stats.missing + 1; return end
+    if not comp then note_miss(id); return end
     jig.generate(comp)
     pushed[id] = true
     push_q[id] = { comp = comp, at = now + 0.3 }
@@ -978,7 +998,6 @@ local hook_fn = function(self, ItemUID) util.safe(on_removed, "loot.removed", se
 -- the game fires only JigMP_OnItemConsumed, no removed event. The host kept the item and its next list put
 -- it back on the guest's copy - every rip left the rags AND the clothes (report 20261027-171134). Sent the
 -- next frame like a stack (the pre-hook may run before the count changes).
-local eaten = {}
 local consumed_fn = function(self, ConsumedItem)
     util.safe(function()
         if applying or not shared() then return end
@@ -987,12 +1006,27 @@ local consumed_fn = function(self, ConsumedItem)
         if uid and util.valid(actor) then eaten[#eaten + 1] = { actor = actor, uid = uid } end
     end, "loot.consumed")
 end
+-- A player's rip/eat/read never reaches the container's JigMP_OnItemConsumed: SERVER_RequestConsumeItem runs
+-- TargetComp.HandleLocalRequestConsumeItem(uid, n, <the asking player's comp>, ..), which fires the event on that
+-- comp's owner - the player (decompiled BP_JigComponent; live: a guest's rips in a bin came back 6x, report
+-- 20261027-205518). The function itself runs on the container's component: hooked there (self = container comp).
+local consume_req_fn = function(self, ItemUID)
+    util.safe(function()
+        if applying or not shared() then return end
+        local comp, owner, uid = util.obj(self), nil, nil
+        if not comp then return end
+        pcall(function() owner = comp:GetOwner() end)
+        pcall(function() uid = uid_str(ItemUID:get()) end)
+        if uid and util.valid(owner) then eaten[#eaten + 1] = { actor = owner, uid = uid } end
+    end, "loot.consume_request")
+end
 local function flush_eaten()
     if not eaten[1] then return end
     local list = eaten
     eaten = {}
     for _, e in ipairs(list) do
-        if util.valid(e.actor) and is_main(e.actor) then removed(e.actor, e.uid) end
+        -- (the UI's no-room removal: nobody took it - the host's list puts it back here)
+        if not uiremove.is(e.uid) and util.valid(e.actor) and is_main(e.actor) then removed(e.actor, e.uid) end
     end
 end
 -- Dropping an item out of a container (all of it or part of a stack) fires no "removed" event on the
@@ -1036,7 +1070,12 @@ local function repair_player_stats()
     local n, names = jig.repair_stats(comp)
     if n > 0 then log.info("loot: gave " .. n .. " item(s) their missing stats: " .. table.concat(names, ", ")) end
     local twins = jig.twin_grids(comp)
-    if twins > 0 then log.warn("loot: " .. twins .. " bag compartment(s) in the inventory exist twice - items in them may not show (drop the bag and pick it up)") end
+    if twins > 0 then
+        local moved, detached, left = jig.merge_twins(comp, comp)
+        log.warn(string.format("loot: %d bag compartment(s) in the inventory existed twice (old versions) - merged: %d item(s) moved"
+            .. " into the shown one, %d twin(s) removed%s", twins, moved, detached,
+            left > 0 and (", " .. left .. " item(s) had no room and stay hidden in a twin") or ""))
+    end
 end
 
 local function retry_later()
@@ -1047,13 +1086,10 @@ local function retry_later()
         if actor and comp_of(actor) then
             log.info("loot: the container for a kept " .. (x.k == "A" and "put-in" or "take") .. " is here now (" .. x.id .. ") - applying it")
             if x.k == "A" then apply_add(x.p) elseif x.k == "N" then apply_count(x.p) else apply(x.p) end
-        elseif now - x.t > LATER_S then
-            log.warn(string.format("loot: gave up on a kept %s for %s after %d s - that container never showed up here",
-                x.k == "A" and "put-in" or "take", x.id, LATER_S))
-            if x.k == "A" then
-                local id, uid, da = x.p:match("^A (%S+) (%S+) (%S+)")
-                if id then channel:send("R " .. id .. " " .. uid .. " " .. da) end
-            end
+        elseif x.k == "A" and now - x.t > LATER_S then
+            log.warn(string.format("loot: gave up on a kept put-in for %s after %d s - that container never showed up here", x.id, LATER_S))
+            local id, uid, da = x.p:match("^A (%S+) (%S+) (%S+)")
+            if id then channel:send("R " .. id .. " " .. uid .. " " .. da) end
         else
             local dup = false
             for _, y in ipairs(later) do if y.p == x.p then dup = true end end
@@ -1090,6 +1126,8 @@ function loot.tick(dt)
         util.ensure_hook(JIG_COMP .. ":HandleSameContainerMoveToIndex", move_fn)
         util.ensure_hook(JIG_COMP .. ":SERVER_RequestStackItem", stack_fn)
         util.ensure_hook(JIG_COMP .. ":SERVER_RequestSplitItem", split_fn)
+        uiremove.ensure_hook()
+        util.ensure_hook(JIG_COMP .. ":HandleLocalRequestConsumeItem", consume_req_fn)
         for _, c in ipairs(MAIN) do
             util.ensure_hook(c .. ":JigMP_OnItemRemoved", hook_fn)
             util.ensure_hook(c .. ":JigMP_OnItemConsumed", consumed_fn)
@@ -1130,7 +1168,13 @@ function loot.tick(dt)
             end
         end
         for id, at in pairs(apply_q) do
-            if now >= at then apply_q[id] = nil; util.safe(sync_from_host, "loot.sync", id) end
+            if now >= at then
+                apply_q[id] = nil
+                -- taken from since that list came (host lagging / gone a while): the list still holds it and would
+                -- bring it back. Ask again - the answer comes after the take and has it.
+                if (pending[id] or 0) <= (host_ack[id] or 0) then util.safe(sync_from_host, "loot.sync", id)
+                else asked_at[id] = now; channel:send("Q " .. id) end
+            end
         end
     end
     local function take_contents(p)

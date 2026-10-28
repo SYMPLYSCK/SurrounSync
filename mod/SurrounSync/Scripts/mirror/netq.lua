@@ -48,11 +48,14 @@ end
 
 function netq.status()
     local r = (rtt_at and os.clock() - rtt_at < 10) and rtt or nil
+    -- graded by the number the tag shows (the network one when known): a tag read "40 ms" in red when the colour
+    -- came from the game-to-game time (frames + file hand-offs)
+    local shown = net_rtt or r
     local state
     if age == math.huge then state = "unknown"
     elseif age > 5 then state = "lost"
-    elseif age > 1.5 or (r and r > 900) then state = "poor"
-    elseif age > 0.5 or (r and r > 400) then state = "moderate"
+    elseif age > 1.5 or (shown and shown > 900) then state = "poor"
+    elseif age > 0.5 or (shown and shown > 400) then state = "moderate"
     else state = "good" end
     return { state = state, rtt = r, net = net_rtt }
 end

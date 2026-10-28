@@ -83,6 +83,9 @@ def main():
     B = j(r)
     check("invite is one-time", call("POST", "/v1/invites/redeem", {"invite": inv, "steam_id": STEAM_C, "player_name": "Eve"})[0] == 404)
     check("member sees realm", j(call("GET", "/v1/realms/" + rid, auth=B))["you"]["role"] == "member")
+    inv2 = j(call("POST", "/v1/realms/%s/invites" % rid, auth=A))["invite"]
+    r2 = call("POST", "/v1/invites/redeem", {"invite": inv2, "steam_id": STEAM_B, "player_name": "Bob"})
+    check("a member can't redeem a second invite (no duplicate member)", r2[0] == 409 and j(r2).get("error") == "already_member", r2)
     check("other realm's key refused", call("GET", "/v1/realms/0000000000", auth=B)[0] == 403)
 
     # lease: one winner

@@ -16,6 +16,7 @@ local CUE_OFF = "/Game/Audio/Survival_Sound_Kit_HD_Remake/Cues/Turning_Flashligh
 local poll_in = 0.0
 local mine = nil
 local applied, applied_gen = nil, nil
+local peer_state = nil
 local peer_on = false
 
 local function path_of(obj)
@@ -72,7 +73,9 @@ function lights.tick(dt, pose)
     end
     local g = ghost.get()
     if not g then applied, applied_gen = nil, nil; return end
-    local state = link.get_blob("light")
+    -- get_blob hands out a blob only when it changed: keep it, or a respawned ghost (every save) stays dark
+    peer_state = link.get_blob("light") or peer_state
+    local state = peer_state
     if state and (state ~= applied or applied_gen ~= ghost.generation()) then
         applied, applied_gen = state, ghost.generation()
         util.safe(apply, "lights.apply", g, state)

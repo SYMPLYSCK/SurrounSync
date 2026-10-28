@@ -354,7 +354,10 @@ class TestNet : INet
         public readonly AutoResetEvent signal = new AutoResetEvent(false);
         public ulong id;
         public volatile bool dead;
+        public long txFrames, txBytes, rxFrames, rxBytes;   // (SURROUNSYNC_TESTNET_TRACE=1 logs them)
     }
+    readonly bool trace = Environment.GetEnvironmentVariable("SURROUNSYNC_TESTNET_TRACE") == "1";
+    long traceAt;
     readonly Dictionary<ulong, Conn> conns = new Dictionary<ulong, Conn>();   // host: by guest id; guest: 1001 = the host
     readonly Dictionary<ulong, int> connGens = new Dictionary<ulong, int>();
     public int ConnGen(ulong id) { lock (qlock) { int g; connGens.TryGetValue(id, out g); return g; } }
@@ -464,6 +467,7 @@ class TestNet : INet
                     if (len < 0 || len > (1 << 22)) break;
                     var data = new byte[len];
                     if (!ReadFull(s, data, len)) break;
+                    c.rxFrames++; c.rxBytes += 5 + len;
                     if (head[4] == 9)
                     {
                         if (len >= 8 && from == 0)
@@ -504,7 +508,7 @@ class TestNet : INet
                 {
                     byte[] f = null;
                     lock (c.outq) if (c.outq.Count > 0) f = c.outq.Dequeue();
-                    if (f != null) { c.stream.Write(f, 0, f.Length); continue; }
+                    if (f != null) { c.stream.Write(f, 0, f.Length); c.txFrames++; c.txBytes += f.Length; continue; }
                     c.signal.WaitOne(1000);
                 }
             }
@@ -526,6 +530,17 @@ class TestNet : INet
     public void Pump(Func<ulong, bool> onSessionRequest, Action<string> log)
     {
         long t = Environment.TickCount;
+        if (trace && t - traceAt > 2000)
+        {
+            traceAt = t;
+            lock (qlock)
+                foreach (var c in conns.Values)
+                {
+                    int q; lock (c.outq) q = c.outq.Count;
+                    log("testnet trace: " + c.id + " tx " + c.txFrames + "/" + c.txBytes + " B, rx " + c.rxFrames + "/" + c.rxBytes
+                        + " B, outq " + q + (c.dead ? " DEAD" : "") + ", inq " + queues[0].Count + "/" + queues[1].Count + "/" + queues[2].Count);
+                }
+        }
         if (role == "host" && listener == null && t >= nextConnect) { nextConnect = t + 1000; TryListen(); if (listenError != null) log("testnet: can't listen: " + listenError); }
         if (listener != null && !listenLogged) { listenLogged = true; log("testnet: listening on " + port); }
         while (role == "host" && listener != null && listener.Pending())
@@ -817,6 +832,7 @@ class PeerLink
     public string chunkName, chunkKey; public string[] chunkParts; public int chunkGot;
     public int rxFragId = -1, rxFragHave; public byte[][] rxFrags;
     public readonly Dictionary<string, long> blobGen = new Dictionary<string, long>();
+    public readonly HashSet<string> epochNames = new HashSet<string>();   // blob names of the peer's current session
     public readonly string indexRun = DateTime.UtcNow.Ticks.ToString();
     public double pktTokens = -1, byteTokens; public long tokensAt;
     public readonly Queue<long> drops = new Queue<long>();
@@ -859,7 +875,7 @@ class Bridge
     volatile string updateVersion = null;
     volatile string reportLine = null;
     const long REQUEST_TIMEOUT = 60000;
-    const int MAX_POSE = 2048, MAX_HELLO = 256, MAX_PART = CHUNK + 1024, MAX_PARTS = 32;
+    const int MAX_POSE = 2048, MAX_HELLO = 256, MAX_PART = CHUNK + 1024, MAX_PARTS = 32, MAX_BLOB_NAMES = 256;
     // a deflated blob may unpack to more than one piece: the world files at a join (~550 KB of text) go
     // compressed in one message instead of raw in pieces (~30% less over a slow Steam relay)
     const int MAX_INFLATE = CHUNK * MAX_PARTS;
@@ -1089,6 +1105,7 @@ class Bridge
             }
             StartWriter();
             StartWatchdog();
+            if (gameCheck) new SurrounSyncShared.GameWatch(Log, null, Win64Dir()).Start();
             try { Loop(); }
             finally
             {
@@ -1154,7 +1171,7 @@ class Bridge
 
     void Loop()
     {
-        long lastHello = 0, lastScan = -10000, lastGameCheck = 0, lastStatus = 0, lastBlobScan = 0;
+        long lastScan = -10000, lastGameCheck = 0, lastStatus = 0, lastBlobScan = 0;
         long lastLobby = -10000, lastCmd = 0, lastPoseRead = 0;
         int gameMissing = 0;
         while (true)
@@ -1172,7 +1189,7 @@ class Bridge
             {
                 Step("idle receive"); Drain(0); Drain(1);
                 Step("idle sleep"); Thread.Sleep(20);
-                if (GameGone(ref lastGameCheck, ref gameMissing)) { Log("game closed - exiting"); return; }
+                if (GameGone(ref lastGameCheck, ref gameMissing)) { Log("game closed - exiting"); if (realms != null) realms.ReleaseHeld(); return; }
                 continue;
             }
             if (role == "guest" && HostLink() == null && t - lastScan > 3000) { Step("friend scan"); lastScan = t; Discover(); }
@@ -1217,7 +1234,7 @@ class Bridge
             WriteVoiceState();
             if (t - lastStatus > 2000) { Step("status file"); lastStatus = t; WriteStatus(); }
             Step("game check");
-            if (GameGone(ref lastGameCheck, ref gameMissing)) { Log("game closed - exiting"); return; }
+            if (GameGone(ref lastGameCheck, ref gameMissing)) { Log("game closed - exiting"); if (realms != null) realms.ReleaseHeld(); return; }
             Step("sleep"); Thread.Sleep(4);
         }
     }
@@ -2160,9 +2177,19 @@ class Bridge
         char type = len > 0 ? (char)data[o] : '?';
         int max = type == 'P' ? MAX_POSE : type == 'H' ? MAX_HELLO : (type == 'B' || type == 'K' || type == 'Z') ? MAX_PART
                 : (type == 'C' || type == 'A' || type == 'R' || type == 'T' || type == 'N') ? 256 : type == 'V' ? 8192 : type == 'F' ? FRAG + 16
-                : type == 'W' ? 1024 : type == 'X' ? MAX_PART + 9 : 0;
+                : type == 'W' ? 1024 : type == 'X' ? MAX_PART + 9 : -1;
+        // a type this bridge doesn't know (a newer peer's): skipped, never a "drop" - 20 of them kicked the newer
+        // player, or on a guest blocked the host (the rate limits above still count it)
+        if (max < 0) { Unknown(l, type); return false; }
         if (len > max) { Dropped(l, "size " + type + " " + len + " B"); return false; }
         return true;
+    }
+
+    readonly HashSet<char> unknownLogged = new HashSet<char>();
+    void Unknown(PeerLink l, char type)
+    {
+        lock (unknownLogged) if (!unknownLogged.Add(type)) return;
+        Log("ignored packets of unknown type '" + (type < ' ' || type > '~' ? '?' : type) + "' from " + l.name + " (a newer SurrounSync?)");
     }
 
     void Dropped(PeerLink l, string why)
@@ -2271,6 +2298,7 @@ class Bridge
         if (ep == l.blobEpoch) return;
         if (l.blobEpoch != null) Log(l.name + "'s game restarted - cleared its old data");
         l.blobEpoch = ep;
+        l.epochNames.Clear();
         try
         {
             string tail = "_" + l.inTag + ".txt";
@@ -2284,6 +2312,15 @@ class Bridge
     void WriteBlob(PeerLink l, string name, string body)
     {
         if (name.Length == 0 || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return;
+        // the index file is "name generation" lines, so no spaces; the mod sends ~60 names, so a peer can't fill the
+        // folder with endless new ones (counted per peer session: BlobEpoch deletes the old session's files)
+        // (logged once, never a kick: on a guest a kick would cut the host off)
+        if (name.IndexOf(' ') >= 0 || (!l.epochNames.Contains(name) && l.epochNames.Count >= MAX_BLOB_NAMES))
+        {
+            if (l.loggedRx.Add(" refused")) Log("ignored blob '" + Clean(name) + "' from " + l.name + " (bad name or over " + MAX_BLOB_NAMES + " names)");
+            return;
+        }
+        l.epochNames.Add(name);
         WriteAtomic(Path.Combine(dir, "mirror_" + name + "_" + l.inTag + ".txt"), body);
         BumpIndex(l, name);
         l.rxBlobs++;
@@ -2348,11 +2385,13 @@ class Bridge
             if (h.Length < 4) return;
             string name = body.Substring(n1 + 1, n2 - n1 - 1);
             int idx, count;
-            if (!int.TryParse(h[2], out idx) || !int.TryParse(h[3], out count) || count <= 0 || idx >= count) return;
+            if (!int.TryParse(h[2], out idx) || !int.TryParse(h[3], out count) || count <= 0 || idx < 0 || idx >= count) return;
             if (count > MAX_PARTS) { Dropped(l, "size K " + count + " parts"); return; }
             BlobEpoch(l, h[0]);
             string key = h[0] + " " + h[1];
             if (key != l.chunkKey || idx == 0) { l.chunkKey = key; l.chunkName = name; l.chunkParts = new string[count]; l.chunkGot = 0; }
+            // a part whose count differs from the first part's would index past the array or finish the blob early
+            if (count != l.chunkParts.Length) return;
             if (l.chunkParts[idx] == null) { l.chunkParts[idx] = body.Substring(n2 + 1); l.chunkGot++; }
             if (l.chunkGot == count)
             {

@@ -71,9 +71,23 @@ local function apply_use(g, asset_p, extra)
     else log.warn("anim: PlayUsingItemMontage failed: " .. tostring(err)) end
 end
 
+-- Montages whose notifies run the attack itself: played on the other player's character here, the stomp killed whoever
+-- stood at its feet (kit 2026-10-27: a DamageTaken right at its start, PvP off). Their raw animation shows the same
+-- move with none of the montage's notifies (kit: foot swings 50 cm, no damage); the hit stays in their own game.
+local SHOW_ONLY = { Chr_Stomp_Montage = "/Game/Character/Anims/Chr_Stomp.Chr_Stomp" }
+
 local function apply(g, kind, p, rate, extra)
     if kind == "use" then apply_use(g, p, extra); return end
     if p == "-" then pcall(function() g:StopAnimMontage(nil) end); return end
+    local seq_path = kind == "play" and SHOW_ONLY[p:match("[^%.]+$") or ""]
+    if seq_path then
+        local seq = find_montage(seq_path)
+        local ok = seq and pcall(function()
+            g.Mesh:GetAnimInstance():PlaySlotAnimationAsDynamicMontage(seq, FName("DefaultSlot"), 0.1, 0.1, rate, 1, -1.0, 0.0)
+        end)
+        log.info("anim: ghost shows " .. seq_path:match("[^%.]+$") .. (ok and "" or " - not loaded here, not shown"))
+        return
+    end
     local m = find_montage(p)
     if not m then log.warn("anim: montage not found: " .. p); return end
     if kind == "play" then

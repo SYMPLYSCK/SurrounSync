@@ -11,11 +11,16 @@ $Tag = "v$Version"
 if (git status --porcelain) { throw "Commit or stash your changes first - a release is built from a clean tree." }
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw "GitHub CLI (gh) not found: https://cli.github.com, then gh auth login" }
 
-$log = Get-Content 'CHANGELOG.md' -Raw
+# UTF-8 both ways, no BOM: Windows PowerShell reads a BOM-less file as ANSI and its utf8 writes a BOM - that put
+# garbage before lines in the 0.13.2 notes on GitHub
+$Utf8 = New-Object System.Text.UTF8Encoding($false)
+$log = [IO.File]::ReadAllText((Join-Path $Repo 'CHANGELOG.md'), $Utf8)
 $m = [regex]::Match(($log -replace "`r`n", "`n"), "(?ms)^## \[?$([regex]::Escape($Version))\]?[^\n]*\n(.*?)(?=^## |\z)")
 if (-not $m.Success) { throw "CHANGELOG.md has no section '## $Version'" }
 $notes = Join-Path $env:TEMP "surrounsync-notes-$Version.md"
-Set-Content $notes ($m.Groups[1].Value.Trim() + "`n`n**Install:** download SurrounSyncSetup.exe below and run it. Already installed? Update from the game: handbook (J) -> CO-OP -> UPDATE.") -Encoding utf8
+$body = $m.Groups[1].Value.Trim() + "`n`n**Install:** download SurrounSyncSetup.exe below and run it. Already installed? Update from the game: handbook (J) -> CO-OP -> UPDATE."
+if ($body -match '[^\x09\x0A\x0D\x20-\x7E]') { throw "The $Version notes have non-ASCII characters (emoji, arrows, dashes) - plain text only" }
+[IO.File]::WriteAllText($notes, $body, $Utf8)
 
 if (-not $NoBuild) { & (Join-Path $PSScriptRoot 'build-release.ps1') }
 $Exe = Join-Path $Repo 'dist\SurrounSyncSetup.exe'

@@ -30,7 +30,8 @@ namespace SurrounSyncShared
                 if (File.Exists(f))
                 {
                     string s = File.ReadAllText(f).Trim();
-                    if (s.StartsWith("http://") || s.StartsWith("https://")) return s;
+                    // plain http only to this PC (a local test server): the update it names is downloaded and run
+                    if (s.StartsWith("https://") || s.StartsWith("http://127.0.0.1") || s.StartsWith("http://localhost")) return s;
                 }
             }
             catch { }
@@ -147,6 +148,8 @@ namespace SurrounSyncShared
                         done += n;
                         if (progress != null && total > 0) progress((int)(done * 100 / total));
                     }
+                    // a connection that closes early just ends the stream: without this a cut-off setup was run
+                    if (total > 0 && done != total) throw new IOException("download cut off at " + done + " of " + total + " bytes");
                 }
                 return true;
             }
@@ -256,6 +259,31 @@ namespace SurrounSyncShared
         }
 
         public static string Win64(string game) { return Path.Combine(game, "SurrounDead", "Binaries", "Win64"); }
+
+        // Two installs on one PC (the test kit) run two games of the same name: the one started from win64 is ours.
+        public static bool RunsFrom(Process p, string win64)
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(p.MainModule.FileName);
+                return string.Equals(Path.GetFullPath(dir).TrimEnd('\\'), Path.GetFullPath(win64).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception) { return false; }   // (no access to that process's modules)
+        }
+
+        // The game process with a window: the one from win64 when there is one, else the first (win64 null = the first).
+        public static Process Pick(string process, string win64)
+        {
+            Process first = null;
+            foreach (var x in Process.GetProcessesByName(process))
+            {
+                if (x.MainWindowHandle == IntPtr.Zero) continue;
+                if (win64 == null) return x;
+                if (RunsFrom(x, win64)) return x;
+                if (first == null) first = x;
+            }
+            return first;
+        }
         public static bool IsGame(string game)
         {
             return !string.IsNullOrEmpty(game) && File.Exists(Path.Combine(Win64(game), Exe));
@@ -320,6 +348,180 @@ namespace SurrounSyncShared
         }
     }
 
+    public static class Dumps
+    {
+        [System.Runtime.InteropServices.DllImport("dbghelp.dll", SetLastError = true)]
+        static extern bool MiniDumpWriteDump(IntPtr process, int processId, Microsoft.Win32.SafeHandles.SafeFileHandle file,
+            int type, IntPtr exception, IntPtr userStream, IntPtr callback);
+
+        // every thread's stack + module list, no heap (a few MB): where each thread is, not what it holds
+        public static void Write(Process p, string path)
+        {
+            using (var fs = new FileStream(path, FileMode.Create, FileAccess.ReadWrite))
+                if (!MiniDumpWriteDump(p.Handle, p.Id, fs.SafeFileHandle, 0x1000 | 0x20, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero))
+                    throw new System.ComponentModel.Win32Exception();
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        class MemStatus
+        {
+            public uint Length = 64, Load;
+            public ulong TotalPhys, AvailPhys, TotalPageFile, AvailPageFile, TotalVirtual, AvailVirtual, AvailExtended;
+        }
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GlobalMemoryStatusEx([System.Runtime.InteropServices.In, System.Runtime.InteropServices.Out] MemStatus m);
+
+        // RAM and commit (RAM + page file: what Windows can still hand out - a full one freezes or kills the game)
+        public static string Memory()
+        {
+            var m = new MemStatus();
+            if (!GlobalMemoryStatusEx(m)) return "memory ?";
+            const double G = 1024.0 * 1024 * 1024;
+            return string.Format("RAM {0:0.0}/{1:0.0} GB free, commit {2:0.0} of {3:0.0} GB used", m.AvailPhys / G, m.TotalPhys / G,
+                (m.TotalPageFile - m.AvailPageFile) / G, m.TotalPageFile / G);
+        }
+    }
+
+    // Beside the game for the whole session (the bridge starts it): a health line every 30 s, and when the game stops
+    // responding, which threads burn CPU plus a stack dump (8 s and 30 s in) - a frozen game writes no crash report
+    // of its own (a guest froze 7 times in one evening with nothing to show for it, 2026-10-27).
+    public sealed class GameWatch
+    {
+        public static string HangDirOverride;   // tests
+        public static string HangDir { get { return HangDirOverride ?? Path.Combine(Release.AppDir, "hangs"); } }
+        const int MaxDumps = 6;
+        // the mod writes it when a level load starts and removes it when the world is ready (session.lua WORLD_LOAD)
+        public const string WorldLoadFile = "mirror_world_load.txt";
+        public const string DuringLoad = "during a world load";
+        const int WorldLoadMaxS = 180;
+        readonly Action<string> log;
+        readonly string process, win64;
+        DateTime hungSince = DateTime.MinValue, lastHealth = DateTime.MinValue, cpuAt = DateTime.MinValue;
+        TimeSpan cpu;
+        int dumps, sessionDumps;
+
+        public GameWatch(Action<string> log, string process = null, string win64 = null)
+        {
+            this.log = log;
+            this.process = process ?? Path.GetFileNameWithoutExtension(Game.Exe);
+            this.win64 = win64;
+        }
+
+        // " during a world load" while the mod's load marker is fresh (a join load blocks the game thread 10-30 s)
+        string LoadPart()
+        {
+            if (win64 == null) return "";
+            try
+            {
+                var f = new FileInfo(Path.Combine(win64, WorldLoadFile));
+                return f.Exists && (DateTime.Now - f.LastWriteTime).TotalSeconds < WorldLoadMaxS ? " " + DuringLoad : "";
+            }
+            catch (IOException) { return ""; }
+        }
+
+        string StepPart()
+        {
+            string s = win64 == null ? null : Report.ReadText(Path.Combine(win64, "mirror_step.txt"));
+            return string.IsNullOrWhiteSpace(s) ? "" : " | mod step: " + s.Trim();
+        }
+
+        public void Start()
+        {
+            var th = new System.Threading.Thread(() =>
+            {
+                while (true) { try { Tick(); } catch (Exception e) { log("watch: " + e.Message); } System.Threading.Thread.Sleep(2000); }
+            });
+            th.IsBackground = true;
+            th.Name = "game watch";
+            th.Start();
+        }
+
+        void Tick()
+        {
+            Process p = Game.Pick(process, win64);
+            if (p == null) { hungSince = DateTime.MinValue; return; }
+            bool responding = p.Responding;   // (asks the game's window, waits up to 5 s)
+            DateTime now = DateTime.Now;
+            if (!responding)
+            {
+                if (hungSince == DateTime.MinValue) { hungSince = now; dumps = 0; log("watch: the game stopped responding" + LoadPart() + " - " + Dumps.Memory()); }
+                double s = (now - hungSince).TotalSeconds;
+                if ((dumps == 0 && s >= 8) || (dumps == 1 && s >= 30)) Capture(p, s);
+            }
+            else if (hungSince != DateTime.MinValue)
+            {
+                log(string.Format("watch: the game responds again after {0:0} s", (now - hungSince).TotalSeconds));
+                hungSince = DateTime.MinValue;
+            }
+            if ((now - lastHealth).TotalSeconds >= 30) { lastHealth = now; log("watch: " + Health(p, now)); }
+        }
+
+        string Health(Process p, DateTime now)
+        {
+            string cpuPart = "";
+            var c = p.TotalProcessorTime;
+            if (cpuAt != DateTime.MinValue)
+                cpuPart = string.Format(", CPU {0:0}%", 100.0 * (c - cpu).TotalSeconds / Math.Max(0.1, (now - cpuAt).TotalSeconds) / Environment.ProcessorCount);
+            cpu = c; cpuAt = now;
+            return string.Format("game {0} MB private, {1} MB in RAM, {2} threads, {3} handles{4} | {5}",
+                p.PrivateMemorySize64 >> 20, p.WorkingSet64 >> 20, p.Threads.Count, p.HandleCount, cpuPart, Dumps.Memory());
+        }
+
+        // Which threads use CPU over one second: a spinning game thread (a loop) vs everything waiting (a deadlock or I/O).
+        static string Busy(Process p)
+        {
+            var before = new Dictionary<int, TimeSpan>();
+            // (a thread that ended meanwhile is skipped)
+            foreach (ProcessThread t in p.Threads)
+            {
+                try { before[t.Id] = t.TotalProcessorTime; }
+                catch (InvalidOperationException) { continue; }
+                catch (System.ComponentModel.Win32Exception) { continue; }
+            }
+            System.Threading.Thread.Sleep(1000);
+            p.Refresh();
+            var used = new List<KeyValuePair<int, double>>();
+            foreach (ProcessThread t in p.Threads)
+            {
+                TimeSpan b;
+                try { if (before.TryGetValue(t.Id, out b)) used.Add(new KeyValuePair<int, double>(t.Id, (t.TotalProcessorTime - b).TotalMilliseconds)); }
+                catch (InvalidOperationException) { continue; }
+                catch (System.ComponentModel.Win32Exception) { continue; }
+            }
+            used.Sort((a, b2) => b2.Value.CompareTo(a.Value));
+            var sb = new StringBuilder();
+            double total = 0;
+            foreach (var u in used) total += u.Value;
+            sb.AppendFormat("{0} threads used {1:0} ms of CPU in 1 s; busiest:", used.Count, total);
+            for (int i = 0; i < Math.Min(5, used.Count); i++) sb.AppendFormat(" #{0} {1:0} ms", used[i].Key, used[i].Value);
+            return sb.ToString();
+        }
+
+        void Capture(Process p, double secs)
+        {
+            dumps++;
+            string busy = "";
+            try { busy = Busy(p); } catch (Exception e) { busy = "CPU sample failed: " + e.Message; }
+            string note = string.Format("frozen {0:0} s{1} | {2} | {3} | {4}{5}", secs, LoadPart(), busy, Dumps.Memory(),
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), StepPart());
+            if (sessionDumps >= MaxDumps) { log("watch: still frozen (" + note + ") - no more dumps this session"); return; }
+            sessionDumps++;
+            Directory.CreateDirectory(HangDir);
+            string name = "hang-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + dumps;
+            try
+            {
+                Dumps.Write(p, Path.Combine(HangDir, name + ".dmp"));
+                log("watch: game frozen - dump " + name + ".dmp (" + note + ")");
+            }
+            catch (Exception e) { log("watch: game frozen (" + note + "), dump failed: " + e.Message); }
+            File.WriteAllText(Path.Combine(HangDir, name + ".txt"), note + "\r\n");
+            // keep the newest few
+            var old = new List<FileInfo>(new DirectoryInfo(HangDir).GetFiles("hang-*"));
+            old.Sort((a, b) => b.LastWriteTime.CompareTo(a.LastWriteTime));
+            for (int i = 2 * MaxDumps; i < old.Count; i++) { try { old[i].Delete(); } catch (IOException) { } }
+        }
+    }
+
     public static class Report
     {
         public static string Create(string win64, out string error) { return Create(win64, out error, false, null); }
@@ -378,6 +580,15 @@ namespace SurrounSyncShared
                         {
                             var fi = new FileInfo(f);
                             if (fi.Length < 8 * 1024 * 1024 && !(lite && fi.Extension.ToLowerInvariant() == ".dmp")) AddFile(z, f, "crash/" + fi.Name);
+                        }
+                    AddHangDump(z, lite, win64);
+                    AddWatchHangs(z, lite);
+                    AddWindows(z);
+                    if (win64 != null)
+                        foreach (var n in new[] { "mirror_steps.txt", "mirror_steps.1.txt" })
+                        {
+                            string steps = RecentSteps(Path.Combine(win64, n));
+                            if (steps != null) Add(z, "game/recent_" + n, Encoding.UTF8.GetBytes(Diagnose.Scrub(steps)));
                         }
                 }
                 return zip;
@@ -629,7 +840,7 @@ namespace SurrounSyncShared
             using (var m = new MemoryStream()) { f.CopyTo(m); return m.ToArray(); }
         }
 
-        static string ReadText(string path)
+        internal static string ReadText(string path)
         {
             try { var d = File.Exists(path) ? ReadShared(path) : null; return d == null ? null : Encoding.UTF8.GetString(d); }
             catch { return null; }
@@ -813,6 +1024,102 @@ namespace SurrounSyncShared
                 else sb.Append(c);
             }
             return sb.Append('"').ToString();
+        }
+
+        // A frozen game leaves no crash report (a guest froze 7 times in saves and fights, 2026-10-27): a report made
+        // while it hangs takes a small dump - every thread's stack, no heap - that shows what the game is stuck in.
+        public static string HangProcess = Path.GetFileNameWithoutExtension(Game.Exe);   // tests: a frozen stand-in
+        static void AddHangDump(ZipArchive z, bool lite, string win64)
+        {
+            var procs = new List<Process>(Process.GetProcessesByName(HangProcess));
+            // two installs on one PC: only this install's game (when it can be told apart)
+            var ours = procs.FindAll(p => Game.RunsFrom(p, win64));
+            foreach (var p in ours.Count > 0 ? ours : procs)
+            {
+                string note;
+                try
+                {
+                    if (p.Responding) continue;   // (asks the game's window, waits up to 5 s)
+                    string tmp = Path.Combine(Path.GetTempPath(), "SurrounSync-hang-" + Process.GetCurrentProcess().Id + "-" + p.Id + ".dmp");
+                    Dumps.Write(p, tmp);
+                    long len = new FileInfo(tmp).Length;
+                    bool keep = len < (lite ? 12L : 64L) * 1024 * 1024;
+                    if (keep) Add(z, "hang/SurrounDead-hang.dmp", File.ReadAllBytes(tmp));
+                    note = "The game was not responding when this report was made. Dump: " + (len / 1024) + " KB" + (keep ? "" : " - too big, left out");
+                    try { File.Delete(tmp); } catch { }
+                }
+                catch (Exception e) { note = "The game was not responding when this report was made; no dump: " + e.Message; }
+                Add(z, "hang/hang.txt", Encoding.UTF8.GetBytes(note + "\r\n"));
+            }
+        }
+
+        // The freezes the game watch caught (bridge, GameWatch) in the last 6 h: notes always, the newest dumps as they fit.
+        static void AddWatchHangs(ZipArchive z, bool lite)
+        {
+            if (!Directory.Exists(GameWatch.HangDir)) return;
+            var files = new List<FileInfo>(new DirectoryInfo(GameWatch.HangDir).GetFiles("hang-*"));
+            files.Sort((a, b) => b.LastWriteTime.CompareTo(a.LastWriteTime));
+            long room = lite ? 4L * 1024 * 1024 : 48L * 1024 * 1024;
+            foreach (var f in files)
+            {
+                if ((DateTime.Now - f.LastWriteTime).TotalHours > 6) continue;
+                bool dump = f.Extension.ToLowerInvariant() == ".dmp";
+                if (dump && f.Length > room) continue;
+                if (dump) { room -= f.Length; Add(z, "hang/" + f.Name, ReadShared(f.FullName)); }
+                else AddFile(z, f.FullName, "hang/" + f.Name);
+            }
+        }
+
+        // Windows' own record: crashes (1000), hangs (1002) and error reports (1001) of the game in the last 2 days,
+        // plus memory - a freeze or kill that left nothing in the game's files still shows here.
+        static void AddWindows(ZipArchive z)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine(Dumps.Memory());
+            try
+            {
+                // the game's name in the query itself: the newest 60 of ALL programs were often other apps only (audit N48)
+                var psi = new ProcessStartInfo("wevtutil.exe",
+                    "qe Application /q:\"*[System[(EventID=1000 or EventID=1001 or EventID=1002) and TimeCreated[timediff(@SystemTime) <= 172800000]]"
+                    + " and EventData[Data='" + Game.Exe + "']]\" /f:text /rd:true /c:60")
+                { UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true };
+                using (var p = Process.Start(psi))
+                {
+                    var read = p.StandardOutput.ReadToEndAsync();
+                    if (!read.Wait(10000))
+                    {
+                        try { p.Kill(); } catch (InvalidOperationException) { /* exited just now - nothing to stop */ }
+                        throw new TimeoutException("wevtutil took over 10 s");
+                    }
+                    string all = read.Result;
+                    p.WaitForExit(2000);
+                    int n = 0;
+                    foreach (var ev in all.Split(new[] { "Event[" }, StringSplitOptions.RemoveEmptyEntries))
+                        if (ev.IndexOf("SurrounDead", StringComparison.OrdinalIgnoreCase) >= 0) { sb.AppendLine("Event[" + ev.TrimEnd()); n++; }
+                    if (n == 0) sb.AppendLine("No crash, hang or error report of the game in Windows' log (last 2 days).");
+                }
+            }
+            catch (Exception e) { sb.AppendLine("Windows event log not read: " + e.Message); }
+            Add(z, "windows/events.txt", Encoding.UTF8.GetBytes(Diagnose.Scrub(sb.ToString())));
+        }
+
+        // mirror_steps.txt is a ring of the mod's last 64 steps ("<seq> <time> <clock> <step>", crumb.lua): oldest first.
+        public static string RecentSteps(string path)
+        {
+            string text = ReadText(path);
+            if (text == null) return null;
+            var rows = new List<KeyValuePair<long, string>>();
+            foreach (var line in text.Split('\n'))
+            {
+                var m = Regex.Match(line, @"^(\d+) (.*\S)");
+                long seq;
+                if (m.Success && long.TryParse(m.Groups[1].Value, out seq)) rows.Add(new KeyValuePair<long, string>(seq, m.Groups[2].Value));
+            }
+            if (rows.Count == 0) return null;
+            rows.Sort((a, b) => a.Key.CompareTo(b.Key));
+            var sb = new StringBuilder("The mod's last " + rows.Count + " steps, oldest first (time, seconds since the game started, step):\r\n");
+            foreach (var r in rows) sb.Append(r.Value).Append("\r\n");
+            return sb.ToString();
         }
 
         static void Add(ZipArchive z, string name, byte[] data)

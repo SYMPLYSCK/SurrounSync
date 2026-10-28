@@ -83,6 +83,11 @@ local function mine_obj(o)
     return false
 end
 
+-- A hit my own character deals (stomp, push): the stomp's trace hits whatever stays at the foot again every few ms
+-- (meant to finish a downed zombie), so one stomp sent 6 hits, ~200 damage (kit 2026-10-27). One per second goes.
+local BODY_HIT_GAP = 1.0
+local last_body_hit = -100
+
 -- Our own hit landed on the ghost: send it to the other game.
 local function on_ghost_damage(self, Damage, DamageType, InstigatedBy, DamageCauser)
     if not ghost.is(self:get()) then return end
@@ -92,6 +97,10 @@ local function on_ghost_damage(self, Damage, DamageType, InstigatedBy, DamageCau
     local amt = 0
     pcall(function() amt = Damage:get() end)
     if not (amt and amt > 0) then return end
+    if util.same(causer, game.player()) then
+        if os.clock() - last_body_hit < BODY_HIT_GAP then return end
+        last_body_hit = os.clock()
+    end
     local cls = util.class_path(util.obj(DamageType)) or "-"
     hits:send(string.format("%.3f %s", math.min(amt, MAX_HIT), cls))
     stats.sent = stats.sent + 1

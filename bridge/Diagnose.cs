@@ -5,6 +5,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -118,6 +119,7 @@ namespace SurrounSyncShared
                 var f = Known(g, d);
                 if (f != null) Merge(d, f);
             }
+            PeerFroze(d, runLines);
             if (recentCrash)
             {
                 var cf = CrashFinding(win64, crash, crashAt, d);
@@ -135,6 +137,7 @@ namespace SurrounSyncShared
                 d.Findings.Add(cf);
             }
             else if (crash != null) d.Context.Add("Newest game crash: " + crashAt.ToString("yyyy-MM-dd HH:mm") + " - older than " + CrashWindowHours + " h, not part of this report's findings.");
+            Hangs(d, local);
             Install(win64, d);
             Timeline(d, runLines);
 
@@ -160,6 +163,129 @@ namespace SurrounSyncShared
         }
 
         static bool IsCrash(Finding f) { return f.Category.StartsWith("Crash") || f.Category == "Freeze"; }
+
+        // Freezes the bridge's game watch caught (GameWatch: dumps + notes in the hangs folder, "watch:" lines in the
+        // connector log) - a frozen game writes no crash report of its own.
+        static void Hangs(Diagnosis d, string local)
+        {
+            var notes = new List<string>();
+            var stalls = new List<string>();
+            try
+            {
+                if (Directory.Exists(GameWatch.HangDir))
+                    foreach (var f in new DirectoryInfo(GameWatch.HangDir).GetFiles("hang-*.txt"))
+                        if ((DateTime.Now - f.LastWriteTime).TotalHours <= CrashWindowHours) notes.Add(f.Name.Replace(".txt", "") + ": " + (ReadText(f.FullName) ?? "").Trim());
+                if (Directory.Exists(local))
+                    foreach (var f in Directory.GetFiles(local, "mirror_bridge*.log"))
+                        // (lines carry only the time of day: an old log's stalls aren't this session's)
+                        if ((DateTime.Now - File.GetLastWriteTime(f)).TotalHours <= CrashWindowHours)
+                        foreach (var line in (ReadText(f) ?? "").Split('\n'))
+                            if (line.Contains("watch: the game stopped responding") || line.Contains("watch: the game responds again")) stalls.Add(line.Trim());
+            }
+            catch (IOException e) { d.Missing.Add("Couldn't read the game watch's freeze notes: " + e.Message); }
+            catch (UnauthorizedAccessException e) { d.Missing.Add("Couldn't read the game watch's freeze notes: " + e.Message); }
+            if (notes.Count == 0 && stalls.Count == 0) return;
+            notes.Sort();
+            // a join load blocks the game thread 10-30 s: under the mod's load marker that is a slow load, not a freeze
+            var loads = notes.FindAll(n => n.Contains(GameWatch.DuringLoad));
+            notes.RemoveAll(n => n.Contains(GameWatch.DuringLoad));
+            if (loads.Count > 0)
+            {
+                var fl = new Finding
+                {
+                    Title = "A world load took a long time", Category = "Performance", Severity = "MINOR", Confidence = "confirmed",
+                    Count = loads.Count,
+                    What = "The game didn't respond for 8 s or more while it loaded a world (joining, leaving or a reload).",
+                    Affects = "Only the loading screen.",
+                    Cause = "Loading a world blocks the game until it's done; slow disks, low memory or a big save make it longer.",
+                    PlayerTry = "Nothing needed if it carried on. If it never finishes, see the dump in hang/.",
+                    DevLook = "hang/*.txt ('during a world load', mod step), hang/*.dmp.",
+                };
+                foreach (var n in loads) fl.Evidence.Add(Trunc(n, 400));
+                d.Findings.Add(fl);
+                if (notes.Count == 0) return;
+            }
+            bool froze = notes.Count > 0;
+            var fd = new Finding
+            {
+                Title = froze ? "The game froze" : "The game stopped responding for a while",
+                Category = "Freeze", Severity = froze ? "CRITICAL" : "MINOR", Confidence = "confirmed",
+                Count = froze ? notes.Count : stalls.Count,
+                What = froze ? "The game stopped responding for 8 s or more; SurrounSync's connector saved what every part of the game was doing."
+                             : "The game stopped responding for a few seconds and then carried on.",
+                Affects = froze ? "The whole session for this player while frozen." : "A short freeze for this player.",
+                Cause = "The dump in hang/ shows the call the game was stuck in. 'busiest' = threads using CPU: one thread near 1000 ms is a loop; all near 0 is waiting (a deadlock, disk or memory).",
+                PlayerTry = froze ? "If it freezes again, leave it frozen for 30 s before closing - a second snapshot shows whether it moves." : "",
+                DevLook = "hang/*.dmp (stacks: WinDbg/VS, game thread first), hang/*.txt (CPU per thread, memory), game/recent_mirror_steps*.txt (the mod's last 64 steps), windows/events.txt.",
+            };
+            foreach (var n in notes) fd.Evidence.Add(Trunc(n, 400));
+            for (int i = Math.Max(0, stalls.Count - 10); i < stalls.Count; i++) fd.Evidence.Add(Trunc(stalls[i], 300));
+            d.Findings.Add(fd);
+        }
+
+        // Every 5 s phase1 logs the link ("... peer_hb <s> peer_game alive|gone") and then the game data
+        // ("phase1[host]: rx <n>/s, last <s>s ago | ghost <kind>|none"). No game data for 20 s+ while the other
+        // player's connector still answers (fresh heartbeat, game "alive") = their GAME froze; "gone" after it = their
+        // game then closed. (The link line's "last rx" counts the connector's heartbeats too - it stayed under 1 s
+        // through a 45 s freeze, so a rule on it never fired: kit 2026-10-27.) Without their ghost here (loading into
+        // or out of this world) only 90 s+ counts: a long load stops the data too. With 3-4 players every other
+        // player's pair of lines comes in turn: each player is followed on its own (by the link line's "peer <name> (<id>)").
+        class PeerState { public double Hb = -1; public string Game; public bool InFreeze; public string Name; }
+        static void PeerFroze(Diagnosis d, List<Line> lines)
+        {
+            var ev = new List<string>();
+            int episodes = 0, closed = 0;
+            var peers = new Dictionary<string, PeerState>();
+            PeerState cur = null;
+            foreach (var l in lines)
+            {
+                var lk = Regex.Match(l.Text, @"peer_hb (-?[\d.]+) peer_game (\S+)");
+                if (lk.Success)
+                {
+                    var who = Regex.Match(l.Text, @"peer (.*?) \((\d+)\)");
+                    string key = who.Success ? who.Groups[2].Value : "";
+                    if (!peers.TryGetValue(key, out cur)) peers[key] = cur = new PeerState { Name = who.Success ? who.Groups[1].Value : null };
+                    if (!double.TryParse(lk.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out cur.Hb)) cur.Hb = -1;
+                    cur.Game = lk.Groups[2].Value;
+                    if (cur.InFreeze && cur.Game == "gone")
+                    {
+                        closed++; cur.InFreeze = false;
+                        if (ev.Count < 8) ev.Add(l.Time + " then " + (cur.Name != null ? cur.Name + "'s" : "their") + " game closed");
+                    }
+                    continue;
+                }
+                var m = Regex.Match(l.Text, @"phase1\[[^\]]+\]: rx [\d.]+/s, last ([\d.]+)s ago.*?\| ghost (\S+)");
+                if (!m.Success || cur == null) continue;
+                double age;
+                if (!double.TryParse(m.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out age)) continue;
+                bool here = m.Groups[2].Value != "none";
+                if (age >= (here ? 20 : 90) && cur.Hb >= 0 && cur.Hb < 5 && cur.Game == "alive")
+                {
+                    if (!cur.InFreeze)
+                    {
+                        episodes++;
+                        if (ev.Count < 6) ev.Add(l.Time + " " + (cur.Name != null ? cur.Name + ": " : "") + "no game data for " + (int)age
+                                                 + " s, their connector answered " + cur.Hb + " s ago" + (here ? "" : " (they weren't in your world - loading?)"));
+                    }
+                    cur.InFreeze = true;
+                }
+                else if (age < 5) cur.InFreeze = false;
+            }
+            if (episodes == 0) return;
+            var f = new Finding
+            {
+                Title = "The other player's game froze", Category = "Freeze", Severity = "ERROR", Confidence = "likely",
+                Count = episodes,
+                What = "The other player's game stopped sending anything for 20 s or more while their SurrounSync connector kept running"
+                       + (closed > 0 ? "; " + closed + "x it then closed." : "."),
+                Affects = "The other player: their game hung (and may have been closed) - your game was fine.",
+                Cause = "Their game froze (not the internet connection: their connector still answered).",
+                PlayerTry = "The other player should send a bug report from their PC - SurrounSync's game watch saves what their game was stuck in.",
+                DevLook = "the other player's report: hang/*.dmp + hang/*.txt, game/recent_mirror_steps*.txt.",
+            };
+            f.Evidence.AddRange(ev);
+            d.Findings.Add(f);
+        }
 
         static bool Near(DateTime a, DateTime b) { return Math.Abs((a - b).TotalMinutes) < 10; }
 
@@ -195,7 +321,8 @@ namespace SurrounSyncShared
             {
                 foreach (var line in File.ReadAllLines(Path.Combine(local, "mirror_lobby.txt")))
                 {
-                    var m = Regex.Match(line, @"^peer (\d+) (.+)$");
+                    // "peer <id> <name> connected|connecting" (the bridge appends the state)
+                    var m = Regex.Match(line, @"^peer (\d+) (.+?)(?: (?:connected|connecting))?\s*$");
                     if (m.Success && d.Peer == "") d.Peer = m.Groups[2].Value.Trim();
                 }
             }

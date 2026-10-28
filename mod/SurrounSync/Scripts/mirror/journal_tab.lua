@@ -27,7 +27,8 @@ local LIST_WIDTH = 560.0
 local GEAR_TEX = "/Game/UI/Textures/over_250_survival_flat_icons/gear.gear"
 local CLOSE_TEX = "/Game/UI/Textures/CrossX.CrossX"
 local INK = { R = 0.12, G = 0.08, B = 0.06, A = 1.0 }
-local SETTING_ROWS = 9
+local SETTING_ROWS = 10   -- MY SETTINGS: SyncFX on top of the 9 others
+local TAG_COLOR = { R = 0.6, G = 0.13, B = 0.0, A = 1.0 }   -- burnt orange "(Experimental)" in front of a label
 local MOD_ROWS = 9
 local REALM_ROWS = 3   -- per page on the lined note (more Realms: < PREV / NEXT >)
 -- the MODS tab: one ribbon below CO-OP (label spot found in-game; the ribbon art is yellow, so a tint can only
@@ -364,8 +365,8 @@ local function build_settings(page)
     u.gear, u.gear_img = icon_button(page, GEAR_TEX, "SETTINGS", 827.0, 932.0, 96.0, 6)
     u.set_box = new("VerticalBox", S.tree, "Settings")
     tilt(u.set_box, TILT.list)
-    -- (9 rows: from 230 the last one ran off the page, screenshot 2026-10-27)
-    place(page, u.set_box, 420.0, 150.0, 580.0, 840.0, 6)
+    -- (9 rows: from 230 the last one ran off the page, screenshot 2026-10-27; 10 rows from 150 too: 120, tighter rows)
+    place(page, u.set_box, 420.0, 120.0, 580.0, 875.0, 6)
     u.set_title = text("SETTINGS", 58, DARK_RED); vadd(u.set_box, u.set_title)
     -- two pages: the host's rules for the shared world, and this PC's own settings
     local tabs = new("HorizontalBox", S.tree, "SettingTabs"); vadd(u.set_box, tabs, 2)
@@ -377,12 +378,13 @@ local function build_settings(page)
     u.set_sub = text("", 16, GREY, 560); vadd(u.set_box, u.set_sub, 4)
     u.set_rows = {}
     for i = 1, SETTING_ROWS do
-        local row = new("HorizontalBox", S.tree, "SettingRow"); vadd(u.set_box, row, i == 1 and 16 or 6)
+        local row = new("HorizontalBox", S.tree, "SettingRow"); vadd(u.set_box, row, i == 1 and 8 or 2)
+        local tag = text("", 26, TAG_COLOR)   -- e.g. "(Experimental)": collapsed on rows without one
         local label = text("", 26)
         local b, bt = button("OFF", 26, DARK_RED)
-        hadd(row, label); hadd(row, b, 24)
+        hadd(row, tag); hadd(row, label); hadd(row, b, 24)
         local hint = text("", 16, GREY, 560); vadd(u.set_box, hint, 2)
-        u.set_rows[i] = { row = row, label = label, btn = b, btn_t = bt, hint = hint }
+        u.set_rows[i] = { row = row, tag = tag, label = label, btn = b, btn_t = bt, hint = hint }
     end
     -- (moved up with the box: at 215 it covered the MODS tab)
     u.set_close, u.set_close_img = icon_button(page, CLOSE_TEX, "X", 930.0, 135.0, 72.0, 7)
@@ -576,6 +578,15 @@ local function build_realms(page, qtree, qpage, itree, ipage)
         .. "playing with you right now join with ADD FRIENDS HERE.", 15, GREY, 540), 8)
     vadd(tools, text("COPY MY KEY copies your membership, to play this Realm from another PC. Keep it private.", 15, GREY, 540), 6)
     u.realms_inv_tools, u.realms_inv_tools_t = code_box(tools, 18)
+    -- the CO-OP tab's chat here too, while in a Realm session (no switching tabs to talk)
+    -- (two lines: a third ran past the folder's bottom edge, measured in-game)
+    local rc = new("HorizontalBox", S.tree, "RealmChatRow"); vadd(tools, rc, 2)
+    hadd(rc, text("CHAT", 20, DARK_RED))
+    u.realms_chat_input = input("RealmChatInput", "say something", 17, 300); hadd(rc, u.realms_chat_input, 12)
+    u.realms_chat_send = button("SEND", 20); hadd(rc, u.realms_chat_send, 12)
+    u.realms_chat_row = rc
+    u.realms_chat_lines = {}
+    for i = 1, 2 do local t = text("", 14, BLACK, 540); vadd(tools, t, 0); u.realms_chat_lines[i] = t end
 
     u.realms_page = 1
     vis_hit(cv, false)
@@ -669,14 +680,27 @@ local function refresh_realms()
         set(u.realms_cur_kind, m.hosting and "YOU'RE HOSTING" or (m.armed and "NEW REALM")
             or (m.visiting and "YOU'RE VISITING") or "YOUR REALM")
         set(u.realms_people, cur.people or "Loading the member list...")
+        local talk = m.hosting == true or m.visiting == true
+        vis_hit(u.realms_chat_row, talk)
+        local lines = talk and require("mirror.chat").recent(2) or {}
+        for i, t in ipairs(u.realms_chat_lines) do
+            local c = lines[i]
+            if i == 1 and talk and u.rl_tip then
+                vis(t, true); set(t, u.rl_tip)
+            else
+                vis(t, c ~= nil)
+                if c then set(t, c.who .. ": " .. c.text) end
+            end
+        end
         set(u.realms_cur_name, cur.name or "")
         set(u.realms_cur_info, (cur.code or "") .. (cur.info and ("   |   " .. cur.info) or ""))
         set(u.realms_cur_state, m.state or "")
         vis_hit(u.realms_friends, m.hosting == true)
-        vis_hit(u.realms_end, m.hosting == true)
+        -- (a visiting member leaves here too, like LEAVE CO-OP, instead of switching to the CO-OP tab)
+        vis_hit(u.realms_end, m.hosting == true or m.visiting == true)
         vis_hit(u.realms_cancel, m.armed == true)
         if u.realms_end_armed and clock > u.realms_end_armed + 4 then u.realms_end_armed = nil end
-        set(u.realms_end_t, u.realms_end_armed and "SURE? END IT" or "END REALM")
+        set(u.realms_end_t, m.visiting and "LEAVE REALM" or (u.realms_end_armed and "SURE? END IT" or "END REALM"))
         return
     end
     local line = m.state or m.note or ""
@@ -719,6 +743,8 @@ local function refresh_settings(m)
         local o = list[i]
         vis_hit(r.row, o ~= nil); vis(r.hint, o ~= nil)
         if o then
+            vis(r.tag, o.tag ~= nil)
+            set(r.tag, o.tag and (o.tag .. " ") or "")
             set(r.label, o.label .. ":")
             set(r.btn_t, o.text or "OFF")
             set(r.hint, o.hint)
@@ -949,8 +975,12 @@ local function refresh()
     if m.tp then set(u.tp_name, m.tp.who .. (m.tp.kind == "goto" and " wants to teleport to you" or " wants to bring you to them")) end
     for i, t in ipairs(u.chat_lines) do
         local c = (m.chat or {})[i]
-        vis(t, m.show_chat and c ~= nil)
-        if c then set(t, c.who .. ": " .. c.text) end
+        if i == 1 and u.co_tip and m.show_chat then
+            vis(t, true); set(t, u.co_tip)
+        else
+            vis(t, m.show_chat and c ~= nil)
+            if c then set(t, c.who .. ": " .. c.text) end
+        end
     end
     local reqs = m.requests or {}
     vis(u.req_title, #reqs > 0)
@@ -983,8 +1013,26 @@ local function refresh()
 end
 
 local refresh_in = 0.0
+-- Enter in a chat box sends it, like SEND. (The box loses its focus on Enter: the one focused in the last 0.5 s counts.)
+local enter_bound = false
+local function chat_focused()
+    local u = S and S.ui
+    return u ~= nil and u.chat_focus ~= nil and clock - (u.chat_focus_at or -9) < 0.5
+end
+local function chat_enter()
+    if not chat_focused() then return end
+    local box, txt = S.ui.chat_focus, ""
+    pcall(function() txt = box:GetText():ToString() end)
+    if txt:find("%S") and ctx.act.chat_send(txt) then pcall(function() box:SetText(FText("")) end) end
+    ctx.refresh_now = true
+end
+
 function journal_tab.tick(dt)
     clock = clock + dt
+    if not enter_bound then
+        enter_bound = true
+        game.keybind("RETURN", nil, chat_enter, chat_focused)
+    end
     if not ensure() then return end
     local open = is_open()
     if open ~= S.was_open then
@@ -1011,6 +1059,20 @@ function journal_tab.tick(dt)
     if not S.shown then return end
     for _, x in ipairs(S.buttons) do hover(x.b, x.t) end
     local u, a = S.ui, ctx.act
+    -- "/" typed in a chat box: its first chat line shows the commands that fit (teleport.tip), or that it isn't one
+    local function typed_tip(box)
+        local t = ""
+        if box then pcall(function() t = box:GetText():ToString() end) end
+        return require("mirror.teleport").tip(t)
+    end
+    local co_tip = u.view == nil and typed_tip(u.chat_input) or nil
+    local rl_tip = u.view == "realms" and typed_tip(u.realms_chat_input) or nil
+    if co_tip ~= u.co_tip or rl_tip ~= u.rl_tip then u.co_tip, u.rl_tip, ctx.refresh_now = co_tip, rl_tip, true end
+    for _, b in ipairs({ u.chat_input, u.realms_chat_input }) do
+        local f = false
+        if b then pcall(function() f = b:HasKeyboardFocus() end) end
+        if f then u.chat_focus, u.chat_focus_at = b, clock end
+    end
     refresh_in = refresh_in - dt
     if u.view == "mods" then
         if clicked(u.set_close) then set_view(nil); ctx.refresh_now = true end
@@ -1049,6 +1111,13 @@ function journal_tab.tick(dt)
         if rm.hosting and c_end then
             -- END REALM sends everyone home: the first press asks
             if u.realms_end_armed then u.realms_end_armed = nil; a.realm_end() else u.realms_end_armed = clock end
+            ctx.refresh_now = true
+        end
+        if rm.visiting and c_end then a.leave(); ctx.refresh_now = true end
+        if (rm.hosting or rm.visiting) and clicked(u.realms_chat_send) then
+            local txt = ""
+            pcall(function() txt = u.realms_chat_input:GetText():ToString() end)
+            if a.chat_send(txt) then pcall(function() u.realms_chat_input:SetText(FText("")) end) end
             ctx.refresh_now = true
         end
         if rm.armed and c_cancel then a.realm_cancel(); ctx.refresh_now = true end

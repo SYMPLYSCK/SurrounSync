@@ -13,9 +13,8 @@ local itemclean = {}
 
 local PICKUP_COMP = "BP_JigPickupComponent_C"
 local JIG = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
-local INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
-local ITEM_ID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"
-local UID = "UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"
+local F = require("mirror.fields")
+local INFO, ITEM_ID, UID = F.INFO, F.ITEM_ID, F.UID
 local SKIP_CLASS = { Container_DeadPlayerLoot_C = true }
 local AGE = nil           -- (dev override in s; else the ITEM CLEANUP host rule's minutes)
 local SCAN_EVERY = 30.0

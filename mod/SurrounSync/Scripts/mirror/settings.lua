@@ -81,16 +81,23 @@ local APPLY = {
 function settings.apply(cfg)
     local f = io.open(FILE, "r")
     if not f then return "config.lua" end
-    local n = 0
+    local n, first = 0, true
+    local keys = {}
+    for k in pairs(APPLY) do keys[#keys + 1] = k end
+    table.sort(keys)
     for line in f:lines() do
+        -- (Notepad's "UTF-8" puts a BOM before the first line: that key never matched)
+        if first then line = line:gsub("^\239\187\191", ""); first = false end
         line = line:gsub("^%s+", ""):gsub("%s+$", "")
         if line ~= "" and not line:match("^[#;]") then
             local k, v = line:match("^([%w_]+)%s*=%s*(.-)$")
             local fn = k and APPLY[k:lower()]
             v = v and v:gsub('^"(.*)"$', "%1")
+            local ok, good = false, false
+            if fn then ok, good = pcall(fn, cfg, v) end
             if not fn then
-                log.warn(FILE .. ": unknown line '" .. line .. "' (keys: transport, peer, netsim, saved, linkdir, testnet, devtest, loglevel, latency_ms, jitter_ms, loss, language)")
-            elseif not fn(cfg, v) then
+                log.warn(FILE .. ": unknown line '" .. line .. "' (keys: " .. table.concat(keys, ", ") .. ")")
+            elseif not (ok and good) then
                 log.warn(FILE .. ": bad value in '" .. line .. "' - ignored")
             else
                 n = n + 1

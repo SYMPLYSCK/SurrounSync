@@ -135,6 +135,10 @@ local backend = {
         local ok, r = pcall(function() return bfu():DeleteDirectory(p, false, true) end)
         return ok and r == true
     end,
+    rmdir_empty = function(p)
+        local ok, r = pcall(function() return bfu():DeleteDirectory(p, false, false) end)
+        return ok and r == true
+    end,
 }
 
 local uepath = require("mirror.uepath")
@@ -148,6 +152,8 @@ function savefs.mkdir(path)
 end
 function savefs.list_dirs(path) return backend.list_dirs(uepath.of(path)) end
 function savefs.rmdir(path) return backend.rmdir(uepath.of(path)) == true end
+-- only an empty folder (anything still in it keeps it)
+function savefs.rmdir_empty(path) return backend.rmdir_empty(uepath.of(path)) == true end
 
 function savefs.dir_exists(dir)
     local probe = dir .. "\\.mirror_probe"

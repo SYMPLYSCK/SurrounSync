@@ -3,6 +3,10 @@ HW="/c/Program Files (x86)/Steam/steamapps/common/SurrounDead/SurrounDead/Binari
 GW="/c/Program Files (x86)/Steam/steamapps/common/SurrounDead_Guest/SurrounDead/Binaries/Win64"
 HL="$HW/ue4ss/UE4SS.log"; GL="$GW/ue4ss/UE4SS.log"
 SD="$LOCALAPPDATA/SurrounDead"
+# The user plays on this PC too: while %LOCALAPPDATA%\SurrounSync\playing.txt exists nothing here may start, kill
+# or re-configure a game (setup/host_up kill EVERY SurrounDead process, kit_mode rewrites the Steam install's settings)
+PLAYING="$LOCALAPPDATA/SurrounSync/playing.txt"
+playing_guard() { [ -f "$PLAYING" ] || return 0; echo "KIT: refused - the user is playing ($PLAYING exists). Ask first."; return 1; }
 # cmd host|guest "<command>"
 cmd() { local f; [ "$1" = host ] && f="$SD/mirror_dev_Saved.txt" || f="$SD/mirror_dev_Saved_Guest.txt"; printf '%s\n' "$2" > "$f"; }
 # waitlog host|guest <regex> <secs>  -> prints the matching line or TIMEOUT
@@ -11,8 +15,9 @@ waitlog() { local l; [ "$1" = host ] && l="$HL" || l="$GL"; for i in $(seq 1 $3)
 lines() { local l; [ "$1" = host ] && l="$HL" || l="$GL"; grep -a -E "$2" "$l" | cut -c30-260 | tail -${3:-15}; }
 # launch <dir> <extra args> [left|right]: windowed, no splash, then placed on that half of the screen
 launch() {
+  playing_guard || return 1
   local pid=$(powershell -NoProfile -Command "(Start-Process -PassThru -FilePath '$(cygpath -w "$1")\SurrounDead-Win64-Shipping.exe' -WorkingDirectory '$(cygpath -w "$1")' -ArgumentList @($2'-windowed','-nosplash','-ResX=960','-ResY=1000')).Id" | tr -dc '0-9')
-  [ -n "$3" ] && powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$(dirname "${BASH_SOURCE[0]}")/place.ps1")" "${pid:-0}" "$3" > "$SD/place_$3.log" 2>&1 &
+  [ -n "$3" ] && powershell -NoProfile -File "$(cygpath -w "$(dirname "${BASH_SOURCE[0]}")/place.ps1")" "${pid:-0}" "$3" > "$SD/place_$3.log" 2>&1 &
 }
 # free commit (GB) - two games need ~15 GB: the commit limit (RAM + pagefile) hangs a loading game when hit
 commit_free() { powershell -NoProfile -Command "\$m=Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory; [math]::Floor((\$m.CommitLimit-\$m.CommittedBytes)/1GB)"; }
@@ -42,8 +47,11 @@ do_() { mark "$1"; cmd "$1" "$2"; waitnew "$1" "$3" "${4:-30}"; }
 # title screen: no player 45 s after the load started -> that game is killed and started once more.
 start_one() {
   local r=$1 dir args slot side pid
+  playing_guard || return 1
   if [ "$r" = host ]; then dir="$HW"; args=""; slot=QuickSave110649_26Jul2026; side=left
   else dir="$GW"; args="'-saveddirsuffix=Guest',"; slot=QuickSave111214_22Jul2026; side=right; fi
+  # a command left from a failed step (a 'join' nobody read) ran at start-up before the link existed and broke it
+  if [ "$r" = host ]; then rm -f "$SD/mirror_dev_Saved.txt"; else rm -f "$SD/mirror_dev_Saved_Guest.txt"; fi
   for try in 1 2; do
     # the new game rewrites its log from line 1: start the wait there (a mark on the old, longer log never matched)
     if [ "$r" = host ]; then : > "$HL"; else : > "$GL"; fi 2>/dev/null; eval "M_$r=0"; launch "$dir" "$args" $side
@@ -64,11 +72,12 @@ start_one() {
 # and keeps the play settings in *.kitbak; restore_mode puts them back.
 kit_mode() {
   grep -q "^devtest = on" "$HW/mirror_settings.txt" 2>/dev/null && grep -q "^testnet" "$HW/mirror_settings.txt" 2>/dev/null     && grep -q "^devtest = on" "$GW/mirror_settings.txt" 2>/dev/null && return 0
+  playing_guard || return 1
   local d f
   for d in "$HW" "$GW"; do for f in mirror_settings.txt mirror_role.txt; do
     [ -f "$d/$f" ] && [ ! -f "$d/$f.kitbak" ] && cp "$d/$f" "$d/$f.kitbak"
   done; done
-  powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$(dirname "${BASH_SOURCE[0]}")/../mirror-mode.ps1")" bridgetest >/dev/null 2>&1
+  powershell -NoProfile -File "$(cygpath -w "$(dirname "${BASH_SOURCE[0]}")/../mirror-mode.ps1")" bridgetest >/dev/null 2>&1
   if grep -q "^devtest = on" "$HW/mirror_settings.txt" && grep -q "^devtest = on" "$GW/mirror_settings.txt"; then
     echo "KIT: switched both installs to bridgetest mode (play settings kept as *.kitbak - restore_mode puts them back)"
   else echo "KIT: couldn't switch to bridgetest mode"; return 1; fi
@@ -82,6 +91,7 @@ restore_mode() {
 }
 # fresh games in their saves, immune, host hosting (~30 s; a hung load costs one restart of that game)
 setup() {
+  playing_guard || return 1
   taskkill //IM SurrounDead-Win64-Shipping.exe //F >/dev/null 2>&1
   taskkill //IM SurrounSyncBridge.exe //F >/dev/null 2>&1      # orphaned connectors (one PC: they never see their game go)
   kit_mode || return 1
@@ -109,6 +119,7 @@ join() {
 }
 # restart the host into its save, god on
 host_up() {
+  playing_guard || return 1
   taskkill //IM SurrounDead-Win64-Shipping.exe //F >/dev/null 2>&1; taskkill //IM SurrounSyncBridge.exe //F >/dev/null 2>&1; sleep 3
   launch "$HW" "" left; sleep 8; until grep -a "devtest: watching" "$HL" | tail -1 | grep -q "$(date +%H:%M)"; do sleep 2; done
   cmd host "god"; sleep 28; local n0=$(wc -l < "$HL"); cmd host "continue QuickSave110649_26Jul2026"

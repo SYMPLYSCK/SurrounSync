@@ -20,11 +20,24 @@ end
 
 function perf.configure(cfg) enabled = not (cfg and cfg.perf_log == false) end
 
+-- nested runs (fire.tick's sub-timers) put the outer step back after them, or a freeze later in the outer part
+-- was blamed on the last sub-timer; top-level runs don't (one crumb write per run). depth resets each frame, so a
+-- run that raised can't leave it counting.
+local depth = 0
 function perf.run(name, fn, ...)
+    local outer = depth > 0 and crumb.current() or nil
     crumb.at(name)
-    if not enabled then return fn(...) end
+    depth = depth + 1
+    if not enabled then
+        fn(...)
+        depth = depth - 1
+        if outer then crumb.at(outer) end
+        return
+    end
     local t, m = os.clock(), collectgarbage("count")
     fn(...)
+    depth = depth - 1
+    if outer then crumb.at(outer) end
     local d, dm = os.clock() - t, collectgarbage("count") - m
     local p = parts[name]
     if not p then p = { sum = 0.0, max = 0.0, kb = 0.0 }; parts[name] = p end
@@ -34,7 +47,10 @@ function perf.run(name, fn, ...)
     if dm > 0 then p.kb = p.kb + dm end
 end
 
-function perf.frame_begin() if enabled then frame_start = os.clock() end end
+function perf.frame_begin()
+    depth = 0
+    if enabled then frame_start = os.clock() end
+end
 
 function perf.frame_end(dt)
     if not (enabled and frame_start) then return end

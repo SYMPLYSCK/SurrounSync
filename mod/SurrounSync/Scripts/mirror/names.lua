@@ -16,14 +16,12 @@ local UMG = "/Script/UMG."
 local WBL = "/Script/UMG.Default__WidgetBlueprintLibrary"
 local SHELL = "/Game/JigSInventory/Jigsaw/Widgets/BP_StatTextW.BP_StatTextW_C"
 local TOOLTIP = "/Game/JigSInventory/Jigsaw/Widgets/HoverDrag/Hover/OnHoverTooltipWidget.OnHoverTooltipWidget_C:Update"
-local MENU = "/Game/JigSInventory/Jigsaw/Widgets/JContextMenu/JigContextMenuComp.JigContextMenuComp_C:OnJigItemRightClick"
 local JIG_COMP = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
 local BACKPACKS = "/Equipment/Backpacks/"
 local WHITE = { R = 1, G = 1, B = 1, A = 1 }
 local BLACK = { R = 0, G = 0, B = 0, A = 1 }
 
 local store, count, loaded = {}, 0, false
-local menu = nil      -- { uid, canvas, w, btn, bg }: our RENAME row while the game's right-click menu is open
 local popup = nil     -- { w, box, save, clear, cancel, uid }
 local clicks = {}
 local where = {}      -- named item uid -> { holder, slot, cell, da }: where it last sat (see names.moved)
@@ -31,13 +29,14 @@ local last_move = -100.0  -- os.clock() of the last inventory move (the tooltip 
 
 local function clean(s)
     s = tostring(s or ""):gsub("[%c|;,%%]", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    if #s > MAX_LEN then s = s:sub(1, MAX_LEN) end
-    return s
+    return util.utf8_cut(s, MAX_LEN)
 end
 
 local function load_file()
     loaded = true
     local f = io.open(FILE, "r")
+    -- a crash between save_file's remove and rename leaves only the finished .tmp
+    if not f and os.rename(FILE .. ".tmp", FILE) then f = io.open(FILE, "r") end
     if not f then return end
     for line in f:lines() do
         local uid, name = line:match("^(%-?%d+_%-?%d+_%-?%d+_%-?%d+)\t(.+)$")
@@ -181,18 +180,6 @@ local function is_backpack(item)
     return type(p) == "string" and p:find(BACKPACKS, 1, true) ~= nil
 end
 
-local function mine(uid)
-    local p = game.player()
-    if not util.valid(p) then return false end
-    local jig = require("mirror.jig")
-    local comp
-    pcall(function() comp = p.BP_JigComponent end)
-    if not util.valid(comp) then pcall(function() comp = p:GetComponentByClass(StaticFindObject(JIG_COMP)) end) end
-    if not util.valid(comp) then return false end
-    for _, h in ipairs(jig.contents_of(comp)) do if h.uid == uid then return true end end
-    return false
-end
-
 local function new(cls, outer)
     local o
     pcall(function() o = StaticConstructObject(StaticFindObject(UMG .. cls), outer) end)
@@ -333,126 +320,6 @@ local function commit(name)
 end
 names.clean = clean
 
--- The RENAME row: our own widget drawn right under the game's right-click menu, same width, row height and font,
--- shown while that menu is open for one of my backpacks. The game's menu is only READ: adding a button to its
--- OptionsVB crashed both games on the next paint, every time.
-local WLL = "/Script/UMG.Default__WidgetLayoutLibrary"
-local ROW_BG = { R = 0.02, G = 0.02, B = 0.02, A = 0.86 }
-local ROW_HOVER = { R = 0.16, G = 0.16, B = 0.16, A = 0.95 }
-local function close_menu()
-    if menu then pcall(function() menu.w:RemoveFromParent() end) end
-    menu = nil
-end
-
--- Where the game's menu is and how its options look (all reads). nil until it has been laid out.
-local function menu_look(canvas)
-    local w, pos, size, row, font
-    pcall(function() w = canvas.JigContextMenuW end)
-    if not util.valid(w) then return nil end
-    local slot, list = child(w, "Slot"), child(w, "OptionsVB")
-    if slot then pcall(function() local p = slot:GetPosition(); pos = { X = p.X, Y = p.Y } end) end
-    pcall(function() local d = w:GetDesiredSize(); size = { X = d.X, Y = d.Y } end)
-    if list then pcall(function()
-        local c = list:GetChildAt(0)
-        if not util.valid(c) then return end
-        local d = c:GetDesiredSize()
-        row = d.Y > 4 and d.Y or nil
-        local t = c:GetContent()
-        if not util.valid(t) then return end
-        local f = t.Font
-        font = { FontObject = f.FontObject, TypefaceFontName = f.TypefaceFontName, Size = f.Size }
-    end) end
-    if not (pos and size and size.X > 4 and size.Y > 4) then return nil end
-    return { pos = pos, size = size, row = row or 34, font = font }
-end
-
-local function show_rename(m, look)
-    local wbl, pc, shell = util.cdo(WBL), game.controller(), StaticFindObject(SHELL)
-    if not (wbl and util.valid(pc) and util.valid(shell)) then return false end
-    local w
-    pcall(function() w = wbl:Create(pc, shell, pc) end)
-    if not util.valid(w) then return false end
-    local tree = w.WidgetTree
-    local root = new("CanvasPanel", tree)
-    tree.RootWidget = root
-    local bg = new("Border", tree)
-    pcall(function() bg:SetBrushColor(ROW_BG) end)
-    pcall(function() bg:SetPadding({ Left = 0, Top = 0, Right = 0, Bottom = 0 }) end)
-    local btn = new("Button", tree)
-    pcall(function() btn:SetBackgroundColor({ R = 1, G = 1, B = 1, A = 0 }) end)
-    local font = look and look.font
-    pcall(function()
-        local cs = btn:SetContent(label(tree, "Rename", font, font and font.Size or 16))
-        cs:SetHorizontalAlignment(0)
-        cs:SetVerticalAlignment(2)
-        cs:SetPadding({ Left = 10, Top = 0, Right = 10, Bottom = 0 })
-    end)
-    pcall(function() bg:SetContent(btn) end)
-    pcall(function() bg:SetHorizontalAlignment(0); bg:SetVerticalAlignment(0) end)
-    local slot
-    pcall(function() slot = root:AddChildToCanvas(bg) end)
-    pcall(function()
-        slot:SetAutoSize(false)
-        if look then
-            slot:SetPosition({ X = look.pos.X + 0.0, Y = look.pos.Y + look.size.Y })
-            slot:SetSize({ X = look.size.X + 0.0, Y = look.row + 0.0 })
-        else
-            local mp = util.cdo(WLL):GetMousePositionOnViewport(pc)
-            slot:SetPosition({ X = mp.X + 0.0, Y = mp.Y - 44.0 })
-            slot:SetSize({ X = 200.0, Y = 38.0 })
-        end
-    end)
-    pcall(function() w:AddToViewport(60) end)
-    m.w, m.btn, m.bg, m.hover = w, btn, bg, false
-    return true
-end
-
-local function add_rename(self)
-    close_menu()
-    local item, canvas
-    pcall(function() item = self.CurrentItemRef end)
-    pcall(function() canvas = self.ContextMRef end)
-    if not (util.valid(item) and util.valid(canvas)) then return end
-    local uid = uid_of(item)
-    if not (uid and is_backpack(item) and mine(uid)) then return end
-    -- shown once the game's menu has been laid out (its size is known a frame or two later)
-    menu = { uid = uid, canvas = canvas, waited = 0.0 }
-end
-
-local function menu_tick(dt)
-    local m = menu
-    local open = false
-    pcall(function() open = util.valid(m.canvas) and m.canvas:IsInViewport() end)
-    if not m.w then
-        if not open then menu = nil; return end
-        m.waited = m.waited + (dt or 0)
-        local look = menu_look(m.canvas)
-        if look or m.waited > 0.4 then
-            if not show_rename(m, look) then menu = nil end
-        end
-        return
-    end
-    -- react on press: the game shuts its menu as soon as the mouse goes down outside it
-    local pressed, hov = false, false
-    pcall(function() pressed = m.btn:IsPressed() end)
-    pcall(function() hov = m.btn:IsHovered() end)
-    if pressed then
-        local uid = m.uid
-        close_menu()
-        pcall(function() m.canvas:RemoveFromParent() end)
-        open_popup(uid, nil)
-        return
-    end
-    if hov ~= m.hover then
-        m.hover = hov
-        pcall(function() m.bg:SetBrushColor(hov and ROW_HOVER or ROW_BG) end)
-    end
-    if not open and not hov then close_menu() end
-end
-
-local pending_menu = nil   -- the JigContextMenuComp that just got a right-click
-local function on_right_click(self) pending_menu = self end
-
 local noted_at = -100.0
 local hovered = nil   -- { uid, at }: the backpack under the mouse and when its tooltip last updated (F2 renames it)
 -- the hint goes at the end of the small description text, not next to the name
@@ -562,7 +429,6 @@ local move_fn = function(self, From, To, ItemUID, FinalRotation, ToIndex, ToCont
     util.safe(function() on_comp_move(From:get(), To:get(), ItemUID:get(), ToIndex:get(), ToContainer:get()) end, "names.move")
 end
 local COMP_MOVE = JIG_COMP .. ":Handle Comp to Comp Move"
-local menu_fn = function(self) util.safe(on_right_click, "names.menu", self:get()) end
 
 local enabled = true
 function names.init(c)
@@ -589,12 +455,6 @@ function names.tick(dt)
         noted_at = os.clock()
         names.note(my_comp())
     end
-    if pending_menu then
-        local comp = pending_menu
-        pending_menu = nil
-        if util.valid(comp) then util.safe(add_rename, "names.menu", comp) end
-    end
-    if menu then util.safe(menu_tick, "names.menu_tick", dt) end
     if popup then
         if clicked(popup.save) then commit(nil)
         elseif popup and popup.clear and clicked(popup.clear) then commit("")
@@ -603,7 +463,7 @@ function names.tick(dt)
 end
 
 names._open = function(uid) open_popup(uid) end  -- devtest
-function names.forget() close_menu(); pending_menu, clicks, where = nil, {}, {}; forget_hover(); close_popup() end
+function names.forget() clicks, where = {}, {}; forget_hover(); close_popup() end
 game.on_world_reset(names.forget)
 
 return names

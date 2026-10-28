@@ -58,9 +58,9 @@ local config = {
         split = {
             split_radius = 40000,    -- players further apart than this ...
             split_after = 10.0,      -- ... for this many seconds -> split
-            merge_radius = 30000,    -- closer than this -> merge (once the guest isn't fighting)
-            force_radius = 20000,    -- closer than this -> merge even mid-fight
-            quiet_radius = 6000,     -- no split while a host AI (or body) is this close to the guest
+            merge_radius = 30000,    -- closer than this -> merge (the guest's zombies are handed back first)
+            force_radius = 20000,    -- 4 players, a follower: closer than this -> stop following even mid-fight
+            quiet_radius = 6000,     -- guest: own AI alive this close = fighting (a follower waits for force_radius)
             ack_timeout = 10.0,      -- the guest must take over within this, else stay merged
             retry_after = 30.0,      -- after a failed or blocked attempt
             horde_radius = 25000,    -- an active horde beacon this close to the guest blocks / ends a split
@@ -90,7 +90,9 @@ local config = {
     camp_sync = true,          -- the guest gets the host's settlement camps (camps.lua)
     door_sync = true,
     power_sync = true,
-    audio_sync = true,
+    -- off: its GameplayStatics sound hooks also fire on worker threads (Niagara particle callbacks), where they wait
+    -- for the Lua lock while our Lua waits for that worker - a freeze (report 20261028-121715)
+    audio_sync = false,
     loot_sync = true,
     notify = true,
     mirror_drops = true,

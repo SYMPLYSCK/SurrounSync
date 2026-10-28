@@ -42,8 +42,18 @@ end
 
 local function name_matches(arg)
     if arg == "" then return true end
-    local peer = tostring(link.peer_name() or "")
-    return peer:lower() == arg:lower() or peer:lower():find(arg:lower(), 1, true) == 1
+    -- (any part of the name: nobody has to type "xX_K3YB0ARD_Xx" in full)
+    return tostring(link.peer_name() or ""):lower():find(arg:lower(), 1, true) ~= nil
+end
+
+-- the other players in this game, for the name tips
+local function player_names()
+    local l, out, seen = link.lobby and link.lobby(), {}, {}
+    if not l then return out end
+    local function add(n) if n and n ~= "" and n ~= l.name and not seen[n] then seen[n] = true; out[#out + 1] = n end end
+    if l.peer and l.peer.connected then add(l.peer.name) end
+    for _, p in ipairs(l.players or {}) do if p.state ~= "connecting" then add(p.name) end end
+    return out
 end
 
 -- Why the local player can't be moved to the other player right now (nil = fine).
@@ -209,6 +219,47 @@ local function other_copy(cmd, arg)
     return target
 end
 
+-- The chat commands (also shown as tips while typing "/", journal_tab.lua)
+local COMMANDS = {
+    { name = "goto", also = {}, tip = "/goto <player> - teleport to them (they accept)" },
+    { name = "bring", also = {}, tip = "/bring <player> - bring them to you (they accept)" },
+    { name = "accept", also = { "yes" }, tip = "/accept or /yes - accept a teleport" },
+    { name = "deny", also = { "no", "decline" }, tip = "/deny or /no - refuse a teleport" },
+}
+local LIST = "Commands: /goto <player>, /bring <player>, /accept, /deny"
+local SHORT = "Commands: /goto, /bring, /accept, /deny"
+
+-- the tip for what's typed so far: nil when it isn't a command
+function teleport.tip(text)
+    local word = tostring(text or ""):match("^/(%S*)")
+    if not word then return nil end
+    word = word:lower()
+    if word == "" then return SHORT end
+    local typed_all = tostring(text):find("%s") ~= nil   -- (past the command word: only an exact name counts)
+    -- "/goto <part of a name>": the players it fits
+    if typed_all and (word == "goto" or word == "bring") then
+        local part = (tostring(text):match("^/%S+%s+(.-)%s*$") or ""):lower()
+        local all, fit = player_names(), {}
+        for _, n in ipairs(all) do if part == "" or n:lower():find(part, 1, true) then fit[#fit + 1] = "/" .. word .. " " .. n end end
+        if #all == 0 then return "Nobody else is in this game right now." end
+        if #fit == 0 then return "No player matches \"" .. part:sub(1, 16) .. "\". Here: " .. table.concat(all, ", ") end
+        -- (one fit: what's typed is enough - say so, nobody has to finish the name)
+        if #fit == 1 and part ~= "" then return fit[1] .. "  - ready, press Enter" end
+        if part == "" then return table.concat(fit, "    ") .. "  - type part of a name" end
+        return table.concat(fit, "    ") .. "  - type more of the name"
+    end
+    local found = {}
+    for _, c in ipairs(COMMANDS) do
+        local names = { c.name }
+        for _, a in ipairs(c.also) do names[#names + 1] = a end
+        for _, n in ipairs(names) do
+            if (typed_all and n == word) or (not typed_all and n:sub(1, #word) == word) then found[#found + 1] = c.tip; break end
+        end
+    end
+    if #found == 0 then return "/" .. word:sub(1, 12) .. " isn't a command. " .. SHORT end
+    return found[1]
+end
+
 -- Handles a chat line starting with "/". Returns true when it was a command (not chat).
 function teleport.command(text)
     local cmd, arg = text:match("^/(%a+)%s*(.-)%s*$")
@@ -218,7 +269,7 @@ function teleport.command(text)
     if cmd == "accept" or cmd == "yes" then answer(true); return true end
     if cmd == "deny" or cmd == "decline" or cmd == "no" then answer(false); return true end
     if cmd ~= "goto" and cmd ~= "bring" then
-        say("Commands: /goto <player>, /bring <player>, /accept, /deny")
+        say(LIST)
         return true
     end
     if not hostrules.get("teleport") then say("The host turned teleports off for this world.", "warn"); return true end

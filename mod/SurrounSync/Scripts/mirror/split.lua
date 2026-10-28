@@ -5,18 +5,24 @@
 -- and sends them to the guest as copies. When the players are far apart that is a second populated area on the
 -- host's CPU. Split, the guest's own game runs the AI around the guest instead:
 --
---   host  merged -> splitting : players further apart than split_radius for split_after s, no host AI (or body)
---                               within quiet_radius of the guest, no horde/infestation fight there.
---                               Host blob "p8" = "s <epoch>".
---   guest                     : removes the host's copies, hands back the spawners the mod stopped, stops removing
---                               its own AI; answers "p8g" = "s <epoch> <fighting>".
+--   host  merged -> splitting : players further apart than split_radius for split_after s, no horde/infestation
+--                               fight there. Host blob "p8" = "s <epoch>".
+--   guest                     : takes the host's copies over where they stand (zombies.begin_handover: same actors,
+--                               their own AI again - nothing pops), hands back the spawners the mod stopped, stops
+--                               removing its own AI; answers "p8g" = "s <epoch> <fighting>".
 --   host  splitting -> split  : only on that answer: the ghost leaves the optimizer (the host despawns the AI around
 --                               the guest and spawns none there) and the host stops sending zombie snapshots.
 --                               No answer within ack_timeout -> stays merged (an older guest never answers).
---   host  split -> merged     : players within merge_radius (and the guest not fighting), within force_radius,
---                               a horde/infestation fight near the guest, the setting turned off or the guest gone.
---                               Ghost back in the optimizer, snapshots resume, "p8" = "m <epoch>".
---   guest                     : own AI near it (and bodies) are kept until done, the rest removed, copies return.
+--   host  split -> merging    : players within merge_radius (fighting or not). "p8" = "M <epoch>".
+--   guest                     : offers its zombies near it ("p8h", zombies.begin_handback), keeps running them.
+--   host  merging -> merged   : spawns its own zombie on each offered one's spot (one at a time, out of the host's
+--                               sight), then ghost back in the optimizer, snapshots resume, "p8" = "m <epoch>" plus
+--                               "H key id" per spawned zombie. Apart again first -> back to split; no offer within
+--                               2 x ack_timeout (older guest) -> merged anyway.
+--   host  split -> merged     : at once on a horde/infestation fight near the guest, the setting turned off or the
+--                               guest gone.
+--   guest                     : each taken zombie becomes the copy of its id where it stands (first snapshot with
+--                               it); the rest: bodies kept until done, others removed once off screen.
 --
 -- The host decides every switch; the guest only follows and answers. Kills, XP and loot of the guest's own AI are
 -- the guest's (as in its single player game) - nothing it does to them reaches the host's world.
@@ -114,14 +120,16 @@ end
 local function merge(why)
     local idx = ghost.exists() and ghost.set_invoker(true) or -1
     zombies.set_split(false)
+    -- zombies spawned for the guest's in a hand-back get their ids now (the merge resets them): "H key id"
+    local map = zombies.bind_taken()
     local was = state
     state, epoch, far_since, leader = "merged", epoch + 1, nil, nil
-    put("m " .. epoch)
+    put("m " .. epoch .. (map ~= "" and ("\n" .. map) or ""))
     if was == "following" then
         stats.merges = stats.merges + 1
         stats.last = why
         log.info(string.format("split: stopped following (%s) - the host runs the AI around the guest again (invoker %d)", why, idx))
-    elseif was == "split" then
+    elseif was == "split" or was == "merging" then
         stats.merges = stats.merges + 1
         stats.last = why
         measure = { at = now + 20.0, what = "after the merge", before = ghost.ai_count() }
@@ -130,6 +138,16 @@ local function merge(why)
     else
         log.info("split: split attempt cancelled (" .. why .. ")")
     end
+end
+
+-- Players close again: the guest hands its zombies back first (zombies.begin_taking / take_offer), so nothing pops
+-- when the host's AI returns. Fights, the setting and a guest who left still merge at once.
+local merge_why, offered, merging_tick = nil, false, nil
+local function begin_merge(why)
+    state, epoch, asked_at, eval_in, merge_why, offered = "merging", epoch + 1, now, 0.25, why, false
+    zombies.begin_taking()
+    put("M " .. epoch)
+    log.info(string.format("split: %s - asking the guest to hand its zombies back first (epoch %d)", why, epoch))
 end
 
 local function host_tick(dt)
@@ -153,15 +171,16 @@ local function host_tick(dt)
     local urgent = state ~= "merged" and require("mirror.infest").guest_hit_age() < 1.0
     eval_in = eval_in - dt
     if eval_in > 0 and not urgent then return end
-    eval_in = (state == "splitting" or state == "asking") and 0.25 or 1.0
+    eval_in = (state == "splitting" or state == "asking" or state == "merging") and 0.25 or 1.0
     read_guest()
     local d, gl, dh = players_apart()
     if not d then return end
     local why = blocked(gl)
     local c = sp()
     if state == "merged" then
-        local near, age = zombies.near_guest()
-        local quiet = age < 2.0 and near >= c.quiet_radius
+        -- (zombies near the guest no longer block a split: the guest takes them over where they stand)
+        local _, age = zombies.near_guest()
+        local live = age < 2.0
         -- near a split guest (lower slot), far from the host: follow it - its game runs the AI here too
         local lead_m = not why and dh > c.split_radius and now >= retry_at and find_leader(gl)
         if lead_m then
@@ -172,7 +191,7 @@ local function host_tick(dt)
                 dh / 100, leader, epoch))
             return
         end
-        if d > c.split_radius and not why and quiet then
+        if d > c.split_radius and not why and live then
             far_since = far_since or now
         else
             far_since = nil
@@ -225,22 +244,48 @@ local function host_tick(dt)
             ghost.set_invoker(false)
             stats.reout = stats.reout + 1
         end
+    elseif state == "merging" then
+        if ghost.invoker_index() >= 0 then ghost.set_invoker(false) end
+        merging_tick(d, why)
     else
         if ghost.invoker_index() >= 0 then
             -- a respawned ghost (after a save) registers itself again
             ghost.set_invoker(false)
             stats.reout = stats.reout + 1
         end
+        -- (a fight no longer holds the merge back: the guest's zombies are handed back where they stand)
         if why then merge(why)
-        elseif d < c.force_radius then merge(string.format("players %.0f m apart", d / 100))
-        elseif d < c.merge_radius and not guest_fighting then merge(string.format("players %.0f m apart", d / 100))
+        elseif d < c.merge_radius then
+            begin_merge(string.format("players %.0f m apart%s", d / 100, guest_fighting and ", mid-fight" or ""))
         end
+    end
+end
+
+-- host, state "merging": spawn the guest's offered zombies here (one at a time), then merge
+merging_tick = function(d, why)
+    local c = sp()
+    local body = link.get_blob("p8h")
+    if body and tonumber(body:match("^(%d+)")) == epoch then
+        zombies.take_offer(body)
+        offered = true
+    end
+    if why then merge(why)
+    elseif d > c.split_radius then
+        -- apart again before the hand-back finished: stay split (the guest never stopped running its AI)
+        zombies.cancel_taking()
+        state, epoch, offered = "split", epoch + 1, false
+        put("s " .. epoch)
+        log.info("split: players apart again - hand-back called off, still split")
+    elseif offered and zombies.taking_done() then merge(merge_why)
+    elseif now - asked_at > c.ack_timeout * 2 then merge(merge_why .. ", hand-back not finished in time")
     end
 end
 
 -- Guest -------------------------------------------------------------------------------------------------
 
 local host_want, host_epoch, host_leader = "m", 0, nil
+local handed_epoch = {}   -- split epochs this guest already started a hand-over for
+local offered_epoch = nil -- the merge epoch whose hand-back this guest is offering
 local answer_in = 0.0
 local was_in = false
 
@@ -262,6 +307,16 @@ local function guest_tick(dt)
     if body then
         local s, e, l = body:match("^(%a) (%d+) ?(%d*)")
         if s then host_want, host_epoch, host_leader = s, tonumber(e), tonumber(l) end
+        -- the merge after a hand-back carries the host's ids for my offered zombies
+        if s == "m" and zombies.is_split() then zombies.finish_handback(body) end
+    end
+    -- the host asks for my zombies before merging: offer them, stay split meanwhile
+    if host_want == "M" and zombies.is_split() and offered_epoch ~= host_epoch then
+        offered_epoch = host_epoch
+        zombies.begin_handback(host_epoch)
+    elseif host_want == "s" and offered_epoch then
+        offered_epoch = nil
+        zombies.cancel_handback()
     end
     -- group split: ask the leader's copy to show its AI here; the host hears "f" once the leader confirmed
     local follow, acked = host_want == "f", false
@@ -277,7 +332,15 @@ local function guest_tick(dt)
             or "the host runs the AI around me again", host_epoch))
         if acked then stats.splits = stats.splits + 1 else stats.merges = stats.merges + 1 end
     end
-    local want = host_want == "s"
+    if host_want == "m" then offered_epoch = nil end
+    local want = host_want == "s" or (host_want == "M" and zombies.is_split())
+    -- the host's zombies here become mine where they stand first (zombies.begin_handover); only then split
+    if want and not zombies.is_split() and not zombies.handing() and not handed_epoch[host_epoch] then
+        handed_epoch[host_epoch] = true
+        zombies.begin_handover()
+    end
+    if want and not zombies.handover_done() then want = false end
+    if not want and host_want ~= "s" and zombies.handing() then zombies.cancel_handover() end
     if want ~= zombies.is_split() then
         zombies.set_split(want)
         local n = zombies.own_count()
@@ -318,6 +381,8 @@ local function forget_world()
     state, far_since, gone_since, sent, measure = "merged", nil, nil, nil, nil
     guest_state, guest_epoch, guest_fighting = "m", -1, false
     host_want, was_in = "m", false
+    -- (zombies.lua drops its hand-back state itself: nothing of the old world is touched here)
+    merge_why, offered, offered_epoch, handed_epoch = nil, false, nil, {}
 end
 
 function split.init(c, r, s)

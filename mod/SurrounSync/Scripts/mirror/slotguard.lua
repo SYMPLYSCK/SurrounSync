@@ -308,6 +308,24 @@ function slotguard.copy_character_home(coop, own)
     return "copied"
 end
 
+-- A new save the game's Save menu started while joined: the game writes its thumbnail into the new slot before
+-- the save itself is sent to the co-op slot (session.lua firewall), and the load list then showed a save that
+-- can't be loaded. Only a non-co-op slot without any save data goes: its thumbnail, then the folder if that
+-- left it empty.
+function slotguard.drop_stray(slot)
+    if not slotguard.valid_name(slot) or slotguard.is_coop(slot) then
+        return refuse("drop_stray", tostring(slot) .. " is not a stray new save")
+    end
+    if has_saves(slot) or savefs.exists(dir(slot) .. "\\General.sav") or savefs.exists(dir(slot) .. "\\PlayerInfo.sav") then
+        return refuse("drop_stray", slot .. " holds a save - left alone")
+    end
+    if not savefs.dir_exists(dir(slot)) then return false end
+    os.remove(dir(slot) .. "\\Thumb.sav")
+    local ok = savefs.rmdir_empty(dir(slot))
+    log.info("slotguard: " .. (ok and "removed" or "couldn't remove (not empty)") .. " the empty new save " .. slot)
+    return ok
+end
+
 function slotguard.purge(coop)
     if not slotguard.is_coop(coop) then refuse("purge", tostring(coop) .. " is not a co-op save"); return 0 end
     if slotguard.foreign(coop) then refuse("purge", coop .. " holds a save SurrounSync didn't make - left alone"); return 0 end

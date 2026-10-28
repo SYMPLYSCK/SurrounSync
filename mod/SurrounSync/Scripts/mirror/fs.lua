@@ -10,7 +10,15 @@ end
 
 function fs.read(path)
     local f = io.open(path, "rb")
-    if not f then return nil end
+    if not f then
+        -- a crash between fs.write's remove and rename leaves only the finished new copy
+        f = io.open(path .. ".new", "rb")
+        if not f then return nil end
+        local s = f:read("*a")
+        f:close()
+        os.rename(path .. ".new", path)
+        return s
+    end
     local s = f:read("*a")
     f:close()
     return s
@@ -27,11 +35,15 @@ function fs.write(path, data)
         require("mirror.log").error("fs: refused a write into a save folder (use slotguard): " .. path)
         return false
     end
-    local f = io.open(path, "wb")
+    -- whole file or the old one: a crash mid-write (truncate + write) emptied the beds / bag owners / Realm sidecars
+    local tmp = path .. ".new"
+    local f = io.open(tmp, "wb")
     if not f then return false end
-    f:write(data)
-    f:close()
-    return true
+    local ok = f:write(data) ~= nil
+    ok = f:close() and ok
+    if not ok then os.remove(tmp); return false end
+    os.remove(path) -- (Windows rename doesn't replace)
+    return os.rename(tmp, path) == true
 end
 
 function fs.copy(src, dst)

@@ -5,7 +5,7 @@
 import os, random, shutil, sys, tempfile
 
 try:
-    from lupa import LuaRuntime
+    from lupa.lua54 import LuaRuntime   # the game's Lua (plain `lupa` is the newest, 5.5 - other semantics)
 except ImportError:
     print("needs lupa (Lua 5.4 for Python): pip install --target <dir> lupa, then set PYTHONPATH=<dir>")
     sys.exit(2)
@@ -80,6 +80,13 @@ def link_blob_comes_back_after_reset():
         body = body[:body.index("\nend\n")]
         check('link.reset_blob("hello")' in body and 'link.reset_blob("look")' in body,
               "phase1 reset_link_state resets the hello + look blobs")
+        # audit N43: compat.reset forgets the friend's mod list - its unchanged "mods" blob must come back too
+        check('link.reset_blob("mods")' in body and 'link.reset_blob("light")' in body,
+              "phase1 reset_link_state resets the mods + light blobs")
+        # audit N42: a rejoin's unchanged host bed came back nil -> random start respawn
+        ses = open(os.path.join(SCRIPTS, "mirror", "session.lua"), encoding="utf-8").read()
+        j = ses.index('link.reset_blob("joincut")')
+        check('link.reset_blob("hostbed")' in ses[j:j + 200], "a join resets the hostbed blob with world/joincut")
         bye = src[src.index('local bye = link.get_blob("bye")'):]
         bye = bye[:bye.index('" stopped hosting."')]
         check(bye.index('session.state() == "joined"') < bye.index("said < opened_at"),
@@ -1724,6 +1731,52 @@ def loot_asks_the_host_again_on_every_reopen():
     check(L.eval("qs()") == 2, "an open right after (the redraw itself) doesn't ask again")
 
 
+def loot_first_open_never_undoes_a_take_the_host_has_not_acked(take=True):
+    # an older host list (host lagging / gone a while) was taken over 0.3 s after the first open even when the
+    # guest had taken something in between: the list still held it, so it came back - the item existed twice
+    print("loot_first_open_never_undoes_a_take_the_host_has_not_acked" + ("" if take else " (control: no take)"))
+    L = loot_guest()
+    L.execute(r"""
+        open()
+        ID = SENT[1] and SENT[1]:match("^Q (%S+)$")
+        package.loaded["mirror.loot"] = nil
+        loot = require("mirror.loot")
+        loot.init({}, "guest", { in_world = function() return true end })
+        loot.tick(0.1)
+        SENT = {}
+        INBOX.lootc = { "C " .. tostring(ID) .. " 0 stale" }
+        loot.tick(0.1)
+        for i = 1, 40 do loot.tick(0.1) end
+        BEFORE = APPLIED
+        open()
+        PUMP.BP_JigMultiplayer = COMP
+    """)
+    if take:
+        L.execute(r"""
+            HOOKS["/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C:JigMP_OnItemRemoved"](
+                { get = function() return PUMP end }, { get = function() return "G1" end })
+        """)
+    L.execute(r"""
+        for i = 1, 5 do loot.tick(0.1) end
+        STALE = APPLIED - BEFORE
+        TAKES = 0
+        for _, p in ipairs(SENT) do if p:match("^%S+ G1 0 %d+") then TAKES = TAKES + 1 end end
+        INBOX.lootc = { "C " .. tostring(ID) .. " 9 acked" }
+        loot.tick(0.1)
+    """)
+    if not take:
+        check(L.eval("STALE") == 1, "control: with no take, the host's list is taken over 0.3 s after the first open")
+        return
+    check(L.eval("TAKES") == 1, "the take was sent (%d)" % L.eval("TAKES"))
+    check(L.eval("STALE") == 0, "the older host list (no ack for the take yet) is NOT taken over after the first open "
+          "- it would bring the taken item back (%d)" % L.eval("STALE"))
+    check(L.eval("LAST") == "acked", "the host's next list, which has the take, is taken over (%s)" % L.eval("LAST"))
+
+
+def loot_first_open_takes_over_an_older_list_without_takes():
+    loot_first_open_never_undoes_a_take_the_host_has_not_acked(take=False)
+
+
 def loot_take_without_a_uid_pairing_finds_the_item():
     print("loot_take_without_a_uid_pairing_finds_the_item")
     L = loot_guest()
@@ -1779,7 +1832,16 @@ def loot_take_for_a_container_the_host_lacks_is_kept():
         R0 = #SENT
         for i = 1, 6100 do loot.tick(0.1) end
         R1 = SENT[1]
+        -- audit N14: a take has no refund - after 10 min it still waits and is applied when the container comes
+        TAKEN = {}
+        INBOX.loot = { ID .. " G1 0 6 /Game/X.DA_Bandage" }
+        loot.tick(0.1)
+        for i = 1, 6100 do loot.tick(0.1) end
+        FOUND = true
+        for i = 1, 12 do loot.tick(0.1) end
+        LATE = TAKEN[1]
     """)
+    check(L.eval("LATE") == "G1:3", "a take whose container comes after 10 min is still applied (%s)" % L.eval("LATE"))
     check(L.eval("BEFORE") == 0, "container not here: the take isn't lost, just waits")
     check(L.eval("AFTER") == "G1:3", "the container shows up: the take is applied (%s)" % L.eval("AFTER"))
     check(L.eval("ONCE") == 1, "and only once (%d)" % L.eval("ONCE"))
@@ -1803,6 +1865,7 @@ def same_moment_container_takes_keep_one_copy():
         CONT = {}
         INV = { { uid = "P5", da = "/Game/X.DA_Bandage", count = 3 } }
         HOOKS["/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C:JigMP_OnItemRemoved"]({ get = function() return PUMP end }, { get = function() return "G1" end })
+        loot.tick(0.01)   -- (removals go out the next frame: audit N44, uiremove)
         TAKE = nil
         for _, p in ipairs(SENT) do if p:find("^" .. ID:gsub("%p", "%%%0") .. " G1 0") then TAKE = p end end
         GAVE = {}
@@ -1938,9 +2001,11 @@ def one_take_fires_both_removed_hooks_and_is_sent_once():
         HOOKS[C .. ":JigMP_OnItemRemoved"](a, u)
         HOOKS[C .. ":JigMP_OnMainContainerItemRemoved"](a, nil, u)
         function takes() local n = 0; for _, p in ipairs(SENT) do if p:find(" G1 0 ", 1, true) then n = n + 1 end end; return n end
+        loot.tick(0.01)   -- (removals go out the next frame: audit N44, uiremove)
         ONCE = takes()
         loot.tick(1.0)
         HOOKS[C .. ":JigMP_OnItemRemoved"](a, u)
+        loot.tick(0.01)
         LATER = takes()
     """)
     check(L.eval("ONCE") == 1, "both hooks for one take send it once (%d)" % L.eval("ONCE"))
@@ -1997,6 +2062,209 @@ def item_used_out_of_a_container_is_a_take():
     # Buildable_DisassemblyWorkbench inherits Buildable_MASTER's JigMP_OnItemConsumed (output + input kept on 0.13.2)
     check(L.eval('HOOKS["/Game/Blueprints/BuildingSystem/Actors/Buildable_MASTER.Buildable_MASTER_C:JigMP_OnItemConsumed"] ~= nil'),
           "a disassembly bench's consumed input is hooked (Buildable_MASTER)")
+
+
+def player_rip_in_a_container_is_a_take():
+    # report 20261027-205518 (0.13.7): a guest's rips/reads in a shared bin came back 6x - a player's consume fires
+    # JigMP_OnItemConsumed on the PLAYER (HandleLocalRequestConsumeItem calls it on the asking comp's owner), never on
+    # the container; only the container comp's HandleLocalRequestConsumeItem says which container
+    print("player_rip_in_a_container_is_a_take")
+    L = loot_guest()
+    L.execute(r"""
+        PUMP.BP_JigMultiplayer = COMP
+        package.loaded["mirror.jig"].contents_of = function(c) return CONT end
+        CONT = { { uid = "G1", da = "/Game/X.DA_BlackShirt", count = 1 }, { uid = "G2", da = "/Game/X.DA_Book", count = 1 } }
+        open(); loot.tick(0.1)
+        ID = SENT[1]:match("^Q (%S+)$")
+        INBOX.lootc = { "C " .. ID .. " 0 one" }
+        loot.tick(0.1)
+        CONT = { { uid = "G2", da = "/Game/X.DA_Book", count = 1 } }
+        function takes(u) local n = 0; for _, p in ipairs(SENT) do if p:find(" " .. u .. " 0 ", 1, true) then n = n + 1 end end; return n end
+        local H = HOOKS["/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:HandleLocalRequestConsumeItem"]
+        HOOKED = H ~= nil
+        H({ get = function() return COMP end }, { get = function() return "G1" end })
+        loot.tick(0.1)
+        AFTER = takes("G1")
+        -- one consume seen by the container's own event too (a bench consuming its own input): one take
+        CONT = {}
+        HOOKS["/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C:JigMP_OnItemConsumed"]({ get = function() return PUMP end },
+            { get = function() return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = "G2" } end })
+        H({ get = function() return COMP end }, { get = function() return "G2" end })
+        loot.tick(0.1)
+        BOTH = takes("G2")
+    """)
+    check(L.eval("HOOKED") is True, "the container component's HandleLocalRequestConsumeItem is hooked")
+    check(L.eval("AFTER") == 1, "a player's rip inside a shared container is sent as a take (%d)" % L.eval("AFTER"))
+    check(L.eval("BOTH") == 1, "the container's own event and the component hook for one consume send one take (%d)" % L.eval("BOTH"))
+
+
+def lights_come_back_on_a_respawned_ghost():
+    # audit N37: get_blob hands out the light blob only when it changes - every save respawns the ghost, which stayed dark
+    print("lights_come_back_on_a_respawned_ghost")
+    L = lua()
+    L.execute(r"""
+        package.loaded["mirror.log"] = setmetatable({}, { __index = function() return function() end end })
+        package.loaded["mirror.util"] = { valid = function(o) return type(o) == "table" end,
+            safe = function(fn, _, ...) return fn(...) end, cdo = function() return nil end, rot = function() return {} end }
+        StaticFindObject = function() return nil end
+        function light()
+            local fl = { Intensity = 0, AttenuationRadius = 0 }
+            function fl:SetIntensity(v) self.Intensity = v end
+            function fl:SetAttenuationRadius(v) self.AttenuationRadius = v end
+            function fl:SetLightFunctionMaterial() end
+            function fl:K2_SetWorldRotation() end
+            return fl
+        end
+        ME = { Flashlight = light() }
+        package.loaded["mirror.game"] = { player = function() return ME end }
+        GEN, GHOST = 1, { Flashlight = light(), K2_GetActorLocation = function() return {} end }
+        package.loaded["mirror.ghost"] = { get = function() return GHOST end, generation = function() return GEN end }
+        PENDING = "800.0 1500 -"
+        package.loaded["mirror.link"] = { put_blob = function() end,
+            get_blob = function(n) if n == "light" then local b = PENDING; PENDING = nil; return b end end }
+        package.loaded["mirror.audio"] = { attenuation_for = function() return nil end }
+        lights = require("mirror.lights")
+        lights.tick(0.3, nil)
+        FIRST = GHOST.Flashlight.Intensity
+        GEN, GHOST = 2, { Flashlight = light(), K2_GetActorLocation = function() return {} end }
+        for _ = 1, 5 do lights.tick(0.3, nil) end
+        AFTER = GHOST.Flashlight.Intensity
+    """)
+    check(L.eval("FIRST") == 800, "the other player's light is on on the first ghost (%s)" % L.eval("FIRST"))
+    check(L.eval("AFTER") == 800, "after a ghost respawn with an unchanged blob the light is still on (%s)" % L.eval("AFTER"))
+
+
+def perf_run_puts_the_outer_step_back():
+    # audit N30: after fire.tick's sub-timers the crash step stayed "f.hurts" for the rest of fire.tick
+    print("perf_run_puts_the_outer_step_back")
+    L = lua()
+    L.execute(r"""
+        package.loaded["mirror.log"] = setmetatable({}, { __index = function() return function() end end })
+        CUR = nil
+        package.loaded["mirror.crumb"] = { at = function(s) CUR = s end, current = function() return CUR end }
+        perf = require("mirror.perf")
+        perf.frame_begin()
+        perf.run("fire", function() perf.run("f.hurts", function() end); IN = CUR end)
+        AFTER = CUR
+        perf.run("pose", function() end)
+        TOP = CUR
+    """)
+    check(L.eval("IN") == "fire", "after a nested run the outer step is back (%s)" % L.eval("IN"))
+    check(L.eval("TOP") == "pose", "a top-level run leaves its own step (%s)" % L.eval("TOP"))
+
+
+def fs_write_is_whole_or_old():
+    # audit N45: fs.write was truncate + write - a crash mid-write emptied beds / bag owners / Realm sidecars
+    print("fs_write_is_whole_or_old")
+    d = tempfile.mkdtemp()
+    try:
+        L = lua()
+        p = os.path.join(d, "beds.txt").replace("\\", "/")
+        L.execute('fs = require("mirror.fs"); P = ...', p)
+        check(L.eval('fs.write(P, "one\\n")') is True and L.eval("fs.read(P)") == "one\n", "a write returns true and reads back")
+        check(L.eval('fs.write(P, "two\\n")') is True and L.eval("fs.read(P)") == "two\n" and not os.path.exists(p + ".new"),
+              "a rewrite replaces the file and leaves no .new")
+        os.remove(p)
+        with open(p + ".new", "wb") as f: f.write(b"three\n")
+        check(L.eval("fs.read(P)") == "three\n" and os.path.exists(p), "a crash after remove (only .new left) is recovered on read")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def utf8_cut_never_splits_a_character():
+    # audit: chat cut a long Cyrillic/emoji line mid-character (200 bytes)
+    print("utf8_cut_never_splits_a_character")
+    L = lua()
+    L.execute(r"""
+        util = require("mirror.util")
+        local s = string.rep("\208\191\209\128", 120) .. "\240\159\152\128"   -- 2-byte letters + a 4-byte emoji
+        local c = util.utf8_cut(s, 201)
+        ODD, VALID = #c, utf8.len(c) ~= nil
+        SHORT = util.utf8_cut("abc", 200) == "abc"
+        EMOJI = util.utf8_cut("ab\240\159\152\128", 4) == "ab"
+    """)
+    check(L.eval("ODD") == 200 and L.eval("VALID"), "a cut at an odd byte drops the half letter (%d bytes)" % L.eval("ODD"))
+    check(L.eval("SHORT"), "a short text is kept")
+    check(L.eval("EMOJI"), "a cut inside an emoji drops the whole emoji")
+
+
+def ui_no_room_removal_is_not_a_take():
+    # audit N44: when the container UI can't place an item, the game removes it via comp.SERVER_RequestRemoveItem(comp, ..)
+    # -> HandleLocalRequestConsumeItem + the container's JigMP_OnItemConsumed - a take sent for it deleted the host's item
+    print("ui_no_room_removal_is_not_a_take")
+    L = loot_guest()
+    L.execute(r"""
+        PUMP.BP_JigMultiplayer = COMP
+        package.loaded["mirror.jig"].contents_of = function(c) return CONT end
+        CONT = { { uid = "G1", da = "/Game/X.DA_BlackShirt", count = 1 }, { uid = "G2", da = "/Game/X.DA_Book", count = 1 } }
+        open(); loot.tick(0.1)
+        ID = SENT[1]:match("^Q (%S+)$")
+        INBOX.lootc = { "C " .. ID .. " 0 one" }
+        loot.tick(0.1)
+        function takes(u) local n = 0; for _, p in ipairs(SENT) do if p:find(" " .. u .. " 0 ", 1, true) then n = n + 1 end end; return n end
+        local P = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:"
+        local R, H = HOOKS[P .. "SERVER_RequestRemoveItem"], HOOKS[P .. "HandleLocalRequestConsumeItem"]
+        local E = HOOKS["/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C:JigMP_OnItemConsumed"]
+        HOOKED = R ~= nil
+        local comp = { get = function() return COMP end }
+        CONT = { { uid = "G2", da = "/Game/X.DA_Book", count = 1 } }
+        -- the order seen in-game (kit 2026-10-27): UE4SS runs a Blueprint "pre" hook after the body, so the inner
+        -- consume / removed hooks fire first and the SERVER_RequestRemoveItem marker last
+        H(comp, { get = function() return "G1" end })
+        E({ get = function() return PUMP end }, { get = function() return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = "G1" } end })
+        HOOKS["/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C:JigMP_OnItemRemoved"]({ get = function() return PUMP end }, { get = function() return "G1" end })
+        R(comp, comp, { get = function() return "G1" end })
+        loot.tick(0.1)
+        UI = takes("G1")
+        -- a remove request from ANOTHER component is not the UI path: the rip after it is still a take
+        local other = obj({})
+        CONT = {}
+        R(comp, { get = function() return other end }, { get = function() return "G2" end })
+        H(comp, { get = function() return "G2" end })
+        loot.tick(0.1)
+        RIP = takes("G2")
+    """)
+    check(L.eval("HOOKED") is True, "SERVER_RequestRemoveItem is hooked")
+    check(L.eval("UI") == 0, "the UI's no-room removal sends no take (%d)" % L.eval("UI"))
+    check(L.eval("RIP") == 1, "a rip after another comp's remove request is still a take (%d)" % L.eval("RIP"))
+
+
+def crumb_keeps_the_last_64_steps():
+    # 2026-10-27: one crash step alone didn't explain a guest's freezes - mirror_steps.txt keeps the last 64, in order
+    print("crumb_keeps_the_last_64_steps")
+    d, old = tempfile.mkdtemp(), os.getcwd()
+    os.chdir(d)
+    try:
+        L = lua()
+        L.execute(r"""
+            package.loaded["mirror.crumb"] = nil
+            local crumb = require("mirror.crumb")
+            crumb.start()
+            for i = 1, 70 do crumb.at("step " .. i) end
+            crumb.at("step 70")
+        """)
+        raw = open("mirror_steps.txt", "rb").read()
+        rows = [r for r in raw.split(b"\n") if r.strip()]
+        seqs = sorted(int(r.split()[0]) for r in rows)
+        check(len(raw) == 64 * 100, "64 fixed-width slots (%d bytes)" % len(raw))
+        check(seqs == list(range(7, 71)), "the newest 64 steps are kept (%s..%s)" % (seqs[0], seqs[-1]))
+        newest = [r for r in rows if r.split()[0] == b"70"][0]
+        check(newest.rstrip().endswith(b"step 70"), "each line ends in its step (%r)" % newest[:60])
+        check(open("mirror_step.txt").read().rstrip().endswith("step 70"), "mirror_step.txt still holds the current step")
+        L.execute(r"""
+            -- (a new game run: the last run's files are closed - Windows can't rename an open file)
+            package.loaded["mirror.crumb"] = nil
+            collectgarbage(); collectgarbage()
+            local crumb = require("mirror.crumb")
+            PREV = crumb.start()
+            crumb.at("next run")
+        """)
+        check(os.path.exists("mirror_steps.1.txt") and len(open("mirror_steps.1.txt", "rb").read()) == 64 * 100,
+              "the last run's steps are kept as mirror_steps.1.txt")
+        check(str(L.eval("PREV")).rstrip().endswith("step 70"), "the last run's final step is still reported at start")
+    finally:
+        os.chdir(old)
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def unanswered_join_keeps_the_friends_list():
@@ -2221,6 +2489,63 @@ def bags_are_never_consumed_and_twin_grids_are_counted():
     check(L.eval("OK1") is False and L.eval("ERR1") is not None, "a bag that can't be removed whole is reported, not taken")
     check(L.eval("OK2") is True, "a bag removed whole is taken")
     check(L.eval("#CONSUMED") == 1 and L.eval("CONSUMED[1]") == 2, "only the plain item was ever consumed")
+
+
+def twin_compartments_are_merged_into_one():
+    # old saves: a bag compartment that exists twice (left by bags consumed in older versions) - items in the
+    # one the UI doesn't show were invisible. Its items move into the other, the empty twin is detached.
+    print("twin_compartments_are_merged_into_one")
+    L = lua()
+    L.execute(FAKES + r"""
+        local ITEMS, INFO = "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B", "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
+        local ITEM_ID, UID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848", "UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"
+        C_IN, C_INDEX = "InContainerUID_24_D1504ED7438699C73EA046AD734E79BF", "ContainerIndex_22_9A211B86466A9D1C57E1FC839A5B0896"
+        REP, COLS, ROWS = "ReplicationUID_23_EB27D09649B6E02591DCA98708B06332", "Columns_4_1D84448048078D988999ABA138CE1809", "Rows_6_78B4BC5B449017D63758E79844375AE9"
+        function arr(t) return { t = t, GetArrayNum = function(self) return #self.t end,
+            ForEach = function(self, fn) for i, v in ipairs(self.t) do fn(i, { get = function() return v end }) end end } end
+        local function g(a) return { A = a, B = 0, C = 0, D = 0 } end
+        function item(u, da) return { [UID] = g(u), [INFO] = { [ITEM_ID] = { GetFullName = function() return "DA " .. da end },
+            Count_8_DD79AF2A46126A338C8DCCB4616D91CD = 1, Durability_22_A3557C454274D193D47AB9B71FB0C0CA = { X = 0, Y = 0 } } } end
+        function grid(rep, holder, idx, cols, rows, items)
+            return { [REP] = g(rep), [C_IN] = g(holder), [C_INDEX] = idx, [COLS] = cols, [ROWS] = rows, [ITEMS] = arr(items) }
+        end
+        function setup(cap)
+            GRIDS = {
+                grid(100, 0, 0, 4, 4, { item(1, "/Game/I.DA_Backpack") }),          -- main: the bag
+                grid(101, 1, 0, 2, 2, { item(2, "/Game/I.DA_Can") }),               -- shown compartment
+                grid(102, 1, 1, 2, 2, {}),                                          -- its other slot (no twin)
+                grid(103, 1, 0, 2, 2, { item(3, "/Game/I.DA_Pills"), item(4, "/Game/I.DA_Nails") }), -- twin
+            }
+            COMP = obj({ MainJigContainers = arr(GRIDS) })
+            COMP.HandleSameContainerMoveToIndex = function(self, guid, to, idx, rot, by, z)
+                local dst
+                for _, ct in ipairs(GRIDS) do if ct[REP].A == to.A then dst = ct end end
+                if #dst[ITEMS].t >= (cap or dst[COLS] * dst[ROWS]) then return end
+                for _, ct in ipairs(GRIDS) do
+                    for i, it in ipairs(ct[ITEMS].t) do
+                        if it[UID].A == guid.A then table.remove(ct[ITEMS].t, i); table.insert(dst[ITEMS].t, it); return end
+                    end
+                end
+            end
+        end
+        jig = require("mirror.jig")
+        setup()
+        M, D, LEFT = jig.merge_twins(COMP)
+        TWINS = jig.twin_grids(COMP)
+        function holders() local o = {} for _, ct in ipairs(GRIDS) do o[#o + 1] = ct[C_IN].A .. "/" .. #ct[ITEMS].t .. "/" .. ct[COLS] end return table.concat(o, " ") end
+        H1, N1 = holders(), #jig.contents_of(COMP)
+        setup(2)   -- the twin holding the most is kept, but the shown one has room for only 2: one item stays
+        M2, D2, LEFT2 = jig.merge_twins(COMP)
+        H2, N2 = holders(), #jig.contents_of(COMP)
+    """)
+    check(L.eval("M") == 1 and L.eval("D") == 1 and L.eval("LEFT") == 0,
+          "the smaller twin's item moves into the twin holding the most, the empty one is detached (%s %s %s)" % (L.eval("M"), L.eval("D"), L.eval("LEFT")))
+    check(L.eval("TWINS") == 0, "no compartment exists twice afterwards")
+    check(L.eval("H1") == "0/1/4 1/0/0 1/0/2 1/3/2".replace("1/0/0", "1397639507/0/0"),
+          "the bag keeps one compartment per slot with all 3 items, the old twin is empty, 0x0 and belongs to no item (%s)" % L.eval("H1"))
+    check(L.eval("N1") == 4, "no item lost or added (%d)" % L.eval("N1"))
+    check(L.eval("M2") == 0 and L.eval("D2") == 0 and L.eval("LEFT2") == 1 and L.eval("N2") == 4,
+          "no room: the item stays where it was and its twin is kept, nothing lost (%s %s %s, %s)" % (L.eval("M2"), L.eval("D2"), L.eval("LEFT2"), L.eval("H2")))
 
 
 def beds_get_a_rename_row_and_shared_names():
@@ -2511,6 +2836,19 @@ def throws_and_mines_reach_the_other_game():
         builds.tick(0.1)
     """)
     check(L.eval('COPY.dead') and L.eval('BOOMS') == 1, "the other game's mine shows the explosion and is removed")
+    # Turret pick-up: OnInteractBuildable's hook runs after the turret destroyed itself (place reads 0,0,0) - without
+    # the place from its BeginPlay nothing was sent and the other game kept its copy (placed again near it: two
+    # turrets stacked there, DBG-20261027-004)
+    L.execute(r"""
+        TUR = actor("Buildable_Turret_C", 5000)
+        HOOKS["Buildable_Turret_C:ReceiveBeginPlay"](P(TUR))
+        TUR.dead = true
+        SENT = {}
+        HOOKS["Buildable_Turret_C:OnInteractBuildable"](P(TUR))
+    """)
+    sent = list(L.eval('SENT').values())
+    check(any(m == "builds:R Buildable_Turret_C@500,0,0" for m in sent),
+          "a picked-up turret is sent with its place even when the hook only runs after it is gone (%s)" % sent)
 
 
 def map_pings_reach_the_other_game():
@@ -3540,7 +3878,21 @@ SPLIT_FAKES = r"""
     GHOST, INV, AI = true, 0, 40
     GL, HL = { X = 0, Y = 0, Z = 0 }, { X = 0, Y = 0, Z = 0 }
     package.loaded["mirror.zombies"] = { set_split = function(on) SPLIT = on end, is_split = function() return SPLIT end, is_follow = function() return FOLLOW == true end, set_follow = function(on) FOLLOW = on end,
-        guest_busy = function() return FIGHT end, near_guest = function() return NEAR, 0.5 end, own_count = function() return 7 end }
+        guest_busy = function() return FIGHT end, near_guest = function() return NEAR, 0.5 end, own_count = function() return 7 end,
+        -- hand-over: HANDOVER_TICKS guest ticks until every copy is taken over (0 = none to take)
+        begin_handover = function() HANDED = (HANDED or 0) + 1; HANDING = HANDOVER_TICKS or 0 end,
+        handing = function() return (HANDING or 0) > 0 end,
+        handover_done = function() if (HANDING or 0) > 0 then HANDING = HANDING - 1 end; return (HANDING or 0) == 0 end,
+        cancel_handover = function() CANCELLED = (CANCELLED or 0) + 1; HANDING = 0 end,
+        -- hand-back: the host spawns what the guest offers (TAKE_TICKS evaluations), then merges with "H key id"
+        begin_taking = function() TAKING = TAKE_TICKS or 0; TAKES = (TAKES or 0) + 1 end,
+        take_offer = function(body) OFFERS_SEEN = (OFFERS_SEEN or 0) + 1 end,
+        taking_done = function() if (TAKING or 0) > 0 then TAKING = TAKING - 1 end; return (TAKING or 0) == 0 end,
+        bind_taken = function() local m = BIND or ""; BIND = nil; return m end,
+        cancel_taking = function() TAKE_CANCELLED = (TAKE_CANCELLED or 0) + 1 end,
+        begin_handback = function(e) OFFERING = e end,
+        finish_handback = function(body) FINISHED = body end,
+        cancel_handback = function() OFFERING = nil end }
     package.loaded["mirror.ghost"] = { exists = function() return GHOST end, location = function() return GHOST and GL or nil end,
         set_invoker = function(on) INV = on and 0 or -1; return INV end, invoker_index = function() return INV end,
         ai_count = function() return AI end }
@@ -3594,7 +3946,10 @@ def group_split_host_decides_follow_and_ignores_followers():
     A.execute('OTHERS = { other(3, { "following" }, { X = 50500, Y = 0, Z = 0 }, 2) }; run(3)')
     check(A.eval('split.host_state()') == "split", "its follower 5 m away: still split")
     A.execute('OTHERS = { other(3, { "merged" }, { X = 50500, Y = 0, Z = 0 }, nil) }; run(1.1)')
-    check(A.eval('split.host_state()') == "merged", "a guest next to it that isn't following: merged")
+    ep = (A.eval('blobs_out.p8') or "").split(" ")[-1]
+    check(A.eval('split.host_state()') == "merging", "a guest next to it that isn't following: merge (hand-back asked first)")
+    A.execute('blobs_in.p8h = "%s\\nA 1 x"; run(0.3)' % ep)
+    check(A.eval('split.host_state()') == "merged", "... merged once the zombies are handed back")
 
 
 def load_split_switches_only_when_both_agree():
@@ -3624,8 +3979,13 @@ def load_split_switches_only_when_both_agree():
     check(H.eval('split.state()') == "merged", "no new attempt before retry_after")
     H.execute('run(11)')
     check(H.eval('split.state()') == "splitting" and H.eval('blobs_out.p8') == "s 3", "retried later")
-    to_guest(); G.execute('run(0.6)')
-    check(G.eval('SPLIT') is True and G.eval('blobs_out.p8g') == "s 3 0", "guest: takes over and answers with the epoch")
+    to_guest(); G.execute('HANDOVER_TICKS = 2; run(0.6)')
+    check(G.eval('HANDED') == 1 and G.eval('SPLIT') is False and G.eval('blobs_out.p8g') != "s 3 0",
+          "guest: takes the host's zombies over first - no answer while that runs")
+    G.execute('run(0.6)')
+    check(G.eval('SPLIT') is True and G.eval('blobs_out.p8g') == "s 3 0" and G.eval('HANDED') == 1,
+          "guest: then splits and answers with the epoch (one hand-over per epoch)")
+    G.execute('HANDOVER_TICKS = 0')
     H.execute('blobs_in.p8g = "s 2 0"; run(0.3)')
     check(H.eval('split.state()') == "splitting", "host: an answer to an old epoch doesn't count")
     to_host(); H.execute('run(0.3)')
@@ -3635,13 +3995,31 @@ def load_split_switches_only_when_both_agree():
     check(H.eval('INV') == -1, "a ghost respawned after a save is taken out again")
     H.execute('SAVING = true; GHOST = false; run(3); SAVING = false; run(3)')
     check(H.eval('split.state()') == "split", "a save (ghost gone for a moment) doesn't merge")
-    H.execute('GHOST = true; GL = { X = 25000, Y = 0, Z = 0 }; blobs_in.p8g = "s 3 1"; run(2)')
-    check(H.eval('split.state()') == "split", "closer than merge_radius but the guest is fighting: still split")
-    H.execute('GL = { X = 15000, Y = 0, Z = 0 }; run(1.1)')
-    check(H.eval('split.state()') == "merged" and H.eval('INV') == 0 and H.eval('SPLIT') is False and H.eval('blobs_out.p8') == "m 4",
-          "within force_radius: merged even mid-fight, ghost back in the optimizer")
+    H.execute('GHOST = true; GL = { X = 35000, Y = 0, Z = 0 }; blobs_in.p8g = "s 3 1"; run(2)')
+    check(H.eval('split.state()') == "split", "between merge_radius and split_radius: still split")
+    H.execute('GL = { X = 25000, Y = 0, Z = 0 }; run(1.1)')
+    check(H.eval('split.state()') == "merging" and H.eval('INV') == -1 and H.eval('SPLIT') is True and H.eval('blobs_out.p8') == "M 4",
+          "within merge_radius, even mid-fight: the host first asks for the guest's zombies (ghost still out)")
     to_guest(); G.execute('run(0.6)')
-    check(G.eval('SPLIT') is False and G.eval('blobs_out.p8g') == "m 4 0", "guest: follows the merge")
+    check(G.eval('OFFERING') == 4 and G.eval('SPLIT') is True, "guest: offers its zombies and keeps running them meanwhile")
+    H.execute('blobs_in.p8h = "3\\nA 1 old"; run(0.3)')
+    check(H.eval('split.state()') == "merging" and H.eval('OFFERS_SEEN') is None, "host: an offer for another epoch doesn't count")
+    H.execute('blobs_in.p8h = "4\\nA 1 x"; BIND = "H 1 77"; run(0.3)')
+    check(H.eval('split.state()') == "merged" and H.eval('INV') == 0 and H.eval('SPLIT') is False
+          and H.eval('blobs_out.p8') == "m 5\nH 1 77",
+          "host: spawns the offered zombies, then merges with their ids - ghost back in the optimizer")
+    to_guest(); G.execute('run(0.6)')
+    check(G.eval('SPLIT') is False and G.eval('blobs_out.p8g') == "m 5 0" and G.eval('FINISHED') == "m 5\nH 1 77",
+          "guest: follows the merge and gets the ids for its zombies")
+    H.execute('GL = { X = 50000, Y = 0, Z = 0 }; run(12)'); handshake()
+    H.execute('GL = { X = 25000, Y = 0, Z = 0 }; blobs_in.p8g = "s 6 0"; run(1.1)')
+    check(H.eval('split.state()') == "merging", "closer again: hand-back asked")
+    H.execute('GL = { X = 50000, Y = 0, Z = 0 }; run(0.3)')
+    check(H.eval('split.state()') == "split" and H.eval('TAKE_CANCELLED') == 1 and H.eval('INV') == -1,
+          "apart again before the hand-back finished: stays split, the spawned zombies go")
+    H.execute('GL = { X = 15000, Y = 0, Z = 0 }; run(30)')
+    check(H.eval('split.state()') == "merged", "a guest that never offers (older version): merged after the time-out")
+    to_guest(); G.execute('run(0.6)')
     H.execute('GL = { X = 50000, Y = 0, Z = 0 }; run(12)'); handshake()
     check(H.eval('split.state()') == "split", "split again")
     H.execute('NEST = 0.2; split.tick(0.016)')
@@ -3650,10 +4028,14 @@ def load_split_switches_only_when_both_agree():
     check(H.eval('split.state()') == "splitting", "after the fight, splitting again")
     H.execute('HORDE = true; run(0.3)')
     check(H.eval('split.state()') == "merged", "a horde near the guest cancels the split")
-    H.execute('HORDE = false; NEAR = 3000; run(60)')
-    check(H.eval('split.state()') == "merged", "a host AI (or body) near the guest blocks the split")
-    H.execute('NEAR = 1e9; run(12)'); handshake()
-    check(H.eval('split.state()') == "split", "split once nothing is near the guest")
+    H.execute('HORDE = false; NEAR = 3000')
+    for _ in range(80):          # (the link carries the blobs both ways all the time)
+        H.execute('run(1)'); handshake()
+        if H.eval('split.state()') == "split":
+            break
+    check(H.eval('split.state()') == "split" and G.eval('HANDED') >= 2,
+          "zombies near the guest don't block a split: the guest takes them over first, then answers (%s, %s hand-overs)"
+          % (H.eval('split.state()'), G.eval('HANDED')))
     H.execute('SETTING = false; run(0.2)')
     check(H.eval('split.state()') == "merged" and H.eval('INV') == 0, "setting turned off mid-split: merged at once")
     H.execute('SETTING = true; run(11)'); handshake()
@@ -3720,7 +4102,7 @@ def load_split_hands_the_ai_to_the_guest():
     L.execute('HOST = { X = 90000, Y = 0, Z = 0 }; zombies._test.setup(CFG, "guest"); S1, S2 = spawner(), spawner(); S2.IsSpawningStopped = true; SPAWNERS = { S1, S2 }; '
               'LIST = {}; zombies._test.sweep(10)')
     check(L.eval('S1.IsSpawningStopped') is True, "guest merged: its spawners are stopped (as before)")
-    L.execute('zombies.set_split(true)')
+    L.execute('zombies.set_split(true); zombies._test.reenable()')
     check(L.eval('S1.IsSpawningStopped') is False and L.eval('S2.IsSpawningStopped') is True,
           "guest split: only the spawners the mod stopped run again")
     L.execute('A, B, C, D = zombie("Fighting", 3000), zombie("Away", 50000), zombie("Body", 10000, true), zombie("NearHost", 85000); '
@@ -3762,6 +4144,7 @@ def load_split_hands_the_ai_to_the_guest():
         until_queued()
         QUEUED = zombies._test.pending()
         zombies.set_split(true); zombies._test.step()
+        REENABLE_FRAMES = zombies._test.reenable(100)
         LEFT_ON = 0; for _, s in ipairs(SPAWNERS) do if not s.IsSpawningStopped then LEFT_ON = LEFT_ON + 1 end end
         AFTER_SPLIT = zombies._test.pending()
         zombies.set_split(false)
@@ -3774,6 +4157,8 @@ def load_split_hands_the_ai_to_the_guest():
     check(L.eval('QUEUED') == 450 and L.eval('AFTER_SPLIT') == 0 and L.eval('LEFT_ON') == 600,
           "a split mid-sweep drops the rest of it (%d queued, %d left after, %d of 600 on)"
           % (L.eval('QUEUED'), L.eval('AFTER_SPLIT'), L.eval('LEFT_ON')))
+    check(L.eval('REENABLE_FRAMES') >= 2, "the split turns its spawners back on over frames (100 a frame, %d frames)"
+          % L.eval('REENABLE_FRAMES'))
 
 def reliable_events_survive_pauses_and_restarts():
     print("reliable_events_survive_pauses_and_restarts")
@@ -3837,6 +4222,24 @@ def reliable_events_survive_pauses_and_restarts():
     check(A2.eval('#ch.recent') > 200, "7 min unread (a guest waiting for its host): every take is still kept (%d)" % A2.eval('#ch.recent'))
     A2.execute('CLOCK = CLOCK + 1500; ch:send("M z")')
     check(A2.eval('#ch.recent') == 64, "an unread history shrinks to the small keep after 30 min")
+
+
+def jig_price_follows_the_traders_table():
+    print("jig_price_follows_the_traders_table")
+    L = lua()
+    L.execute(FAKES + r"""
+        jig = require("mirror.jig")
+        BOOK, AXE, CAN = obj({ Price = 40 }), obj({ Price = 25 }), obj({ Price = 3 })
+        local function row(a, p) return { ItemID_41_8C5E69274AB445604263E4A2B3091BAD = a, PriceOverride_29_306CC4B441051ADD17999E8D00D06A7F = p } end
+        local rows = { row(BOOK, 120.0), row(AXE, -1.0) }
+        local arr = setmetatable({ GetArrayNum = function() return #rows end }, { __index = function(_, i) return rows[i] end })
+        TRADER = { ContainersSettings = { { StartingItems_10_C6DB208442353E0AA9B5DB892266821A = arr } } }
+        CRATE = {}
+    """)
+    check(L.eval('jig.price_in(TRADER, BOOK)') == 120.0, "a trader's table price is used (%s)" % L.eval('jig.price_in(TRADER, BOOK)'))
+    check(L.eval('jig.price_in(TRADER, AXE)') == 25, "no override (-1): the item's own price")
+    check(L.eval('jig.price_in(TRADER, CAN)') == 3, "an item not in the table: the item's own price")
+    check(L.eval('jig.price_in(CRATE, BOOK)') == 40, "an ordinary container: the item's own price")
 
 
 def jig_probe_names_what_a_patch_removed():
@@ -3986,6 +4389,48 @@ def settlement_camps_follow_the_host():
     G.execute('JOINED = false; camp("Prefab_Settlement2_C"); for i = 1, 6 do camps.tick(5) end')
     check(G.eval('n("Prefab_Settlement2_C")') == 1, "the guest's home world is left alone")
     check(H.eval('n("Prefab_Settlement4_C")') == 1, "the host's world is never changed")
+
+
+def military_trader_follows_the_host():
+    print("military_trader_follows_the_host")
+    def side(role, at):
+        L = lua()
+        L.execute(FAKES + r"""
+            util = require("mirror.util")
+            WORLD = {}
+            util.instances = function(cls) return WORLD[cls] or {} end
+            function trader(x, y, z, yaw)
+                local a = obj({ loc = { X = x, Y = y, Z = z }, yaw = yaw })
+                a.K2_GetActorLocation = function() return a.loc end
+                a.K2_GetActorRotation = function() return { Pitch = 0, Yaw = a.yaw, Roll = 0 } end
+                a.K2_SetActorLocationAndRotation = function(_, l, r, sweep, hit, tp)
+                    a.loc, a.yaw, a.tp = { X = l.X, Y = l.Y, Z = l.Z }, r.Yaw, tp end
+                WORLD.BP_MilitaryTrader_C = { a }; return a end
+            JOINED = true
+            package.loaded["mirror.game"] = { on_world_reset = function() end }
+            camps = require("mirror.camps")
+            camps.init({}, "%s", { in_world = function() return JOINED end }, function() return true end)
+            T = trader(%s)
+        """ % (role, at))
+        return L
+    H, G = side("host", "-1937, 239448, 1737, 90"), side("guest", "215480, -64813, 1622, 0")
+    H.execute('camps.tick(5)')
+    sent = H.eval('blobs_out.miltrader')
+    check(sent == "-1937.00 239448.00 1737.00 90.0", "the host sends where its military trader stands (%r)" % sent)
+    # (the host's camps blob always comes along - "-" when it has no camp)
+    G.execute('blobs_in.miltrader = ...; blobs_in.camps = "%s"; camps.tick(5)' % H.eval('blobs_out.camps'), sent)
+    check(G.eval('T.loc.X') == 215480, "nothing moves in the first seconds after arriving")
+    for _ in range(3):
+        G.execute('camps.tick(5)')
+    check(G.eval('T.loc.X') == -1937 and G.eval('T.loc.Y') == 239448 and G.eval('T.yaw') == 90.0,
+          "the guest's trader stands where the host's does (%s, %s)" % (G.eval('T.loc.X'), G.eval('T.loc.Y')))
+    check(G.eval('T.tp') is True, "moved as a teleport (no sweep through the world)")
+    G.execute('T.loc = { X = 1, Y = 2, Z = 3 }; JOINED = false; for i = 1, 4 do camps.tick(5) end')
+    check(G.eval('T.loc.X') == 1, "the guest's own world is left alone")
+    H.execute('camps.tick(5)')
+    check(H.eval('T.loc.X') == -1937, "the host's trader is never moved")
+    H.execute('blobs_out.miltrader = nil; camps.tick(5)')
+    check(H.eval('blobs_out.miltrader') is None, "an unchanged spot is not sent again")
 
 
 PEERS_FAKES = r'''
@@ -4193,11 +4638,11 @@ def mods_switch_restart_and_match_the_host():
         w64 = os.path.join(d, "SurrounDead", "Binaries", "Win64")
         mods = os.path.join(w64, "ue4ss", "Mods")
         paks = os.path.join(d, "SurrounDead", "Content", "Paks")
-        for m in ("SurrounSync", "shared", "AimRun", "HeadshotBrains", "Keybinds", "SelfOn", "ConsoleEnablerMod"):
+        for m in ("SurrounSync", "shared", "AimRun", "HeadshotBrains", "Keybinds", "SelfOn", "ConsoleEnablerMod", "SyncFX"):
             os.makedirs(os.path.join(mods, m))
         open(os.path.join(mods, "SelfOn", "enabled.txt"), "w").close()
         with open(os.path.join(mods, "mods.txt"), "w", newline="") as f:
-            f.write("SurrounSync : 1\r\nAimRun : 1\r\nHeadshotBrains : 0\r\nConsoleEnablerMod : 0\r\n"
+            f.write("SurrounSync : 1\r\nAimRun : 1\r\nHeadshotBrains : 0\r\nConsoleEnablerMod : 0\r\nSyncFX : 0\r\n"
                     "; Built-in keybinds, do not move up!\r\nKeybinds : 1\r\n")
         with open(os.path.join(mods, "mods.json"), "w") as f:
             f.write('[\n    {\n        "mod_name": "AimRun",\n        "mod_enabled": true\n    }\n]\n')
@@ -4261,11 +4706,29 @@ def mods_switch_restart_and_match_the_host():
         check(not r["AimRun"]["differs"] and not r["HeadshotBrains"]["differs"] and not r["ConsoleEnablerMod"]["on"] and m["restart"],
               "after MATCH only the missing one differs, the client mod is left alone, restart asked")
         check(not L.eval('ml.model({ set = {}, who = "G", host = false }).can_match'), "the host doesn't get MATCH")
+
+        # SyncFX: not in the MODS list, never matched; its switch is on top of MY SETTINGS (mods.txt, next start)
+        check("SyncFX" not in ids, "SyncFX isn't in the MODS list")
+        L.execute('peer2 = { set = { SyncFX = true }, who = "Host", host = true, kind = function() return "unknown" end }')
+        m, r = L.eval('rows(peer2)')
+        check("SyncFX" not in list(r.keys()) and m["missing"] == 0, "a host's SyncFX is never MISSING for the guest")
+        L.execute('ml.match(peer2)')
+        check(L.eval('(select(2, ml.state("SyncFX")))') is False, "MATCH HOST leaves SyncFX alone")
+        L.execute('package.loaded["mirror.link"] = { dir = function() return W64 end, put_blob = function() end }'
+                  '; ms = require("mirror.mysettings")')
+        first = L.eval('ms.rows()[1]')
+        check(first.key == "syncfx" and first.tag == "(Experimental)" and first.text == "OFF" and "FPS" in first.hint,
+              "MY SETTINGS starts with (Experimental) SYNCFX GRAPHICS, OFF, with its FPS note")
+        L.execute('ml.set("SyncFX", true)')
+        first = L.eval('ms.rows()[1]')
+        check("SyncFX : 1\r\n" in open(os.path.join(mods, "mods.txt"), newline="").read() and first.text == "ON"
+              and "next game start" in first.hint, "switching it writes mods.txt and says it starts next time")
+        check(L.eval('ms.rows()[2].key') == "nametags", "the other settings follow it")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
-for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, unanswered_join_keeps_the_friends_list, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
+for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, player_rip_in_a_container_is_a_take, ui_no_room_removal_is_not_a_take, lights_come_back_on_a_respawned_ghost, perf_run_puts_the_outer_step_back, fs_write_is_whole_or_old, utf8_cut_never_splits_a_character, crumb_keeps_the_last_64_steps, unanswered_join_keeps_the_friends_list, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, jig_price_follows_the_traders_table, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, military_trader_follows_the_host,posepack_recovers_lost_packets, link_blob_comes_back_after_reset, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, tactical_reads_only_lights_the_class_has,
           vehicles_keep_this_worlds_fuel, harvest_uses_up_nodes_once, zombie_copies_take_the_hosts_look,
           copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_tooltip_reads_the_item_once, foreach_keeps_temporary_arrays_alive, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
@@ -4275,7 +4738,9 @@ for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container
           trader_stock_is_the_hosts, instances_walk_once_then_follow_beginplay, grouped_classes_share_one_walk, walk_skip_is_measured_after_a_load, unloaded_tracked_classes_cost_few_lookups,
           link_reads_only_blobs_the_index_says_changed, corpse_loot_reaches_every_player, host_settled_corpses_cost_almost_nothing,
           standing_hooks_skip_the_lookup, hook_lookups_share_one_budget, find_remembers_misses, container_items_keep_their_cell_and_rotation, loot_skips_containers_gone_since_listed, bags_are_never_consumed_and_twin_grids_are_counted,
-          load_split_switches_only_when_both_agree, load_split_hands_the_ai_to_the_guest):
+          load_split_switches_only_when_both_agree, load_split_hands_the_ai_to_the_guest,
+          loot_first_open_never_undoes_a_take_the_host_has_not_acked, loot_first_open_takes_over_an_older_list_without_takes,
+          twin_compartments_are_merged_into_one):
     try:
         t()
     except Exception as e:

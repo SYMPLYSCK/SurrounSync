@@ -14,6 +14,9 @@ local io_root = ""
 local lister = nil
 local list_win64, list_paks = nil, nil
 local NOT_MODS = { shared = true, SurrounSync = true, MirrorCoop = true }
+-- Mods SurrounSync switches from its own settings (MY SETTINGS), not from the MODS list: they only change how this
+-- PC's game looks, so they're never matched with the host either.
+modlist.BUILT_IN = { SyncFX = true }
 local PAKS = { "~mods", "LogicMods" }
 local PAK_PARTS = { ".pak", ".ucas", ".utoc", ".sig" }
 
@@ -227,6 +230,14 @@ function modlist.toggle(id)
     return modlist.set(id, not e.on)
 end
 
+-- A built-in mod's switch: installed?, on (from the next start), and whether that differs from what runs now.
+function modlist.state(id)
+    local e = find(id)
+    if not e then return false, false, false end
+    local was = loaded and loaded[e.id] or false
+    return true, e.on, was ~= e.on
+end
+
 -- ids that run in this game (as it started): what compat.lua tells the other side
 function modlist.loaded_ids()
     if not loaded then scan() end
@@ -254,8 +265,12 @@ local function matters(peer, id) return not (peer and peer.kind and peer.kind(id
 function modlist.model(peer)
     local rows, differs = {}, 0
     local mine = {}
+    local listed = {}
     for _, e in ipairs(fresh()) do
         mine[e.id] = true
+        if not modlist.BUILT_IN[e.id] then listed[#listed + 1] = e end
+    end
+    for _, e in ipairs(listed) do
         local r = { id = e.id, label = short(e.name, 26) .. (e.kind == "pak" and " (pak)" or ""), on = e.on,
                     text = e.on and "ON" or "OFF" }
         if was_on(e) ~= e.on then r.note = e.on and "on after a restart" or "off after a restart" end
@@ -276,7 +291,7 @@ function modlist.model(peer)
     local missing = {}
     if peer and peer.set then
         for id in pairs(peer.set) do
-            if not mine[id] and matters(peer, id) and not NOT_MODS[id] then missing[#missing + 1] = id end
+            if not mine[id] and matters(peer, id) and not NOT_MODS[id] and not modlist.BUILT_IN[id] then missing[#missing + 1] = id end
         end
         table.sort(missing)
         for _, id in ipairs(missing) do
@@ -296,10 +311,14 @@ function modlist.match(peer)
     for _, e in ipairs(fresh()) do
         mine[e.id] = true
         local theirs = peer.set[e.id] == true
-        if theirs ~= e.on and matters(peer, e.id) and modlist.set(e.id, theirs) then changed = changed + 1 end
+        if theirs ~= e.on and matters(peer, e.id) and not modlist.BUILT_IN[e.id] and modlist.set(e.id, theirs) then
+            changed = changed + 1
+        end
     end
     for id in pairs(peer.set) do
-        if not mine[id] and matters(peer, id) and not NOT_MODS[id] then missing[#missing + 1] = (id:gsub("^pak:", "")) end
+        if not mine[id] and matters(peer, id) and not NOT_MODS[id] and not modlist.BUILT_IN[id] then
+            missing[#missing + 1] = (id:gsub("^pak:", ""))
+        end
     end
     table.sort(missing)
     return changed, missing

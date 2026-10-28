@@ -19,3 +19,5 @@ tools/testpkg/
 
 # written by the unit tests (names.lua keeps item names next to the game)
 mirror_item_names.txt
+# (session.lua's world-load marker, also next to the game)
+mirror_world_load.txt

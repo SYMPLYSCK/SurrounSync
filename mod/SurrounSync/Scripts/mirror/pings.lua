@@ -58,6 +58,9 @@ local pending = {}      -- { p = message, n = tries }
 -- and the scanner's game spawns its icon again when the quest loads)
 local theirs_q = {}
 local theirs_c = {}     -- addr -> true: crate copies made here (searching one of them is nothing to send)
+-- my bounty icons and crates still active, by quest tag: sent again when a guest arrives (a bounty bought before the
+-- guest joined only went out at my world's load, to nobody - kit 2026-10-27: the host's 004 missing on the guest)
+local mine_q, mine_c = {}, {}
 local hook_in, retry_in = 0.0, 0.0
 local stats = { sent = 0, removed = 0, made = 0, unmade = 0, scans = 0, crates = 0 }
 
@@ -139,8 +142,9 @@ local function on_quest_marker(ev)
     local tag, text = word(text_of(ev.ActorTag)), text_of(ev.Text) or ""
     if not l or tag == "" or tag == "None" then return end
     c = c or { 1, 1, 1, 1 }
-    channel:send(string.format("Q %.0f %.0f %.0f %s %.3f %.3f %.3f %.3f %d %s %s", l.X, l.Y, l.Z, tex or "-",
-        c[1], c[2], c[3], c[4], ug and 1 or 0, tag, (text:gsub("[\r\n]+", " "))))
+    mine_q[tag] = string.format("Q %.0f %.0f %.0f %s %.3f %.3f %.3f %.3f %d %s %s", l.X, l.Y, l.Z, tex or "-",
+        c[1], c[2], c[3], c[4], ug and 1 or 0, tag, (text:gsub("[\r\n]+", " ")))
+    channel:send(mine_q[tag])
     stats.scans = stats.scans + 1
     log.info(string.format("pings: laptop scan marked %s at %.0f %.0f - sent", tag, l.X, l.Y))
 end
@@ -148,7 +152,10 @@ end
 local function on_quest_unmarker(ev)
     if busy.on or not share_mine() or not from_bounty(ev) then return end
     local tag = word(text_of(ev.ActorTag))
-    if tag ~= "" and tag ~= "None" then channel:send("X " .. tag) end
+    if tag ~= "" and tag ~= "None" then
+        mine_q[tag], mine_c[tag] = nil, nil
+        channel:send("X " .. tag)
+    end
 end
 
 local function on_spawner(sp)
@@ -160,7 +167,9 @@ local function on_spawner(sp)
     pcall(function() local v = sp:K2_GetActorRotation(); r = { v.Pitch, v.Yaw, v.Roll } end)
     if not (path and l) then return end
     r = r or { 0, 0, 0 }
-    channel:send(string.format("C %s %.1f %.1f %.1f %.2f %.2f %.2f", path, l.X, l.Y, l.Z, r[1], r[2], r[3]))
+    local msg = string.format("C %s %.1f %.1f %.1f %.2f %.2f %.2f", path, l.X, l.Y, l.Z, r[1], r[2], r[3])
+    mine_c[word(text_of(sp.QuestTag))] = msg
+    channel:send(msg)
     log.info(string.format("pings: laptop scan crate at %.0f %.0f - sent", l.X, l.Y))
 end
 
@@ -392,13 +401,47 @@ end
 
 function pings.relay_send(p) channel:send(p) end
 
+-- a guest arrived in my world: my bounties still running (the other game skips any it already shows). Icons the
+-- game put back at my world's load came before the hooks: they're picked up here by their quest tag.
+function pings.resend_mine()
+    if role == "off" or not share_mine() then return end
+    local copies = {}
+    for _, m in pairs(theirs_q) do if util.valid(m) then copies[util.addr(m) or 0] = true end end
+    local all
+    pcall(function() all = FindAllOf("BP_QuestMarker_C") end)
+    for _, m in ipairs(all or {}) do
+        local tag
+        pcall(function()
+            for i = 1, m.Tags:GetArrayNum() do
+                local t = m.Tags[i]:ToString()
+                if t:find(BOUNTY) then tag = word(t) end
+            end
+        end)
+        local l = loc_of(m)
+        if tag and l and not mine_q[tag] and not copies[util.addr(m) or 0] then
+            local tex, c, ug, text
+            pcall(function() tex = path_of(m[QF.tex]) end)
+            pcall(function() local v = m[QF.color]; c = { v.R, v.G, v.B, v.A } end)
+            pcall(function() ug = m[QF.ug] == true end)
+            pcall(function() text = m[QF.text]:ToString() end)
+            c = c or { 1, 1, 1, 1 }
+            mine_q[tag] = string.format("Q %.0f %.0f %.0f %s %.3f %.3f %.3f %.3f %d %s %s", l.X, l.Y, l.Z, tex or "-",
+                c[1], c[2], c[3], c[4], ug and 1 or 0, tag, ((text or ""):gsub("[\r\n]+", " ")))
+        end
+    end
+    local n = 0
+    for _, m in pairs(mine_q) do channel:send(m); n = n + 1 end
+    for _, m in pairs(mine_c) do channel:send(m) end
+    if n > 0 then log.info("pings: sent my " .. n .. " running bounty scan(s) to the arriving player") end
+end
+
 function pings.status()
     return string.format("pings: sent %d, removed %d, scans %d | placed %d, removed %d, crates %d%s", stats.sent,
         stats.removed, stats.scans, stats.made, stats.unmade, stats.crates, #pending > 0 and (", waiting " .. #pending) or "")
 end
 
 -- Respawn/reload: the old world's objects are freed - drop them without touching them.
-local function forget_world() known, dying, pending, theirs_q, theirs_c = {}, nil, {}, {}, {} end
+local function forget_world() known, dying, pending, theirs_q, theirs_c, mine_q, mine_c = {}, nil, {}, {}, {}, {}, {} end
 function pings.init(c, r, s)
     game.on_world_reset(forget_world)
     cfg, role, session = c, r, s

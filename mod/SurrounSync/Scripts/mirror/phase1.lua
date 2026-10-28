@@ -44,6 +44,7 @@ local compat = require("mirror.compat")
 local voice = require("mirror.voice")
 local pvp = require("mirror.pvp")
 local perf = require("mirror.perf")
+local crumb = require("mirror.crumb")
 local devtest = require("mirror.devtest")
 local peers = require("mirror.peers")
 
@@ -230,6 +231,15 @@ local function same_world()
 end
 function phase1.same_world() return same_world() end
 
+-- Crash steps between pose and save_guard, tagged per link: a guest froze for 48 s with "pose" as the last step,
+-- which fit both the main link's and another guest's tick (reports 20261027-204548/204621).
+local steps = {}
+local function step(name)
+    local s = steps[name]
+    if not s then s = "p1 " .. name .. (tags and (" " .. tags.out) or ""); steps[name] = s end
+    crumb.at(s)
+end
+
 local started = false
 local cur_peer = nil
 function phase1.started() return started and role or nil end
@@ -246,6 +256,7 @@ local function on_tick(dt)
     if send_in <= 0 then
         send_in = 1.0 / cfg.phase1.send_hz
         perf.run("pose", sample, player)
+        step("send")
         if pose_line then
             seq = seq + 1
             -- The car we're driving travels with the pose: same rate, same redundancy.
@@ -254,6 +265,7 @@ local function on_tick(dt)
         end
     end
 
+    step("poll")
     local pseq, payload = link.poll()
     pseq = tonumber(pseq)
     if pseq and payload then
@@ -273,6 +285,7 @@ local function on_tick(dt)
             end
         end
     end
+    step("state")
     if not connected and now - last_rx < 1 then
         connected = true
         local who = link.peer_name()
@@ -295,7 +308,10 @@ local function on_tick(dt)
         if bye and bye ~= bye_seen then
             bye_seen = bye
             local said = tonumber(bye:match("^stop (%d+)") or "")
-            if session.state() == "joined" then
+            if session.state() == "joined" and session.realm_joined() then
+                notify.show(link.peer_name() .. " left the Realm. You keep playing in it - you'll host it now, one moment...", "info")
+                session.realm_host_left()
+            elseif session.state() == "joined" then
                 notify.show(link.peer_name() .. " ended the session. Taking you home with your character...", "info")
                 session.go_home_now()
             elseif said and opened_at and said < opened_at then
@@ -309,6 +325,7 @@ local function on_tick(dt)
         end
     end
 
+    step("where")
     local mine_where = session.where()
     if mine_where ~= my_where then
         my_where = mine_where
@@ -326,9 +343,11 @@ local function on_tick(dt)
         if mate and w == "joined" and session.in_world() then notify.show(link.peer_name() .. " is here too.", "good") end
         if role == "host" then
             local who = link.peer_name()
-            if w == "joined" and was == "loading" then
+            -- (a join goes loading -> arriving -> joined: only "loading" here never announced the guest)
+            if w == "joined" and (was == "loading" or was == "arriving") and not guest_announced then
                 guest_announced = true
                 notify.show(who .. " joined your world.", "good")
+                util.safe(pings.resend_mine, "pings.resend_mine")
             elseif (guest_announced and (w == "leaving" or w == "own")) or (w == "own" and was == "loading") then
                 guest_announced = false
                 notify.show(who .. " left your world.", "info")
@@ -359,6 +378,7 @@ local function on_tick(dt)
         quiet_logged = false
         log.info("phase1: the other game is back")
     end
+    step("life")
     local dead = false
     pcall(function() dead = player["PlayerDead?"] == true end)
     if dead ~= my_dead then
@@ -390,6 +410,7 @@ local function on_tick(dt)
             log.info(string.format("phase1: dead in co-op - game time back from %.2fx to real time (the other player plays on)", td))
         end
     end
+    step("ghost check")
     if peer_dead and ghost.exists() then
         ghost.destroy("peer dead")
     elseif not together and ghost.exists() then
@@ -411,6 +432,7 @@ local function on_tick(dt)
         end
     end
 
+    step("look")
     local switching = anim.count() ~= look_anims or my_combat ~= look_combat
     if switching then
         look_anims, look_combat, look_fast_until = anim.count(), my_combat, now + 1.5
@@ -487,11 +509,12 @@ local function on_tick(dt)
         end
     end
 
-    perf.run("save_guard", save_guard.tick, dt, game.world())
+    -- every system runs under util.safe: one that raises must not skip the systems after it (and frame_end) each frame
+    perf.run("save_guard", util.safe, save_guard.tick, "save_guard.tick", dt, game.world())
     if mate then
         -- another guest: only what shows them (the world comes from the host link)
-        perf.run("anim", anim.tick)
-        perf.run("fire", fire.tick, dt)
+        perf.run("anim", util.safe, anim.tick, "anim.tick")
+        perf.run("fire", util.safe, fire.tick, "fire.tick", dt)
         perf.run("netq", util.safe, netq.tick, "netq.tick", dt, first_rx and (now - last_rx) or math.huge)
         perf.run("chat", util.safe, chat.tick, "chat.tick")
         perf.run("teleport", util.safe, teleport.tick, "teleport.tick", dt)
@@ -504,29 +527,29 @@ local function on_tick(dt)
         perf.run("throwables", util.safe, throwables.tick, "throwables.tick", dt)
         perf.run("vehicles", util.safe, vehicles.tick, "vehicles.tick", dt)
         perf.run("group", util.safe, group.tick, "group.tick", dt)
-        perf.run("zombies", zombies.tick, dt)
-        perf.run("corpses", corpses.tick, dt)
+        perf.run("zombies", util.safe, zombies.tick, "zombies.tick", dt)
+        perf.run("corpses", util.safe, corpses.tick, "corpses.tick", dt)
         status_in = status_in - dt
         if status_in <= 0 then status_in = cfg.phase1.status_interval; status() end
         return
     end
-    perf.run("keepalive", keepalive.tick, dt)
-    perf.run("session", session.tick, dt)
-    perf.run("anim", anim.tick)
-    perf.run("zombies", zombies.tick, dt)
-    perf.run("fire", fire.tick, dt)
-    perf.run("drops", drops.tick, dt)
-    perf.run("world", world.tick, dt)
+    perf.run("keepalive", util.safe, keepalive.tick, "keepalive.tick", dt)
+    perf.run("session", util.safe, session.tick, "session.tick", dt)
+    perf.run("anim", util.safe, anim.tick, "anim.tick")
+    perf.run("zombies", util.safe, zombies.tick, "zombies.tick", dt)
+    perf.run("fire", util.safe, fire.tick, "fire.tick", dt)
+    perf.run("drops", util.safe, drops.tick, "drops.tick", dt)
+    perf.run("world", util.safe, world.tick, "world.tick", dt)
     perf.run("camps", util.safe, require("mirror.camps").tick, "camps.tick", dt)
-    perf.run("doors", doors.tick, dt)
+    perf.run("doors", util.safe, doors.tick, "doors.tick", dt)
     perf.run("infest", util.safe, infest.tick, "infest.tick", dt)
     perf.run("horde", util.safe, horde.tick, "horde.tick", dt)
     perf.run("split", util.safe, split.tick, "split.tick", dt)
-    perf.run("jobs", util.jobs_tick, 0.004)
+    perf.run("jobs", util.safe, util.jobs_tick, "util.jobs_tick", 0.004)
     perf.run("power", util.safe, power.tick, "power.tick", dt)
     perf.run("audio", util.safe, audio.tick, "audio.tick", dt)
-    perf.run("loot", loot.tick, dt)
-    perf.run("builds", builds.tick, dt)
+    perf.run("loot", util.safe, loot.tick, "loot.tick", dt)
+    perf.run("builds", util.safe, builds.tick, "builds.tick", dt)
     perf.run("pings", util.safe, pings.tick, "pings.tick", dt)
     perf.run("netq", util.safe, netq.tick, "netq.tick", dt, first_rx and (now - last_rx) or math.huge)
     perf.run("chat", util.safe, chat.tick, "chat.tick")
@@ -534,20 +557,20 @@ local function on_tick(dt)
     perf.run("compat", util.safe, compat.tick, "compat.tick")
     perf.run("voice", util.safe, voice.tick, "voice.tick", dt)
     perf.run("pvp", util.safe, pvp.tick, "pvp.tick", dt)
-    perf.run("corpses", corpses.tick, dt)
-    perf.run("deathbags", deathbags.tick, dt)
+    perf.run("corpses", util.safe, corpses.tick, "corpses.tick", dt)
+    perf.run("deathbags", util.safe, deathbags.tick, "deathbags.tick", dt)
     perf.run("nametag", util.safe, nametag.tick, "nametag.tick", dt)
     perf.run("lights", util.safe, lights.tick, "lights.tick", dt, remote:newest())
     perf.run("tactical", util.safe, tactical.tick, "tactical.tick", dt)
     perf.run("throwables", util.safe, throwables.tick, "throwables.tick", dt)
     perf.run("vehicles", util.safe, vehicles.tick, "vehicles.tick", dt)
     perf.run("harvest", util.safe, harvest.tick, "harvest.tick", dt)
-    notify.tick(dt)
+    perf.run("notify", util.safe, notify.tick, "notify.tick", dt)
     -- dev command files run arbitrary Lua (eval): only on test installs (devtest = on)
-    if cfg.devtest then util.safe(devtest.tick, "devtest.tick", dt) end
+    if cfg.devtest then perf.run("devtest", util.safe, devtest.tick, "devtest.tick", dt) end
 
     status_in = status_in - dt
-    if status_in <= 0 then status_in = cfg.phase1.status_interval; status() end
+    if status_in <= 0 then status_in = cfg.phase1.status_interval; perf.run("status", util.safe, status, "phase1.status") end
     if not tags then perf.frame_end(dt) end
 end
 
@@ -570,6 +593,8 @@ local function reset_link_state()
     -- never came back -> "it runs an OLDER SurrounSync" 30 s later (in-game, a Realm opened after stop hosting)
     link.reset_blob("hello")
     link.reset_blob("look")
+    link.reset_blob("mods") -- compat.reset forgets the friend's list too
+    link.reset_blob("light")
     netq.reset()
     compat.reset()
     pose_gaps.seq = nil

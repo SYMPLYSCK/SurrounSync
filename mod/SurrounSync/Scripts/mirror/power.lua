@@ -36,6 +36,10 @@ local mine_at = {}
 local applied_at = {}
 local missing = {}
 local last_blob = nil
+-- guest: the host's last list by id. get_blob hands out only a changed list, so an object that loads (or is
+-- recreated) after it arrived gets its line from here
+local host_lines = {}
+local reapply = {}
 local stats = { sent = 0, applied = 0 }
 
 local function shared() return role == "host" or (session and session.in_world()) end
@@ -63,13 +67,16 @@ local function scan_step()
     if not walked then return end
     local seen = {}
     for _, a in ipairs(objs) do
-        local ok, id = pcall(id_of, a)
+        -- (a group walk's list can be a few frames old: an actor freed since then must not be read)
+        local ok, id = false, nil
+        if util.valid(a) then ok, id = pcall(id_of, a) end
         if ok then
             seen[id] = true
             local k = known[id]
             if not k or not util.same(k.a, a) then
                 local on, fuel = read(a, kind)
                 known[id] = { a = a, kind = kind, on = on, fuel = fuel }
+                if host_lines[id] then reapply[#reapply + 1] = host_lines[id] end
             end
         end
     end
@@ -180,8 +187,19 @@ function power.tick(dt)
         if s ~= last_blob then last_blob = s; link.put_blob("power", s) end
     elseif role ~= "host" and shared() then
         local b = link.get_blob("power")
-        if b then for s in b:gmatch("[^\n]+") do util.safe(apply_line, "power.list", s, "host's list") end end
+        if b then
+            host_lines = {}
+            for s in b:gmatch("[^\n]+") do
+                local id = s:match("^(%S+)")
+                if id then host_lines[id] = s end
+                util.safe(apply_line, "power.list", s, "host's list")
+            end
+        end
+        local q = reapply
+        reapply = {}
+        for _, s in ipairs(q) do util.safe(apply_line, "power.list", s, "host's list") end
     end
+    if (role == "host" or not shared()) and (reapply[1] or next(host_lines)) then host_lines, reapply = {}, {} end
 end
 
 local function nearest(kinds)

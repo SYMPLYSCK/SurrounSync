@@ -16,6 +16,28 @@ static class SetupTest
     }
     static void W(string path, string text) { Directory.CreateDirectory(Path.GetDirectoryName(path)); File.WriteAllText(path, text); }
 
+    // one HTTP response on a local port: says Content-Length: length, sends only `send` bytes, then closes
+    static string Serve(int length, int send)
+    {
+        var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        l.Start();
+        int port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
+        new System.Threading.Thread(() =>
+        {
+            using (var c = l.AcceptTcpClient())
+            using (var s = c.GetStream())
+            {
+                var buf = new byte[4096];
+                s.Read(buf, 0, buf.Length);
+                var head = System.Text.Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Length: " + length + "\r\nConnection: close\r\n\r\n");
+                s.Write(head, 0, head.Length);
+                s.Write(new byte[send], 0, send);
+            }
+            l.Stop();
+        }) { IsBackground = true }.Start();
+        return "http://127.0.0.1:" + port + "/SurrounSyncSetup.exe";
+    }
+
     static int Main()
     {
         string root = Path.Combine(Path.GetTempPath(), "test-setup-" + Guid.NewGuid().ToString("N").Substring(0, 8));
@@ -123,6 +145,39 @@ static class SetupTest
             File.WriteAllText(acf, File.ReadAllText(acf).Replace("experimental", ""));
             var br = Find(Doctor.Check(game), "wrong Steam branch");
             Ok(br != null && br.Fix.Contains("\"Experimental 0.8\""), "normal branch -> told to pick Experimental 0.8");
+
+            // the updater: a download whose connection closes early is a failure, never a cut-off setup to run
+            string dl = Path.Combine(root, "dl.exe"), err;
+            Ok(!SurrounSyncShared.Release.Download(Serve(1000, 10), dl, null, out err) && err.Contains("cut off") && !File.Exists(dl),
+               "cut-off download fails and leaves no file (" + err + ")");
+            Ok(SurrounSyncShared.Release.Download(Serve(1000, 1000), dl, null, out err) && new FileInfo(dl).Length == 1000,
+               "complete download succeeds (" + err + ")");
+
+            // SyncFX in the setup: a new install has it off; an update keeps the player's on/off and settings
+            string fxMods = Path.Combine(root, "fxgame", "Mods");
+            Directory.CreateDirectory(fxMods);
+            var ms = new MemoryStream();
+            using (var za = new System.IO.Compression.ZipArchive(ms, System.IO.Compression.ZipArchiveMode.Create, true))
+                foreach (var n in new[] { "game/ue4ss/Mods/SyncFX/Scripts/main.lua", "game/ue4ss/Mods/SyncFX/SyncFX.ini" })
+                    using (var w = new StreamWriter(za.CreateEntry(n).Open())) w.Write("new");
+            ms.Position = 0;
+            var inst = new Installer();
+            var rec = new Dictionary<string, string>();
+            File.WriteAllText(Path.Combine(fxMods, "mods.txt"), "SurrounSync : 1");
+            using (var za = new System.IO.Compression.ZipArchive(ms, System.IO.Compression.ZipArchiveMode.Read, true))
+                inst.InstallSyncFx(za, fxMods, rec);
+            string fx = Path.Combine(fxMods, "SyncFX");
+            Ok(File.ReadAllText(Path.Combine(fxMods, "mods.txt")) == "SurrounSync : 1\r\nSyncFX : 0\r\n" && File.Exists(Path.Combine(fx, "Scripts", "main.lua"))
+               && rec["syncfx"] == "ours", "new install: SyncFX unpacked and listed OFF in mods.txt");
+            File.WriteAllText(Path.Combine(fxMods, "mods.txt"), "SurrounSync : 1\r\nSyncFX : 1\r\n");
+            W(Path.Combine(fx, "SyncFX.user.ini"), "grain = 20");
+            W(Path.Combine(fx, "Scripts", "gone.lua"), "old");
+            ms.Position = 0;
+            using (var za = new System.IO.Compression.ZipArchive(ms, System.IO.Compression.ZipArchiveMode.Read, true))
+                inst.InstallSyncFx(za, fxMods, rec);
+            Ok(File.ReadAllText(Path.Combine(fxMods, "mods.txt")).Contains("SyncFX : 1") && File.ReadAllText(Path.Combine(fx, "SyncFX.user.ini")) == "grain = 20"
+               && !File.Exists(Path.Combine(fx, "Scripts", "gone.lua")) && File.ReadAllText(Path.Combine(fx, "Scripts", "main.lua")) == "new",
+               "update: player's ON and SyncFX.user.ini kept, old scripts replaced");
         }
         finally
         {

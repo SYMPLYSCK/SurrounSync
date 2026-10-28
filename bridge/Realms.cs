@@ -288,6 +288,19 @@ class Realms
         lock (state) { if (why != null) leases[id] = why; else leases.Remove(id); }
     }
 
+    // the game closed while hosting (quit or crash without ending the Realm): free it now, not when the lease runs out
+    // 2 min later - members saw the host as still playing all that time
+    public void ReleaseHeld()
+    {
+        List<string> held;
+        lock (state) { held = new List<string>(); foreach (var kv in leases) if (kv.Value == "held") held.Add(kv.Key); }
+        foreach (var id in held)
+        {
+            try { Release(id); log("realms: game closed - released " + id); }
+            catch (Exception e) { log("realms: release of " + id + " at exit failed: " + Clean(e.Message)); }
+        }
+    }
+
     void Heartbeats()
     {
         List<string> held;

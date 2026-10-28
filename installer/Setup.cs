@@ -25,6 +25,9 @@ namespace SurrounSyncSetup
         public Action<int> Progress = delegate { };
 
         const string ModPath = "game/ue4ss/Mods/SurrounSync/";
+        const string FxPath = "game/ue4ss/Mods/SyncFX/";   // the graphics mod: installed off, switched in MY SETTINGS
+        // UE4SS's own files (the mods are installed on their own)
+        static bool NotAMod(ZipArchiveEntry e) { string n = N(e); return !n.StartsWith(ModPath) && !n.StartsWith(FxPath); }
         public static string RecordFile { get { return Path.Combine(Release.AppDir, "install.txt"); } }
 
         static byte[] payloadBytes;
@@ -148,6 +151,26 @@ namespace SurrounSyncSetup
             catch { return false; }
         }
 
+        // SyncFX, the graphics mod. A new install has it off (no cost until the player switches it on in MY SETTINGS);
+        // an update keeps their on/off and their SyncFX.user.ini / .calib.ini (only Scripts is replaced).
+        internal void InstallSyncFx(ZipArchive z, string mods, Dictionary<string, string> rec)
+        {
+            bool inside = false;
+            foreach (var e in z.Entries) if (N(e).StartsWith(FxPath)) { inside = true; break; }
+            if (!inside) return;
+            string fx = Path.Combine(mods, "SyncFX");
+            if (IsLink(fx)) { Log("Mods\\SyncFX is a developer link - left as it is."); return; }
+            string scripts = Path.Combine(fx, "Scripts");
+            if (Directory.Exists(scripts)) DeleteDir(scripts);
+            Extract(z, FxPath, fx, null);
+            rec["syncfx"] = "ours";
+            string txt = Path.Combine(mods, "mods.txt");
+            string list = File.Exists(txt) ? File.ReadAllText(txt) : "";
+            if (Regex.IsMatch(list, "^\\s*SyncFX\\s*:", RegexOptions.Multiline)) { Log("Updated SyncFX (your on/off choice is kept)."); return; }
+            File.AppendAllText(txt, (list.Length > 0 && !list.EndsWith("\n") ? "\r\n" : "") + "SyncFX : 0\r\n");
+            Log("Installed SyncFX (experimental graphics) - off. Switch it on in the handbook: CO-OP, gear, MY SETTINGS.");
+        }
+
         // PDS and its pak, only when an older setup installed them ("ours" in the record); a PDS the player
         // installed themselves is left alone.
         void RemoveOldPds(string game, string mods, Dictionary<string, string> rec)
@@ -202,7 +225,7 @@ namespace SurrounSyncSetup
                 }
                 else
                 {
-                    Extract(z, "game/", w64, e => !N(e).StartsWith(ModPath));
+                    Extract(z, "game/", w64, NotAMod);
                     rec["ue4ss"] = "ours";
                     Log("Installed UE4SS.");
                 }
@@ -247,6 +270,7 @@ namespace SurrounSyncSetup
                     try { on = Regex.IsMatch(File.ReadAllText(list), "^\\s*" + c + "\\s*:\\s*1\\s*$", RegexOptions.Multiline); } catch { }
                     if (on) { DisableMod(mods, c); Log("Switched off " + c + " (an older multiplayer mod - it fights with SurrounSync)."); }
                 }
+                InstallSyncFx(z, mods, rec);
                 Progress(55);
 
                 // Older setups could install PDS (blood and gore) and its pak; this setup no longer ships them.
@@ -353,6 +377,13 @@ namespace SurrounSyncSetup
                     else if (Directory.Exists(target)) { DeleteDir(target); Log("Removed SurrounSync."); }
                     DisableMod(mods, "SurrounSync");
                     string v;
+                    if (rec.TryGetValue("syncfx", out v) && v == "ours")
+                    {
+                        string fx = Path.Combine(mods, "SyncFX");
+                        if (IsLink(fx)) Log("Mods\\SyncFX is a developer link - left as it is.");
+                        else if (Directory.Exists(fx)) { DeleteDir(fx); Log("Removed SyncFX."); }
+                        if (!IsLink(fx)) DisableMod(mods, "SyncFX");
+                    }
                     RemoveOldPds(game, mods, rec);
                     if (rec.TryGetValue("ue4ss", out v) && v == "ours")
                     {
@@ -385,7 +416,7 @@ namespace SurrounSyncSetup
             using (var z = Payload())
             {
                 if (z == null) { Log("This setup has no UE4SS inside it (a broken download?)."); return false; }
-                Extract(z, "game/", Game.Win64(game), e => !N(e).StartsWith(ModPath));
+                Extract(z, "game/", Game.Win64(game), NotAMod);
             }
             Log("Put SurrounSync's UE4SS files back.");
             return true;
@@ -403,7 +434,7 @@ namespace SurrounSyncSetup
                 MoveDir(ue, old);
                 string oldDwm = Path.Combine(w64, "dwmapi.dll");
                 if (File.Exists(oldDwm)) File.Copy(oldDwm, Path.Combine(old, "dwmapi.dll"), true);
-                try { Extract(z, "game/", w64, e => !N(e).StartsWith(ModPath)); }
+                try { Extract(z, "game/", w64, NotAMod); }
                 catch
                 {
                     if (Directory.Exists(ue)) DeleteDir(ue);
@@ -506,7 +537,8 @@ namespace SurrounSyncSetup
                 if (filter != null && !filter(e)) continue;
                 string rel = n.Substring(prefix.Length).Replace('/', '\\');
                 string dst = Path.GetFullPath(Path.Combine(to, rel));
-                if (!dst.StartsWith(Path.GetFullPath(to), StringComparison.OrdinalIgnoreCase)) continue;
+                // (with the separator: "...\Win64" also prefixes "...\Win64x\")
+                if (!dst.StartsWith(Path.GetFullPath(to).TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)) continue;
                 Directory.CreateDirectory(Path.GetDirectoryName(dst));
                 e.ExtractToFile(dst, true);
             }

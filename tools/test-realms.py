@@ -10,6 +10,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -20,9 +21,19 @@ import zipfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKEND = os.path.join(REPO, "realms-backend")
-EXE = os.path.join(REPO, "mod", "SurrounSync", "bridge", "SurrounSyncBridge.exe")
-# REALMS_TEST_PORT: run beside a wrangler that already holds 8787
-PORT_API, PORT_NET = int(os.environ.get("REALMS_TEST_PORT", "8787")), 47911
+EXE = os.environ.get("SURROUNSYNC_BRIDGE") or os.path.join(REPO, "mod", "SurrounSync", "bridge", "SurrounSyncBridge.exe")
+
+
+def free_port():
+    # a port the OS lets us listen on: Windows (Hyper-V/WinNAT) reserves ranges that move at boot, and a fixed
+    # port can also be held by another wrangler
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# REALMS_TEST_PORT: a fixed port for the local Realms server (default: any free one)
+PORT_API, PORT_NET = int(os.environ.get("REALMS_TEST_PORT") or free_port()), free_port()
 URL = "http://127.0.0.1:%d" % PORT_API
 failures = []
 
@@ -124,9 +135,13 @@ def start_backend():
     if r.returncode != 0:
         print(r.stdout[-2000:], r.stderr[-2000:])
         sys.exit("couldn't make the local database")
+    # wrangler's own output goes to a file, shown when the server doesn't come up
+    out_path = os.path.join(tempfile.gettempdir(), "realms_wrangler_%d.log" % os.getpid())
+    out = open(out_path, "w", encoding="utf-8", errors="replace")
+    # (no --ip 127.0.0.1: with it the local server answered every Realm request with "not a Realm code")
     p = subprocess.Popen([npx, "wrangler", "dev", "--local", "--port", str(PORT_API), "--persist-to",
                           ".wrangler/test-state", "--var", "LEASE_SECONDS:3"], cwd=BACKEND,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                         stdout=out, stderr=subprocess.STDOUT)
 
     def up():
         try:
@@ -136,6 +151,8 @@ def start_backend():
             return False
     if not wait_for(up, 60):
         kill_tree(p)
+        out.close()
+        print(open(out_path, encoding="utf-8", errors="replace").read()[-3000:])
         sys.exit("the local Realms server didn't start")
     return p
 
@@ -192,7 +209,9 @@ def main():
         r = b.cmd("redeem " + code.lower())
         check(r.startswith("ok " + rid), "B redeems it (any case): " + r)
         r = b.cmd("redeem " + code)
-        check(r.startswith("fail bad_invite"), "the invite works once: " + r)
+        # a member redeeming again is refused before the used check (audit N19); one-time use by another
+        # player is covered in realms-backend/test/test_api.py
+        check(r.startswith("fail already_member"), "a second redeem makes no second member: " + r)
 
         r = b.cmd("claim " + rid)
         check(r.startswith("ok hosted 76561197960266730"), "B finds A hosting (A's SteamID): " + r)
@@ -200,6 +219,10 @@ def main():
         world = {"Level.sav": b"EMSH" + os.urandom(5000), "General.sav": b"EMSH" + b"g" * 300,
                  "mirror_realm_beds.txt": b"bed 1 2 3\n"}
         write_world(os.path.join(a.realm_dir(rid), "up"), world)
+        # the server runs 3 s leases (the take-over below needs one to run out): A renews right before each step
+        # that needs it, or a slow run lost it on the way ("lease.token" gone, uploads refused)
+        renew = lambda: check(a.cmd("claim " + rid).startswith("ok won"), "A renews its lease")
+        renew()
         r = a.cmd("upload %s 1" % rid)
         check(r.startswith("ok 1 "), "A uploads generation 1: " + r)
         r = a.cmd("upload %s 1" % rid)
@@ -221,11 +244,13 @@ def main():
               "B: one member line per member (owner A with its steam id, names last): %s" % ml)
 
         write_world(os.path.join(a.realm_dir(rid), "up"), {"bad name.sav": b"x"})
+        renew()
         r = a.cmd("upload %s 2" % rid)
         check(r.startswith("fail bad_input"), "a file name with a space isn't uploaded: " + r)
 
         # a hostile world on the server: an entry that climbs out of the folder
         key = open(os.path.join(a.realm_dir(rid), "member.key")).read().strip()
+        renew()
         token = open(os.path.join(a.realm_dir(rid), "lease.token")).read().strip()
         z = io.BytesIO()
         with zipfile.ZipFile(z, "w") as zf:

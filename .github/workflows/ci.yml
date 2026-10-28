@@ -1,0 +1,48 @@
+# Lint + every offline test suite on each push / pull request. Needs no Steam, game or webhook:
+# the bridge runs on its --test-net loopback stand-in (no steam_api64.dll), the setup/report tests stub the webhook.
+name: CI
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: tools/testpkg
+      SURROUNSYNC_BRIDGE: ${{ github.workspace }}\ci-bridge\SurrounSyncBridge.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Test tools
+        run: |
+          pip install --target tools/lint/luapkg luaparser==4.2.0
+          pip install --target tools/testpkg lupa==2.8
+          npm ci --prefix realms-backend
+      - name: Lua lint
+        shell: pwsh
+        run: python -I tools/lint/lualint.py (Get-ChildItem mod/SurrounSync/Scripts -Recurse -Filter *.lua).FullName
+      - name: Build the bridge (warnings shown)
+        shell: pwsh
+        run: |
+          $rt = & tools/report-target.ps1 | Select-Object -Last 1
+          New-Item -ItemType Directory -Force ci-bridge | Out-Null
+          & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /warn:4 /optimize+ /platform:x64 /target:exe /out:ci-bridge\SurrounSyncBridge.exe `
+            /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll /r:Microsoft.VisualBasic.dll /r:System.Web.Extensions.dll `
+            bridge\SurrounSyncBridge.cs bridge\Common.cs bridge\Diagnose.cs bridge\Realms.cs $rt
+          if ($LASTEXITCODE -ne 0) { throw "csc failed" }
+      - name: Tests
+        shell: pwsh
+        run: |
+          $failed = @()
+          foreach ($t in 'test-sync', 'test-saves', 'test-journal-ui', 'test-realm-lua', 'test-setup', 'test-report',
+                         'test-bridge', 'test-bridge-4p', 'test-link-e2e', 'test-realms') {
+            Write-Host "== $t"
+            python tools/$t.py
+            if ($LASTEXITCODE -ne 0) { $failed += $t }
+          }
+          if ($failed) { throw "failed: $($failed -join ', ')" }

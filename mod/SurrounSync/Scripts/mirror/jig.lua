@@ -6,17 +6,12 @@ local stats_logged = 0
 
 local jig = {}
 
-local ITEMS = "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"
-local INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
-local ITEM_ID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"
-local COUNT = "Count_8_DD79AF2A46126A338C8DCCB4616D91CD"
-local DURABILITY = "Durability_22_A3557C454274D193D47AB9B71FB0C0CA"
-local UID = "UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"
+local F = require("mirror.fields")
+local ITEMS, INFO, ITEM_ID, COUNT, DURABILITY, UID = F.ITEMS, F.INFO, F.ITEM_ID, F.COUNT, F.DURABILITY, F.UID
 local C_REPUID = "ReplicationUID_23_EB27D09649B6E02591DCA98708B06332"
 local C_IN = "InContainerUID_24_D1504ED7438699C73EA046AD734E79BF"
 local C_INDEX = "ContainerIndex_22_9A211B86466A9D1C57E1FC839A5B0896"
-local SLOT_INDEX = "SlotIndex_6_8ED1F34A4AF1D565616883B80192E3DD"
-local ROTATED = "Rotated_9_3CFE5D9342A81FB1FF17DEB7B491CE56"
+local SLOT_INDEX, ROTATED = F.SLOT_INDEX, F.ROTATED
 
 function jig.asset(path) return util.find(path) end
 
@@ -247,13 +242,8 @@ function jig.decode(s)
     return out
 end
 
-local ITEM_VEC = "ItemVec_13_4DB12E4E4F80730BD25ACFA6FA51AD0A"
-local WEIGHT = "Weight_16_C6B7568A4E062D2AE81209916A32B4EB"
-local PRICE = "Price_19_FEFE0D2A4561BAF04CE37D9BAE1D6EF7"
-local PENDING = "Pending?_31_C3AE39044666796C0FA128BA521590CB"
-local IS_CONTAINER = "IsContainer_14_0198F62E4F1B93DD8B4D6E92B7E3EA45"
-local MOTHER = "ContainerMotherID_38_33D59C5047C31FF0367835AAF5ABE05D"
-local IN_INDEX = "InContainerIndex_31_A61F5C3A47C8E761BA5CF0ADA1DF9FDE"
+local ITEM_VEC, WEIGHT, PRICE, PENDING = F.ITEM_VEC, F.WEIGHT, F.PRICE, F.PENDING
+local IS_CONTAINER, MOTHER, IN_INDEX = F.IS_CONTAINER, F.MOTHER, F.IN_INDEX
 local COLS = "Columns_4_1D84448048078D988999ABA138CE1809"
 local ROWS = "Rows_6_78B4BC5B449017D63758E79844375AE9"
 local REPUID = "ReplicationUID_23_EB27D09649B6E02591DCA98708B06332"
@@ -310,7 +300,7 @@ function jig.flush_ui()
                         mother = { A = m.A, B = m.B, C = m.C, D = m.D }
                         local v = e.asset.SlotDimensions
                         info = { [ITEM_ID] = e.asset, [COUNT] = h.count, [DURABILITY] = { X = h.dx, Y = h.dy },
-                                 [ITEM_VEC] = { X = v.X, Y = v.Y }, [WEIGHT] = e.asset.Weight or 0, [PRICE] = e.asset.Price or 0,
+                                 [ITEM_VEC] = { X = v.X, Y = v.Y }, [WEIGHT] = e.asset.Weight or 0, [PRICE] = jig.price_in(e.comp, e.asset),
                                  [PENDING] = -1.0 }
                     end)
                     if mother and info and h.cell then show_added(e.comp, h.uid, info, mother, h.cell, h.rot) end
@@ -328,16 +318,38 @@ function jig.show_count(comp, uid, count)
     pcall(function() comp:ClientUpdateCount(jig.guid(uid), count, false) end)
 end
 
+local STARTING = "StartingItems_10_C6DB208442353E0AA9B5DB892266821A"
+local R_ITEM = "ItemID_41_8C5E69274AB445604263E4A2B3091BAD"
+local R_PRICE = "PriceOverride_29_306CC4B441051ADD17999E8D00D06A7F"
+-- An item's price in this container, the way the game sets it (BP_JigComponent: PriceOverride < 0 -> the item's
+-- own Price): a trader's StartingItems rows carry its DT_VendorTable prices. Ordinary containers have -1 there.
+function jig.price_in(comp, asset)
+    local price = 0
+    pcall(function() price = asset.Price end)
+    pcall(function()
+        local arr = comp.ContainersSettings[1][STARTING]
+        local a = util.addr(asset)
+        for j = 1, arr:GetArrayNum() do
+            if util.addr(arr[j][R_ITEM]) == a then
+                local p = tonumber(arr[j][R_PRICE])
+                if p and p >= 0 then price = p end
+                return
+            end
+        end
+    end)
+    return price or 0
+end
+
 -- place = { cell, rot }: the grid cell + rotation the item had in the other game; tried first in each
 -- container, then the first free cell (unrotated) as before.
 function jig.add_item(comp, da, count, dx, dy, conts, place)
     local asset = jig.asset(da)
     if not util.valid(asset) then return nil, "not loaded in this game" end
-    local size, weight, price, holds = { X = 1, Y = 1 }, 0, 0, false
+    local size, weight, holds = { X = 1, Y = 1 }, 0, false
     pcall(function() local v = asset.SlotDimensions; size = { X = v.X, Y = v.Y } end)
     pcall(function() holds = asset["IsContainer?"] == true end)
     pcall(function() weight = asset.Weight end)
-    pcall(function() price = asset.Price end)
+    local price = jig.price_in(comp, asset)
     -- UE4SS writes out-params back into the tables passed in: use fresh ones for every call.
     local function new_info(rot)
         return {
@@ -440,6 +452,87 @@ function jig.twin_grids(comp)
         end)
     end)
     return twins
+end
+
+-- Twin compartments: the UI shows one, items in the other were invisible. Their items go into the twin holding
+-- the most (the game's own same-component move); an emptied twin is detached - its holder set to a made-up uid no
+-- item has, its size 0x0 - so the bag has one compartment per slot again and nothing is ever put into the old one.
+-- Returns items moved, twins detached, items left where they were (no room).
+local DETACHED = 1397639507 -- "SSYN"
+local function grid_of(comp, rep)
+    local out
+    pcall(function()
+        util.each(comp.MainJigContainers, function(_, c)
+            local ct = c:get()
+            if not out and jig.uid_str(ct[C_REPUID]) == rep then out = ct end
+        end)
+    end)
+    return out
+end
+local function uids_in(ct)
+    local out = {}
+    pcall(function() util.each(ct[ITEMS], function(_, el) out[#out + 1] = jig.uid_str(el:get()[UID]) end) end)
+    return out
+end
+function jig.merge_twins(comp, by)
+    local is_item, groups, order = {}, {}, {}
+    for _, h in ipairs(jig.contents_of(comp)) do is_item[h.uid] = true end
+    pcall(function()
+        util.each(comp.MainJigContainers, function(_, c)
+            local ct = c:get()
+            local holder, slot, rep
+            pcall(function() holder = jig.uid_str(ct[C_IN]); slot = ct[C_INDEX]; rep = jig.uid_str(ct[C_REPUID]) end)
+            if holder and rep and is_item[holder] then
+                local key = holder .. "#" .. tostring(slot)
+                if not groups[key] then groups[key] = {}; order[#order + 1] = key end
+                local g = groups[key]
+                g[#g + 1] = { rep = rep, n = #uids_in(ct) }
+            end
+        end)
+    end)
+    local moved, detached, left = 0, 0, 0
+    for _, key in ipairs(order) do
+        local g = groups[key]
+        if #g > 1 then
+            local keep = g[1]
+            for _, x in ipairs(g) do if x.n > keep.n then keep = x end end
+            for _, x in ipairs(g) do
+                if x ~= keep then
+                    local src = grid_of(comp, x.rep)
+                    for _, uid in ipairs(src and uids_in(src) or {}) do
+                        local dst = grid_of(comp, keep.rep)
+                        local cells = 0
+                        pcall(function() cells = dst[COLS] * dst[ROWS] end)
+                        local to = (jig.container_arg(dst))[REPUID]
+                        local done, tries = false, 0
+                        for idx = 0, cells - 1 do
+                            for _, rot in ipairs({ false, true }) do
+                                if not done and tries < MAX_TRIES then
+                                    tries = tries + 1
+                                    pcall(function() comp:HandleSameContainerMoveToIndex(jig.guid(uid), to, idx, rot, by or comp, 0) end)
+                                    for _, u in ipairs(uids_in(grid_of(comp, keep.rep) or {})) do
+                                        if u == uid then done = true; break end
+                                    end
+                                    if done then jig.show_moved(comp, uid, { A = to.A, B = to.B, C = to.C, D = to.D }, idx, rot) end
+                                end
+                            end
+                            if done then break end
+                        end
+                        if done then moved = moved + 1 else left = left + 1 end
+                    end
+                    src = grid_of(comp, x.rep)
+                    if src and #uids_in(src) == 0 then
+                        local ok = pcall(function()
+                            src[C_IN] = { A = DETACHED, B = 0, C = 0, D = detached + 1 }
+                            src[COLS], src[ROWS] = 0, 0
+                        end)
+                        if ok then detached = detached + 1 end
+                    end
+                end
+            end
+        end
+    end
+    return moved, detached, left
 end
 local function consume(comp, h) jig.take(comp, h.uid, h.count, h.count) end
 
@@ -625,12 +718,9 @@ function jig.fill(comp, holder_uid, list)
     return added, missing
 end
 
-local STARTING = "StartingItems_10_C6DB208442353E0AA9B5DB892266821A"
-local R_ITEM = "ItemID_41_8C5E69274AB445604263E4A2B3091BAD"
 local R_CHANCE = "SpawnChance_9_0A1811814580181DD09AE78500C25A28"
 local R_MIN = "RandomCountMin_17_2CF035DB43DEE23801AD29A29560BDA9"
 local R_MAX = "RandomCountMax_18_C37B88104F52B02AA216B5912518580D"
-local R_PRICE = "PriceOverride_29_306CC4B441051ADD17999E8D00D06A7F"
 local R_INSIDE = "InContainerItem_26_8B73BDAE473217274FE336B3D2EB2407"
 local R_INDEX = "Index_37_B46F3993454026F67AFD6D936119D0F6"
 local R_ROT = "PreferRotated?_39_71AEF07C444B177A20CAF4A74260B9CD"

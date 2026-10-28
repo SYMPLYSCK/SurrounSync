@@ -52,6 +52,7 @@ local now, scan_in, state_in = 0.0, 0.0, 0.0
 local guest_hit_at = -1e9
 local active = false
 local warm = 0
+local last_nests = nil -- guest: the host's last "nests" blob
 local sent_state = nil
 local shown_dead = {}
 local retargeting = false
@@ -133,7 +134,7 @@ local function rescan_class(cls)
     end
     pcall(function()
         for _, o in ipairs(objs) do
-            local a = util.addr(o)
+            local a = util.valid(o) and util.addr(o)
             if a and not by_addr[a] then
                 local ok, k, l = pcall(key_of, o, cls)
                 if ok then
@@ -390,8 +391,9 @@ local function warmed()
     end
     log.info(string.format("infest: %d nests here", c))
     if role == "guest" then
-        local b = link.get_blob("nests")
-        if b then take_state(b) end
+        -- get_blob hands out only a changed state: a rescan re-applies the last one or nests look untouched
+        local b = link.get_blob("nests") or last_nests
+        if b then last_nests = b; take_state(b) end
     end
 end
 
@@ -434,7 +436,7 @@ function infest.tick(dt)
     else
         hits:pump(on_guest_message)
         local b = link.get_blob("nests")
-        if b then take_state(b) end
+        if b then last_nests = b; take_state(b) end
         state_in = state_in - dt
         if state_in <= 0 then state_in = STATE_EVERY; open_primaries() end
     end
@@ -450,18 +452,23 @@ function infest.status()
 end
 
 -- Single player too: a nest saved with the old pin gets its real health back, once per loaded world.
+-- All classes in one frame: one group walk fills every class's list, and a list used a frame later can hold an
+-- old-world nest the GC freed in between (guest crash 5 s after going home, DBG-20261027-008).
 local solo = { left = nil, idx = 0, wait = 0.0 }
 local function solo_tick(dt)
     if active then return end
     if solo.left == nil then solo.wait = solo.wait + (dt or 0); if solo.wait < 5.0 then return end; solo.left = #CLASSES end
-    if solo.left <= 0 then return end
-    local cls = CLASSES[solo.left]
-    local objs, walked = util.instances(cls, PATH, GROUP)
-    if not walked then return end
-    solo.left = solo.left - 1
-    for _, o in ipairs(objs or {}) do
-        local ok, k, l = pcall(key_of, o, cls)
-        if ok then repair({ obj = o, key = k, loc = l, cls = cls }) end
+    while solo.left > 0 do
+        local cls = CLASSES[solo.left]
+        local objs, walked = util.instances(cls, PATH, GROUP)
+        if not walked then return end
+        solo.left = solo.left - 1
+        for _, o in ipairs(objs or {}) do
+            if util.valid(o) then
+                local ok, k, l = pcall(key_of, o, cls)
+                if ok then repair({ obj = o, key = k, loc = l, cls = cls }) end
+            end
+        end
     end
 end
 function infest.watch()

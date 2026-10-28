@@ -16,6 +16,7 @@ local KNOWN = {
     BPModLoaderMod = "client", BPML_GenericFunctions = "client", Keybinds = "client",
     ConsoleCommandsMod = "client", ConsoleEnablerMod = "client", CheatManagerEnablerMod = "client",
     SuppressorHeatGlow = "client", LineTraceMod = "client", AutoContinue = "client",
+    SyncFX = "client", DreadFX = "client",   -- graphics only (SyncFX is switched from MY SETTINGS)
     PDS = "gameplay", SDTrainer = "gameplay", WeaponProgression = "gameplay", HeadshotBrains = "gameplay",
     UniversalCraftingNetwork = "gameplay", SplitScreenMod = "gameplay",
     SurrounDeadMP = "gameplay", SurrounDeadMPInput = "gameplay",

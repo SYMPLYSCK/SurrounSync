@@ -42,14 +42,8 @@ local allow_copy_damage = false
 local dmg_stats = { sent = 0, applied = 0, dodged = 0 }
 local install_hit_hooks = function() end
 local hit_hooks_done = false
-local master_cls = nil
 
 local LOOK_KEYS, look_of, health_of
-local function master()
-    if util.valid(master_cls) then return master_cls end
-    master_cls = StaticFindObject(MASTER)
-    return util.valid(master_cls) and master_cls or nil
-end
 
 local TRADER = "/Game/AI/Humans/Trader/BP_MasterTrader.BP_MasterTrader_C"
 local FAMILIES = {
@@ -158,12 +152,16 @@ local function zlist_add(z)
 end
 -- an ended zombie leaves at the next prune, before it can be freed (a freed one's wrapper still passes IsValid)
 util.on_end(function(a) if zlist_set[a] then zlist_set[a] = false end end)
+local begin_fn = function(self) local o; pcall(function() o = self:get() end); if o then zlist_new[#zlist_new + 1] = o end end
+-- New zombies come from the master class's BeginPlay (game thread). NotifyOnNewObject was used before: it runs
+-- on whichever thread constructs the object - the loading thread during a level load, where its Lua callback
+-- waits for the Lua lock the game thread holds while our Lua waits for that load (DBG-20261027-006 H1).
 local function watch_new_zombies()
-    if notify_on then return end
-    notify_on = pcall(function()
-        NotifyOnNewObject(MASTER, function(obj) zlist_new[#zlist_new + 1] = obj end)
-    end)
-    log.info("zombies: watching for new zombies " .. (notify_on and "(no periodic scan needed)" or "FAILED - scanning instead"))
+    local was = notify_on
+    notify_on = util.ensure_hook(MASTER .. ":ReceiveBeginPlay", begin_fn) == true
+    if notify_on ~= was then
+        log.info("zombies: watching for new zombies " .. (notify_on and "(BeginPlay - no periodic scan needed)" or "lost the BeginPlay hook - scanning instead"))
+    end
 end
 local BEGIN_CLASSES = {
     "/Game/AI/Zombies/Boss/BP_ZombieBoss.BP_ZombieBoss_C",
@@ -177,12 +175,12 @@ local BEGIN_CLASSES = {
     "/Game/AI/Animals/Rabbit/BP_AnimalRabbit.BP_AnimalRabbit_C",
     "/Game/AI/Animals/Dog/BP_AnimalDog.BP_AnimalDog_C",
 }
-local begin_fn = function(self) local o; pcall(function() o = self:get() end); if o then zlist_new[#zlist_new + 1] = o end end
 local begin_in = 0.0
 local function watch_begin(dt)
     begin_in = begin_in - dt
     if begin_in > 0 then return end
     begin_in = 2.0
+    watch_new_zombies()
     for _, c in ipairs(BEGIN_CLASSES) do util.ensure_hook(c .. ":ReceiveBeginPlay", begin_fn) end
 end
 local function zombies_cached(t)
@@ -303,6 +301,39 @@ local function loot_ready()
         if not o then missing = missing + 1 end
     end
     return missing == 0, missing
+end
+
+-- Our own zombie spawns must never make the game load anything (DBG-20261027-016): the zombie BP's BeginPlay
+-- (Event_SetMeshAndMaterial) LoadAsset's a random Meshes_Soft / Materials_Soft entry of the class defaults. One
+-- whose package is still streaming in makes the engine flush async loading inside our SpawnActor, and the loading
+-- thread then waits in UE4SS's object-construction hook for the Lua lock this call holds: a permanent freeze.
+-- So during our spawn every entry points at a look that is loaded already (the wanted one, else the class's own
+-- template mesh). Returns the restore function, or nil when there is no loaded look (then don't spawn).
+local function pin_soft_looks(cdo, mesh, mat)
+    if not cdo then return function() end end
+    local K = util.cdo("/Script/Engine.Default__KismetSystemLibrary")
+    local saved = {}
+    local function restore()
+        for _, s in ipairs(saved) do pcall(function() for i, v in ipairs(s.old) do s.a[i] = v end end) end
+    end
+    local function pin(name, obj)
+        local a, n = nil, 0
+        pcall(function() a = cdo[name]; n = a:GetArrayNum() end)
+        if n == 0 then return true end
+        local sp
+        -- (a soft pointer made by the engine: UE4SS crashes writing a plain object into a soft array)
+        if util.valid(obj) then pcall(function() sp = K:Conv_ObjectToSoftObjectReference(obj) end) end
+        if not sp then return false end
+        local s = { a = a, old = {} }
+        saved[#saved + 1] = s
+        return (pcall(function() for i = 1, n do s.old[i] = a[i]; a[i] = sp end end))
+    end
+    local tmpl_mesh, tmpl_mat
+    pcall(function() tmpl_mesh = cdo.Mesh:GetSkinnedAsset() end)
+    pcall(function() tmpl_mat = cdo.Mesh:GetMaterial(0) end)
+    if pin("Meshes_Soft", mesh or tmpl_mesh) and pin("Materials_Soft", mat or tmpl_mat) then return restore end
+    restore()
+    return nil
 end
 
 local function copy_class(p)
@@ -531,7 +562,13 @@ local function host_tick(dt)
     if send_in > 0 then return end
     send_in = 1.0 / cfg.zombies.send_hz
     local gl = guest_center()
-    if not gl then return end
+    if not gl then
+        -- no guest (left, or its ghost is gone): the zombies sent to it are despawned around its old spot soon; the
+        -- ids only get pruned below, so drop them now - a reader of by_id (corpses scan) touched freed zombies 7 s
+        -- after a guest left (host crash 2026-10-27 17:07, AV in UE4SS)
+        if next(by_id) then ids, by_id, statics, p8.bound = {}, {}, {}, {} end
+        return
+    end
 
     local dict, dict_n, lines = {}, 0, {}
     local function idx(p)
@@ -643,8 +680,9 @@ local function host_tick(dt)
     end
     p8.near.d, p8.near.at = nearest, now
     for a, id in pairs(ids) do
-        if not alive[a] then
-            ids[a] = nil; by_id[id] = nil; statics[id] = nil
+        local held = p8.bound[a] and now < p8.bound[a] and util.valid(by_id[id])
+        if not alive[a] and not held then
+            ids[a] = nil; by_id[id] = nil; statics[id] = nil; p8.bound[a] = nil
         end
     end
     local out = {}
@@ -863,9 +901,14 @@ local function spawn_copy(id, e)
             for i = 1, a:GetArrayNum() do old_mats[i] = a[i]; if mat then a[i] = mat end end
         end)
     end
-    local ok = pcall(function()
+    local unpin = pin_soft_looks(cdo, mesh, mat)
+    local ok = unpin and pcall(function()
         z = w:SpawnActor(cls, { X = e.loc.X, Y = e.loc.Y, Z = e.loc.Z + 10 }, { Pitch = 0, Yaw = e.yaw, Roll = 0 })
     end)
+    if unpin then unpin() elseif not warned_class["pin " .. e.cls] then
+        warned_class["pin " .. e.cls] = true
+        log.warn("zombies: no loaded look for " .. tostring(e.cls) .. " - not spawned (a spawn would load one and could freeze)")
+    end
     if old_possess ~= nil then pcall(function() cdo.AutoPossessAI = old_possess end) end
     pcall(function() local a = cdo.Meshes; for i, m in ipairs(old_meshes) do a[i] = m end end)
     pcall(function() local a = cdo.Materials; for i, m in ipairs(old_mats) do a[i] = m end end)
@@ -952,6 +995,7 @@ function p8.drained(z, a)
     local keep = l ~= nil and now < k.till
         and not (host and util.dist(host, l) < sp.host_near)
         and not (not k.dead and me and util.dist(me, l) > 2 * sp.drain_radius)
+    if not keep and l ~= nil and p8.rendered(z) then return true end   -- (until I look away)
     if not keep then p8.drain[a] = nil end
     return keep
 end
@@ -990,7 +1034,9 @@ function sweep.step()
             end
         else
             local a = util.addr(o) or 0
-            if util.valid(o) and not zombies.is_copy(o) and not (destroyed[a] and now - destroyed[a] < 120) and not p8.drained(o, a) then
+            -- (one on my screen stays until I look away: the next pass gets it - nothing vanishes in front of me)
+            if util.valid(o) and not zombies.is_copy(o) and not (destroyed[a] and now - destroyed[a] < 120) and not p8.drained(o, a)
+                    and not p8.rendered(o) then
                 destroyed[a] = now
                 pcall(function()
                     local c = o.Controller
@@ -1185,8 +1231,14 @@ local function read_snapshot()
             }
             seen[id] = true
             local c = copies[id]
-            if not c and not e.dead and (not spawn_gate or spawn_gate(id)) then
-                perf.run("z.spawn", function() c = spawn_copy(id, e) end); copies[id] = c
+            -- a zombie of mine the host took over in a merge: it becomes this copy where it stands
+            if not c and p8.pending[id] then c = p8.demote(id); copies[id] = c end
+            if not c and not e.dead and not p8.handed[id] and (not spawn_gate or spawn_gate(id)) then
+                local wait
+                perf.run("z.recycle", function() c, wait = p8.recycle(id, e) end)
+                -- (out of this frame's reuse time: next frame, rather than a spawn now)
+                if not c and wait ~= "later" then perf.run("z.spawn", function() c = spawn_copy(id, e) end) end
+                copies[id] = c
                 if c and on_spawned then util.safe(on_spawned, "zombies.on_spawned", id, c.z) end
             end
             if c then
@@ -1380,12 +1432,14 @@ local function guest_tick(dt)
         util.safe(function() xp.reward_kill(c and util.valid(c.z) and c.z or nil, tonumber(amount)) end, "zombies.zkill")
     end)
     spawn_budget = 1
+    p8.recycle_budget, p8.recycle_spent = 4, 0
     local joined = session.in_world() and util.valid(game.player())
     if joined ~= active then
         active, active_at = joined, now
         if not active then destroy_all_copies("left the host's world")
         else log.info("zombies: in the host's world - showing the host's zombies") end
         p8.on, p8.fighting, p8.drain, p8.stopped = false, false, {}, {}
+        p8.handed, p8.handing, p8.offer, p8.pending, p8.reenable, p8.brainless = {}, nil, nil, {}, nil, {}
         spawner_in = 0.0
         sweep.volumes = {}
         native_in = 0.0
@@ -1415,6 +1469,11 @@ local function guest_tick(dt)
         hook_archetypes()
     end) end
     if not (p8.on or p8.follow) then perf.run("z.read", read_snapshot) end
+    if p8.handing then perf.run("z.handover", p8.step_handover) end
+    if p8.brainless[1] then perf.run("z.brainless", p8.brainless_tick) end
+    if p8.reenable then p8.step_reenable(100) end
+    if p8.offer then perf.run("z.offer", p8.offer_tick, dt) end
+    if (next(p8.pending) or p8.pend_stats) and not p8.on then perf.run("z.pending", p8.pending_tick) end
     perf.run("z.drive", drive, dt)
 end
 
@@ -1432,15 +1491,17 @@ function zombies.set_split(on)
         return
     end
     if on then
-        destroy_all_copies("load split - your game runs the AI around you")
-        local n = 0
-        for _, sp in pairs(p8.stopped) do
-            if util.valid(sp) then pcall(function() sp:SetIsSpawningStopped(false) end); n = n + 1 end
-        end
+        p8.handing = nil
+        destroy_all_copies("load split - your game runs the AI around you (not handed over)")
+        -- the spawners this mod stopped go back on 100 a frame (all ~1000 at once was one long frame)
+        local list = {}
+        for _, sp in pairs(p8.stopped) do list[#list + 1] = sp end
+        p8.reenable = { list = list, i = 0 }
         p8.stopped, p8.drain, p8.fighting = {}, {}, false
-        log.info(string.format("zombies: split - %d spawner(s) back on, my own AI stays", n))
+        log.info(string.format("zombies: split - %d spawner(s) going back on, my own AI stays", #list))
         return
     end
+    p8.reenable = nil
     local sp, me, kept = cfg.zombies.split, p8.my_location(), 0
     p8.drain = {}
     for _, z in ipairs(me and zombies_cached(now) or {}) do
@@ -1459,6 +1520,402 @@ function zombies.set_split(on)
 end
 
 function zombies.is_split() return p8.on end
+
+-- Split hand-over (guest): before the guest answers a split, each of the host's copies becomes this game's own AI
+-- where it stands - the same actor with its look, pose and target area, no spawn and nothing removed: contain_copy
+-- undone, then the class's own AI controller. A few per frame (time budget), dead copies simply stay as bodies.
+-- Handed ids are never spawned again from a late snapshot, and the host's hits from them are ignored (the zombie
+-- here hits on its own now).
+p8.handed, p8.handing = {}, nil
+function p8.release(z)
+    local cdo
+    pcall(function() cdo = z:GetClass():GetCDO() end)
+    if not cdo then return false end
+    pcall(function() z.AIOSubject:SetCanBeUpdatedBySubsystem(true) end)
+    pcall(function()
+        local cm, d = z.CharacterMovement, cdo.CharacterMovement
+        cm.bRunPhysicsWithNoController = d.bRunPhysicsWithNoController
+        cm.BrakingDecelerationWalking = d.BrakingDecelerationWalking
+        cm.GroundFriction = d.GroundFriction
+        cm.BrakingFrictionFactor = d.BrakingFrictionFactor
+    end)
+    pcall(function() z.DamageComponent["CanHeadshot1Shot?"] = cdo.DamageComponent["CanHeadshot1Shot?"] end)
+    -- (contain_copy added the player class: a copy doesn't see me; this one hunts me now)
+    pcall(function()
+        local a, d = z.ClassesToIgnore, cdo.ClassesToIgnore
+        a:Empty()
+        for i = 1, d:GetArrayNum() do a[i] = d[i] end
+    end)
+    pcall(function() z:SpawnDefaultController() end)
+    local ok = false
+    pcall(function() ok = util.valid(z.Controller) end)
+    return ok
+end
+function p8.promote(id)
+    local c = copies[id]
+    copies[id], xlooks[id], p8.handed[id] = nil, nil, true
+    if not (c and util.valid(c.z)) then return "gone" end
+    copy_addr[util.addr(c.z) or 0] = nil
+    if p8.handing then p8.handing.mine[#p8.handing.mine + 1] = c.z end
+    if c.dead_at or dead_of(c.z, c.fam) then return "body" end
+    if p8.release(c.z) then return "ai" end
+    p8.brainless[#p8.brainless + 1] = { z = c.z, tries = 0 }
+    return "no brain"
+end
+-- a taken-over zombie the engine gave no controller would stand frozen: tried again a few frames, then removed
+-- the moment it is off my screen
+p8.brainless = {}
+function p8.brainless_tick()
+    local keep = {}
+    for _, b in ipairs(p8.brainless) do
+        if util.valid(b.z) and not dead_of(b.z) then
+            b.tries = b.tries + 1
+            local ok = false
+            if b.tries <= 5 then pcall(function() b.z:SpawnDefaultController() end) end
+            pcall(function() ok = util.valid(b.z.Controller) end)
+            if ok then
+                log.info("zombies: a taken-over zombie got its brain on try " .. b.tries)
+            elseif b.tries > 5 and not p8.rendered(b.z) then
+                destroy_holdables(b.z)
+                pcall(function() b.z:K2_DestroyActor() end)
+                log.info("zombies: a taken-over zombie without a brain removed out of sight")
+            else
+                keep[#keep + 1] = b
+            end
+        end
+    end
+    p8.brainless = keep
+end
+-- the host called the split off mid hand-over: what is already mine stays until done, like after a merge
+function zombies.cancel_handover()
+    local h = p8.handing
+    if not h then return end
+    p8.handing = nil
+    local sp, n = cfg.zombies.split, 0
+    for _, z in ipairs(h.mine) do
+        if util.valid(z) then
+            local dead = dead_of(z) == true
+            p8.drain[util.addr(z) or 0] = { till = now + (dead and sp.corpse_s or sp.drain_s), dead = dead }
+            n = n + 1
+        end
+    end
+    log.info(string.format("zombies: split hand-over called off - %d taken over so far stay until they're done", n))
+end
+function zombies.begin_handover()
+    local ids_ = {}
+    for id in pairs(copies) do ids_[#ids_ + 1] = id end
+    p8.handing = { ids = ids_, i = 0, n = { ai = 0, body = 0, gone = 0, ["no brain"] = 0 }, t0 = os.clock(), worst = 0.0, mine = {} }
+    log.info(string.format("zombies: split hand-over - taking over %d of the host's zombies where they stand", #ids_))
+end
+-- one frame's share (~3 ms); true once every copy is this game's own
+function p8.step_handover()
+    local h = p8.handing
+    if not h then return true end
+    local t0 = os.clock()
+    repeat
+        if h.i >= #h.ids then
+            -- copies that arrived meanwhile go too
+            local more = false
+            for id in pairs(copies) do h.ids[#h.ids + 1] = id; more = true end
+            if not more then break end
+        end
+        h.i = h.i + 1
+        local t1 = os.clock()
+        local r = p8.promote(h.ids[h.i])
+        h.n[r] = (h.n[r] or 0) + 1
+        h.worst = math.max(h.worst, os.clock() - t1)
+    until os.clock() - t0 > 0.003
+    if h.i < #h.ids or next(copies) then return false end
+    log.info(string.format("zombies: split hand-over done in %.2f s - %d now mine, %d bodies, %d gone, %d without a brain (slowest %.1f ms)",
+        os.clock() - h.t0, h.n.ai, h.n.body, h.n.gone, h.n["no brain"], h.worst * 1000))
+    p8.handing = nil
+    return true
+end
+-- the spawners a split hands back, n a frame
+function p8.step_reenable(n)
+    local r = p8.reenable
+    for _ = 1, n do
+        r.i = r.i + 1
+        local sp = r.list[r.i]
+        if not sp then p8.reenable = nil; return end
+        if util.valid(sp) then pcall(function() sp:SetIsSpawningStopped(false) end) end
+    end
+end
+zombies._test.reenable = function(n)
+    local frames = 0
+    while p8.reenable do p8.step_reenable(n or 100); frames = frames + 1 end
+    return frames
+end
+function zombies.handing() return p8.handing ~= nil end
+function zombies.handover_done() return p8.handing == nil end
+
+-- Merge hand-back (the way back). The host asks ("M"); the guest offers its own zombies near it in blob "p8h",
+-- refreshed every 0.2 s: "A key cls mesh mat x y z yaw arch bones eyes health dead". The host spawns its own zombie
+-- for each key where the guest's stands - out of the host's sight (the players are still far apart), one at a time,
+-- and keeps it on the guest's latest spot - then merges with "H key id" lines. The guest turns each offered zombie
+-- into the copy of that id when the first snapshot with the id arrives: the same actor, nothing pops on either side.
+-- Other families and anything not taken stay until done (drain), as before.
+p8.offer, p8.pending, p8.taken, p8.bound = nil, {}, nil, {}
+-- on my screen just now (a zombie removed then would vanish in front of me)
+function p8.rendered(z)
+    local r = false
+    pcall(function() r = z:WasRecentlyRendered(0.5) == true end)
+    return r
+end
+function zombies.begin_handback(epoch)
+    p8.offer = { epoch = epoch, by_key = {}, key_of = {}, n = 0, every = 0.0, t0 = os.clock() }
+    log.info("zombies: merge hand-back - offering my zombies near me to the host")
+end
+function p8.offer_tick(dt)
+    local o = p8.offer
+    o.every = o.every - dt
+    if o.every > 0 then return end
+    o.every = 0.2
+    local me = p8.my_location()
+    if not me then return end
+    -- only what I'd notice: on screen or within 40 m, nearest first, at most 24, inside the host's snapshot radius
+    -- (the rest is removed out of sight - sweep), so the host spawns few and the merge is quick
+    -- (the host sends copies within radius x MY performance setting - "gperf" here would be the host's, never set)
+    local ms = require("mirror.mysettings")
+    local r, fresh = cfg.zombies.radius * (ms.PERF_SHARE[ms.value("perf") or "full"] or 1.0) * 0.9, {}
+    for _, z in ipairs(zombies_cached(now)) do
+        if util.valid(z) and not zombies.is_copy(z) and not o.key_of[util.addr(z) or 0] and family_of(z) == "zombie" and not dead_of(z) then
+            local l = p8.body_loc(z)
+            local d = l and util.dist(me, l)
+            if d and d <= r and (d <= 4000 or p8.rendered(z)) then fresh[#fresh + 1] = { z = z, d = d } end
+        end
+    end
+    table.sort(fresh, function(x, y) return x.d < y.d end)
+    for _, f in ipairs(fresh) do
+        if o.n >= 24 then break end
+        o.n = o.n + 1
+        o.key_of[util.addr(f.z) or 0], o.by_key[o.n] = o.n, f.z
+    end
+    local out = { tostring(o.epoch) }
+    for key, z in pairs(o.by_key) do
+        if util.valid(z) then
+            local dead = dead_of(z) == true
+            local l = p8.body_loc(z)
+            if l then
+                local yaw, mesh, mat = 0, nil, nil
+                pcall(function() yaw = z:K2_GetActorRotation().Yaw end)
+                pcall(function() mesh = z.Mesh:GetSkinnedAsset() end)
+                pcall(function() mat = material_asset(z.Mesh:GetMaterial(0)) end)
+                out[#out + 1] = string.format("A %d %s %s %s %.1f %.1f %.1f %.1f %d %d %d %.1f %d", key,
+                    path_of(z:GetClass()) or "-", path_of(mesh) or "-", path_of(mat) or "-", l.X, l.Y, l.Z, yaw,
+                    arch_of(z, util.fname(z)) or 0, bones_of(z) or 0, eyes_of(z) or 0, health_of(z, "zombie") or -1, dead and 1 or 0)
+            end
+        end
+    end
+    link.put_blob("p8h", table.concat(out, "\n"))
+end
+-- the host merged: "H key id" -> that zombie waits for the id's first snapshot; the rest stay until done
+function zombies.finish_handback(body)
+    local o = p8.offer
+    p8.offer = nil
+    if not o then return 0 end
+    local n = 0
+    for key, id in (body or ""):gmatch("\nH (%d+) (%d+)") do
+        local z = o.by_key[tonumber(key)]
+        if util.valid(z) and not dead_of(z) then p8.pending[tonumber(id)] = { z = z, at = now }; n = n + 1 end
+    end
+    link.put_blob("p8h", "-")
+    p8.pend_stats = n > 0 and { demoted = 0, expired = 0 } or nil
+    log.info(string.format("zombies: merge hand-back - the host took %d of my %d zombies over (%.1f s)", n, o.n, os.clock() - o.t0))
+    return n
+end
+function zombies.cancel_handback() if p8.offer then p8.offer = nil; link.put_blob("p8h", "-") end end
+-- a taken zombie the host's snapshot never named within 10 s: it simply stays mine until done
+function p8.pending_tick()
+    local ps = p8.pend_stats
+    for id, p in pairs(p8.pending) do
+        if now - p.at > 10.0 then p8.pending[id] = nil; if ps then ps.expired = ps.expired + 1 end end
+    end
+    if ps and not next(p8.pending) then
+        log.info(string.format("zombies: merge hand-back - %d of my zombies became the host's copies where they stand, %d never showed up in a snapshot (stay mine until done)",
+            ps.demoted, ps.expired))
+        p8.pend_stats = nil
+    end
+end
+-- the first snapshot with a taken id: my zombie becomes its copy where it stands
+function p8.demote(id)
+    local p = p8.pending[id]
+    p8.pending[id] = nil
+    local z = p.z
+    if not util.valid(z) or dead_of(z) then return nil end
+    contain_copy(z)
+    local a = util.addr(z) or 0
+    copy_addr[a] = id
+    p8.drain[a] = nil
+    if p8.pend_stats then p8.pend_stats.demoted = p8.pend_stats.demoted + 1 end
+    return { z = z, track = track.new(2.0), seen = now, born = now, fam = family_of(z), look_at = now }
+end
+
+-- Guest: a copy can be one of my own zombies instead of a new spawn - alive, same class, off my screen: contained
+-- and moved to the host's zombie's spot out of sight (a SpawnActor is 4-40 ms a copy: the hitch after a merge or a
+-- join, while the sweep was removing my own zombies anyway). It shows up where the host's zombie is; sync_look
+-- settles its look like any copy's.
+function p8.recycle(id, e)
+    -- (a few a frame within ~4 ms; the rest go on the next frames' snapshots)
+    if not e.cls then return nil end
+    if p8.recycle_budget <= 0 or (p8.recycle_spent or 0) > 0.004 then return nil, "later" end
+    local held = {}
+    for _, p in pairs(p8.pending) do held[util.addr(p.z) or 0] = true end
+    -- (only near me: far ones are what my game is despawning - one picked mid-despawn was gone a frame later)
+    local me = p8.my_location()
+    if not me then return nil end
+    for _, z in ipairs(zombies_cached(now)) do
+        local a = util.addr(z) or 0
+        local l = util.valid(z) and p8.body_loc(z)
+        if l and util.dist(me, l) <= cfg.zombies.radius and not copy_addr[a] and not held[a] and not p8.drain[a] and not destroyed[a]
+                and not zombies.is_copy(z) and family_of(z) == "zombie" and not dead_of(z)
+                and path_of(z:GetClass()) == e.cls and not p8.rendered(z) then
+            -- (one the game already removed stays "valid" at 0,0,0 until garbage collection: never reused)
+            local gone = copy_broken(z)
+            if not gone then pcall(function() gone = z:IsActorBeingDestroyed() == true end) end
+            if gone then destroyed[a] = now end
+            if not gone then
+                p8.recycle_budget = p8.recycle_budget - 1
+                local t0 = os.clock()
+                contain_copy(z)
+                local t1 = os.clock()
+                pcall(function() z:K2_SetActorLocationAndRotation({ X = e.loc.X, Y = e.loc.Y, Z = e.loc.Z + 10 },
+                    { Pitch = 0, Yaw = e.yaw, Roll = 0 }, false, {}, true) end)
+                local t2 = os.clock()
+                local mesh, mat = e.mesh and find(e.mesh), e.mat and find(e.mat)
+                pcall(function() if mesh and not util.same(z.Mesh:GetSkinnedAsset(), mesh) then z.Mesh:SetSkinnedAssetAndUpdate(mesh, false) end end)
+                pcall(function() if mat then z.Mesh:SetMaterial(0, mat) end end)
+                local t3 = os.clock()
+                copy_addr[a] = id
+                stats.recycled = (stats.recycled or 0) + 1
+                p8.recycle_spent = (p8.recycle_spent or 0) + (t3 - t0)
+                if stats.recycled <= 6 then
+                    log.info(string.format("zombies: reused my zombie as copy %d in %.1f ms (contain %.1f, move %.1f, look %.1f)",
+                        id, (t3 - t0) * 1000, (t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - t2) * 1000))
+                end
+                return { z = z, track = track.new(2.0), seen = now, born = now, fam = "zombie" }
+            end
+        end
+    end
+    return nil
+end
+p8.recycle_budget = 0
+
+-- Host side of the hand-back.
+function zombies.begin_taking() p8.taken = { keys = {}, queue = {}, n = 0, failed = 0, worst = 0.0, t0 = os.clock(), next_at = 0.0 } end
+function zombies.take_offer(body)
+    local t = p8.taken
+    if not t or not body then return end
+    for k, cls, mesh, mat, x, y, z, yaw, arch, bones, eyes, h, dead in body:gmatch(
+            "\nA (%d+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%d+) (%d+) (%d+) (%S+) (%d)") do
+        local key = tonumber(k)
+        local e = t.keys[key]
+        local loc = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
+        if not e then
+            if dead ~= "1" then
+                e = { cls = cls, mesh = mesh ~= "-" and mesh or nil, mat = mat ~= "-" and mat or nil, arch = tonumber(arch),
+                      bones = tonumber(bones), eyes = tonumber(eyes), h = tonumber(h) }
+                t.keys[key] = e
+                t.queue[#t.queue + 1] = key
+            end
+        end
+        if e then
+            e.loc, e.yaw, e.dead = loc, tonumber(yaw), dead == "1"
+            -- (spawned already: kept on the guest's zombie's spot until the merge, so the copy doesn't jump)
+            if e.z and util.valid(e.z) and not e.dead then
+                pcall(function() e.z:K2_SetActorLocation({ X = loc.X, Y = loc.Y, Z = loc.Z + 10 }, false, {}, true) end)
+            elseif e.z and util.valid(e.z) and e.dead then
+                pcall(function() e.z:K2_DestroyActor() end)
+                e.z = nil
+            end
+        end
+    end
+end
+function p8.spawn_original(e)
+    local cls = copy_class(e.cls)
+    if not util.valid(cls) then return nil end
+    local cdo
+    pcall(function() cdo = cls:GetCDO() end)
+    local mesh, mat = e.mesh and find(e.mesh), e.mat and find(e.mat)
+    local old_meshes, old_mats = {}, {}
+    if cdo then
+        pcall(function() local a = cdo.Meshes; for i = 1, a:GetArrayNum() do old_meshes[i] = a[i]; if mesh then a[i] = mesh end end end)
+        pcall(function() local a = cdo.Materials; for i = 1, a:GetArrayNum() do old_mats[i] = a[i]; if mat then a[i] = mat end end end)
+    end
+    local z
+    local unpin = pin_soft_looks(cdo, mesh, mat)
+    if unpin then
+        pcall(function()
+            z = game.world():SpawnActor(cls, { X = e.loc.X, Y = e.loc.Y, Z = e.loc.Z + 10 }, { Pitch = 0, Yaw = e.yaw, Roll = 0 })
+        end)
+        unpin()
+    end
+    if cdo then
+        pcall(function() local a = cdo.Meshes; for i, m in ipairs(old_meshes) do a[i] = m end end)
+        pcall(function() local a = cdo.Materials; for i, m in ipairs(old_mats) do a[i] = m end end)
+    end
+    if not util.valid(z) then return nil end
+    -- the guest's zombie's archetype, never a new roll
+    for _, k in ipairs(ARCH_CHANCES) do pcall(function() z[k] = 0 end) end
+    pcall(function() if mesh and not util.same(z.Mesh:GetSkinnedAsset(), mesh) then z.Mesh:SetSkinnedAssetAndUpdate(mesh, false) end end)
+    pcall(function() if mat then z.Mesh:SetMaterial(0, mat) end end)
+    local seen = e.arch > 0 and arch_hooks.ready[e.arch]
+    if seen and os.clock() - seen < ARCH_READY_S then
+        arch_hooks.calling = true
+        pcall(function() local f = z["Archetype_" .. ARCH[e.arch]]; f(z) end)
+        arch_hooks.calling = false
+    end
+    for i = 1, #BONES do
+        if (e.bones // BIT[i]) % 2 == 1 then pcall(function() z.Mesh:HideBoneByName(bone_fname(i), 0) end) end
+    end
+    if e.eyes == 2 then pcall(function() z:Event_BloodMoon(true) end) end
+    if e.h and e.h > 0 then pcall(function() z.DamageComponent.CurrentHealth = e.h end) end
+    return z
+end
+-- one spawn every 0.25 s at most (a spawn is 4-40 ms of engine work); true once every offered zombie has one
+function p8.take_tick()
+    local t = p8.taken
+    if not t then return true end
+    if #t.queue == 0 then return true end
+    if os.clock() < t.next_at then return false end
+    t.next_at = os.clock() + 0.25
+    local key = table.remove(t.queue, 1)
+    local e = t.keys[key]
+    if e and not e.dead then
+        local t0 = os.clock()
+        local ok, z = pcall(p8.spawn_original, e)
+        t.worst = math.max(t.worst, os.clock() - t0)
+        if ok and z then e.z = z; t.n = t.n + 1 else t.failed = t.failed + 1 end
+    end
+    return #t.queue == 0
+end
+function zombies.taking_done() return p8.take_tick() end
+-- after the host's merge (ids reset): ids for the spawned zombies, as "H key id" lines for the guest
+function zombies.bind_taken()
+    local t = p8.taken
+    p8.taken = nil
+    if not t then return "" end
+    local out = {}
+    for key, e in pairs(t.keys) do
+        if e.z and util.valid(e.z) and not e.dead then
+            local a = util.fname(e.z) or tostring(util.addr(e.z))
+            znames[e.z] = a
+            next_id = next_id + 1
+            ids[a], by_id[next_id] = next_id, e.z
+            p8.bound[a] = now + 10.0   -- (kept while outside the snapshot radius, so the guest's id still matches)
+            out[#out + 1] = string.format("H %d %d", key, next_id)
+        end
+    end
+    log.info(string.format("zombies: merge hand-back - spawned %d of the guest's zombies here, %d failed (slowest spawn %.0f ms, %.1f s)",
+        t.n, t.failed, t.worst * 1000, os.clock() - t.t0))
+    return table.concat(out, "\n")
+end
+function zombies.cancel_taking()
+    local t = p8.taken
+    p8.taken = nil
+    if not t then return end
+    for _, e in pairs(t.keys) do if e.z and util.valid(e.z) then pcall(function() e.z:K2_DestroyActor() end) end end
+end
 
 -- 4 players, group split (split.lua / group.lua): this guest follows another guest who runs the AI around both;
 -- the host sends no zombies here, its copies go, own AI is still removed (the leader's copies come instead).
@@ -1540,6 +1997,8 @@ local function selftest_tick(dt)
             selftest_copy = nil
         end
     end
+    -- the command file is a dev tool: test installs only (was a file open every second on every player's game)
+    if not cfg.devtest then return end
     selftest_in = selftest_in - dt
     if selftest_in > 0 then return end
     selftest_in = 1.0
@@ -1758,6 +2217,7 @@ apply_dmg = function(payload)
     local id, amt, cls, x, y, z, ranged = payload:match("^(%-?%d+) (%S+) (%S+) (%S+) (%S+) (%S+) ?(%d?)$")
     amt = tonumber(amt)
     if not amt or amt <= 0 then return end
+    if p8.handed[tonumber(id)] then return end   -- taken over in a split hand-over: it hits me on its own now
     local p = game.player()
     if not util.valid(p) then return end
     local c = copies[tonumber(id)]
@@ -1804,8 +2264,8 @@ function zombies.status()
             end
         end
     end
-    return string.format("%d copies (%d dead; spawned %d, replaced %d; off from host avg %.1f m, max %.1f m) own zombies removed %d, spawners stopped %d | hits taken %d, dodged %d, host hits replayed %d, speed from track %d",
-        n, dead, stats.spawned, stats.respawned or 0, off_n > 0 and off_sum / off_n or 0, off_max, stats.removed_native, stats.spawners,
+    return string.format("%d copies (%d dead; spawned %d, reused %d, replaced %d; off from host avg %.1f m, max %.1f m) own zombies removed %d, spawners stopped %d | hits taken %d, dodged %d, host hits replayed %d, speed from track %d",
+        n, dead, stats.spawned, stats.recycled or 0, stats.respawned or 0, off_n > 0 and off_sum / off_n or 0, off_max, stats.removed_native, stats.spawners,
         dmg_stats.applied, dmg_stats.dodged, zhit_stats.played, stats.vel_from_track or 0)
 end
 
@@ -1909,6 +2369,7 @@ local function forget_world()
     sweep.q = nil
     ANY_COPIES[zombies] = copy_addr
     p8.on, p8.fighting, p8.drain, p8.stopped, p8.follow = false, false, {}, {}, false
+    p8.handed, p8.handing, p8.offer, p8.pending, p8.reenable, p8.taken, p8.brainless, p8.bound = {}, nil, nil, {}, nil, nil, {}, {}
     arch_seen, arch_seen_n = {}, 0
     rad.comp, rad.seen, rad.retry = nil, nil, 0
     cache, missed, appeared, loot_obj, fam_cls, fam_retry, player_cls = {}, {}, {}, {}, {}, {}, nil

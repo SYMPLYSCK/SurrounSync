@@ -12,21 +12,10 @@ local drops = {}
 local PLAYER = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C"
 local JIG = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
 local KSL = "/Script/Engine.Default__KismetSystemLibrary"
-local INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
-local ITEM_ID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"
-local COUNT = "Count_8_DD79AF2A46126A338C8DCCB4616D91CD"
-local DURABILITY = "Durability_22_A3557C454274D193D47AB9B71FB0C0CA"
-local UID = "UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68"
-local PICKUP_REF = "PickupRef_20_A3E97763428AC84AF4DBB8A56CFAC657"
-local ROTATED = "Rotated_9_3CFE5D9342A81FB1FF17DEB7B491CE56"
-local ITEM_VEC = "ItemVec_13_4DB12E4E4F80730BD25ACFA6FA51AD0A"
-local WEIGHT = "Weight_16_C6B7568A4E062D2AE81209916A32B4EB"
-local PRICE = "Price_19_FEFE0D2A4561BAF04CE37D9BAE1D6EF7"
-local PENDING = "Pending?_31_C3AE39044666796C0FA128BA521590CB"
-local IS_CONTAINER = "IsContainer_14_0198F62E4F1B93DD8B4D6E92B7E3EA45"
-local MOTHER = "ContainerMotherID_38_33D59C5047C31FF0367835AAF5ABE05D"
-local SLOT_INDEX = "SlotIndex_6_8ED1F34A4AF1D565616883B80192E3DD"
-local IN_INDEX = "InContainerIndex_31_A61F5C3A47C8E761BA5CF0ADA1DF9FDE"
+local F = require("mirror.fields")
+local INFO, ITEM_ID, COUNT, DURABILITY, UID = F.INFO, F.ITEM_ID, F.COUNT, F.DURABILITY, F.UID
+local PICKUP_REF, ROTATED, ITEM_VEC, WEIGHT, PRICE = F.PICKUP_REF, F.ROTATED, F.ITEM_VEC, F.WEIGHT, F.PRICE
+local PENDING, IS_CONTAINER, MOTHER, SLOT_INDEX, IN_INDEX = F.PENDING, F.IS_CONTAINER, F.MOTHER, F.SLOT_INDEX, F.IN_INDEX
 
 local cfg, role, session
 local channel = events.reliable("drops")
@@ -56,7 +45,6 @@ local refill = {}
 -- as "gone" from the ground. held[uid] = the inventory items of the copy's kind while it lies near the
 -- player, so the new one can be told apart when it goes.
 local held = {}
-local ITEMS = "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"
 local now = 0.0
 local check_in = 0.0
 local stats = { sent = 0, made = 0, removed = 0, forced = 0 }
@@ -473,14 +461,21 @@ local function remove_world(payload)
         end
     end
     local best, best_d = nil, 60
-    for _, o in ipairs(FindAllOf(cls) or {}) do
-        if on_ground(o) and not tracked_uid(o) then
-            local l
-            pcall(function() l = util.vec(o:K2_GetActorLocation()) end)
-            local d = l and util.dist(l, at)
-            if d and d < best_d and item_of(o) == da then best, best_d = o, d end
+    local function pick(list)
+        for _, o in ipairs(list) do
+            if on_ground(o) and not tracked_uid(o) then
+                local l
+                pcall(function() l = util.vec(o:K2_GetActorLocation()) end)
+                local d = l and util.dist(l, at)
+                if d and d < best_d and item_of(o) == da then best, best_d = o, d end
+            end
         end
     end
+    -- a pile picked up fast was one full object walk per item: a shared 2 s list, walked again only on a miss
+    -- (an item dropped since the list was made)
+    local list, age = util.all_of(cls, 2.0)
+    pick(list)
+    if not best and age > 0 then pick(util.all_of(cls, 0)) end
     if best then
         pcall(function() best:K2_DestroyActor() end)
         ended[util.addr(best) or 0] = true

@@ -80,7 +80,14 @@ def dir_backend(L):
     def rmdir(p):
         shutil.rmtree(p, ignore_errors=True)
         return not os.path.exists(p)
-    return L.table_from({"mkdir": mkdir, "list_dirs": list_dirs, "rmdir": rmdir})
+
+    def rmdir_empty(p):
+        try:
+            os.rmdir(p)          # fails on a folder with anything in it, like UE's DeleteDirectory(p, false, false)
+        except OSError:
+            return False
+        return True
+    return L.table_from({"mkdir": mkdir, "list_dirs": list_dirs, "rmdir": rmdir, "rmdir_empty": rmdir_empty})
 
 
 def fresh(tmp):
@@ -539,6 +546,27 @@ def snapshot(tmp, slot, sub="Saved"):
 
 
 @test
+def guard_drops_only_an_empty_new_save(L, tmp):
+    # a guest's Save menu "new save" in co-op: the game wrote only Thumb.sav there, the save went to the co-op slot
+    guard(L, tmp)
+    d = saves(tmp, "Saved")
+    write(os.path.join(d, "NewSave", "Thumb.sav"), JPEG + b"thumb")
+    check(first(L.eval('slotguard.drop_stray("NewSave")')) is True and not os.path.exists(os.path.join(d, "NewSave")),
+          "a thumbnail-only new save is removed (it showed in the load list and couldn't load)")
+    make_slot(tmp, "S1")
+    before = snapshot(tmp, "S1")
+    check(not first(L.eval('slotguard.drop_stray("S1")')) and snapshot(tmp, "S1") == before, "a real save is never touched")
+    write(os.path.join(d, COOP, "Thumb.sav"), JPEG)
+    check(not first(L.eval('slotguard.drop_stray(...)', COOP)) and os.path.exists(os.path.join(d, COOP, "Thumb.sav")),
+          "a co-op save is refused")
+    write(os.path.join(d, "Odd", "Thumb.sav"), JPEG)
+    write(os.path.join(d, "Odd", "notes.txt"), b"mine")
+    check(not first(L.eval('slotguard.drop_stray("Odd")')) and os.path.exists(os.path.join(d, "Odd", "notes.txt")),
+          "a folder with anything else in it stays")
+    check(not first(L.eval('slotguard.drop_stray("../x")')), "a path is refused")
+
+
+@test
 def guard_names(L, tmp):
     guard(L, tmp)
     make_slot(tmp, "S1")
@@ -987,6 +1015,31 @@ def session_leave_copies_character_home(L, tmp):
     check(L.eval('LOADS[#LOADS]') == "S1" and L.eval('session.state()') == "idle", "own save loaded, idle")
     check(any(e["reason"] in ("before going home", "before joining") for e in listing(L, "S1")),
           "own save backed up before the copy (unchanged since joining: the 'before joining' copy is that backup)")
+
+
+@test
+def session_leave_clears_own_cached_player_before_home_load(L, tmp):
+    # DBG-20261027-007: the home load reads EMS's cached PlayerInfo, not the copied file - the own slot's
+    # entry still held the pre-join inventory, so co-op takes were lost and put-ins came home again
+    joined_session(L, tmp)
+    L.execute('''
+        local function save(name) return { name = name, IsValid = function() return true end } end
+        local entries = { { k = "PlayerInfo@cso@S1", o = save("own") }, { k = "PlayerInfo@cso@''' + COOP + '''", o = save("coop") },
+                          { k = "General@cso@S1", o = save("general") } }
+        EMSOBJ.CachedCustomSaves = { ForEach = function(_, fn)
+            for _, e in ipairs(entries) do fn(e.k, { get = function() return e.o end }) end
+        end }
+        RESETS = {}
+        EMSLIB.ResetCustomSave = function(_, _, obj, kind) RESETS[#RESETS + 1] = { name = obj.name, kind = kind, loads = #LOADS } end''')
+    loads0 = L.eval('#LOADS')
+    L.execute('session.request_toggle()')
+    L.execute('TICK(6)')
+    check(L.eval('LOADS[#LOADS]') == "S1", "went home")
+    check(L.eval('#RESETS') == 1 and L.eval('RESETS[1].name') == "own" and L.eval('RESETS[1].kind') == 1,
+          "only the own slot's cached PlayerInfo is cleared (ClearMemory) (%s)" % L.eval('#RESETS'))
+    check(L.eval('RESETS[1].loads') == loads0, "cleared before the home load")
+    check(read(os.path.join(saves(tmp), "S1", "Player.sav")).startswith(b"EMSH Player.sav of " + COOP.encode()),
+          "the file the load will read is the co-op character")
 
 
 HOME_BED = "1 100.0 200.0 300.0 0.000000 0.000000 0.000000 1.000000"

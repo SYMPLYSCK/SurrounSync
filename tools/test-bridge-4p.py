@@ -4,7 +4,7 @@ relay, a guest leaving and coming back, and a fifth player being turned away.
 
     python tools/test-bridge-4p.py      (build the bridge first: tools/build-bridge.ps1)
 """
-import os, random, shutil, subprocess, sys, tempfile, time
+import os, random, shutil, socket, subprocess, sys, tempfile, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from importlib import import_module
@@ -12,7 +12,15 @@ tb = import_module("test-bridge")
 
 ROOT = tb.ROOT
 EXE = tb.EXE
-PORT = 45000 + random.randint(0, 999)
+def free_port():
+    # a port the OS lets us listen on: Windows (Hyper-V/WinNAT) reserves ranges that move at boot, and this
+    # range overlapped one (45915-46014 here: ~1 run in 12 couldn't listen)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = free_port()
 fails = []
 
 
@@ -73,12 +81,16 @@ def main():
     try:
         procs["h"] = start("host", H)
         time.sleep(0.5)
-        for i in (1002, 1003, 1004):
+        def connected(n):
+            peers = (roster(H) or {}).get("peers", {})
+            return peers if len(peers) == n and all(p["state"] == "connected" for p in peers.values()) else None
+        # in order, each after the one before is in: slots follow the connect order, and a slow loopback connect
+        # (antivirus here: 1-3 s) reordered them with fixed gaps (audit N1)
+        for n, i in enumerate((1002, 1003, 1004), 1):
             procs[i] = start("guest", G[i], i)
-            time.sleep(0.3)      # in order, so the slots are predictable
+            tb.wait_for(lambda: connected(n), 20)
 
-        r = tb.wait_for(lambda: (roster(H) or {}).get("peers") if len((roster(H) or {}).get("peers", {})) == 3
-                        and all(p["state"] == "connected" for p in roster(H)["peers"].values()) else None, 20)
+        r = tb.wait_for(lambda: connected(3), 40)
         check(r is not None, "host has three connected guests")
         if r:
             check(r["1002"]["out"] == "host" and r["1002"]["in"] == "guest" and r["1002"]["slot"] == 1,
@@ -124,8 +136,11 @@ def main():
 
         # a fifth player: the game is full
         procs[1005] = start("guest", G[1005], 1005)
-        lobby = lambda: open(os.path.join(G[1005], "mirror_lobby.txt"), encoding="utf-8").read() \
-            if os.path.exists(os.path.join(G[1005], "mirror_lobby.txt")) else ""
+        def lobby():
+            try:
+                with open(os.path.join(G[1005], "mirror_lobby.txt"), encoding="utf-8") as f: return f.read()
+            except OSError:   # missing yet, or denied while the bridge replaces it
+                return ""
         check(tb.wait_for(lambda: "joinerror full" in lobby(), 15), "a fifth player is told the game is full")
         procs[1005].kill(); procs[1005].wait(); del procs[1005]
 

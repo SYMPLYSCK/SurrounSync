@@ -23,22 +23,24 @@ function game.controller() return controller end
 -- tick_steps[i] = "tick <file:line>" of handler i: the crash step names the handler (a crash inside
 -- one used to show only "hook ReceiveTick" - the GetFName crash was in itemclean, seven times)
 local tick_slot, ready_slot, tick_steps = {}, {}, {}
+
+-- One handler per call site: registering again from the same line (a module re-initialised) replaces the handler
+-- instead of adding a second one. Returns its index and whether it is new.
+local function register(list, slots, site, fn)
+    local i = site and slots[site]
+    if i then list[i] = fn; return i, false end
+    list[#list + 1] = fn
+    if site then slots[site] = #list end
+    return #list, true
+end
+
 function game.on_tick(fn)
     local site = util.callsite(2)
-    local i = site and tick_slot[site]
-    if i then tick_handlers[i] = fn; return end
-    tick_handlers[#tick_handlers + 1] = fn
-    tick_steps[#tick_handlers] = "tick " .. tostring(site and site:match("([^/\\]+)$") or #tick_handlers)
-    if site then tick_slot[site] = #tick_handlers end
+    local i, added = register(tick_handlers, tick_slot, site, fn)
+    if added then tick_steps[i] = "tick " .. tostring(site and site:match("([^/\\]+)$") or i) end
 end
 function game.on_ready(fn)
-    local site = util.callsite(2)
-    local i = site and ready_slot[site]
-    if i then ready_handlers[i] = fn
-    else
-        ready_handlers[#ready_handlers + 1] = fn
-        if site then ready_slot[site] = #ready_handlers end
-    end
+    register(ready_handlers, ready_slot, util.callsite(2), fn)
     if ready_done then util.safe(fn, "game.on_ready") end
 end
 local phook_slot = {}
@@ -55,24 +57,12 @@ function game.player_hook(fn_name, cb)
 end
 
 local new_player_handlers, new_player_slot = {}, {}
-function game.on_new_player(fn)
-    local site = util.callsite(2)
-    local i = site and new_player_slot[site]
-    if i then new_player_handlers[i] = fn; return end
-    new_player_handlers[#new_player_handlers + 1] = fn
-    if site then new_player_slot[site] = #new_player_handlers end
-end
+function game.on_new_player(fn) register(new_player_handlers, new_player_slot, util.callsite(2), fn) end
 
 -- A respawn or load tears the old world down: everything cached from it is freed memory now.
 -- Reset handlers drop those references without touching them (no IsValid, no calls).
 local reset_handlers, reset_slot = {}, {}
-function game.on_world_reset(fn)
-    local site = util.callsite(2)
-    local i = site and reset_slot[site]
-    if i then reset_handlers[i] = fn; return end
-    reset_handlers[#reset_handlers + 1] = fn
-    if site then reset_slot[site] = #reset_handlers end
-end
+function game.on_world_reset(fn) register(reset_handlers, reset_slot, util.callsite(2), fn) end
 
 -- Runs the reset handlers now: a load that removes the old world's actors itself calls this right away.
 function game.reset_world()

@@ -13,6 +13,7 @@ local VOLUMES = { 100, 60, 30 }
 -- on/off and volume belong to the player, not to one link (more than two players: every copy sees this)
 local st = require("mirror.peers").shared("voice", { on = false, vol_i = 1 })
 local write_in = 0.0
+local written = nil -- the text last written (rewritten only when it changes)
 local same_world = function() return false end
 
 local function distance_m()
@@ -35,10 +36,16 @@ function voice.tick(dt)
     require("mirror.peers").each("mirror.voice", function(v, inst)
         if inst then more[#more + 1] = string.format(" dist_%s %.1f", inst.tag, v.distance()) end
     end)
-    local f = io.open(link.dir() .. "\\mirror_voice.txt", "wb")
+    local text = string.format("on %d key %d volume %d dist %.1f", st.on and 1 or 0, KEY_VK, VOLUMES[st.vol_i], distance_m()) .. table.concat(more)
+    if text == written then return end
+    -- whole file or none: the bridge read "dist 1" out of a half-written "dist 12.3" (a volume blip)
+    local path = link.dir() .. "\\mirror_voice.txt"
+    local f = io.open(path .. ".tmp", "wb")
     if not f then return end
-    f:write(string.format("on %d key %d volume %d dist %.1f", st.on and 1 or 0, KEY_VK, VOLUMES[st.vol_i], distance_m()) .. table.concat(more))
+    f:write(text)
     f:close()
+    os.remove(path)
+    if os.rename(path .. ".tmp", path) then written = text end
 end
 
 function voice.toggle()

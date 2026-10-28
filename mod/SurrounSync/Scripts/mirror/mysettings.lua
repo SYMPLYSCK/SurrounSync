@@ -75,9 +75,25 @@ function mysettings.toggle(key)
     log.info("mysettings: " .. key .. " " .. mine[key])
 end
 
+-- SyncFX, the graphics mod: on top of MY SETTINGS when it's installed. Its switch is the mod itself (mods.txt,
+-- through modlist), so it takes effect when the game starts next.
+mysettings.SYNCFX = "SyncFX"
+mysettings.SYNCFX_ROW = { key = "syncfx", tag = "(Experimental)", label = "SYNCFX GRAPHICS",
+    hint = "Scarier graphics, own menu (F6). Can lower your FPS." }   -- one line on the page
+
+local function syncfx_row()
+    local ok, installed, on, pending = pcall(function() return require("mirror.modlist").state(mysettings.SYNCFX) end)
+    if not ok or not installed then return nil end
+    local r = mysettings.SYNCFX_ROW
+    return { key = r.key, tag = r.tag, label = r.label, text = on and "ON" or "OFF",
+             hint = pending and ((on and "On" or "Off") .. " from your next game start. Can lower FPS.") or r.hint }
+end
+
 function mysettings.rows()
     if not loaded then load() end
     local out = {}
+    local fx = syncfx_row()
+    if fx then out[1] = fx end
     for _, o in ipairs(mysettings.LIST) do
         local text = mine[o.key]
         for _, x in ipairs(o.values) do if x[1] == mine[o.key] then text = x[2] end end

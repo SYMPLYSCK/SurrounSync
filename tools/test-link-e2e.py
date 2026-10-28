@@ -3,7 +3,7 @@ so the whole Steam path can be tested without Steam or the game.
 
     pip install --target <dir> lupa, set PYTHONPATH=<dir>, then: python tools/test-link-e2e.py
 """
-import os, random, shutil, subprocess, sys, tempfile, time
+import os, random, shutil, socket, subprocess, sys, tempfile, time
 
 try:
     from lupa import lua54
@@ -14,7 +14,15 @@ except ImportError:
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "mod", "SurrounSync", "Scripts")
 EXE = os.environ.get("SURROUNSYNC_BRIDGE") or os.path.join(ROOT, "mod", "SurrounSync", "bridge", "SurrounSyncBridge.exe")
-PORT = 46000 + random.randint(0, 999)
+def free_port():
+    # a port the OS lets us listen on: Windows (Hyper-V/WinNAT) reserves ranges that move at boot, and a fixed
+    # range here sometimes landed in one ("can't listen: ... forbidden by its access permissions")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = free_port()
 fails = []
 
 

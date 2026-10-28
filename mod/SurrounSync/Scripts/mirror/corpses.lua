@@ -4,6 +4,7 @@ local log = require("mirror.log")
 local util = require("mirror.util")
 local events = require("mirror.events")
 local jig = require("mirror.jig")
+local uiremove = require("mirror.uiremove")
 local ghost = require("mirror.ghost")
 
 local corpses = {}
@@ -20,9 +21,10 @@ local LOOT_CLASSES = { MASTER,
     "/Game/AI/Animals/Bear/BP_AnimalBear.BP_AnimalBear_C",
     "/Game/AI/Animals/Rabbit/BP_AnimalRabbit.BP_AnimalRabbit_C",
     "/Game/AI/Animals/Dog/BP_AnimalDog.BP_AnimalDog_C" }
-local INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
-local ITEM_ID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"
-local COUNT = "Count_8_DD79AF2A46126A338C8DCCB4616D91CD"
+local F = require("mirror.fields")
+local INFO, ITEM_ID, COUNT, UID = F.INFO, F.ITEM_ID, F.COUNT, F.UID
+local JIG_COMP = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
+local PLAYER = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C"
 
 local cfg, role, zombies, session
 local channel = events.reliable("zloot")
@@ -196,7 +198,8 @@ local function host_scan()
         end
         -- death can change what a body holds (a trader's stock empties and money is added; the game may
         -- roll death loot): send what the body holds once that's done, so the guest's corpse matches
-        if sent[id] and not dead_sent[id] and is_dead(z) then
+        -- (util.valid first: a body removed since the last snapshot is never touched)
+        if sent[id] and not dead_sent[id] and util.valid(z) and is_dead(z) then
             dead_seen[id] = dead_seen[id] or t
             local comp = t - dead_seen[id] >= 1.0 and comp_of(z)
             if comp then
@@ -274,16 +277,18 @@ local function on_removed(self, ItemRemovedInfo)
     local z = self:get()
     local id = role == "host" and zombies.host_id_of(z) or zombies.copy_id_of(z)
     if not id then return end
-    local da, n
+    local da, n, uid
     pcall(function() da = jig.full_path(ItemRemovedInfo:get()[INFO][ITEM_ID]) end)
     pcall(function() n = tonumber(ItemRemovedInfo:get()[INFO][COUNT]) end)
-    if da then takes[#takes + 1] = { z = z, id = id, da = da, n = n } end
+    pcall(function() uid = jig.uid_str(ItemRemovedInfo:get()[UID]) end)
+    if da then takes[#takes + 1] = { z = z, id = id, da = da, n = n, uid = uid } end
 end
 
 local function flush_takes()
     if #takes == 0 then return end
     for _, tk in ipairs(takes) do
-        local comp = util.valid(tk.z) and comp_of(tk.z)
+        -- (the UI's no-room removal: its marker hook runs after these events, so it's checked here, a frame on)
+        local comp = not uiremove.is(tk.uid) and util.valid(tk.z) and comp_of(tk.z)
         if comp then
             local left = jig.count_of_item(comp, tk.da)
             -- what this take removed: the host's list said how many there were (the hook's count may be the stack's)
@@ -377,6 +382,39 @@ end
 -- same item struct as ItemRemovedInfo; flush_takes works out how many went from the host's list.
 local consumed_fn = function(self, ConsumedItem)
     util.safe(on_removed, "corpses.consumed", self, ConsumedItem)
+end
+
+-- ...but a player's rip/eat off a body fires JigMP_OnItemConsumed on the PLAYER, not the body (see loot.lua
+-- consume_req_fn): the body's component runs HandleLocalRequestConsumeItem (which body, which uid), the player's
+-- event carries the item (which asset). Matched by uid in the next tick, whichever hook ran first.
+local consumed_da, consume_q = {}, {}
+local player_consumed_fn = function(self, ConsumedItem)
+    util.safe(function()
+        local item, uid, da
+        pcall(function() item = ConsumedItem:get() end)
+        if not item then return end
+        pcall(function() uid = jig.uid_str(item[UID]) end)
+        pcall(function() da = jig.full_path(item[INFO][ITEM_ID]) end)
+        if uid and da then consumed_da[uid] = da end
+    end, "corpses.player_consumed")
+end
+local consume_req_fn = function(self, ItemUID)
+    util.safe(function()
+        if not hooks_here() then return end
+        local comp, z, uid = util.obj(self), nil, nil
+        if comp then pcall(function() z = comp:GetOwner() end) end
+        pcall(function() uid = jig.uid_str(ItemUID:get()) end)
+        if uid and util.valid(z) then consume_q[#consume_q + 1] = { z = z, uid = uid } end
+    end, "corpses.consume_request")
+end
+local function flush_consumed()
+    local q = consume_q
+    consume_q = {}
+    for _, c in ipairs(q) do
+        local da = consumed_da[c.uid]
+        if da and not uiremove.is(c.uid) then corpses.stack_take(c.z, da) end
+    end
+    if next(consumed_da) then consumed_da = {} end
 end
 
 local item_removed_fn = function(self, ItemUID, FromUID, ToContainer, To)
@@ -474,8 +512,12 @@ function corpses.tick(dt)
             util.ensure_hook(cl .. ":JigMP_OnItemConsumed", consumed_fn)
             util.ensure_hook(cl .. ":JigMP_OnItemAdded", item_added_fn)
         end
+        uiremove.ensure_hook()
+        util.ensure_hook(JIG_COMP .. ":HandleLocalRequestConsumeItem", consume_req_fn)
+        util.ensure_hook(PLAYER .. ":JigMP_OnItemConsumed", player_consumed_fn)
         if not shared() then lists, gate_since, checked = {}, {}, {} end
     end
+    if consume_q[1] or next(consumed_da) then util.safe(flush_consumed, "corpses.consumed") end
     util.safe(flush_takes, "corpses.takes")
     scan_in = scan_in - dt
     if scan_in <= 0 then

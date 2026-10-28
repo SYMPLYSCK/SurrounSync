@@ -6,10 +6,8 @@ local game = require("mirror.game")
 
 local invdiag = {}
 
-local ITEMS = "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"
-local INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
-local ITEM_ID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"
-local PICKUP = "PickupRef_20_A3E97763428AC84AF4DBB8A56CFAC657"
+local F = require("mirror.fields")
+local ITEMS, INFO, ITEM_ID, PICKUP = F.ITEMS, F.INFO, F.ITEM_ID, F.PICKUP_REF
 local EQUIP_FLAGS = { "PrimaryWeaponEquipped?", "SecondaryWeaponEquipped?", "SidearmWeaponEquipped?", "MeleeWeaponEquipped?" }
 
 local want = false
@@ -86,6 +84,37 @@ function invdiag.live_containers()
     local n = -1
     pcall(function() n = len(game.player().BP_JigMultiplayer.MainJigContainers) end)
     return n
+end
+
+-- A character saved without any inventory containers (Realm characters, report 20261028-123703) can't pick anything
+-- up. InitNoStartingItems builds the default pockets like a new character's, without the starting kit, so no item
+-- is made from nothing. Only when there are no containers at all. (InitializeJigComponent is a DoOnce that already
+-- ran at spawn with nothing loaded: ResetInitComponent opens it again, else the call does nothing.)
+function invdiag.ensure_pockets(why)
+    if invdiag.live_containers() ~= 0 then return false end
+    local settings, linked = -1, 0
+    local ok, err = pcall(function()
+        local c = game.player().BP_JigMultiplayer
+        settings = c.ContainersSettings:GetArrayNum()
+        c:ResetInitComponent()
+        c:InitNoStartingItems()
+        -- the inventory screen's grids got their container ids at spawn, when there were none: give them the new ones
+        -- like the game's own load does (LocalJSIContainers[i].ContainerID = MainContainersIDs[i]), else every item
+        -- taken shows as a flashing icon that can't be used (kit 2026-10-27: 0 of 22 grids matched before this)
+        local grids, ids = c.LocalJSIContainers, c.MainContainersIDs
+        for i = 1, math.min(grids:GetArrayNum(), ids:GetArrayNum()) do
+            grids[i].ContainerID = ids[i]
+            linked = linked + 1
+        end
+    end)
+    log.warn(string.format("invdiag: %s - the character had no inventory containers; gave it empty pockets (%d container "
+        .. "setting(s), %d grid(s) linked): %s, %d container(s) now", why, settings, linked, ok and "ok" or tostring(err),
+        invdiag.live_containers()))
+    if ok and invdiag.live_containers() > 0 then
+        util.safe(require("mirror.session").save_now, "invdiag.pockets_save")
+        require("mirror.notify").show("Your character was missing its pockets - fixed.", "info")
+    end
+    return true
 end
 
 function invdiag.snapshot(why, verbose)

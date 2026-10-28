@@ -3,11 +3,19 @@
 
     python tools/test-bridge.py      (build the bridge first: tools/build-bridge.ps1)
 """
-import os, random, re, shutil, string, subprocess, sys, tempfile, time
+import os, random, re, shutil, socket, string, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.environ.get("SURROUNSYNC_BRIDGE") or os.path.join(ROOT, "mod", "SurrounSync", "bridge", "SurrounSyncBridge.exe")
-PORT = 47000 + random.randint(0, 999)
+def free_port():
+    # a port the OS lets us listen on: Windows (Hyper-V/WinNAT) reserves ranges that move at boot, and a fixed
+    # range here sometimes landed in one ("can't listen: ... forbidden by its access permissions")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = free_port()
 fails = []
 
 
@@ -150,6 +158,17 @@ def main():
         put_blob(A, "fresh", "host", "fresh after restart")
         check(wait_for(lambda: get_blob(B, "fresh", "host"), 15) == "fresh after restart", "fresh blob after the restart arrives")
         check(get_blob(B, "oldreq", "host") is None, "the 10-minute-old leftover was not sent")
+
+        print("1d. a peer can't create endless blob files: at most 256 names per link, the link stays up")
+        for i in range(300):
+            put_blob(A, "flood%03d" % i, "host", "x")
+        check(wait_for(lambda: "ignored blob" in log_of(B, "mirror_bridge_guest.log"), 20), "names over the cap are refused (logged)")
+        got = [f for f in os.listdir(B) if f.startswith("mirror_flood")]
+        check(0 < len(got) <= 256, "guest holds at most 256 names' files (%d flood files)" % len(got))
+        put_blob(A, "fresh", "host", "still connected")
+        check(wait_for(lambda: get_blob(B, "fresh", "host") == "still connected", 15), "a known name still arrives after the flood")
+        for i in range(300):
+            os.remove(os.path.join(A, "mirror_flood%03d_host.txt" % i))
 
         print("2. host restarts: its old files must vanish on the guest")
         procs[0].kill(); procs[0].wait()

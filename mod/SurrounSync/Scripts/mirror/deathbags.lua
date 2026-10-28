@@ -4,6 +4,7 @@ local log = require("mirror.log")
 local util = require("mirror.util")
 local events = require("mirror.events")
 local jig = require("mirror.jig")
+local uiremove = require("mirror.uiremove")
 local game = require("mirror.game")
 local ghost = require("mirror.ghost")
 local link = require("mirror.link")
@@ -12,8 +13,7 @@ local fs = require("mirror.fs")
 local deathbags = {}
 
 local BAG = "/Game/Inventory/Containers/Container_DeadPlayerLoot.Container_DeadPlayerLoot_C"
-local INFO = "ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7"
-local ITEM_ID = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848"
+local UID = require("mirror.fields").UID
 local C_NAME = "ContainerName_13_2E875F304DF2B4B31A44F98C299C3982"
 local C_EQUIP = "IsEquipTo?_17_A70EBD1B42E398B0EB14E0B352CCC0A2"
 local C_COLS = "Columns_4_A32AA159420F47D951669C9636084F9D"
@@ -154,7 +154,10 @@ local function watch_tick(dt)
     if not death then return end
     if not watch then
         if clock - death.at < 0.3 or clock < death.scan_at then return end
-        death.scan_at = clock + 0.25
+        -- each scan is a full object walk: fast while the bag normally appears, then backing off (a death with
+        -- no bag - the difficulty keeps the items - walked 240 times in the minute before giving up)
+        local since = clock - death.at
+        death.scan_at = clock + (since < 5 and 0.25 or since < 20 and 1.0 or 3.0)
         local best, bd, seen = nil, FIND_RADIUS, {}
         for _, b in ipairs(death.loc and all_bags() or {}) do
             local k, l = key_of(b), loc_of(b)
@@ -286,16 +289,28 @@ local function make_copy(from, loc, items)
     end
 end
 
-local function on_removed(self)
+-- uid nil = a removal of unknown item (always sent); only removals that are all the UI's no-room ones are skipped
+-- (checked at flush: the marker hook runs after these events)
+local function on_removed(self, uid)
     if applying or spawning or not together() then return end
     local b = self:get()
     local k = b and key_of(b)
-    if k then dirty[k] = b end
+    if not k then return end
+    local d = dirty[k] or { b = b, uids = {} }
+    dirty[k] = d
+    if uid then d.uids[#d.uids + 1] = uid else d.real = true end
+end
+
+local function only_ui(d)
+    if d.real or not d.uids[1] then return false end
+    for _, u in ipairs(d.uids) do if not uiremove.is(u) then return false end end
+    return true
 end
 
 local function flush_takes()
-    for k, b in pairs(dirty) do
-        local comp = util.valid(b) and comp_of(b)
+    for k, d in pairs(dirty) do
+        local b = d.b
+        local comp = not only_ui(d) and util.valid(b) and comp_of(b)
         local l = comp and loc_of(b)
         if l then
             local list = {}
@@ -334,7 +349,26 @@ local function parse(p)
     return { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }, rest
 end
 
-local removed_fn = function(self) util.safe(on_removed, "deathbags.removed", self) end
+local removed_fn = function(self, FromContainerUID, ItemUID)
+    local uid
+    pcall(function() uid = jig.uid_str(ItemUID:get()) end)
+    util.safe(on_removed, "deathbags.removed", self, uid)
+end
+-- a player's rip/eat out of the bag fires JigMP_OnItemConsumed on the player, not the bag (see loot.lua
+-- consume_req_fn): the bag's component runs HandleLocalRequestConsumeItem
+local consumed_fn = function(self, ConsumedItem)
+    local uid
+    pcall(function() uid = jig.uid_str(ConsumedItem:get()[UID]) end)
+    util.safe(on_removed, "deathbags.consumed", self, uid)
+end
+local consume_req_fn = function(self, ItemUID)
+    util.safe(function()
+        local comp, b, uid = util.obj(self), nil, nil
+        pcall(function() uid = jig.uid_str(ItemUID:get()) end)
+        if comp then pcall(function() b = comp:GetOwner() end) end
+        if util.valid(b) and util.class_name(b) == "Container_DeadPlayerLoot_C" then on_removed({ get = function() return b end }, uid) end
+    end, "deathbags.consume_request")
+end
 
 function deathbags.tick(dt)
     if role == "off" then return end
@@ -344,7 +378,9 @@ function deathbags.tick(dt)
         hook_in = 1.0
         util.ensure_hook(BAG .. ":JigMP_OnMainContainerItemRemoved", removed_fn)
         -- used out of the bag (rip, eat...): consumed fires no removed event
-        util.ensure_hook(BAG .. ":JigMP_OnItemConsumed", removed_fn)
+        util.ensure_hook(BAG .. ":JigMP_OnItemConsumed", consumed_fn)
+        uiremove.ensure_hook()
+        util.ensure_hook("/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:HandleLocalRequestConsumeItem", consume_req_fn)
     end
     util.safe(watch_tick, "deathbags.watch", dt)
     if relabel_at and clock >= relabel_at then relabel_at = nil; util.safe(relabel, "deathbags.relabel") end

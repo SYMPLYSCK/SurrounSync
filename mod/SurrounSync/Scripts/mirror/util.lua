@@ -73,6 +73,17 @@ function util.class_path(obj)
     return ok2 and type(n) == "string" and n:match("^%S+ (.+)$") or nil
 end
 
+-- The first n bytes of s, never ending inside a UTF-8 character (a cut Cyrillic letter or emoji shows as junk).
+function util.utf8_cut(s, n)
+    if #s <= n then return s end
+    while n > 0 do
+        local b = s:byte(n + 1)
+        if b < 0x80 or b >= 0xC0 then break end   -- the next byte starts a character: cut before it
+        n = n - 1
+    end
+    return s:sub(1, n)
+end
+
 -- Object addresses get reused after GC: don't use them as long-lived ids.
 function util.addr(obj)
     if not util.valid(obj) then return nil end

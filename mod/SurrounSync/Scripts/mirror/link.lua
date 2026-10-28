@@ -239,13 +239,19 @@ function link.start_lobby()
     if kind == "steam" then link.start_bridge("auto") end
 end
 
-local lobby, lobby_read = nil, -100
+local lobby, lobby_read, lobby_miss = nil, -100, nil
 function link.lobby()
     if kind ~= "steam" or not auto then return nil end
     if now - lobby_read < 1 then return lobby end
     lobby_read = now
     local f = io.open(app_dir() .. "\\mirror_lobby.txt", "r")
-    if not f then lobby = nil; return nil end
+    if not f then
+        -- the bridge replaces the file (File.Replace): a read in that moment is denied - keep the last lobby a while
+        lobby_miss = lobby_miss or now
+        if now - lobby_miss >= 3 then lobby = nil end
+        return lobby
+    end
+    lobby_miss = nil
     local s = f:read("*a") or ""
     f:close()
     if not s:find("\nEND\n", 1, true) then return lobby end

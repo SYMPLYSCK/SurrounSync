@@ -506,7 +506,7 @@ function menu.realm_host() host() end
 function menu.realm_join(steamid, who) join(steamid, who) end
 function menu.realm_stop(why)
     -- (the co-op text said "sending your friend home" even when hosting a Realm alone)
-    stop_hosting("Ending the Realm: saving it and sending everyone home...")
+    stop_hosting("Leaving the Realm: saving it. Anyone still in it keeps playing and hosts it next...")
     if stopping then stopping.why = why end
 end
 function menu.role() return my_role() end
@@ -574,7 +574,20 @@ function menu.init(c)
             voice = function() require("mirror.voice").toggle() end,
             voice_vol = function() require("mirror.voice").cycle_volume() end,
             setting = function(key, tab)
-                if tab == "mine" then require("mirror.mysettings").toggle(key) else require("mirror.hostrules").toggle(key) end
+                if tab == "mine" and key == "syncfx" then
+                    -- the graphics mod: switched in mods.txt, runs from the next game start
+                    local ml, ms = require("mirror.modlist"), require("mirror.mysettings")
+                    local _, on = ml.state(ms.SYNCFX)
+                    if not ml.set(ms.SYNCFX, not on) then
+                        notify.show("Couldn't switch SyncFX (is a file in use or read-only?).", "bad"); return
+                    end
+                    if not on then
+                        notify.show("SyncFX is experimental and can lower your FPS - switch it off here if the game "
+                            .. "runs slow.", "info", nil, true)
+                    end
+                    if ml.restart_needed() then mods_restart_note() end
+                elseif tab == "mine" then require("mirror.mysettings").toggle(key)
+                else require("mirror.hostrules").toggle(key) end
             end,
             refresh = function()
                 if link.bridge_cmd("browse") then notify.show("Looking for public games...", "info") end

@@ -79,7 +79,9 @@ local function open(actor, what)
     if not util.valid(comp) then log.info("devtest: " .. what .. " has no inventory"); return end
     local ok, err = pcall(function() game.player():RequestServerData(comp, {}) end)
     log.info("devtest: opened " .. what .. (ok and "" or (" FAILED: " .. tostring(err))))
-    later[#later + 1] = { at = os.clock() + 2.5, fn = function() log.info("devtest: " .. what .. " holds " .. describe(comp)) end }
+    later[#later + 1] = { at = os.clock() + 2.5, fn = function()
+        if util.valid(comp) then log.info("devtest: " .. what .. " holds " .. describe(comp)) end
+    end }
 end
 
 local function container_name(a)
@@ -114,7 +116,9 @@ local function run(cmd)
         local a, d = nearest_container(6)
         if a then
             loot.prefetch(a)
-            later[#later + 1] = { at = os.clock() + 2.0, fn = function() open(a, container_name(a) .. string.format(" (%.1f m)", d)) end }
+            later[#later + 1] = { at = os.clock() + 2.0, fn = function()
+                if util.valid(a) then open(a, container_name(a) .. string.format(" (%.1f m)", d)) end
+            end }
         else
             log.info("devtest: no shared container within 6 m")
         end
@@ -200,14 +204,21 @@ local function run(cmd)
         if not (item and util.valid(fb)) then log.info("devtest: takeout - no item in a container within 6 m"); return end
         local n0 = #jig.contents_of(fb)
         local moved, err = false, nil
-        for c = 1, fb.MainJigContainers:GetArrayNum() do
-            local cont, cells = jig.container_arg(fb.MainJigContainers[c])
-            for idx = 0, cells - 1 do
-                local ok, e = pcall(function()
-                    fa:SERVER_RequestMoveItemToAnotherComp(fa, fb, jig.guid(item.uid), false, idx, cont[jig.REPUID], 0, {}, 0)
-                end)
-                if not ok then err = e; break end
-                if #jig.contents_of(fb) > n0 then moved = true; break end
+        -- (the 1-cell containers are equipment slots: the server request doesn't check the item type, and a book
+        -- "worn" there is dropped by the game's next inventory load - looked like co-op item loss, DBG-20261027-007)
+        for pass = 1, 2 do
+            for c = 1, fb.MainJigContainers:GetArrayNum() do
+                local cont, cells = jig.container_arg(fb.MainJigContainers[c])
+                if (pass == 1) == (cells > 1) then
+                    for idx = 0, cells - 1 do
+                        local ok, e = pcall(function()
+                            fa:SERVER_RequestMoveItemToAnotherComp(fa, fb, jig.guid(item.uid), false, idx, cont[jig.REPUID], 0, {}, 0)
+                        end)
+                        if not ok then err = e; break end
+                        if #jig.contents_of(fb) > n0 then moved = true; break end
+                    end
+                end
+                if moved or err then break end
             end
             if moved or err then break end
         end
@@ -296,6 +307,9 @@ end
 
 function devtest.watch(cfg)
     if not cfg.devtest then return end
+    -- a job queued just before a leave/join (open's "holds" 2.5 s later) ran on the first tick of the new world and
+    -- read the old world's freed container: kit guest crashes 2026-10-27 09:07-09:28 (DBG-20261027-008)
+    game.on_world_reset(function() later = {} end)
     if type(LoopAsync) ~= "function" or type(ExecuteInGameThread) ~= "function" then return end
     local name = (cfg.phase2 and cfg.phase2.saved_override) or "Saved"
     local path = (os.getenv("LOCALAPPDATA") or ".") .. "\\SurrounDead\\mirror_dev_" .. name .. ".txt"
@@ -400,6 +414,55 @@ function devtest.watch(cfg)
             local to = { X = l.X + tonumber(dx) * 100, Y = l.Y + tonumber(dy) * 100, Z = l.Z + 300 }
             local ok, err = pcall(function() p:K2_TeleportTo(to, p:K2_GetActorRotation()) end)
             log.info(string.format("devtest: tp -> (%.0f, %.0f, %.0f) %s", to.X, to.Y, to.Z, ok and "ok" or tostring(err)))
+        elseif cmd == "cars" or cmd == "getin" or cmd == "getout" then
+            -- car tests (DBG-20261027-002): the nearest cars, get in the nearest one the game's way, get out
+            local p = game.player()
+            if cmd == "getout" then
+                -- the player BP's whole exit (BP_PlayerCharacter input path): ExitVehicle alone left the player
+                -- InVehicle? with a stale VehicleDrivingComponent.Vehicle, and the kit guest crashed 4 cycles later
+                -- (the game detaches the player only when it allows the exit - that decides, not the out param)
+                local car, still, ok, err
+                pcall(function() car = p:GetAttachParentActor() end)
+                if not util.valid(car) then log.info("devtest: getout - not in a car"); return end
+                ok, err = pcall(function()
+                    car:ExitVehicle({})
+                    pcall(function() still = p:GetAttachParentActor() end)
+                    if util.valid(still) and util.same(still, car) then still = "refused"; return end
+                    pcall(function() p:ResetVehicleCameraArmLength() end)
+                    p:VehicleInteraction(false, car)
+                    pcall(function() p.VehicleDrivingComponent.Vehicle = nil end)
+                end)
+                log.info("devtest: getout " .. util.fname(car) .. " -> " .. (not ok and tostring(err) or still == "refused" and "refused (still in)" or "out"))
+                return
+            end
+            local list = {}
+            for _, t in ipairs({ "4x4Jeep", "APC", "Ambulance", "BigRig", "Buggy", "Charger", "DamagedSedan", "FlatbedTruck", "GolfCart",
+                                 "Humvee", "ModifiedPickupUtilityTruck", "PickupTruck", "RV", "SUV", "Sheriff", "SwatVan", "Truck",
+                                 "PickupUtilityTruck", "Van" }) do
+                for _, v in ipairs(FindAllOf("Vehicle_" .. t .. "_C") or {}) do
+                    if util.valid(v) then
+                        local d = dist_to_player(v)
+                        if d < 200 then list[#list + 1] = { v = v, d = d } end
+                    end
+                end
+            end
+            table.sort(list, function(a, b) return a.d < b.d end)
+            if cmd == "getin" then
+                local e = list[1]
+                if not (e and e.d <= 10) then log.info("devtest: getin - no car within 10 m"); return end
+                local ok, err = pcall(function() e.v:Interact_GetInVehicle() end)
+                log.info(string.format("devtest: getin %s (%.1f m) -> %s", util.fname(e.v), e.d, ok and "ok" or tostring(err)))
+                return
+            end
+            local near = 0
+            for i, e in ipairs(list) do
+                if e.d <= 15 then near = near + 1 end
+                if i <= 6 then
+                    local l = e.v:K2_GetActorLocation()
+                    log.info(string.format("devtest: car %s %.1f m at %.0f %.0f %.0f", util.fname(e.v), e.d, l.X, l.Y, l.Z))
+                end
+            end
+            log.info("devtest: cars within 15 m: " .. near .. ", within 200 m: " .. #list)
         elseif cmd == "gkill" then require("mirror.zombies").dev_guest_kill()
         elseif cmd == "die" then
             god = false
@@ -749,30 +812,46 @@ function devtest.watch(cfg)
             container_cmds(cmd)
         else log.info("devtest: unknown command") end
     end
+    local empty_reads = 0
+    -- a command whose file couldn't be deleted (still locked) ran again every 250 ms: one "continue" became
+    -- 14 in-place loads, each leaving the old player body (with its gear) behind - the host came out naked
+    local stuck = nil
+    local function take()
+        local f = io.open(path, "r")
+        if not f then stuck = nil; return nil end
+        local cmd = (f:read("*l") or ""):gsub("%s+$", "")
+        f:close()
+        if cmd == "" and empty_reads < 8 then empty_reads = empty_reads + 1; return nil end
+        empty_reads = 0
+        local removed = os.remove(path)
+        if cmd == stuck then return nil end
+        stuck = not removed and cmd or nil
+        return cmd
+    end
+    -- In a world the file is read on the game thread: Lua running in LoopAsync's thread while the game thread runs
+    -- the mod crashed the kit games 4x in 51 car cycles 2026-10-27, each at a command pickup (UE4SS hook dispatch,
+    -- freed-object vtable reads). LoopAsync only covers the main menu (no player ticks) and stops at the first tick.
+    -- (ExecuteInGameThread from here: commands still run outside the player's tick, as before)
+    local ticking, poll_in = false, 0.0
     local god_in = 0.0
     game.on_tick(function(dt)
         ticks = ticks + 1
+        ticking = true
         god_in = god_in - dt
         if god and god_in <= 0 then
             god_in = 1.0
             pcall(function() game.player().MedicalComponent["CanTakeDamage?"] = false end)
         end
+        poll_in = poll_in - dt
+        if poll_in > 0 then return end
+        poll_in = 0.25
+        local cmd = take()
+        if cmd then ExecuteInGameThread(function() util.safe(run, "devtest.watch", cmd) end) end
     end)
-    local empty_reads = 0
-    -- a command whose file couldn't be deleted (still locked) ran again every 250 ms: one "continue" became
-    -- 14 in-place loads, each leaving the old player body (with its gear) behind - the host came out naked
-    local stuck = nil
     LoopAsync(250, function()
-        local f = io.open(path, "r")
-        if not f then stuck = nil; return false end
-        local cmd = (f:read("*l") or ""):gsub("%s+$", "")
-        f:close()
-        if cmd == "" and empty_reads < 8 then empty_reads = empty_reads + 1; return false end
-        empty_reads = 0
-        local removed = os.remove(path)
-        if cmd == stuck then return false end
-        stuck = not removed and cmd or nil
-        ExecuteInGameThread(function() util.safe(run, "devtest.watch", cmd) end)
+        if ticking then log.info("devtest: commands now read on the game thread"); return true end
+        local cmd = take()
+        if cmd then ExecuteInGameThread(function() util.safe(run, "devtest.watch", cmd) end) end
         return false
     end)
     log.info("devtest: watching " .. path)

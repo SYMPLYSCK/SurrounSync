@@ -305,7 +305,20 @@ async function uploadWorld(env, request, r, me, gen) {
          WHERE id = ? AND head_gen = ? AND lease_token = ? AND lease_member = ?`)
         .bind(gen, got, data.byteLength, me.member_id, t, t + leaseSeconds, r.id, gen - 1, token, me.member_id).run();
     if (res.meta.changes !== 1) {
-        await env.WORLDS.delete(key);
+        // Two uploads of one generation (a timed-out retry) share the key: when the other one moved the head to
+        // this gen, the object is the head's - deleting it left the head pointing at nothing (audit N18). Keep it
+        // and make the head describe the bytes that are stored now (whichever put landed last).
+        const cur = await realm(env, r.id);
+        const obj = cur.head_gen === gen ? await env.WORLDS.head(key) : null;
+        if (obj) {
+            const h = obj.customMetadata.sha256;
+            await env.DB.prepare("UPDATE realms SET head_hash = ?, head_size = ? WHERE id = ? AND head_gen = ?")
+                .bind(h, obj.size, r.id, gen).run();
+            await env.DB.prepare("UPDATE generations SET hash = ?, size = ? WHERE realm_id = ? AND gen = ?")
+                .bind(h, obj.size, r.id, gen).run();
+        } else {
+            await env.WORLDS.delete(key);
+        }
         fail(409, "stale", "the Realm changed during the upload");
     }
     await env.DB.prepare("INSERT OR REPLACE INTO generations (realm_id, gen, hash, size, member_id, created_at) VALUES (?, ?, ?, ?, ?, ?)")
@@ -357,14 +370,26 @@ async function redeem(env, request) {
     const t = now(), h = await sha256hex(code);
     // a full Realm keeps the invite unused
     const full = await env.DB.prepare(
-        "SELECT (SELECT COUNT(*) FROM members WHERE realm_id = i.realm_id) AS n FROM invites i WHERE code_hash = ?").bind(h).first();
+        `SELECT (SELECT COUNT(*) FROM members WHERE realm_id = i.realm_id) AS n,
+                (SELECT COUNT(*) FROM members WHERE realm_id = i.realm_id AND steam_id = ?2) AS mine
+         FROM invites i WHERE code_hash = ?1`).bind(h, steam).first();
     if (full && full.n >= MAX_MEMBERS) fail(409, "full", `a Realm has at most ${MAX_MEMBERS} members`);
+    // a second invite for the same player made a second member row (audit N19)
+    if (full && full.mine > 0) fail(409, "already_member", "you are already a member of this Realm");
     // used up in the same statement that checks it: two redeems of one code can't both win
     const inv = await env.DB.prepare(
         "UPDATE invites SET used_at = ? WHERE code_hash = ? AND used_at IS NULL AND expires_at > ? RETURNING realm_id").bind(t, h, t).first();
     if (!inv) fail(404, "bad_invite", "that invite is wrong, used or expired");
     const r = await realm(env, inv.realm_id);
     const m = await newMember(env, r.id, steam, name, "member");
+    // the count above and the insert are separate statements: parallel redeems could pass the cap together -
+    // the one over it is undone and its invite works again
+    const after = await env.DB.prepare("SELECT COUNT(*) AS n FROM members WHERE realm_id = ?").bind(r.id).first();
+    if (after.n > MAX_MEMBERS) {
+        await env.DB.prepare("DELETE FROM members WHERE realm_id = ? AND member_id = ?").bind(r.id, m.member_id).run();
+        await env.DB.prepare("UPDATE invites SET used_at = NULL WHERE code_hash = ?").bind(h).run();
+        fail(409, "full", `a Realm has at most ${MAX_MEMBERS} members`);
+    }
     return json({ realm_id: r.id, code: realmCode(r.id), name: r.name, ...m }, 201);
 }
 

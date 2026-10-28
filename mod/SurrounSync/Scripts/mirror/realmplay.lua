@@ -77,7 +77,7 @@ local STEP_TEXT = {
     download = "Downloading the newest world...", saving_own = "Saving your own world first...",
     loading = "Loading the Realm...",
     playing = "You're hosting. Members join you from their REALMS tab.",
-    stopping = "Sending your friends home...", ending_save = "Saving the Realm...", ending_upload = "Uploading the Realm...",
+    stopping = "Handing the Realm over...", ending_save = "Saving the Realm...", ending_upload = "Uploading the Realm...",
     going_home = "Taking you back to your own world...",
 }
 local function plural(n, what) return n .. " " .. what .. (n == 1 and "" or "s") end
@@ -178,7 +178,30 @@ end
 
 -- ---- start ----
 
-function realmplay.start(id)
+-- The host left its Realm while I was in it (session.lua: home now, my Realm character stored): open it myself and
+-- keep playing there with its newest world. While the old host still holds it (its final upload, or until its
+-- lease runs out) the claim answers "hosted" by that host: ask again every 5 s for a while.
+local takeover = nil
+local TAKEOVER_EVERY, TAKEOVER_TRIES = 5.0, 30
+
+-- who's connected and where I am in a Realm: when it changes (a player joins or leaves, a host ends or takes over)
+-- the list - LIVE, who hosts, who's in - is asked again at once instead of at the next 30 s refresh
+local sig_in, last_sig = 0.0, nil
+local function realm_sig()
+    local l = link.lobby and link.lobby()
+    local parts = { S and S.step or "-", session and session.realm_joined() or "-" }
+    if l then
+        if l.peer and l.peer.connected then parts[#parts + 1] = l.peer.name or "?" end
+        for _, p in ipairs(l.players or {}) do if p.state ~= "connecting" then parts[#parts + 1] = p.name or "?" end end
+    end
+    return table.concat(parts, "|")
+end
+function realmplay.takeover(id, old_host)
+    takeover = { id = id, old = old_host, at = 0.0, tries = 0 }
+    say("You keep playing in the Realm - opening it as its host...", "info")
+end
+
+function realmplay.start(id, retry)
     if not realm.enabled() then return end
     if S then say("You're already in a Realm.", "info"); return end
     if not realm.valid_id(id) then return end
@@ -200,6 +223,12 @@ function realmplay.start(id)
             -- somebody already hosts it: join them like any co-op host (R4)
             local steam, who = w[2], table.concat(w, " ", 3)
             S = nil
+            if retry and retry.old and steam == retry.old then
+                -- (taking over: still the host who just left)
+                retry.at = TAKEOVER_EVERY
+                takeover = retry
+                return
+            end
             local function join_host()
                 log.info("realmplay: " .. id .. " is hosted by " .. steam .. " - joining")
                 menu.realm_join(steam, who ~= "" and who or nil)
@@ -519,6 +548,7 @@ local function to_main_menu()
             if not (S and S.step == "armed" and S.auto == "menu") then return end
             local gi = FindFirstOf("SD_GameInstance_C")
             if not util.valid(gi) then log.error("realmplay: no game instance - can't go to the main menu"); S.auto = nil; return end
+            session.anim_on_game_thread(true)   -- (the join freeze, session.lua: this load is called from Lua too)
             -- exactly the pause screen's MAIN MENU (PauseScreen_C, decompiled): every player's UI cleared and the
             -- player removed, all actors removed, the autosave timer stopped, then the MainMenu level
             -- (ClearUI alone left world prompts like "[F] Clothing Cupboard" over the main menu)
@@ -699,7 +729,27 @@ end
 local function tick(dt)
     realm.tick(dt)
     members.tick(dt)
+    sig_in = sig_in - dt
+    if sig_in <= 0 then
+        sig_in = 1.0
+        local s = realm_sig()
+        if last_sig and s ~= last_sig then list_wanted = true end
+        last_sig = s
+    end
     if list_wanted and bridge_up() then realmplay.refresh_list(true) end
+    if takeover and not S and bridge_up() then
+        takeover.at = takeover.at - dt
+        if takeover.at <= 0 then
+            local t = takeover
+            takeover = nil
+            t.tries = t.tries + 1
+            if t.tries > TAKEOVER_TRIES then
+                say("The Realm's last host still holds it. Open it from the REALMS tab in a moment.", "info")
+            else
+                realmplay.start(t.id, t)
+            end
+        end
+    end
     if not S then return end
     S.t, S.clock = S.t + dt, (S.clock or 0) + dt
     if S.step == "armed" or S.step == "new_game" or S.step == "capturing" then
@@ -711,6 +761,10 @@ local function tick(dt)
         if S.wait > 180 and not S.slow_told then S.slow_told = true; log.error("realmplay: the Realm didn't load in 3 min") end
         arrived_tick(dt)
     elseif S.step == "playing" then
+        if not S.pockets and S.t >= 5.0 and not session.saving() then
+            S.pockets = true
+            util.safe(require("mirror.invdiag").ensure_pockets, "realmplay.pockets", "hosting a Realm")
+        end
         if S.save_in then
             S.save_in = S.save_in - dt
             if S.save_in <= 0 and not session.saving() then S.save_in = nil; session.save_now() end

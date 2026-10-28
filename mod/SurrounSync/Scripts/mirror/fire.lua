@@ -7,6 +7,7 @@ local ghost = require("mirror.ghost")
 local look = require("mirror.look")
 local events = require("mirror.events")
 local audio = require("mirror.audio")
+local perf = require("mirror.perf")
 
 local fire = {}
 
@@ -281,21 +282,30 @@ local function play_hurt(payload)
     log.debug("fire: the other player got hurt (" .. payload .. ") - blood on its ghost")
 end
 
+-- (sub-timers: "fire" hitched 30-133 ms ~4x/s while the guest shot, report 20261027-204621 - which part is unknown)
+local function ensure_hooks()
+    hooked = util.ensure_hook(FIREARM .. ":Svr_WeaponEffects", capture_hook)
+    util.ensure_hook(FIREARM .. ":FireSurfaceHit", surface_hook)
+    util.ensure_hook(FIREARM .. ":Svr_SpawnTrail", trail_hook)
+end
+local function pump_trails() trails:pump(function(payload) util.safe(play_trail, "fire.trail", payload) end) end
+local function pump_shots() shots:pump(function(payload) util.safe(play, "fire.play", payload) end) end
+local function pump_impacts() impacts:pump(function(payload) util.safe(play_impact, "fire.impact", payload) end) end
+local function pump_hurts() hurts:pump(function(payload) util.safe(play_hurt, "fire.hurt", payload) end) end
+
 function fire.tick(dt)
-    if cfg and cfg.fix_stuck_lasers then util.safe(fix_lasers, "fire.lasers", dt) end
-    if cfg and cfg.lasers_follow_aim then util.safe(lasers_follow_aim, "fire.laser_aim", dt) end
+    if cfg and cfg.fix_stuck_lasers then perf.run("f.lasers", util.safe, fix_lasers, "fire.lasers", dt) end
+    if cfg and cfg.lasers_follow_aim then perf.run("f.aim", util.safe, lasers_follow_aim, "fire.laser_aim", dt) end
     if not (cfg and cfg.ghost.mirror_fire) then return end
     check_in = check_in - dt
     if check_in <= 0 then
         check_in = 2.0
-        hooked = util.ensure_hook(FIREARM .. ":Svr_WeaponEffects", capture_hook)
-        util.ensure_hook(FIREARM .. ":FireSurfaceHit", surface_hook)
-        util.ensure_hook(FIREARM .. ":Svr_SpawnTrail", trail_hook)
+        perf.run("f.hooks", ensure_hooks)
     end
-    trails:pump(function(payload) util.safe(play_trail, "fire.trail", payload) end)
-    shots:pump(function(payload) util.safe(play, "fire.play", payload) end)
-    impacts:pump(function(payload) util.safe(play_impact, "fire.impact", payload) end)
-    hurts:pump(function(payload) util.safe(play_hurt, "fire.hurt", payload) end)
+    perf.run("f.trails", pump_trails)
+    perf.run("f.shots", pump_shots)
+    perf.run("f.impacts", pump_impacts)
+    perf.run("f.hurts", pump_hurts)
 end
 
 local LASERS = { "BP_SmallTacticalLaserSightLocalAttachment_C", "BP_TacticalLaserLightComboLocalAttachment_C" }

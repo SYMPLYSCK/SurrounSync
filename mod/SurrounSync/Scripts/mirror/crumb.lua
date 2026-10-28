@@ -7,24 +7,35 @@ local crumb = {}
 
 local FILE, WIDTH = "mirror_step.txt", 72
 local FMT = "%-" .. WIDTH .. "s"
-local out = nil
+-- mirror_steps.txt: the last RING_N steps, one fixed-width line each, written round-robin with a sequence number -
+-- one step alone didn't explain the 2026-10-27 freezes (the report puts them back in order, Report.RecentSteps)
+local RING, RING_N, RING_W = "mirror_steps.txt", 64, 100
+local RING_FMT = "%-" .. (RING_W - 1) .. "s\n"
+local out, ring = nil, nil
+local ring_i, ring_seq = 0, 0
 local enabled = true
 local last = nil
 
 function crumb.configure(cfg) enabled = not (cfg and cfg.crash_steps == false) end
 
+local function rotate(name, older)
+    local prev = io.open(name, "r")
+    if not prev then return nil end
+    local first = prev:read("*l")
+    prev:close()
+    os.remove(older)
+    os.rename(name, older)
+    return first
+end
+
 local function open_file()
     if out ~= nil then return out end
     out = false
     pcall(function()
-        local prev = io.open(FILE, "r")
-        if prev then
-            crumb.previous = prev:read("*l")
-            prev:close()
-            os.remove("mirror_step.1.txt")
-            os.rename(FILE, "mirror_step.1.txt")
-        end
+        crumb.previous = rotate(FILE, "mirror_step.1.txt")
+        rotate(RING, "mirror_steps.1.txt")
         out = io.open(FILE, "w") or false
+        ring = io.open(RING, "wb") or false   -- (binary: text mode's \r\n would shift the fixed-width slots)
     end)
     return out
 end
@@ -42,9 +53,17 @@ function crumb.at(step)
     if not f then return end
     last = step
     -- file methods report failures as return values, so no pcall (no closure per step)
+    local now = os.date("%H:%M:%S ")
     f:seek("set", 0)
-    f:write(string.format(FMT, os.date("%H:%M:%S ") .. tostring(step)):sub(1, WIDTH))
+    f:write(string.format(FMT, now .. tostring(step)):sub(1, WIDTH))
     f:flush()
+    if ring then
+        ring_seq = ring_seq + 1
+        ring:seek("set", ring_i * RING_W)
+        ring:write(string.format(RING_FMT, string.format("%d %s%.3f %s", ring_seq, now, os.clock(), tostring(step)):sub(1, RING_W - 1)))
+        ring:flush()
+        ring_i = (ring_i + 1) % RING_N
+    end
 end
 
 -- Around a hook: the step before it, then back to that step afterwards when the hook fired inside mod

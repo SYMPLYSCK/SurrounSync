@@ -14,7 +14,7 @@ with open(stub, "w") as f:
     f.write('namespace SurrounSyncShared { static class ReportTarget { public const string Webhook = ""; } }\n')
 exe = os.path.join(work, "test-report.exe")
 cmd = [CSC, "/nologo", "/target:exe", "/out:" + exe,
-       "/r:System.IO.Compression.dll", "/r:System.IO.Compression.FileSystem.dll", "/r:Microsoft.VisualBasic.dll", "/r:System.Core.dll",
+       "/r:System.IO.Compression.dll", "/r:System.IO.Compression.FileSystem.dll", "/r:Microsoft.VisualBasic.dll", "/r:System.Core.dll", "/r:System.Windows.Forms.dll",
        os.path.join(REPO, "tools", "test-report.cs"), os.path.join(REPO, "bridge", "Common.cs"),
        os.path.join(REPO, "bridge", "Diagnose.cs"), stub]
 b = subprocess.run(cmd, capture_output=True, text=True)

@@ -1,6 +1,7 @@
 -- Text chat between the two players (CO-OP tab).
 
 local log = require("mirror.log")
+local util = require("mirror.util")
 local events = require("mirror.events")
 local link = require("mirror.link")
 local notify = require("mirror.notify")
@@ -20,8 +21,7 @@ local incoming = {}
 
 local function clean(s)
     s = tostring(s or ""):gsub("%c", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    if #s > MAX_LEN then s = s:sub(1, MAX_LEN) end
-    return s
+    return util.utf8_cut(s, MAX_LEN)
 end
 
 local function add(who, text, mine)

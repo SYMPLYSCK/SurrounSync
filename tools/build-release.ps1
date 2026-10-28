@@ -1,7 +1,9 @@
 # Builds dist/SurrounSyncSetup.exe: the setup with UE4SS, the mod and the bridge packed in.
 #   .\tools\build-release.ps1
 param(
-    [string]$Game = 'C:\Program Files (x86)\Steam\steamapps\common\SurrounDead'
+    [string]$Game = 'C:\Program Files (x86)\Steam\steamapps\common\SurrounDead',
+    # the SyncFX graphics mod (its own repo); packed in and installed off
+    [string]$SyncFX = (Join-Path $env:USERPROFILE 'Desktop\DreadFX\mod\SyncFX')
 )
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path $PSScriptRoot -Parent
@@ -28,6 +30,12 @@ $ini = Join-Path $Ue 'UE4SS-settings.ini'
 (Get-Content $ini) -replace '^(ConsoleEnabled|GuiConsoleEnabled|GuiConsoleVisible)\s*=.*', '$1 = 0' | Set-Content $ini -Encoding ascii
 Copy-Item (Join-Path $Repo 'mod\SurrounSync') (Join-Path $Ue 'Mods') -Recurse
 Get-ChildItem (Join-Path $Ue 'Mods\SurrounSync') -Recurse -Include '*.bak*', '*.log', 'dlls' | Remove-Item -Recurse -Force
+# SyncFX without the developer's own settings / lamp calibration (players start from the shipped defaults) and
+# without enabled.txt (it stays off until switched on in MY SETTINGS)
+if (-not (Test-Path (Join-Path $SyncFX 'Scripts\main.lua'))) { throw "SyncFX not found in $SyncFX" }
+$Fx = Join-Path $Ue 'Mods\SyncFX'
+Copy-Item $SyncFX $Fx -Recurse
+Get-ChildItem $Fx -Recurse -Include 'SyncFX.user.ini', 'SyncFX.calib.ini', 'enabled.txt', '*.tmp', '*.bak*', '*.log' | Remove-Item -Force
 # always a fresh bridge, built straight into the package (a running game locks the one in mod\SurrounSync\bridge)
 & (Join-Path $PSScriptRoot 'build-bridge.ps1') -Out (Join-Path $Ue 'Mods\SurrounSync\bridge')
 $Manifest = Join-Path (Split-Path (Split-Path $Game -Parent) -Parent) 'appmanifest_1645820.acf'

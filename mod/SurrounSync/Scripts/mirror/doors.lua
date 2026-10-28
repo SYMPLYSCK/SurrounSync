@@ -88,11 +88,6 @@ local function rescan_class(cls)
     return walked
 end
 
-local function rescan()
-    list = {}
-    for _, cls in ipairs(CLASSES) do rescan_class(cls) end
-end
-
 local function read(d)
     local open, unlocked
     pcall(function()

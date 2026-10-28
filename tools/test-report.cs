@@ -14,6 +14,7 @@ static class TestReport
 {
     static int failed;
     static string root;
+    static string noHangs;   // the run's own empty hangs folder: real freeze notes on this PC must not leak into the tests
 
     static void Check(bool ok, string what)
     {
@@ -278,13 +279,159 @@ static class TestReport
         Check(sw.ElapsedMilliseconds < 15000, "a huge log is diagnosed in reasonable time");
     }
 
+    // a guest's game froze 7 times with no crash report (2026-10-27): a report made while the game hangs carries a dump
+    static void FrozenGameGetsAHangDump()
+    {
+        Console.WriteLine("frozen_game_gets_a_hang_dump");
+        string self = Process.GetCurrentProcess().MainModule.FileName;
+        var p = Process.Start(new ProcessStartInfo(self, "--hang") { UseShellExecute = false });
+        try
+        {
+            bool hung = false;
+            for (int i = 0; i < 60 && !hung; i++) { System.Threading.Thread.Sleep(250); p.Refresh(); hung = p.MainWindowHandle != IntPtr.Zero && !p.Responding; }
+            Check(hung, "the stand-in game window stops responding");
+            Report.HangProcess = Path.GetFileNameWithoutExtension(self);
+            string d = Dir("hang");
+            Log(d, "mirror_log.txt", new[] { L("13:00:00", "INFO", "session: checkpoint save (items changed hands)") }, DateTime.Now);
+            string outDir = Path.Combine(d, "out");
+            Directory.CreateDirectory(outDir);
+            Report.OutDir = outDir;
+            string err;
+            string zip = Report.Create(Path.Combine(d, "win64"), out err, false, null);
+            Check(zip != null, "the report is made (" + (err ?? "ok") + ")");
+            if (zip == null) return;
+            using (var a = ZipFile.OpenRead(zip))
+            {
+                var dump = a.GetEntry("hang/SurrounDead-hang.dmp");
+                var note = a.GetEntry("hang/hang.txt");
+                string text = note != null ? new StreamReader(note.Open()).ReadToEnd() : "";
+                Check(dump != null && dump.Length > 1024, "the frozen game's dump is packed (" + text.Trim() + ")");
+                Check(text.Contains("not responding"), "hang.txt says the game wasn't responding");
+                var hangs = a.Entries.Where(e => e.FullName.StartsWith("hang/")).Select(e => e.FullName).ToList();
+                Check(hangs.Count == 2, "only the frozen process is dumped, not this responding one (" + string.Join(", ", hangs) + ")");
+            }
+        }
+        finally
+        {
+            try { p.Kill(); } catch { }
+            Report.HangProcess = "SurrounDead-Win64-Shipping";
+        }
+    }
+
+    // the bridge's game watch catches a freeze by itself: CPU per thread + a dump at 8 s, a freeze finding in the report
+    static void GameWatchCatchesAFreeze()
+    {
+        Console.WriteLine("game_watch_catches_a_freeze");
+        string self = Process.GetCurrentProcess().MainModule.FileName;
+        string d = Dir("watch");
+        GameWatch.HangDirOverride = Path.Combine(d, "hangs");
+        var lines = new List<string>();
+        var p = Process.Start(new ProcessStartInfo(self, "--hang") { UseShellExecute = false });
+        try
+        {
+            new GameWatch(m => { lock (lines) lines.Add(m); }, Path.GetFileNameWithoutExtension(self)).Start();
+            var until = DateTime.Now.AddSeconds(40);
+            while (DateTime.Now < until && !Directory.Exists(GameWatch.HangDirOverride)) System.Threading.Thread.Sleep(500);
+            System.Threading.Thread.Sleep(1000);
+            string[] dumps = Directory.Exists(GameWatch.HangDirOverride) ? Directory.GetFiles(GameWatch.HangDirOverride, "hang-*.dmp") : new string[0];
+            string[] notes = Directory.Exists(GameWatch.HangDirOverride) ? Directory.GetFiles(GameWatch.HangDirOverride, "hang-*.txt") : new string[0];
+            string all; lock (lines) all = string.Join("\n", lines);
+            Check(all.Contains("watch: the game stopped responding"), "the watch notices the frozen window");
+            Check(dumps.Length == 1 && new FileInfo(dumps[0]).Length > 1024, "a dump is written by itself after 8 s (" + dumps.Length + ")");
+            string note = notes.Length > 0 ? File.ReadAllText(notes[0]) : "";
+            Check(note.Contains("busiest") && note.Contains("commit"), "the note has CPU per thread and memory (" + note.Trim() + ")");
+            Check(all.Contains("watch: game ") && all.Contains("MB private"), "a health line is logged");
+            var dg = Diagnose.Run(null, Path.Combine(d, "nolocal"));
+            var fr = dg.Findings.FirstOrDefault(f => f.Category == "Freeze");
+            Check(fr != null && fr.Severity == "CRITICAL" && fr.Evidence.Any(e => e.Contains("busiest")), "the report leads with the freeze and its CPU note");
+        }
+        finally
+        {
+            try { p.Kill(); } catch (InvalidOperationException) { }
+            GameWatch.HangDirOverride = noHangs;
+        }
+        string ring = Path.Combine(d, "steps.txt");
+        File.WriteAllText(ring, "66 21:20:19 812.400 session".PadRight(99) + "\n" + "65 21:20:19 812.390 zombies".PadRight(99) + "\n" + "garbage\n");
+        string steps = Report.RecentSteps(ring);
+        Check(steps != null && steps.IndexOf("zombies") < steps.IndexOf("session") && !steps.Contains("garbage"), "recent steps come out oldest first");
+    }
+
+    // audit N35/N36/N4: a friend's game freeze is named as such, the peer name has no state word, a load isn't a freeze
+    static void PeerFreezeLoadAndPeerName()
+    {
+        Console.WriteLine("peer_freeze_load_and_peer_name");
+        string d = Dir("peerfreeze");
+        // (real line shapes, kit 2026-10-27: "last rx" on the link line is the connector's heartbeat - it stays low
+        // through a game freeze; the game data's age is on the phase1[host] line)
+        string lk = "phase1: link bridge host: me 7656, peer K3YBOARD32 (7657), last rx {0} s, pkts tx 1 rx 1, KB tx 0 rx 0, blobs tx 0 rx 0 peer_hb {0} peer_game {1} at 1793094228 rtt 300 ms";
+        string gd = "phase1[host]: rx {0}/s, last {1}s ago | ghost {2} | zombies: sending 0 zombie(s)";
+        Log(d, "mirror_log.txt", new[] {
+            // a normal leave: their ghost goes at once, their game at home keeps sending
+            L("03:10:10", "INFO", string.Format(lk, "0.0", "alive")), L("03:10:10", "INFO", string.Format(gd, "22.0", "0.99", "none")),
+            L("03:10:15", "INFO", string.Format(lk, "0.4", "alive")), L("03:10:15", "INFO", string.Format(gd, "0.0", "5.99", "none")),
+            L("03:10:20", "INFO", string.Format(lk, "0.4", "alive")), L("03:10:20", "INFO", string.Format(gd, "4.6", "0.03", "none")),
+            // joined again, then their game froze for good and closed
+            L("03:20:10", "INFO", string.Format(lk, "0.1", "alive")), L("03:20:10", "INFO", string.Format(gd, "27.4", "0.00", "host 2 m from you")),
+            L("03:20:35", "WARN", "phase1: no data from the other game for 10 s (paused, loading or closed)"),
+            L("03:20:40", "INFO", string.Format(lk, "0.3", "alive")), L("03:20:40", "INFO", string.Format(gd, "0.0", "25.45", "host 2 m from you")),
+            L("03:20:45", "INFO", string.Format(lk, "0.3", "alive")), L("03:20:45", "INFO", string.Format(gd, "0.0", "30.45", "host 2 m from you")),
+            L("03:21:10", "INFO", string.Format(lk, "-1.0", "gone")), L("03:21:10", "INFO", string.Format(gd, "0.0", "55.46", "host 2 m from you")),
+        }, DateTime.Now);
+        File.WriteAllText(Path.Combine(d, "local", "mirror_lobby.txt"), "peer 7657 ap connected\n");
+        GameWatch.HangDirOverride = Path.Combine(d, "hangs");
+        Directory.CreateDirectory(GameWatch.HangDirOverride);
+        File.WriteAllText(Path.Combine(GameWatch.HangDirOverride, "hang-20261027-030000-1.txt"),
+            "frozen 9 s " + GameWatch.DuringLoad + " | busiest: #1 900 ms\r\n");
+        try
+        {
+            var g = Run(d);
+            var pf = Find(g, "other player's game froze");
+            Check(pf != null && pf.Count == 1 && pf.What.Contains("1x it then closed"), "the friend's game freeze (then close) is named");
+            Check(g.Context.Any(c => c.Contains("other player: ap") && !c.Contains("ap connected")), "the lobby name has no state word");
+            Check(Find(g, "world load took") != null && Find(g, "The game froze") == null, "a hang during a world load is a slow load, not a freeze");
+        }
+        finally { GameWatch.HangDirOverride = noHangs; }
+    }
+
+    // 3-4 players: every other player's module copy logs its own link line + game-data line, interleaved. One
+    // friend frozen 15 s while the other plays on is one freeze, not one per status round.
+    static void PeerFreezeWithSeveralPlayers()
+    {
+        Console.WriteLine("peer_freeze_with_several_players");
+        string d = Dir("peerfreeze3");
+        string lk = "phase1: link bridge host: me 7656, peer {0} ({1}), last rx 0.1 s, pkts tx 1 rx 1, KB tx 0 rx 0, blobs tx 0 rx 0 peer_hb 0.2 peer_game alive at 1793094228 rtt 30 ms";
+        string gd = "phase1[host]: rx {0}/s, last {1}s ago | ghost host 3 m from you | zombies: sending 0 zombie(s)";
+        var lines = new List<string>();
+        int s = 0;
+        foreach (var age in new[] { "0.01", "22.40", "27.40", "32.40", "0.02" })
+        {
+            string t = "04:00:" + (10 + s * 5).ToString("00");
+            lines.Add(L(t, "INFO", string.Format(lk, "Anna", 7657))); lines.Add(L(t, "INFO", string.Format(gd, age == "0.01" || age == "0.02" ? "27.0" : "0.0", age)));
+            lines.Add(L(t, "INFO", string.Format(lk, "Ben", 7658))); lines.Add(L(t, "INFO", string.Format(gd, "26.8", "0.03")));
+            s++;
+        }
+        Log(d, "mirror_log.txt", lines.ToArray(), DateTime.Now);
+        var g = Run(d);
+        var pf = Find(g, "other player's game froze");
+        Check(pf != null && pf.Count == 1, "one friend's freeze is counted once while another plays on (" + (pf == null ? "none" : pf.Count + "x: " + string.Join(" / ", pf.Evidence)) + ")");
+    }
+
     static int Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "--hang")
+        {
+            var f = new System.Windows.Forms.Form();
+            f.Show();
+            System.Threading.Thread.Sleep(120000);
+            return 0;
+        }
         root = Path.Combine(Path.GetTempPath(), "surrounsync-test-report");
         Directory.CreateDirectory(root);
+        noHangs = Path.Combine(Dir("nohangs"), "hangs");
+        GameWatch.HangDirOverride = noHangs;
         var tests = new Action[] { RepeatedErrorsAreGroupedAndExplained, VersionMismatchSaveSafetyAndConnection, CrashesAreExplainedWithTheModStep,
                                    TheCrashedRunIsTheOneExplained, MissingLogsAndQuietRuns, SensitiveDataIsFiltered, ReportPackageAndDuplicates,
-                                   PerformanceIsBounded };
+                                   PerformanceIsBounded, FrozenGameGetsAHangDump, GameWatchCatchesAFreeze, PeerFreezeLoadAndPeerName, PeerFreezeWithSeveralPlayers };
         foreach (var t in tests)
         {
             try { t(); }
