@@ -4,6 +4,8 @@ Both players need the same version. The game checks this when you connect and te
 
 ## 0.14.1 (2026-10-29)
 
+**I apologize for the spam patches.** This download now also fixes a crash when switching SyncFX on, a "host's game closed" message that could stay stuck on screen, and the REALMS tab's join requests - if you installed 0.14.1 earlier today, download it again.
+
 **SyncFX grows up, Realms stop reloading, and a long list of co-op fixes.** Plays with friends on 0.14.0, but get everyone on 0.14.1 to get all of it.
 
 **SyncFX: eight looks that live up to their names**
@@ -17,7 +19,8 @@ Both players need the same version. The game checks this when you connect and te
 **Realms that never reload**
 - When the Realm host leaves, a player who is still there takes over right where they stand. No loading screen, nobody sent home.
 - Items no longer vanish from Realm characters, and ending a Realm while moving no longer freezes the game.
-- Realms and co-op are kept apart: Realm members get in by themselves, others wait for LET IN or DECLINE on the REALMS card, a JOINING card has a CANCEL button, and new Realm characters start with the starting kit.
+- Realms and co-op are kept apart: Realm members get in by themselves, anyone else shows up as a JOIN REQUEST on the REALMS tab with a clear ACCEPT and DECLINE, a JOINING card has a CANCEL button, and new Realm characters start with the starting kit.
+- The REALMS tab shows who's online in green, and its chat stays on the page.
 - Creating a Realm uses the difficulty of your own world, and the owner can change it with MY DIFFICULTY.
 
 **The world you share is the host's world**

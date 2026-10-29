@@ -1077,7 +1077,14 @@ function session.promote_realm()
 end
 
 local function watch_host(dt)
-    if state ~= "joined" then gone, paused_told, promoting = nil, false, false; return end
+    if state ~= "joined" then
+        -- the countdown's cards go with it: a leave some other way (2026-10-29: a friend's game) left
+        -- "... in 5 seconds" on screen for good
+        if gone then notify.clear("hostgone", true) end
+        if paused_told then notify.clear("hostpaused") end
+        gone, paused_told, promoting = nil, false, false
+        return
+    end
     if promoting then return end
     local ps = peer_state()
     if ps == "gone" or (gone and ps ~= "ok") then

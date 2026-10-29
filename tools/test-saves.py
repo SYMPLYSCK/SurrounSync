@@ -2049,6 +2049,19 @@ def hostgone_countdown_then_home(L, tmp):
 
 
 @test
+def hostgone_card_goes_when_the_guest_leaves_another_way(L, tmp):
+    # 2026-10-29: a friend's "Host's game closed ... in 5 seconds" card stayed on screen after the leave
+    joined_session(L, tmp)
+    L.execute('CLEARED = {}; package.loaded["mirror.notify"].clear = function(k) CLEARED[#CLEARED + 1] = k end')
+    host_state(L, "gone")
+    L.execute('TICK(50)')
+    check(L.eval('session.host_gone()') == 5, "countdown at 5 s (%s)" % L.eval('session.host_gone()'))
+    L.execute('session.request_toggle(); TICK(2)')
+    check(L.eval('session.state()') != "joined", "the guest leaves (LEAVE)")
+    check(any(k == "hostgone" for k in L.eval('CLEARED').values()), "...and the countdown card goes with the countdown")
+
+
+@test
 def hostgone_host_back_cancels(L, tmp):
     joined_session(L, tmp)
     host_state(L, "gone")

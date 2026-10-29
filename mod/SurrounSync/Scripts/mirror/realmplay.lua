@@ -97,7 +97,8 @@ end
 
 -- "Ann (owner) - hosting   Bob - here   Cy" : every member of the Realm, the ones playing first.
 -- here = in this session with me (my name + the players the bridge has connected), hosting = holds the lease.
-local function people_text(r, in_session)
+-- The members, the ones playing first: { label = "Ann (owner) - hosting", on = true } (on: in the session right now).
+local function people_list(r, in_session)
     if not r or not r.people or #r.people == 0 then return nil end
     local on = {}
     local l = in_session and link.lobby() or nil
@@ -109,11 +110,20 @@ local function people_text(r, in_session)
     local first, rest = {}, {}
     for _, p in ipairs(r.people) do
         local st = (r.host and p.steam == r.host) and "hosting" or (on[p.name] and "here") or nil
-        local s = p.name .. (p.owner and " (owner)" or "") .. (st and (" - " .. st) or "")
-        if st then first[#first + 1] = s else rest[#rest + 1] = s end
+        -- (short: the handbook's one-label-each list, where green already says who's here)
+        local e = { label = p.name .. (p.owner and " (owner)" or "") .. (st and (" - " .. st) or ""), on = st ~= nil,
+                    short = p.name .. (st == "hosting" and " (host)" or "") }
+        if st then first[#first + 1] = e else rest[#rest + 1] = e end
     end
-    for _, s in ipairs(rest) do first[#first + 1] = s end
-    return table.concat(first, "     ")
+    for _, e in ipairs(rest) do first[#first + 1] = e end
+    return first
+end
+
+local function people_text(list)
+    if not list then return nil end
+    local s = {}
+    for i, e in ipairs(list) do s[i] = e.label end
+    return table.concat(s, "     ")
 end
 
 -- the name of the Realm I host right now (nil = not hosting one)
@@ -180,14 +190,17 @@ function realmplay.model()
         m.state = STEP_TEXT[S.step] or "One moment..."
         -- opened before the list came in (dev/KEY path): the card showed the code until now
         if r and r.name and r.name ~= "" and S.name == realm.code(S.id) then S.name = r.name end
+        local people = people_list(r, S.step == "playing")
         m.current = { id = S.id, name = S.name, code = S.id and realm.code(S.id) or nil,
                       info = r and plural(r.members or 0, "member") or nil,
-                      people = people_text(r, S.step == "playing"), owner = r ~= nil and r.role == "owner" }
+                      people = people_text(people), people_list = people, owner = r ~= nil and r.role == "owner" }
         -- the first player asking to come in (members don't ask: menu lets them in)
         if m.hosting and menu and menu.requests then
             local q = menu.requests()[1]
             if q then
-                m.request = { id = q.id, name = q.name or "Someone" }
+                -- (Steam names only friends; the joiner sends its name a moment later - never a raw id)
+                local name = q.name and q.name ~= "" and q.name ~= tostring(q.id) and q.name or "Someone"
+                m.request = { id = q.id, name = name }
                 m.state = m.request.name .. " wants to join " .. (S.name or "your Realm") .. "."
             end
         end
@@ -196,15 +209,17 @@ function realmplay.model()
         m.joining = true
         m.state = "Asked " .. ((r and r.host_name) or "the host") .. " to let you in - waiting..."
         m.current = { id = asking, name = r and r.name or realm.code(asking), code = realm.code(asking),
-                      info = r and plural(r.members or 0, "member") or nil, people = people_text(r, false) }
+                      info = r and plural(r.members or 0, "member") or nil, people = people_text(people_list(r, false)),
+                      people_list = people_list(r, false) }
     elseif joined then
         local r = realm.find(joined)
         m.state = "You're playing in " .. (r and r.name or "a Realm") .. (r and r.host_name and (", hosted by " .. r.host_name) or "") .. "."
         -- a visiting member gets the card too (who's in, INVITE CODE / COPY MY KEY)
         m.visiting = true
+        local people = people_list(r, true)
         m.current = { id = joined, name = r and r.name or realm.code(joined), code = realm.code(joined),
                       info = r and plural(r.members or 0, "member") or nil,
-                      people = people_text(r, true) }
+                      people = people_text(people), people_list = people }
     end
     return m
 end

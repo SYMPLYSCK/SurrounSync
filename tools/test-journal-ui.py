@@ -73,7 +73,7 @@ MT.__call = function(f, self, ...)
     return fake("ret")
 end
 function StaticFindObject(p) return fake(p) end
-function StaticConstructObject(cls, outer) local o = fake(cls.__name); o.cls = cls.__name; return o end
+function StaticConstructObject(cls, outer, name) local o = fake(cls.__name); o.cls = cls.__name; o.wname = name; return o end
 function FName(s) return s end
 function FText(s) return s end
 function NotifyOnNewObject() end
@@ -128,6 +128,25 @@ function COUNT(name, arg)
     return n
 end
 function SHOWN(o) local v = o.props.SetVisibility; return v ~= nil and v[1] ~= 1 end
+-- the box new() made under this name (journal_tab names them "SurrounSync_<name>_<n>")
+function BOX(name)
+    for _, o in ipairs(ALL) do
+        if o.wname and o.wname:find("SurrounSync_" .. name .. "_", 1, true) == 1 then return o end
+    end
+end
+-- "green" / "ink" / "other": the colour a text was last given
+function COLOR_OF(s)
+    for i = #ALL, 1, -1 do
+        local o = ALL[i]
+        if o.cls == "/Script/UMG.TextBlock" and o.props.SetText and o.props.SetText[1] == s then
+            local c = o.props.SetColorAndOpacity and o.props.SetColorAndOpacity[1].SpecifiedColor
+            if not c then return nil end
+            if c.G > 0.3 and c.R < 0.1 then return "green" end
+            if c.R == 0.12 and c.G == 0.08 then return "ink" end
+            return "other"
+        end
+    end
+end
 function TEXT_SHOWN(s)
     for _, o in ipairs(ALL) do
         if o.cls == "/Script/UMG.TextBlock" and o.props.SetText and o.props.SetText[1] == s then return true end
@@ -214,20 +233,37 @@ def realms_page():
     check(L.eval('BUTTON("SURE? END IT")') is not None, "END asks SURE?")
     L.execute('CLICK(BUTTON("SURE? END IT"))')
     check(L.eval('LAST_ACT("realm_end")') is not None, "second press ends the Realm")
-    # a non-member asking to come in: answered on the card, not the CO-OP tab (members are let in by menu.lua)
+    # a non-member asking to come in: its own JOIN REQUEST box in the folder with ACCEPT / DECLINE (members are let
+    # in by menu.lua). 2026-10-29: the host found no way to let a friend in when it was a relabelled button
     L.execute('MODEL.request = { id = "1002", name = "Bob" }; TICK(6)')
-    # (the CO-OP tab's request rows have DECLINE buttons too, built first: the Realm card's is the last one)
-    L.execute('RDECLINE = nil; for _, o in ipairs(ALL) do if o.cls == "/Script/UMG.Button" and LABEL(o) == "DECLINE" then RDECLINE = o end end')
-    check(L.eval('BUTTON("LET BOB IN")') is not None and L.eval('SHOWN(RDECLINE)') is True,
-          "a join request turns the buttons into LET BOB IN / DECLINE")
-    L.execute('CLICK(BUTTON("LET BOB IN"))')
+    # (the CO-OP tab's request rows have ACCEPT / DECLINE buttons too, built first: the Realm folder's are the last ones)
+    L.execute('''RACCEPT, RDECLINE = nil, nil
+        for _, o in ipairs(ALL) do
+            if o.cls == "/Script/UMG.Button" and LABEL(o) == "ACCEPT" then RACCEPT = o end
+            if o.cls == "/Script/UMG.Button" and LABEL(o) == "DECLINE" then RDECLINE = o end
+        end''')
+    check(L.eval('TEXT_SHOWN("JOIN REQUEST")') is True and L.eval('TEXT_SHOWN("Bob wants to join Our Farm.")') is True,
+          "a join request: JOIN REQUEST, who and where")
+    # (the buttons show with their box: they never get a visibility of their own)
+    check(L.eval('RACCEPT ~= nil and RDECLINE ~= nil and RACCEPT.props.SetVisibility == nil') is True,
+          "...with its own ACCEPT and DECLINE")
+    check(L.eval('SHOWN(BOX("RealmRequest"))') is True and L.eval('SHOWN(BOX("RealmBring"))') is False,
+          "...BRING FRIENDS makes room for it (chat stays on the page)")
+    check(L.eval('BUTTON("ADD FRIENDS HERE")') is not None, "ADD FRIENDS HERE keeps its own job")
+    L.execute('CLICK(RACCEPT)')
     a = L.eval('LAST_ACT("accept")')
-    check(a is not None and a[2] == "1002" and a[3] == "Bob", "LET BOB IN accepts that player")
+    check(a is not None and a[2] == "1002" and a[3] == "Bob", "ACCEPT lets that player in")
     check(L.eval('COUNT("realm_friends")') == 1, "...and doesn't run ADD FRIENDS HERE")
     L.execute('CLICK(RDECLINE)')
     check(L.eval('LAST_ACT("decline")') is not None and L.eval('LAST_ACT("decline")[2]') == "1002", "DECLINE turns them away")
     L.execute('MODEL.request = nil; TICK(6)')
-    check(L.eval('BUTTON("ADD FRIENDS HERE")') is not None, "no request: ADD FRIENDS HERE again")
+    check(L.eval('SHOWN(BOX("RealmRequest"))') is False and L.eval('SHOWN(BOX("RealmBring"))') is True,
+          "no request: the box goes, BRING FRIENDS is back")
+    # who's in: one label each, online in green
+    L.execute('''MODEL.current.people_list = { { short = "Ann (host)", on = true }, { short = "Bob", on = true },
+        { short = "Cy", on = false } }; TICK(6)''')
+    check(L.eval('TEXT_SHOWN("Ann (host)")') is True and L.eval('TEXT_SHOWN("Cy")') is True, "members listed one label each")
+    check(L.eval('COLOR_OF("Bob")') == "green" and L.eval('COLOR_OF("Cy")') == "ink", "online in green, the others not")
     # a member still waiting for the Realm's host: the card shows it, CANCEL stops asking
     L.execute('''MODEL = { service = "on", free = false, joining = true, state = "Asked Ann to let you in - waiting...", rows = {},
         current = { id = "7K2M9P4Q1Z", name = "Ann's Realm", code = "R-7K2M9-P4Q1Z" } }; TICK(6)''')

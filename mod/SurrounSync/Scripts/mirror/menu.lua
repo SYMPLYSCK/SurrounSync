@@ -451,7 +451,7 @@ local function watch_requests()
                     answer("accept", q.id, name or "Someone")
                 elseif realm_name then
                     notify.show((name or "Someone") .. " wants to join " .. realm_name .. " - open the handbook (J), REALMS tab, "
-                        .. "to LET THEM IN or DECLINE.", "good", "join_req_" .. q.id, nil, { sticky = true })
+                        .. "and press ACCEPT or DECLINE.", "good", "join_req_" .. q.id, nil, { sticky = true })
                     if require("mirror.mysettings").on("joinsound") then notify.ping(2) end
                 else
                     notify.show((name or "Someone") .. " wants to join your world - open the handbook (J), CO-OP tab, to ACCEPT or DECLINE.",

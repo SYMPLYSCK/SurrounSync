@@ -27,10 +27,12 @@ local LIST_WIDTH = 560.0
 local GEAR_TEX = "/Game/UI/Textures/over_250_survival_flat_icons/gear.gear"
 local CLOSE_TEX = "/Game/UI/Textures/CrossX.CrossX"
 local INK = { R = 0.12, G = 0.08, B = 0.06, A = 1.0 }
+local GREEN = { R = 0.03, G = 0.40, B = 0.08, A = 1.0 }   -- (dark enough to read on the page's paper)
 local SETTING_ROWS = 10   -- MY SETTINGS: SyncFX on top of the 9 others
 local TAG_COLOR = { R = 0.6, G = 0.13, B = 0.0, A = 1.0 }   -- burnt orange tag in front of a label (a row's tag_color wins)
 local MOD_ROWS = 9
 local REALM_ROWS = 3   -- per page on the lined note (more Realms: < PREV / NEXT >)
+local PEOPLE_ROWS, PEOPLE_PER_ROW = 2, 4   -- WHO'S IN: one label per member (more: "+N more" in the last one)
 -- the MODS tab: one ribbon below CO-OP (label spot found in-game; the ribbon art is yellow, so a tint can only
 -- darken it: orange, not blue)
 local MODS_TINT = { R = 1.0, G = 0.5, B = 0.35, A = 1.0 }
@@ -567,19 +569,38 @@ local function build_realms(page, qtree, qpage, itree, ipage)
     tilt(tools, TILT.piece)
     place(cv, tools, 380.0, 652.0, 560.0, 380.0, 6)
     u.realms_tools = tools
-    -- every member, the ones playing first ("- hosting" / "- here")
-    vadd(tools, text("WHO'S IN", 26, DARK_RED))
+    -- a player asking to come in, first thing in the folder with its own ACCEPT / DECLINE (2026-10-29: the host found no
+    -- way to let a friend in - the request was a relabelled button off on the card's row)
+    local req = new("VerticalBox", S.tree, "RealmRequest"); vadd(tools, req)
+    u.realms_req = req
+    vadd(req, text("JOIN REQUEST", 26, DARK_RED))
+    u.realms_req_t = text("", 18, BLACK, 540); vadd(req, u.realms_req_t, 2)
+    local rq = new("HorizontalBox", S.tree, "RealmRequestRow"); vadd(req, rq, 6)
+    u.realms_req_accept = button("ACCEPT", 26, GREEN); hadd(rq, u.realms_req_accept)
+    u.realms_req_decline = button("DECLINE", 26, DARK_RED); hadd(rq, u.realms_req_decline, 40)
+    -- every member, the ones playing first; who's online in green (one label each, two rows at most)
+    u.realms_who = text("WHO'S IN", 26, DARK_RED); vadd(tools, u.realms_who, 14)
     u.realms_people = text("", 16, INK, 540); vadd(tools, u.realms_people, 2)
-    vadd(tools, text("BRING FRIENDS", 26, DARK_RED), 14)
-    local tr = new("HorizontalBox", S.tree, "RealmToolRow"); vadd(tools, tr, 8)
+    u.realms_names = {}
+    for r = 1, PEOPLE_ROWS do
+        local row = new("HorizontalBox", S.tree, "RealmPeopleRow"); vadd(tools, row, r == 1 and 2 or 0)
+        for i = 1, PEOPLE_PER_ROW do
+            local t = text("", 16, INK); hadd(row, t, i > 1 and 18 or nil)
+            u.realms_names[#u.realms_names + 1] = t
+        end
+    end
+    -- (hidden while a request is up: the folder has room for one or the other, and chat must stay on the page)
+    local bring = new("VerticalBox", S.tree, "RealmBring"); vadd(tools, bring, 14)
+    u.realms_bring = bring
+    vadd(bring, text("BRING FRIENDS", 26, DARK_RED))
+    local tr = new("HorizontalBox", S.tree, "RealmToolRow"); vadd(bring, tr, 8)
     u.realms_cur_invite = button("INVITE CODE", 22, DARK_RED); hadd(tr, u.realms_cur_invite)
     u.realms_cur_key = button("COPY MY KEY", 22, DARK_RED); hadd(tr, u.realms_cur_key, 30)
     -- the owner, hosting: the Realm takes the difficulty of their own save (collapsed for everyone else)
     u.realms_my_diff = button("MY DIFFICULTY", 22, DARK_RED); hadd(tr, u.realms_my_diff, 30)
-    vadd(tools, text("INVITE CODE copies a one-time code for a friend who isn't here (it works for 7 days). Friends "
-        .. "playing with you right now join with ADD FRIENDS HERE.", 15, GREY, 540), 8)
-    vadd(tools, text("COPY MY KEY copies your membership, to play this Realm from another PC. Keep it private.", 15, GREY, 540), 6)
-    u.realms_inv_tools, u.realms_inv_tools_t = code_box(tools, 18)
+    vadd(bring, text("INVITE CODE: a one-time code for a friend who isn't here (7 days). COPY MY KEY: play this Realm "
+        .. "from another PC - keep it private.", 15, GREY, 540), 8)
+    u.realms_inv_tools, u.realms_inv_tools_t = code_box(bring, 12)
     -- the CO-OP tab's chat here too, while in a Realm session (no switching tabs to talk)
     -- (two lines: a third ran past the folder's bottom edge, measured in-game)
     local rc = new("HorizontalBox", S.tree, "RealmChatRow"); vadd(tools, rc, 2)
@@ -681,7 +702,23 @@ local function refresh_realms()
     if cur then
         set(u.realms_cur_kind, m.hosting and "YOU'RE HOSTING" or (m.armed and "NEW REALM")
             or (m.visiting and "YOU'RE VISITING") or (m.joining and "JOINING") or "YOUR REALM")
+        -- WHO'S IN: one label per member, online ones in green; the last label says how many more there are
+        local list = cur.people_list or {}
+        vis(u.realms_people, #list == 0)
         set(u.realms_people, cur.people or "Loading the member list...")
+        local slots = #u.realms_names
+        for i, t in ipairs(u.realms_names) do
+            local p = list[i]
+            if p and i == slots and #list > slots then p = { short = "+" .. (#list - slots + 1) .. " more", on = false } end
+            vis(t, p ~= nil)
+            if p then
+                local s = p.short or p.label or ""
+                if #s > 16 then s = util.utf8_cut(s, 15) .. "." end   -- (four to a row on the folder)
+                set(t, s)
+                local on = p.on == true
+                if t.syncfx_on ~= on then t.syncfx_on = on; style_text(t, 16, on and GREEN or INK) end
+            end
+        end
         local talk = m.hosting == true or m.visiting == true
         vis_hit(u.realms_chat_row, talk)
         local lines = talk and require("mirror.chat").recent(2) or {}
@@ -697,18 +734,17 @@ local function refresh_realms()
         set(u.realms_cur_name, cur.name or "")
         set(u.realms_cur_info, (cur.code or "") .. (cur.info and ("   |   " .. cur.info) or ""))
         set(u.realms_cur_state, m.state or "")
-        -- a player asking to come in: ADD FRIENDS HERE turns into LET <NAME> IN, CANCEL into DECLINE (a Realm's join
-        -- requests are answered here, not on the CO-OP tab)
+        -- a player asking to come in: the JOIN REQUEST box with its own ACCEPT / DECLINE (a Realm's join requests are
+        -- answered here, not on the CO-OP tab); BRING FRIENDS makes room for it
         local q = m.hosting and m.request or nil
+        vis_hit(u.realms_req, q ~= nil)
+        vis_hit(u.realms_bring, q == nil)
+        if q then set(u.realms_req_t, (q.name or "Someone") .. " wants to join " .. (cur.name or "your Realm") .. ".") end
         vis_hit(u.realms_friends, m.hosting == true)
-        local qn = q and q.name:upper() or nil
-        if qn and #qn > 10 then qn = util.utf8_cut(qn, 9) .. "." end
-        set(u.realms_friends_t, qn and ("LET " .. qn .. " IN") or "ADD FRIENDS HERE")
         -- (a visiting member leaves here too, like LEAVE CO-OP; one still asking to come in cancels here)
         vis_hit(u.realms_end, m.hosting == true or m.visiting == true or m.joining == true)
-        vis_hit(u.realms_cancel, m.armed == true or q ~= nil)
+        vis_hit(u.realms_cancel, m.armed == true)
         vis_hit(u.realms_my_diff, m.hosting == true and cur.owner == true)
-        set(u.realms_cancel_t, q and "DECLINE" or "CANCEL")
         if u.realms_end_armed and clock > u.realms_end_armed + 4 then u.realms_end_armed = nil end
         set(u.realms_end_t, m.joining and "CANCEL" or m.visiting and "LEAVE REALM"
             or (u.realms_end_armed and "SURE? END IT" or "END REALM"))
@@ -1120,9 +1156,10 @@ function journal_tab.tick(dt)
         local c_fr, c_end, c_cancel = clicked(u.realms_friends), clicked(u.realms_end), clicked(u.realms_cancel)
         local c_inv, c_key = clicked(u.realms_cur_invite), clicked(u.realms_cur_key)
         local q = rm.hosting and rm.request or nil
-        if q and c_fr then a.accept(q.id, q.name); ctx.refresh_now = true
-        elseif rm.hosting and c_fr then a.realm_friends() end
-        if q and c_cancel then a.decline(q.id, q.name); ctx.refresh_now = true end
+        local c_yes, c_no = clicked(u.realms_req_accept), clicked(u.realms_req_decline)
+        if q and c_yes then a.accept(q.id, q.name); ctx.refresh_now = true end
+        if q and c_no then a.decline(q.id, q.name); ctx.refresh_now = true end
+        if rm.hosting and c_fr then a.realm_friends() end
         if rm.joining and c_end then a.cancel_join(); ctx.refresh_now = true end
         if rm.hosting and c_end then
             -- END REALM sends everyone home: the first press asks
