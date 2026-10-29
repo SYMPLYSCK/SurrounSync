@@ -1,5 +1,5 @@
 @echo off
-rem Tells Claude's test kit you are playing on this PC: while the flag is on, tools/ingame/t.sh won't start, kill
+rem Tells the test kit you are playing on this PC: while the flag is on, tools/ingame/t.sh won't start, kill
 rem or re-configure any game. Double-click to switch it on/off, or: playing on | playing off
 set "F=%LOCALAPPDATA%\SurrounSync\playing.txt"
 if not exist "%LOCALAPPDATA%\SurrounSync" mkdir "%LOCALAPPDATA%\SurrounSync"
