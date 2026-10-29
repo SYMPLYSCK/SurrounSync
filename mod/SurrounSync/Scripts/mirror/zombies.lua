@@ -309,16 +309,31 @@ end
 -- thread then waits in UE4SS's object-construction hook for the Lua lock this call holds: a permanent freeze.
 -- So during our spawn every entry points at a look that is loaded already (the wanted one, else the class's own
 -- template mesh). Returns the restore function, or nil when there is no loaded look (then don't spawn).
+-- Only a pin that reads back counts (DBG-20261027-016 came back 2026-10-29 on a hand-back after a teleport):
+-- for the master zombie's family a list that can't be read is a failure, never "empty", and every entry must
+-- resolve to the loaded look afterwards (Conv_SoftObjectReferenceToObject never loads).
+local MZ = "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C"
 local function pin_soft_looks(cdo, mesh, mat)
     if not cdo then return function() end end
     local K = util.cdo("/Script/Engine.Default__KismetSystemLibrary")
+    local mzc, must = find(MZ), false
+    if mzc then pcall(function() must = cdo:IsA(mzc) == true end) end
     local saved = {}
     local function restore()
         for _, s in ipairs(saved) do pcall(function() for i, v in ipairs(s.old) do s.a[i] = v end end) end
     end
+    local function why_not(name, why)
+        local k = "pin " .. name .. " " .. tostring(util.fname(cdo))
+        if not warned_class[k] then
+            warned_class[k] = true
+            log.warn("zombies: " .. name .. " of " .. tostring(util.fname(cdo)) .. " " .. why .. " - not spawned (it could load a look and freeze)")
+        end
+        return false
+    end
     local function pin(name, obj)
-        local a, n = nil, 0
-        pcall(function() a = cdo[name]; n = a:GetArrayNum() end)
+        local a, n
+        local read = pcall(function() a = cdo[name]; n = a:GetArrayNum() end)
+        if not read or type(n) ~= "number" then return not must or why_not(name, "can't be read") end
         if n == 0 then return true end
         local sp
         -- (a soft pointer made by the engine: UE4SS crashes writing a plain object into a soft array)
@@ -326,7 +341,14 @@ local function pin_soft_looks(cdo, mesh, mat)
         if not sp then return false end
         local s = { a = a, old = {} }
         saved[#saved + 1] = s
-        return (pcall(function() for i = 1, n do s.old[i] = a[i]; a[i] = sp end end))
+        if not pcall(function() for i = 1, n do s.old[i] = a[i]; a[i] = sp end end) then return why_not(name, "couldn't be pinned") end
+        local ok, held = pcall(function()
+            for i = 1, n do
+                if not util.same(K:Conv_SoftObjectReferenceToObject(a[i]), obj) then return false end
+            end
+            return true
+        end)
+        return (ok and held) or why_not(name, "didn't keep the pinned look")
     end
     local tmpl_mesh, tmpl_mat
     pcall(function() tmpl_mesh = cdo.Mesh:GetSkinnedAsset() end)
@@ -370,7 +392,7 @@ end
 -- Zombie archetypes: BP_MasterZombie rolls one in SelectArchetype 1.0-1.25 s after BeginPlay and crawlers
 -- roll ToughenedCrawler (and which legs are missing) inside BeginPlay, so each game rolls its own. The host
 -- sends its archetype, hidden bones and whether the eyes glow (EyesColour's dynamic material); copies match.
-local MZ = "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C"
+-- (MZ: the master zombie class, above pin_soft_looks)
 local ARCH = { "Sprinter", "UltraRadiated", "Acidic", "Screamer", "Grenadier", "ToughenedCrawler" }
 local ARCH_CHANCES = { "SprinterArchetypeChance", "UltraRadiatedArchetypeChance", "AcidicArchetypeChance",
     "ScreamerArchetypeChance", "GrenadierArchetypeChance" }
@@ -659,13 +681,19 @@ local function host_tick(dt)
                 if st.look then
                     local parts = {}
                     for _, k in ipairs(LOOK_KEYS) do parts[#parts + 1] = tostring(idx(st.look[k])) end
-                    local beh, h = -1, nil
+                    local beh, h, gun = -1, nil, nil
                     if cs then beh, h = cs.beh, cs.h
                     else
-                        if st.fam == "human" then pcall(function() beh = smart_ai(z)["AI Current Behaviour"] or -1 end) end
+                        if st.fam == "human" then
+                            pcall(function() beh = smart_ai(z)["AI Current Behaviour"] or -1 end)
+                            -- the weapon in its hand (its own actor, made by the AI's start-up a copy never runs)
+                            local held
+                            pcall(function() held = smart_ai(z)["Holdable Actor"] end)
+                            gun = util.class_path(held)
+                        end
                         h = health_of(z, st.fam)
                     end
-                    lines[#lines + 1] = string.format("L %d %s %.1f %d", id, table.concat(parts, " "), h or -1, beh)
+                    lines[#lines + 1] = string.format("L %d %s %.1f %d %d", id, table.concat(parts, " "), h or -1, beh, idx(gun))
                     if dead and not cs then st.beh, st.h = beh, h end
                 end
                 if dead and not cs then
@@ -776,6 +804,30 @@ destroy_holdables = function(z)
     for _, h in ipairs(held) do
         if util.valid(h) then pcall(function() h:K2_DestroyActor() end) end
     end
+end
+
+-- A human copy holds what the host's holds: the game's own Equip Holdable spawns the weapon and puts it in the
+-- hand socket (BP_SmartAIComponent, decompiled - the start-up that arms a raider needs its AI controller, which a
+-- copy doesn't get). Only a class loaded here: loading one from Lua can stall the game (L-014). "-": empty hands.
+function zombies.arm_copy(c, path)
+    c.weapon = path
+    local ai = smart_ai(c.z)
+    if not ai then return end
+    local cur
+    pcall(function() cur = ai["Holdable Actor"] end)
+    if util.valid(cur) and util.class_path(cur) == path then return end
+    destroy_holdables(c.z)
+    pcall(function() ai["Attached Holdables"]:Empty() end)
+    pcall(function() ai["Holdable Actor"] = nil end)
+    if path == "-" then return end
+    local cls = util.find(path)
+    if not util.valid(cls) then
+        log.every("zombies.gun." .. path, 120, "zombies: a human copy's weapon " .. path:match("([%w_]+)$") .. " isn't loaded here - shown empty-handed")
+        return
+    end
+    local ok, err = pcall(function() ai["Equip Holdable"](ai, cls) end)
+    stats.armed = (stats.armed or 0) + (ok and 1 or 0)
+    if not ok then log.every("zombies.arm", 60, "zombies: arming a human copy failed: " .. tostring(err)) end
 end
 
 local function destroy_copy(id, why)
@@ -1028,7 +1080,7 @@ function sweep.step()
         elseif it.k == "v" then
             local a = util.addr(o) or 0
             if util.valid(o) and not sweep.volumes[a] then
-                sweep.volumes[a] = true
+                sweep.volumes[a] = o
                 pcall(function() local f = o["Stop Spawning"]; f(o) end)
                 q.n_sp = q.n_sp + 1
             end
@@ -1181,7 +1233,7 @@ end
 
 -- For tools/test-sync.py.
 zombies._look = { arch_hooks = arch_hooks, moon_hook = arch_hooks.moon.hook, arch_of = function(z, n) return arch_of(z, n) end, bones_of = function(z) return bones_of(z) end,
-                  sync = function(id, c, e, x) xlooks[id] = x; sync_look(id, c, e) end }
+                  sync = function(id, c, e, x) xlooks[id] = x; sync_look(id, c, e) end, pin = pin_soft_looks }
 zombies._host = { tick = function(c, dt) cfg = cfg or c; now = now + dt; host_tick(dt) end }
 zombies._test = { setup = function(c, r) cfg, role = c, r end,
     -- a whole sweep (all its frames); start/step: one frame's slice at a time
@@ -1215,6 +1267,8 @@ local function read_snapshot()
         looks[id] = lk
         host_health[id] = tonumber(f[#LOOK_KEYS + 1] or "")
         host_behaviour[id] = tonumber(f[#LOOK_KEYS + 2] or "")
+        local g = tonumber(f[#LOOK_KEYS + 3] or "")
+        lk.gun = g and (g > 0 and dict[g] or "-") or nil   -- (nil: an older host that doesn't say)
     end
     for xid, a, b, ey in body:gmatch("\nX (%d+) (%d+) (%d+) (%d+)") do
         xlooks[tonumber(xid)] = { arch = tonumber(a), bones = tonumber(b), eyes = tonumber(ey) }
@@ -1316,6 +1370,8 @@ local function drive(dt)
                 c.behaviour = b
                 pcall(function() smart_ai(c.z)["AI Current Behaviour"] = b end)
             end
+            local gun = looks[id] and looks[id].gun
+            if c.fam == "human" and gun and gun ~= c.weapon then util.safe(zombies.arm_copy, "zombies.arm_copy", c, gun) end
         end
         if not util.valid(c.z) then
             copies[id] = nil
@@ -1468,7 +1524,7 @@ local function guest_tick(dt)
         install_hit_hooks()
         hook_archetypes()
     end) end
-    if not (p8.on or p8.follow) then perf.run("z.read", read_snapshot) end
+    if not (p8.on or p8.follow or p8.keep) then perf.run("z.read", read_snapshot) end
     if p8.handing then perf.run("z.handover", p8.step_handover) end
     if p8.brainless[1] then perf.run("z.brainless", p8.brainless_tick) end
     if p8.reenable then p8.step_reenable(100) end
@@ -1494,11 +1550,13 @@ function zombies.set_split(on)
         p8.handing = nil
         destroy_all_copies("load split - your game runs the AI around you (not handed over)")
         -- the spawners this mod stopped go back on 100 a frame (all ~1000 at once was one long frame)
-        local list = {}
+        local list, vols = {}, {}
         for _, sp in pairs(p8.stopped) do list[#list + 1] = sp end
-        p8.reenable = { list = list, i = 0 }
-        p8.stopped, p8.drain, p8.fighting = {}, {}, false
-        log.info(string.format("zombies: split - %d spawner(s) going back on, my own AI stays", #list))
+        -- (and the people's spawn volumes the sweep stopped: their "Restart Spawning" arms the radius check again)
+        for _, v in pairs(sweep.volumes) do vols[#vols + 1] = v end
+        p8.reenable = { list = list, vols = vols, i = 0 }
+        p8.stopped, p8.drain, p8.fighting, sweep.volumes = {}, {}, false, {}
+        log.info(string.format("zombies: split - %d spawner(s) and %d spawn volume(s) going back on, my own AI stays", #list, #vols))
         return
     end
     p8.reenable = nil
@@ -1637,10 +1695,17 @@ function p8.step_reenable(n)
     for _ = 1, n do
         r.i = r.i + 1
         local sp = r.list[r.i]
-        if not sp then p8.reenable = nil; return end
+        if not sp then
+            for _, v in ipairs(r.vols or {}) do
+                if util.valid(v) then pcall(function() local f = v["Restart Spawning"]; f(v) end) end
+            end
+            p8.reenable = nil
+            return
+        end
         if util.valid(sp) then pcall(function() sp:SetIsSpawningStopped(false) end) end
     end
 end
+zombies._test.handover = function() local f = 0; while p8.handing do p8.step_handover(); f = f + 1 end; return f end
 zombies._test.reenable = function(n)
     local frames = 0
     while p8.reenable do p8.step_reenable(n or 100); frames = frames + 1 end
@@ -1648,6 +1713,27 @@ zombies._test.reenable = function(n)
 end
 function zombies.handing() return p8.handing ~= nil end
 function zombies.handover_done() return p8.handing == nil end
+
+-- Realm takeover in place (realmplay.promote): this game becomes the Realm's host without a load. The host's
+-- copies become my own AI where they stand (the split hand-over), the old host's last snapshots make no new ones,
+-- then the spawners this mod stopped go back on (set_split). split.lua keeps out of it meanwhile.
+function zombies.begin_takeover()
+    p8.keep = true
+    if not p8.on and not p8.handing then zombies.begin_handover() end
+end
+function zombies.taking_over() return p8.keep == true end
+-- true once every copy is mine and the stopped spawners run again
+function zombies.takeover_ready()
+    if p8.handing then return false end
+    if not p8.on then zombies.set_split(true) end
+    return p8.reenable == nil
+end
+-- after the switch to host (the same frame as phase1.init "host"), or when the takeover is called off: none of the
+-- guest's split state is left for the host's code
+function zombies.end_takeover()
+    p8.keep, p8.on, p8.handing, p8.reenable, p8.offer = nil, false, nil, nil, nil
+    p8.stopped, p8.drain, p8.fighting, p8.pending = {}, {}, false, {}
+end
 
 -- Merge hand-back (the way back). The host asks ("M"); the guest offers its own zombies near it in blob "p8h",
 -- refreshed every 0.2 s: "A key cls mesh mat x y z yaw arch bones eyes health dead". The host spawns its own zombie
@@ -1832,8 +1918,14 @@ function zombies.take_offer(body)
     end
 end
 function p8.spawn_original(e)
+    -- (the same rule as copies: a zombie whose loot table isn't loaded would load it inside our SpawnActor)
+    if not loot_ok then return nil end
     local cls = copy_class(e.cls)
     if not util.valid(cls) then return nil end
+    if not warned_class["hand-back " .. e.cls] then
+        warned_class["hand-back " .. e.cls] = true
+        log.info("zombies: hand-back - first " .. tostring(e.cls):match("[^%.]+$") .. " spawning here")
+    end
     local cdo
     pcall(function() cdo = cls:GetCDO() end)
     local mesh, mat = e.mesh and find(e.mesh), e.mat and find(e.mat)
@@ -1848,28 +1940,36 @@ function p8.spawn_original(e)
         pcall(function()
             z = game.world():SpawnActor(cls, { X = e.loc.X, Y = e.loc.Y, Z = e.loc.Z + 10 }, { Pitch = 0, Yaw = e.yaw, Roll = 0 })
         end)
-        unpin()
     end
-    if cdo then
-        pcall(function() local a = cdo.Meshes; for i, m in ipairs(old_meshes) do a[i] = m end end)
-        pcall(function() local a = cdo.Materials; for i, m in ipairs(old_mats) do a[i] = m end end)
+    local function restore()
+        if unpin then unpin() end
+        if cdo then
+            pcall(function() local a = cdo.Meshes; for i, m in ipairs(old_meshes) do a[i] = m end end)
+            pcall(function() local a = cdo.Materials; for i, m in ipairs(old_mats) do a[i] = m end end)
+        end
     end
-    if not util.valid(z) then return nil end
-    -- the guest's zombie's archetype, never a new roll
-    for _, k in ipairs(ARCH_CHANCES) do pcall(function() z[k] = 0 end) end
-    pcall(function() if mesh and not util.same(z.Mesh:GetSkinnedAsset(), mesh) then z.Mesh:SetSkinnedAssetAndUpdate(mesh, false) end end)
-    pcall(function() if mat then z.Mesh:SetMaterial(0, mat) end end)
-    local seen = e.arch > 0 and arch_hooks.ready[e.arch]
-    if seen and os.clock() - seen < ARCH_READY_S then
-        arch_hooks.calling = true
-        pcall(function() local f = z["Archetype_" .. ARCH[e.arch]]; f(z) end)
-        arch_hooks.calling = false
-    end
-    for i = 1, #BONES do
-        if (e.bones // BIT[i]) % 2 == 1 then pcall(function() z.Mesh:HideBoneByName(bone_fname(i), 0) end) end
-    end
-    if e.eyes == 2 then pcall(function() z:Event_BloodMoon(true) end) end
-    if e.h and e.h > 0 then pcall(function() z.DamageComponent.CurrentHealth = e.h end) end
+    if not util.valid(z) then restore(); return nil end
+    -- the class's lists go back only after every BP call on the new zombie (none of them may re-roll a look
+    -- unpinned), and always (an error here must not leave every later zombie of this class with one look)
+    local ok, err = pcall(function()
+        -- the guest's zombie's archetype, never a new roll
+        for _, k in ipairs(ARCH_CHANCES) do pcall(function() z[k] = 0 end) end
+        pcall(function() if mesh and not util.same(z.Mesh:GetSkinnedAsset(), mesh) then z.Mesh:SetSkinnedAssetAndUpdate(mesh, false) end end)
+        pcall(function() if mat then z.Mesh:SetMaterial(0, mat) end end)
+        local seen = e.arch > 0 and arch_hooks.ready[e.arch]
+        if seen and os.clock() - seen < ARCH_READY_S then
+            arch_hooks.calling = true
+            pcall(function() local f = z["Archetype_" .. ARCH[e.arch]]; f(z) end)
+            arch_hooks.calling = false
+        end
+        for i = 1, #BONES do
+            if (e.bones // BIT[i]) % 2 == 1 then pcall(function() z.Mesh:HideBoneByName(bone_fname(i), 0) end) end
+        end
+        if e.eyes == 2 then pcall(function() z:Event_BloodMoon(true) end) end
+        if e.h and e.h > 0 then pcall(function() z.DamageComponent.CurrentHealth = e.h end) end
+    end)
+    restore()
+    if not ok then error(err, 0) end
     return z
 end
 -- one spawn every 0.25 s at most (a spawn is 4-40 ms of engine work); true once every offered zombie has one

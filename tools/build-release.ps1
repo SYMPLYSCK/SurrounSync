@@ -35,7 +35,16 @@ Get-ChildItem (Join-Path $Ue 'Mods\SurrounSync') -Recurse -Include '*.bak*', '*.
 if (-not (Test-Path (Join-Path $SyncFX 'Scripts\main.lua'))) { throw "SyncFX not found in $SyncFX" }
 $Fx = Join-Path $Ue 'Mods\SyncFX'
 Copy-Item $SyncFX $Fx -Recurse
-Get-ChildItem $Fx -Recurse -Include 'SyncFX.user.ini', 'SyncFX.calib.ini', 'enabled.txt', '*.tmp', '*.bak*', '*.log' | Remove-Item -Force
+Get-ChildItem $Fx -Recurse -Include 'SyncFX.user.ini', 'SyncFX.calib.ini', 'noise.txt', 'enabled.txt', '*.tmp', '*.bak*', '*.log' | Remove-Item -Force
+# SurrounSync's game content (Setup puts content\ into SurrounDead\Content): the startup intro and the dog sounds pak,
+# with UE4SS's BPModLoaderMod that loads Paks\LogicMods (Setup adds it only where it is missing)
+$Content = Join-Path $P 'content'
+New-Item -ItemType Directory -Force (Join-Path $Content 'Movies'), (Join-Path $Content 'Paks\LogicMods') | Out-Null
+Copy-Item (Join-Path $Repo 'mod\Movies\UE5 Intro.mp4') (Join-Path $Content 'Movies')
+Copy-Item (Join-Path $Repo 'mod\LogicMods\SurrounSyncSounds.pak') (Join-Path $Content 'Paks\LogicMods')
+$Bp = Join-Path $Ue 'Mods\BPModLoaderMod\Scripts'
+New-Item -ItemType Directory -Force $Bp | Out-Null
+Copy-Item (Join-Path $Win64 'ue4ss\Mods\BPModLoaderMod\Scripts\main.lua') $Bp
 # always a fresh bridge, built straight into the package (a running game locks the one in mod\SurrounSync\bridge)
 & (Join-Path $PSScriptRoot 'build-bridge.ps1') -Out (Join-Path $Ue 'Mods\SurrounSync\bridge')
 $Manifest = Join-Path (Split-Path (Split-Path $Game -Parent) -Parent) 'appmanifest_1645820.acf'

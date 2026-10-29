@@ -1132,40 +1132,55 @@ class Bridge
     string RosterFile() { return Path.Combine(dir, "mirror_roster.txt"); }
 
     // what the other players sent us before (the files of every link this role can have), and their names
-    void ClearPeerFiles()
+    // A role switch clears only the files this bridge wrote and nobody rewrote since (onlyOurs). Switching guest ->
+    // host, "_host" is the old host's files AND the game's own new ones: the game writes its hello right after the
+    // command, before the bridge reads it, and only once (player report 2026-10-28: "OLDER SurrounSync").
+    bool WroteIt(string f)
+    {
+        DateTime at;
+        bool ours;
+        lock (writeLock) ours = wroteAt.TryGetValue(f, out at);
+        try { return ours && File.GetLastWriteTimeUtc(f) == at; } catch { return false; }
+    }
+
+    void ClearPeerFiles(bool onlyOurs = false)
     {
         var tails = new List<string> { "_" + other + ".txt" };
         for (int s = 1; s <= 3; s++) tails.Add("_from" + s + ".txt");
         Func<string, bool> mine = n => n.StartsWith("mirror_") && (n.StartsWith("mirror_peer_") && n.EndsWith(".name") || tails.Exists(t => n.EndsWith(t)));
         DropQueuedWrites(mine);
-        try { foreach (var f in Directory.GetFiles(dir, "mirror_*")) if (mine(Path.GetFileName(f))) try { File.Delete(f); } catch { } }
+        try
+        {
+            foreach (var f in Directory.GetFiles(dir, "mirror_*"))
+                if (mine(Path.GetFileName(f)) && (!onlyOurs || WroteIt(f))) try { File.Delete(f); } catch { }
+        }
         catch { }
     }
 
     // one link's files, when it goes away
-    void ClearLinkFiles(PeerLink l)
+    void ClearLinkFiles(PeerLink l, bool onlyOurs = false)
     {
         string tail = "_" + l.inTag + ".txt", nf = Path.GetFileName(NameFile(l));
         Func<string, bool> mine = n => n == nf || (n.StartsWith("mirror_") && n.EndsWith(tail));
         DropQueuedWrites(mine);
-        try { foreach (var f in Directory.GetFiles(dir, "mirror_*" + tail)) try { File.Delete(f); } catch { } } catch { }
+        try { foreach (var f in Directory.GetFiles(dir, "mirror_*" + tail)) if (!onlyOurs || WroteIt(f)) try { File.Delete(f); } catch { } } catch { }
         try { File.Delete(NameFile(l)); } catch { }
         if (!l.primary) { try { File.Delete(ClockFile(l)); } catch { } try { File.Delete(StatusFile(l.outTag)); } catch { } }
     }
 
-    void DropLink(PeerLink l, string why)
+    void DropLink(PeerLink l, string why, bool onlyOurs = false)
     {
         if (!l.mate) try { net.Close(l.id); } catch { }
-        ClearLinkFiles(l);
+        ClearLinkFiles(l, onlyOurs);
         l.voice.Close();
         links.Remove(l);
         rosterDirty = true;
         Log("left " + l.name + " (" + l.id + ")" + (l.mate ? " [via the host]" : "") + " - " + why);
     }
 
-    void DropAllLinks(string why)
+    void DropAllLinks(string why, bool onlyOurs = false)
     {
-        foreach (var l in new List<PeerLink>(links)) DropLink(l, why);
+        foreach (var l in new List<PeerLink>(links)) DropLink(l, why, onlyOurs);
         mySlot = -1;
     }
 
@@ -1394,8 +1409,8 @@ class Bridge
         {
             if (role != "idle")
             {
-                DropAllLinks("switching");
-                ClearPeerFiles();
+                DropAllLinks("switching", true);
+                ClearPeerFiles(true);
                 pendingFrom = 0;
             }
             if (c == "host") { role = "host"; configuredPeer = 0; slotOf.Clear(); }
@@ -1961,6 +1976,8 @@ class Bridge
     readonly object writeLock = new object();
     readonly Dictionary<string, string> pendingWrites = new Dictionary<string, string>();
     readonly List<string> writeOrder = new List<string>();
+    // path -> its write time when this bridge last wrote it (a role switch clears only those, see ClearPeerFiles)
+    readonly Dictionary<string, DateTime> wroteAt = new Dictionary<string, DateTime>();
     readonly AutoResetEvent writeSignal = new AutoResetEvent(false);
     long slowWriteLogAt = -60000;
 
@@ -2015,6 +2032,7 @@ class Bridge
                     long t0 = Environment.TickCount;
                     bool ok = false;
                     for (int i = 0; i < 3 && !ok; i++) { ok = TryWrite(path, content); if (!ok) Thread.Sleep(1); }
+                    if (ok) try { var at = File.GetLastWriteTimeUtc(path); lock (writeLock) wroteAt[path] = at; } catch { }
                     long took = Environment.TickCount - t0;
                     if (took > 500 && Environment.TickCount - slowWriteLogAt > 60000)
                     {

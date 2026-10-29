@@ -14,7 +14,8 @@ local GS = "/Script/Engine.GameplayStatics:"
 local KIND = { PlaySoundAtLocation = "at", SpawnSoundAtLocation = "at", SpawnSoundAttached = "attached" }
 local SKIP = { "Footstep", "footstep", "Sprint", "Grass_Cue", "Dirt_Cue", "Concrete_Cue", "Wood_Cue", "Metal_Cue",
                "Water_Cue", "Death", "Hit", "Impact", "Flesh", "Bite", "explosion", "Explosion", "CarLand",
-               "VehicleCollision", "door", "Door", "UI_" }
+               "VehicleCollision", "door", "Door", "UI_",
+               "DogBark", "DogGrowl" }   -- (dogs.lua barks in each game for its own player's hounds)
 local MAX_PER_S = 25
 local NEAR_CM = 400
 

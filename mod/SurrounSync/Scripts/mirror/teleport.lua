@@ -26,7 +26,8 @@ local last_cmd = -100
 local hold = nil
 local vehicles
 
-local function say(text, kind) notify.show(text, kind or "info"); log.info("teleport: " .. text) end
+-- key: "tp_out" (my request, from asking to how it ended) or "tp_in" (theirs): one live card each
+local function say(text, kind, key, opts) notify.show(text, kind or "info", key, nil, opts); log.info("teleport: " .. text) end
 
 local function swimming(a)
     local s
@@ -182,22 +183,22 @@ end
 -- The other player said yes: whoever moves runs its own checks now.
 local function do_goto()
     local why = go_to_peer()
-    if why then say("Can't teleport: " .. why .. ".", "warn"); channel:send("N " .. theirs(why))
-    else say("Teleported to " .. peer() .. "."); channel:send("G") end
+    if why then say("Can't teleport: " .. why .. ".", "warn", "tp_out"); channel:send("N " .. theirs(why))
+    else say("Teleported to " .. peer() .. ".", "good", "tp_out"); channel:send("G") end
 end
 
 local function answer(yes)
     if not pending then say("Nobody asked to teleport."); return end
     local kind = pending.kind
     pending = nil
-    if not yes then channel:send("D"); say("Turned down " .. peer() .. "'s teleport."); return end
+    if not yes then channel:send("D"); say("Turned down " .. peer() .. "'s teleport.", "info", "tp_in"); return end
     if kind == "goto" then
         channel:send("A")
-        say(peer() .. " is coming to you.")
+        say(peer() .. " is coming to you.", "good", "tp_in")
     else
         local why = go_to_peer()
-        if why then say("Can't go to " .. peer() .. ": " .. why .. ".", "warn"); channel:send("N " .. theirs(why))
-        else say("You went to " .. peer() .. "."); channel:send("Y") end
+        if why then say("Can't go to " .. peer() .. ": " .. why .. ".", "warn", "tp_in"); channel:send("N " .. theirs(why))
+        else say("You went to " .. peer() .. ".", "good", "tp_in"); channel:send("Y") end
     end
 end
 
@@ -226,8 +227,8 @@ local COMMANDS = {
     { name = "accept", also = { "yes" }, tip = "/accept or /yes - accept a teleport" },
     { name = "deny", also = { "no", "decline" }, tip = "/deny or /no - refuse a teleport" },
 }
-local LIST = "Commands: /goto <player>, /bring <player>, /accept, /deny"
-local SHORT = "Commands: /goto, /bring, /accept, /deny"
+local LIST = "Commands: /goto <player>, /bring <player>, /accept, /deny, /messages"
+local SHORT = "Commands: /goto, /bring, /accept, /deny, /messages"
 
 -- the tip for what's typed so far: nil when it isn't a command
 function teleport.tip(text)
@@ -287,7 +288,7 @@ function teleport.command(text)
     last_cmd = t
     asked = { kind = cmd, left = ASK_FOR }
     channel:send(cmd == "goto" and "Q G" or "Q B")
-    say("Asked " .. peer() .. " - waiting for them to accept...")
+    say("Asked " .. peer() .. " - waiting for them to accept...", "info", "tp_out", { sticky = true })
     return true
 end
 
@@ -303,34 +304,37 @@ function teleport.tick(dt)
     if hold then util.safe(hold_tick, "teleport.hold", dt) end
     if asked then
         asked.left = asked.left - dt
-        if asked.left <= 0 then asked = nil; say(peer() .. " didn't answer the teleport request.") end
+        if asked.left <= 0 then asked = nil; say(peer() .. " didn't answer the teleport request.", "info", "tp_out") end
     end
     if pending then
         pending.left = pending.left - dt
-        if pending.left <= 0 then pending = nil; channel:send("X"); say("Teleport request from " .. peer() .. " timed out.") end
+        if pending.left <= 0 then pending = nil; channel:send("X"); say("Teleport request from " .. peer() .. " timed out.", "info", "tp_in") end
     end
     channel:pump(function(msg)
         local who = peer()
         if msg == "Q G" or msg == "Q B" then
             pending = { kind = msg == "Q G" and "goto" or "bring", left = ASK_FOR }
-            say(msg == "Q G" and (who .. " wants to teleport to you.") or (who .. " wants to bring you to them."))
+            local ask = msg == "Q G" and (who .. " wants to teleport to you") or (who .. " wants to bring you to them")
             if not hostrules.get("teleport") then
+                -- (refused for them: say so, not a request that can't be answered)
                 pending = nil
                 channel:send("N teleports are turned off in this world")
+                say(ask:gsub(" wants to ", " asked to ", 1) .. " - teleports are off in this world, so no.", "info", "tp_in")
             elseif require("mirror.mysettings").on("autotp") then
                 answer(true)
             else
-                say("Type /accept or /deny in the CO-OP chat, or answer in the handbook (J), CO-OP tab.")
+                say(ask .. ". Type /accept or /deny in the CO-OP chat, or answer in the handbook (J), CO-OP tab.", "good",
+                    "tp_in", { sticky = true })
             end
         elseif msg == "A" then
             if asked and asked.kind == "goto" then asked = nil; do_goto() end
         elseif msg == "D" then
-            if asked then asked = nil; say(who .. " turned down the teleport.") end
+            if asked then asked = nil; say(who .. " turned down the teleport.", "info", "tp_out") end
         elseif msg == "X" then
-            if asked then asked = nil; say(who .. " didn't answer the teleport request.") end
-        elseif msg == "G" then say(who .. " teleported to you.")
-        elseif msg == "Y" then asked = nil; say(who .. " is here.")
-        elseif msg:sub(1, 2) == "N " then asked = nil; say("Teleport didn't work: " .. msg:sub(3) .. ".", "warn") end
+            if asked then asked = nil; say(who .. " didn't answer the teleport request.", "info", "tp_out") end
+        elseif msg == "G" then say(who .. " teleported to you.", "good", "tp_in")
+        elseif msg == "Y" then asked = nil; say(who .. " is here.", "good", "tp_out")
+        elseif msg:sub(1, 2) == "N " then asked = nil; say("Teleport didn't work: " .. msg:sub(3) .. ".", "warn", "tp_out") end
     end)
 end
 

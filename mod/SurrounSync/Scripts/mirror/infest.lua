@@ -69,6 +69,7 @@ local function read(n)
     pcall(function()
         dead = n.obj["IsDestroyed?"] == true
         local dc = n.obj.DamageComponent
+        if not util.valid(dc) then return end
         cur, std, max = dc.CurrentHealth, dc.StandardHealthValue, dc.MaxHealth
     end)
     return dead, tonumber(cur) or 0, tonumber(std) or 0, tonumber(max) or 0
@@ -99,6 +100,7 @@ local function repair(n)
     if not real_std or real_std <= 0 then return end
     pcall(function()
         local dc = n.obj.DamageComponent
+        if not util.valid(dc) then return end
         if bad_std then
             local ratio = std > 0 and math.min(math.max(cur / std, 0), 1) or 1
             dc.StandardHealthValue = real_std
@@ -454,10 +456,13 @@ end
 -- Single player too: a nest saved with the old pin gets its real health back, once per loaded world.
 -- All classes in one frame: one group walk fills every class's list, and a list used a frame later can hold an
 -- old-world nest the GC freed in between (guest crash 5 s after going home, DBG-20261027-008).
+-- 30 s, not 5: the load still runs 5 s in (a burst of InitializeJigComponent at the crash) and a nest's
+-- property read then crashed in UE4SS twice (DBG-20261027-008, 0.14.0 player report 2026-10-28 20:39:50).
+local SOLO_WAIT = 30.0
 local solo = { left = nil, idx = 0, wait = 0.0 }
 local function solo_tick(dt)
     if active then return end
-    if solo.left == nil then solo.wait = solo.wait + (dt or 0); if solo.wait < 5.0 then return end; solo.left = #CLASSES end
+    if solo.left == nil then solo.wait = solo.wait + (dt or 0); if solo.wait < SOLO_WAIT then return end; solo.left = #CLASSES end
     while solo.left > 0 do
         local cls = CLASSES[solo.left]
         local objs, walked = util.instances(cls, PATH, GROUP)

@@ -47,7 +47,7 @@ local function set_accepted(t)
     local f = io.open(accepted_path(), "w")
     if f then for id in pairs(t) do f:write(id, "\n") end; f:close() end
 end
-local function host()
+local function host(realm)
     local r = my_role()
     if r == "host" then notify.show("You're already hosting.", "info"); return end
     if r and not p1().can_switch() then
@@ -59,13 +59,17 @@ local function host()
     p1().init(cfg, "host")
     set_accepted({})
     link.bridge_cmd("password " .. password)
+    -- (a Realm says its own "You're hosting <Realm>... REALMS tab": the co-op line came first and pointed at CO-OP)
+    if realm then return end
     notify.show("You're hosting" .. (password ~= "" and " with a password" or "") .. ". Friends join you from the CO-OP tab of their handbook (J).", "good")
 end
 
 local joined_peer = nil
 local sent_password = ""
-local function join(steamid, who)
+local joining_realm = nil   -- the Realm's name while asking to join one (its own words in the messages)
+local function join(steamid, who, realm_name)
     session.realm_guest(nil)   -- (menu.realm_join arms the Realm again after this)
+    joining_realm = realm_name
     local r = my_role()
     if r == "host" then
         if not p1().can_switch() then
@@ -104,7 +108,8 @@ local function join(steamid, who)
     p1().init(cfg, "guest", steamid)
     pending_join = true
     wait_since, wait_told, wait_who = os.clock(), nil, who
-    notify.show("Asked " .. (who or "the host") .. " to join - waiting for them to accept...", "info", "join_wait")
+    notify.show(realm_name and ("Asked " .. (who or "the host") .. " to let you into " .. realm_name .. " - waiting...")
+        or ("Asked " .. (who or "the host") .. " to join - waiting for them to accept..."), "info", "join_wait")
 end
 
 local stopping = nil
@@ -136,6 +141,19 @@ local function leave()
     if my_role() == "guest" and session.state() == "joined" then session.request_toggle()
     else notify.show("You're not in someone else's world.", "info") end
 end
+
+-- stop asking to join (the request is still waiting for the host): the REALMS tab's CANCEL on a pending Realm join
+local function cancel_join(message)
+    if my_role() ~= "guest" or session.state() ~= "idle" then return end
+    p1().stop()
+    pending_join, wait_since, wait_told = false, nil, nil
+    session.realm_guest(nil)
+    log.info("menu: stopped asking to join" .. (message and " (no answer)" or ""))
+    notify.show(message or "You stopped asking to join.", "info", "join_wait")
+end
+-- A request nobody answers stops by itself: a host who comes back much later must not take us in unasked
+-- (a co-op request still waiting after 13 min was accepted into a Realm, 2026-10-28)
+local JOIN_EXPIRE = 120
 
 local function copy_code(code)
     if not code then return end
@@ -359,7 +377,16 @@ local function answer(cmd, id, name)
     if not link.bridge_cmd(cmd .. " " .. id) then notify.show("Couldn't reach the Steam connection.", "bad"); return end
     local said = { accept = " can join now.", allow = " can join now - and always will without asking.",
                    decline = " was turned away." }
-    notify.show((name or id) .. said[cmd], cmd == "decline" and "info" or "good")
+    -- (a name, never a raw id: from the request when the caller has none - kit 2026-10-28 showed "1002 can join now")
+    if not name or name == tostring(id) then
+        name = nil
+        for _, q in ipairs((link.lobby() or {}).requests or {}) do
+            if tostring(q.id) == tostring(id) and q.name and q.name ~= tostring(q.id) then name = q.name end
+        end
+        name = name or "The player"
+    end
+    -- (in the request's card: it turns into the answer)
+    notify.show((name or id) .. said[cmd], cmd == "decline" and "info" or "good", "join_req_" .. tostring(id))
     local t = accepted_ids(); t[tostring(id)] = cmd ~= "decline" or nil; set_accepted(t)
 end
 local seen_requests, last_kick, last_joinerror = {}, nil, nil
@@ -399,6 +426,10 @@ local function watch_requests()
     end
     if not (l and my_role() == "host") then return end
     local joins = require("mirror.hostrules").my_value("joins")
+    -- hosting a Realm: its members are let in (their membership is the invitation); anyone else asks on the
+    -- REALMS tab, not the CO-OP tab
+    local rp = require("mirror.realmplay")
+    local realm_name = rp.hosting and rp.hosting()
     local now_ids = {}
     for _, q in ipairs(l.requests or {}) do
         now_ids[q.id] = true
@@ -412,21 +443,35 @@ local function watch_requests()
             if name or os.clock() - request_seen_at[q.id] > 2 then
                 log.info("menu: join request from " .. (name or "?") .. " (" .. q.id .. ")" .. (q.friend and " (friend)" or ""))
                 request_nag[q.id] = os.clock()
-                if joins == "all" or (joins == "friends" and q.friend) then
+                if realm_name and rp.is_member(q.id) then
+                    log.info("menu: a member of the Realm - let in without asking")
+                    answer("accept", q.id, name or "A member")
+                elseif joins == "all" or (joins == "friends" and q.friend) then
                     log.info("menu: let in without asking (JOIN REQUESTS: " .. joins .. ")")
                     answer("accept", q.id, name or "Someone")
+                elseif realm_name then
+                    notify.show((name or "Someone") .. " wants to join " .. realm_name .. " - open the handbook (J), REALMS tab, "
+                        .. "to LET THEM IN or DECLINE.", "good", "join_req_" .. q.id, nil, { sticky = true })
+                    if require("mirror.mysettings").on("joinsound") then notify.ping(2) end
                 else
                     notify.show((name or "Someone") .. " wants to join your world - open the handbook (J), CO-OP tab, to ACCEPT or DECLINE.",
-                        "good", "join_req_" .. q.id)
+                        "good", "join_req_" .. q.id, nil, { sticky = true })
                     if require("mirror.mysettings").on("joinsound") then notify.ping(2) end
                 end
             end
         elseif os.clock() - request_nag[q.id] > 30 then
             request_nag[q.id] = os.clock()
-            notify.show((name or "Someone") .. " is still waiting to join - handbook (J), CO-OP tab.", "info", "join_req_" .. q.id)
+            notify.show((name or "Someone") .. " is still waiting to join - handbook (J), " .. (realm_name and "REALMS" or "CO-OP")
+                .. " tab.", "good", "join_req_" .. q.id, nil, { sticky = true })
         end
     end
-    for id in pairs(request_nag) do if not now_ids[id] then request_nag[id] = nil end end
+    -- a request that's gone (answered, given up, timed out): its card goes too, unless it shows the answer now
+    for id in pairs(request_nag) do
+        if not now_ids[id] then
+            request_nag[id] = nil
+            notify.clear("join_req_" .. id, true)
+        end
+    end
     for id in pairs(request_seen_at) do if not now_ids[id] then request_seen_at[id] = nil end end
     seen_requests = now_ids
     local k = l.kicked and l.kicked.id
@@ -483,15 +528,18 @@ local function tick(dt)
     end
     if pending_join and wait_since and my_role() == "guest" and not p1().connected() then
         local t = os.clock()
-        if t - (wait_told or wait_since) >= 20 then
+        if t - wait_since >= JOIN_EXPIRE then
+            cancel_join((wait_who or link.peer_name()) .. " didn't answer within 2 minutes - stopped asking. Ask again any time.")
+        elseif t - (wait_told or wait_since) >= 20 then
             wait_told = t
-            notify.show("Still waiting for " .. (wait_who or link.peer_name()) .. " to accept your request (" ..
-                math.floor(t - wait_since) .. " s)...", "info", "join_wait")
+            notify.show("Still waiting for " .. (wait_who or link.peer_name()) .. " to " .. (joining_realm and "let you in"
+                or "accept your request") .. " (" .. math.floor(t - wait_since) .. " s)...", "info", "join_wait")
         end
     end
     if pending_join and my_role() == "guest" and p1().connected() then
         if wait_since then
-            notify.show(link.peer_name() .. " accepted - joining their world...", "good", "join_wait")
+            notify.show(joining_realm and (link.peer_name() .. " let you in - loading " .. joining_realm .. "...")
+                or (link.peer_name() .. " accepted - joining their world..."), "good", "join_wait")
             notify.ping(1)
         end
         wait_since = nil
@@ -502,14 +550,20 @@ local function tick(dt)
 end
 
 -- Realms (realmplay.lua) host, join and stop through the same paths as the CO-OP tab
-function menu.realm_host() host() end
-function menu.realm_join(steamid, who) join(steamid, who) end
+function menu.realm_host() host(true) end
+function menu.realm_join(steamid, who, realm_name) join(steamid, who, realm_name) end
 function menu.realm_stop(why)
     -- (the co-op text said "sending your friend home" even when hosting a Realm alone)
     stop_hosting("Leaving the Realm: saving it. Anyone still in it keeps playing and hosts it next...")
     if stopping then stopping.why = why end
 end
 function menu.role() return my_role() end
+-- the host's join requests waiting for an answer ({ id, name }), for the REALMS tab
+function menu.requests()
+    local l = my_role() == "host" and link.lobby() or nil
+    return (l and l.requests) or {}
+end
+function menu.asking() return my_role() == "guest" and session.state() == "idle" and pending_join end
 function menu.dev_host() host() end
 function menu.dev_join() join(nil, nil) end
 function menu.dev_stop() stop_hosting() end
@@ -535,10 +589,12 @@ function menu.init(c)
             -- here - the goodbye blob goes out before the bridge reads its stop command (15 vs 250 ms)
             if not stopping then p1().say_bye() end
             stopping = nil
+            local had_guest = session.guest_in_world()
             p1().stop()
             session.forget_hosted()
             log.info("menu: left the save while hosting - hosting stopped")
-            notify.show("You left your save, so you stopped hosting and your friend went home.", "info")
+            notify.show(had_guest and "You left your save, so you stopped hosting and your friend went home."
+                or "You left your save, so you stopped hosting.", "info")
             return
         end
         if stopping then return end
@@ -581,10 +637,8 @@ function menu.init(c)
                     if not ml.set(ms.SYNCFX, not on) then
                         notify.show("Couldn't switch SyncFX (is a file in use or read-only?).", "bad"); return
                     end
-                    if not on then
-                        notify.show("SyncFX is experimental and can lower your FPS - switch it off here if the game "
-                            .. "runs slow.", "info", nil, true)
-                    end
+                    notify.show(on and "SyncFX goes off from your next game start."
+                        or "SyncFX goes on from your next game start. Its own menu opens with F6.", "info", nil, true)
                     if ml.restart_needed() then mods_restart_note() end
                 elseif tab == "mine" then require("mirror.mysettings").toggle(key)
                 else require("mirror.hostrules").toggle(key) end
@@ -602,6 +656,7 @@ function menu.init(c)
             accept = function(id, name) answer("accept", id, name) end,
             allow = function(id, name) answer("allow", id, name) end,
             decline = function(id, name) answer("decline", id, name) end,
+            cancel_join = cancel_join,
             clear_allowed = function()
                 if link.bridge_cmd("clearallow") then notify.show("Nobody joins without asking any more.", "info") end
             end,
@@ -627,6 +682,7 @@ function menu.init(c)
             realm_open = function(id, how) require("mirror.realmplay").open(id, how) end,
             realm_invite = function(id) require("mirror.realmmembers").invite(id) end,
             realm_key = function(id) require("mirror.realmmembers").copy_key(id) end,
+            realm_my_difficulty = function() require("mirror.realmplay").use_my_difficulty() end,
             realm_create = function(name) require("mirror.realmplay").create(name) end,
             realm_add = function(text)
                 text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")

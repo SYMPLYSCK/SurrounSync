@@ -41,6 +41,12 @@ require("mirror.ghost").configure(cfg)
 require("mirror.game").init()
 -- nests saved with the old 1,000,000-health pin get their real health back, in single player too
 require("mirror.infest").watch()
+-- zombies stop at arm's length instead of standing inside the player (the game's zombie capsule ignores pawns)
+util.safe(function() require("mirror.personalspace").init(cfg) end, "personalspace.init")
+-- dogs bark (the game has no bark sound; SurrounSyncSounds.pak brings them)
+util.safe(function() require("mirror.dogs").init(cfg) end, "dogs.init")
+-- the message cards' world-reset hook and the history key (Ctrl+F9)
+util.safe(function() require("mirror.notify").init() end, "notify.init")
 
 local menu = require("mirror.menu")
 if role == "auto" then

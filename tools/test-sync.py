@@ -95,6 +95,34 @@ def link_blob_comes_back_after_reset():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def link_restart_puts_the_games_blobs_again():
+    """A bridge starting idle clears the "_host" files: the hosting game's own one-shot hello went with them after a
+    bridge restart and every guest then said "it runs an OLDER SurrounSync" (player report 2026-10-28)."""
+    print("link_restart_puts_the_games_blobs_again")
+    L = lua()
+    d = tempfile.mkdtemp()
+    try:
+        L.execute('local d = ...; package.loaded["mirror.localdir"] = { get = function() return d end }', d)
+        L.execute('link = require("mirror.link"); link.configure({ transport = "steam" }); link.start_lobby()')
+        L.execute('link.open("host"); link.put_blob("hello", "SurrounSync protocol 54 role host")')
+        hello = os.path.join(d, "mirror_hello_host.txt")
+        os.remove(hello)   # the restarted bridge's start-up clear
+        L.execute('link.restart_bridge()')
+        L.execute('link.idle_tick(0.1)')
+        check(not os.path.exists(hello), "nothing is put again while the new bridge isn't up (its clear may still come)")
+        with open(os.path.join(d, "mirror_lobby.txt"), "wb") as f:
+            f.write(("me 1 2 x\ntime %d\nEND\n" % int(__import__("time").time())).encode())
+        L.execute('link.idle_tick(0.1)')
+        body = open(hello, "rb").read().decode() if os.path.exists(hello) else None
+        check(body == "SurrounSync protocol 54 role host\nEND\n", "once the bridge is up the hello is there again (%r)" % body)
+        L.execute('link.open("guest")')
+        check(not os.path.exists(hello), "switching to guest removes my host hello at once")
+        L.execute('link.restart_bridge(); link.idle_tick(0.1)')
+        check(not os.path.exists(hello), "after a new role only that role's blobs come back (no old host hello)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def clockmap_quiet_places_without_stats():
     print("clockmap_quiet_places_without_stats")
     L = lua()
@@ -214,7 +242,7 @@ FAKES = r"""
     end
     function cls(name) return obj({ GetFName = function() return { ToString = function() return name end } end,
                                      GetFullName = function() return "Class /Game/X." .. name end }) end
-    package.loaded["mirror.notify"] = { show = function() end }
+    package.loaded["mirror.notify"] = { show = function() end, clear = function() end }
     blobs_out, blobs_in = {}, {}
     package.loaded["mirror.link"] = { put_blob = function(n, b) blobs_out[n] = b end,
                                       get_blob = function(n) local b = blobs_in[n]; blobs_in[n] = nil; return b end }
@@ -702,6 +730,49 @@ def vehicles_seat_four_players_by_slot():
     L.execute('vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 1.000"); for i = 1, 3 do vehicles.tick(0.1) end')
     check(L.eval('vehicles.status():find("driving Vehicle_Van_C_1") ~= nil'), "and the host keeps driving")
 
+    # lights go the game's own way (TurnOnOffLights: intensity), never hidden - the driver's own switch lit hidden
+    # lights (user 2026-10-29: the other player saw them, the driver didn't)
+    L = setup("guest", 1, 0)
+    L.execute(r'''
+        A["LightsOn?"], TOGGLES, VIS = false, 0, nil
+        A.TurnOnOffLights = function(self) self["LightsOn?"] = not self["LightsOn?"]; TOGGLES = TOGGLES + 1 end
+        A.LightLeft = { SetVisibility = function(_, v) VIS = v end }
+        vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 1 1.000"); vehicles.tick(0.1)
+        vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 1 2.000"); vehicles.tick(0.1)
+    ''')
+    check(L.eval('A["LightsOn?"]') is True and L.eval('TOGGLES') == 1, "the driver's lights on: the game's own switch, once")
+    check(L.eval('VIS') is True, "the lights are never hidden")
+    L.execute('vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 3.000"); vehicles.tick(0.1)')
+    check(L.eval('A["LightsOn?"]') is False and L.eval('TOGGLES') == 2 and L.eval('VIS') is True,
+          "lights off the same way (still not hidden: the game's own switch must keep working here)")
+
+    # the guest drives a car the host's world doesn't have: the host makes one to show it, but it never goes into the
+    # host's saves and is gone when the guest leaves (report 2026-10-29: cars in the host's save it never had)
+    L = setup("host", 0, 1)
+    L.execute(r'''
+        HERE = true
+        vehicles.init({ mirror_vehicles = true }, "host", { guest_in_world = function() return HERE end, in_world = function() return true end })
+        for i = 1, 3 do vehicles.tick(0.1) end
+        SKIPSAVE, MADE = nil, nil
+        util.cdo().SetActorSaveProperties = function(self, a, skip) if a == MADE then SKIPSAVE = skip end end
+        local made = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end,
+                           K2_GetActorRotation = function() return { Pitch = 0, Yaw = 0, Roll = 0 } end,
+                           K2_SetActorLocationAndRotation = function() end, K2_TeleportTo = function() return true end,
+                           IsActorBeingDestroyed = function() return false end, GetVelocity = function() return { X = 0, Y = 0, Z = 0 } end,
+                           Mesh = A.Mesh, VehicleMovementComponent = A.VehicleMovementComponent, IsA = function() return true end,
+                           K2_DestroyActor = function(self) self.dead = true; DESTROYED = true end,
+                           GetFName = function() return { ToString = function() return "Vehicle_Truck_C_77" end } end,
+                           GetFullName = function() return "Vehicle_Truck_C /Game/L.L:P.Vehicle_Truck_C_77" end })
+        MADE = made
+        package.loaded["mirror.game"].world = function() return { SpawnActor = function() return made end } end
+        vehicles.drive_sample("D Vehicle_Truck_C_9 0 0 0 0 0 0 0 0 0 1 0 1.000 /Game/Vehicles/Truck.Vehicle_Truck_C")
+        for i = 1, 3 do vehicles.tick(0.1) end
+    ''')
+    check(L.eval('vehicles.status():find("added 1") ~= nil'), "the host made the guest's car (%s)" % L.eval('vehicles.status()'))
+    check(L.eval('SKIPSAVE') is True, "...kept out of the host's saves")
+    L.execute('HERE = false; for i = 1, 3 do vehicles.tick(0.1) end')
+    check(L.eval('DESTROYED') is True, "...and removed when the guest leaves")
+
     # wheels: the driver's steering / throttle / brake travel with the car, the follower's wheels use them
     L = setup("host", 0, 1)
     L.execute('A.VehicleMovementComponent.RawSteeringInput = 0.3; A.VehicleMovementComponent.RawThrottleInput = 1.0;'
@@ -780,6 +851,147 @@ def vehicles_keep_this_worlds_fuel():
     check(L.eval('blobs_out.carstate') is None, "applied state is not echoed back")
     L.execute('A.FuelComponent.CurrentFuel = 97.5; for i = 1, 30 do vehicles.tick(0.1) end')
     check("Vehicle_Van_C_1 0 97.5" in (L.eval('blobs_out.carstate') or ""), "a refuel here is told to the other game")
+
+
+def car_horn_reaches_the_other_game():
+    print("car_horn_reaches_the_other_game")
+    for role in ("host", "guest"):
+        L = lua()
+        L.execute(FAKES + r"""
+            package.loaded["mirror.link"].peer_age = function() return 0 end
+            PARENT = nil
+            PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end,
+                           GetAttachParentActor = function() return PARENT end })
+            GHOST = obj({})
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return nil end,
+                                              on_world_reset = function() end }
+            package.loaded["mirror.ghost"] = { get = function() return GHOST end, set_seated = function() end, generation = function() return 1 end }
+            StaticFindObject = function() return obj({}) end
+            util = require("mirror.util")
+            HOOKS = {}
+            util.ensure_hook = function(path, fn) HOOKS[path:match("([%w_]+:[%w_]+)$")] = fn; return true end
+            HORNS, NOISES = {}, {}
+            local ksl = obj({})
+            ksl.IsValid = function(self, a) if a == nil then return true end return a.dead ~= true end
+            ksl.PlaySoundAtLocation = function(self, ctx, cue, loc) HORNS[#HORNS + 1] = loc end
+            ksl.ReportNoiseEvent = function(self, by, loc, loud, inst, range, tag) NOISES[#NOISES + 1] = { by = by, range = range } end
+            util.cdo = function() return ksl end
+            function car(name, x)
+                return obj({ VehicleColor = 0, Colors = {}, Mesh = { SetMaterial = function() end }, ["EngineOn?"] = true,
+                             FuelComponent = { CurrentFuel = 50, MaxFuel = 100, Empty = false },
+                             VehicleHealthComponent = { CurrentHealth = 100, MaxHealth = 100 },
+                             K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end,
+                             K2_GetActorRotation = function() return { Pitch = 0, Yaw = 0, Roll = 0 } end,
+                             K2_SetActorLocationAndRotation = function() end, VehicleEngineFX = function() end,
+                             IsActorBeingDestroyed = function() return false end,
+                             IsA = function() return true end,
+                             GetClass = function() return cls("Vehicle_Van_C") end,
+                             GetFullName = function() return "Vehicle_Van_C /Game/L.L:P." .. name end,
+                             GetFName = function() return { ToString = function() return name end } end })
+            end
+            A = car("Vehicle_Van_C_1", 100)
+            B = car("Vehicle_Van_C_2", 900)
+            FindAllOf = function(c) if c == "Vehicle_Van_C" or c == "BP_VehicleMaster_C" then return { A, B } end return {} end
+            vehicles = require("mirror.vehicles")
+            vehicles.init({ mirror_vehicles = true }, ROLE, { guest_in_world = function() return true end, in_world = function() return true end })
+            local tick = vehicles.tick
+            vehicles.tick = function(dt) util.new_frame(); tick(dt) end
+            for i = 1, 30 do vehicles.tick(0.1) end
+            function P(v) return { get = function() return v end } end
+        """.replace("ROLE", '"%s"' % role))
+        check(L.eval('HOOKS["BP_VehicleMaster_C:Horn"] ~= nil'), "%s: the game's Horn is hooked" % role)
+        L.execute('blobs_out.horn = nil; HOOKS["BP_VehicleMaster_C:Horn"](P(B)); vehicles.tick(0.1)')
+        check(L.eval('blobs_out.horn') is None, "%s: a horn of a car I'm not driving is not sent" % role)
+        L.execute('PARENT = A; for i = 1, 3 do vehicles.tick(0.1) end; HOOKS["BP_VehicleMaster_C:Horn"](P(A)); vehicles.tick(0.1)')
+        check(" 100 0 0" in (L.eval('blobs_out.horn') or ""), "%s: my honk is sent with my car's place" % role)
+        L.execute('blobs_in.horn = "x 1 %d 500 0 0"; vehicles.tick(0.1)' % (L.eval('os.time()')))
+        check(L.eval('#HORNS') == 1 and L.eval('HORNS[1].X') == 500, "%s: the other player's honk is played where their car is" % role)
+        if role == "host":
+            check(L.eval('#NOISES') == 1 and L.eval('NOISES[1].by == GHOST') and L.eval('NOISES[1].range') == 8500,
+                  "host: the guest's honk is a noise for my zombies (8500, like the game's own horn)")
+        else:
+            check(L.eval('#NOISES') == 0, "guest: no noise here (my zombies are the host's copies)")
+        check("horns sent 1, played 1" in L.eval('vehicles.status()'), "%s: horns counted in the status" % role)
+        # SyncFX wreck horns: the guest passes a fresh one on, the host's zombies hear it (at most the game horn's 8500)
+        old = os.getcwd()
+        d = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(d, "ue4ss", "Mods", "SyncFX"))
+            os.chdir(d)
+            noise = os.path.join("ue4ss", "Mods", "SyncFX", "noise.txt")
+            with open(noise, "w") as f:
+                f.write("%d 3 10 20 30 6000\n" % (L.eval('os.time()') - 60))
+            L.execute('blobs_out.horn = nil; for i = 1, 7 do vehicles.tick(0.1) end')
+            check(L.eval('blobs_out.horn') is None, "%s: an old wreck honk is not sent" % role)
+            with open(noise, "w") as f:
+                f.write("%d 4 10 20 30 6000\n" % L.eval('os.time()'))
+            L.execute('for i = 1, 7 do vehicles.tick(0.1) end')
+            sent = L.eval('blobs_out.horn') or ""
+            if role == "guest":
+                check("N 10 20 30 6000" in sent, "guest: a fresh SyncFX wreck honk goes to the host")
+                L.execute('blobs_out.horn = nil; for i = 1, 7 do vehicles.tick(0.1) end')
+                check(L.eval('blobs_out.horn') is None, "guest: ...once")
+            else:
+                check("N " not in sent, "host: its own wreck honks stay here (SyncFX made the noise already)")
+        finally:
+            os.chdir(old)
+            shutil.rmtree(d, ignore_errors=True)
+        L.execute('NOISES = {}; HORNS = {}; blobs_in.horn = "y 1 %d N 10 20 30 99999"; vehicles.tick(0.1)' % L.eval('os.time()'))
+        if role == "host":
+            check(L.eval('#NOISES') == 1 and L.eval('NOISES[1].range') == 8500 and L.eval('#HORNS') == 0,
+                  "host: the guest's wreck honk is a noise here (capped at 8500), no second horn sound")
+        else:
+            check(L.eval('#NOISES') == 0, "guest: a wreck honk from the host makes no noise here")
+
+
+def raiders_can_hit_the_guests_ghost():
+    # DBG-20261028-003: raider shots trace "Weapons" (23); a no-PvP ghost answered Visibility only -> they never hit
+    print("raiders_can_hit_the_guests_ghost")
+    L = lua()
+    L.execute(FAKES + r"""
+        PVP = false
+        package.loaded["mirror.hostrules"] = { get = function(k) if k == "pvp" then return PVP end end }
+        RESTORED = 0
+        local function mesh(blocks)
+            local m = obj({ resp = {} })
+            for _, ch in ipairs(blocks) do m.resp[ch] = 2 end
+            m.SetCollisionEnabled = function() end
+            m.SetCollisionResponseToChannel = function(self, ch, r) m.resp[ch] = r end
+            m.GetCollisionResponseToChannel = function(self, ch) return m.resp[ch] or 0 end
+            m.SetPhysMaterialOverride = function() FLESH = true end
+            return m
+        end
+        PLAYER = obj({ Mesh = mesh({ 3, 9, 10, 23, 25 }) })
+        GHOST = obj({ Mesh = mesh({ 3 }) })
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, controller = function() return nil end,
+                                          player_hook = function() end, on_world_reset = function() end }
+        package.loaded["mirror.ghost"] = { get = function() return GHOST end, is = function(a) return a == GHOST end,
+            generation = function() return 1 end,
+            restore_mesh = function() RESTORED = RESTORED + 1; GHOST.Mesh.resp = { [3] = 2 } end }
+        util = require("mirror.util")
+        HOOKS = {}
+        util.ensure_hook = function(path, fn) HOOKS[path:match(":(.+)$")] = fn; return true end
+        pvp = require("mirror.pvp")
+        pvp.init("host", function() return true end)
+        pvp.tick(0.1)
+        RAIDER = obj({ Dead = false })
+        function P(v) return { get = function() return v end } end
+        function tick(n) for i = 1, n or 3 do pvp.tick(0.1) end end
+    """)
+    check(L.eval('HOOKS["Set BB Attack Target"] ~= nil'), "host hooks the raiders' Set BB Attack Target")
+    L.execute('RAIDER["Attack Target"] = PLAYER; HOOKS["Set BB Attack Target"](P(RAIDER)); tick()')
+    check(L.eval('GHOST.Mesh.resp[23]') is None, "a raider after me (not the ghost) changes nothing")
+    L.execute('RAIDER["Attack Target"] = GHOST; HOOKS["Set BB Attack Target"](P(RAIDER)); tick()')
+    check(L.eval('GHOST.Mesh.resp[23]') == 2 and L.eval('GHOST.Mesh.resp[9]') == 2,
+          "a raider after the guest: the ghost blocks the weapon traces the real player blocks")
+    check(L.eval('FLESH') is None, "...without the flesh surface (my own stray bullets hurt nobody)")
+    check("raiders after the other player 1, cover on" in L.eval('pvp.status()'), "counted in the status")
+    L.execute('RAIDER["Attack Target"] = PLAYER; tick()')
+    check(L.eval('RESTORED') == 1 and L.eval('GHOST.Mesh.resp[23]') is None, "the raider turns away: ghost back to no-PvP collision")
+    L.execute('RAIDER["Attack Target"] = GHOST; HOOKS["Set BB Attack Target"](P(RAIDER)); RAIDER.Dead = true; tick()')
+    check(L.eval('GHOST.Mesh.resp[23]') is None, "a dead raider is no reason")
+    L.execute('RAIDER.Dead = false; PVP = true; RESTORED = 0; HOOKS["Set BB Attack Target"](P(RAIDER)); tick(); PVP = false')
+    check(L.eval('RESTORED') == 0, "with PvP on the PvP setup owns the mesh (nothing restored under it)")
 
 
 def harvest_uses_up_nodes_once():
@@ -907,6 +1119,157 @@ def harvest_uses_up_nodes_once():
     carry(H, G)
     got = list(G.eval("REMOVED").values())
     check(7 in got and 8 not in got, "without the component name the right foliage instance is still removed (%s)" % got)
+
+
+def zombie_spawn_pins_hold_or_refuse():
+    # DBG-20261027-016 came back on a hand-back (2026-10-29): a pin that didn't take, or a list that couldn't be
+    # read, let the zombie BP load a random soft look inside our SpawnActor. Only a pin that reads back may spawn.
+    print("zombie_spawn_pins_hold_or_refuse")
+    L = lua()
+    L.execute(FAKES + r"""
+        package.loaded["mirror.game"] = { player = function() return nil end, world = function() return nil end,
+                                          on_world_reset = function() end, keybind = function() end }
+        package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
+        package.loaded["mirror.loader"] = { want = function() end }
+        ASSETS = {}
+        StaticFindObject = function(p) return ASSETS[p] end
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        DROP = false
+        util.cdo = function() return {
+            Conv_ObjectToSoftObjectReference = function(self, o) return { soft = o } end,
+            Conv_SoftObjectReferenceToObject = function(self, s) return type(s) == "table" and s.soft or nil end } end
+        zombies = require("mirror.zombies")
+        MZC = cls("BP_MasterZombie_C")
+        ASSETS["/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C"] = MZC
+        MESH, MAT = obj({}), obj({})
+        function arr(t)
+            local a = { GetArrayNum = function() return #t end }
+            return setmetatable(a, { __index = function(_, i) return t[i] end,
+                                     __newindex = function(_, i, v) if not DROP then t[i] = v end end }), t
+        end
+        function cdo(zombie_family, lists)
+            local c = obj({ IsA = function(self, k) return zombie_family and k == MZC end,
+                            GetFName = function() return { ToString = function() return "Default__BP_Z_C" end } end,
+                            Mesh = { GetSkinnedAsset = function() return MESH end, GetMaterial = function() return MAT end } })
+            for k, v in pairs(lists) do c[k] = v end
+            return c
+        end
+    """)
+    # a pin that holds: every entry points at the loaded look while spawning, the lists come back afterwards
+    L.execute('M, MT = arr({ "softA", "softB" }); T, TT = arr({ "softC" }); '
+              'C = cdo(true, { Meshes_Soft = M, Materials_Soft = T }); UNPIN = zombies._look.pin(C, MESH, MAT)')
+    check(L.eval('UNPIN ~= nil and MT[1].soft == MESH and MT[2].soft == MESH and TT[1].soft == MAT'),
+          "a pin that reads back lets the zombie spawn, every soft entry on the loaded look")
+    L.execute('UNPIN()')
+    check(L.eval('MT[1] == "softA" and MT[2] == "softB" and TT[1] == "softC"'), "and the class's own lists come back")
+    # UE4SS dropped the write: the random (maybe still streaming) look would load inside our SpawnActor
+    L.execute('DROP = true; M, MT = arr({ "softA" }); C = cdo(true, { Meshes_Soft = M, Materials_Soft = arr({}) }); '
+              'R = zombies._look.pin(C, MESH, MAT); DROP = false')
+    check(L.eval('R') is None, "a pin that didn't take refuses the spawn")
+    # a zombie whose list can't be read: refused, never taken for "no list"
+    L.execute('C = cdo(true, {}); C.Meshes_Soft = setmetatable({}, { __index = function() error("no read") end }); '
+              'R = zombies._look.pin(C, MESH, MAT)')
+    check(L.eval('R') is None, "a zombie's unreadable soft list refuses the spawn")
+    # not the master zombie's family (no soft looks to roll): spawns as before
+    L.execute('C = cdo(false, {}); R = zombies._look.pin(C, MESH, MAT)')
+    check(L.eval('type(R)') == "function", "a class outside the zombie family without soft lists still spawns")
+    L.execute('C = cdo(true, { Meshes_Soft = arr({}), Materials_Soft = arr({}) }); R = zombies._look.pin(C, MESH, MAT)')
+    check(L.eval('type(R)') == "function", "empty soft lists need no pin")
+
+
+def hounds_bark_when_they_come_for_you():
+    """User 2026-10-28: zombie dogs bark while they chase you, stop the moment they die, and bark once when they
+    first get near (the game has no bark sound; SurrounSyncSounds.pak brings them)."""
+    print("hounds_bark_when_they_come_for_you")
+    L = lua()
+    L.execute(FAKES + r"""
+        package.loaded["mirror.zombies"] = { dead_of = function(z) return z.dead == true end }
+        TICKS = {}
+        PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end })
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return {} end,
+            on_tick = function(f) TICKS[#TICKS + 1] = f end, on_world_reset = function() end }
+        LOADED = true
+        StaticFindObject = function(p) if p:find("SurrounSyncSounds") and not LOADED then return nil end return obj({ p = p, Duration = 0.8 }) end
+        T = 0
+        function hound(x) local d = obj({ x = x, dead = false, speed = 0 })
+            d.K2_GetActorLocation = function() return { X = d.x, Y = 0, Z = 0 } end
+            d.K2_GetRootComponent = function() return obj({}) end; d.IsActorBeingDestroyed = function() return false end; return d end
+        H = hound(3000)
+        IN = { H }
+        PLAYS = {}
+        local k = obj({})
+        k.SphereOverlapActors = function(self, w, loc, r, t, cls, ign, out)
+            for _, d in ipairs(IN) do if math.abs(d.x - loc.X) <= r then out[#out + 1] = d end end end
+        local gs = obj({})
+        -- (a sound plays for its Duration at its pitch, then the component destroys itself: IsPlaying/Stop on it
+        -- afterwards are calls on a dead object - counted as LATE)
+        LATE = 0
+        gs.SpawnSoundAttached = function(self, snd, root, _, _, _, _, _, _, pitch)
+            local c = obj({ on = true, p = snd.p, t_end = T + snd.Duration / pitch })
+            c.IsPlaying = function() if T >= c.t_end then LATE = LATE + 1 end return c.on end
+            c.Stop = function() if T >= c.t_end then LATE = LATE + 1 end c.on = false; c.stopped = true end
+            PLAYS[#PLAYS + 1] = c
+            return c
+        end
+        util = require("mirror.util")
+        util.cdo = function(p) return p:find("GameplayStatics") and gs or k end
+        dg = require("mirror.dogs")
+        dg.init({})
+        function run(s, step) for i = 1, math.floor(s * 10) do T = T + 0.1; H.x = H.x + (step or 0); for _, f in ipairs(TICKS) do f(0.1) end
+            for _, c in ipairs(PLAYS) do if c.on and T >= c.t_end then c.on = false end end end end
+    """)
+    L.execute('run(10)')
+    check(L.eval('#PLAYS') == 0, "a hound standing 30 m off: quiet")
+    L.execute('run(45, -5)')   # walking up at 0.5 m/s (not a chase) from 30 m to 7.5 m
+    check(L.eval('#PLAYS') >= 1 and "DogBark" in L.eval('PLAYS[1].p'), "it comes within 10 m: one bark")
+    L.execute('N0 = #PLAYS; run(1.5, -20); H.x = 400; run(6.5)')   # 2 m/s at the player, then right on them
+    n = L.eval('#PLAYS - N0')
+    check(3 <= n <= 30, "chasing me: bark after bark (%d)" % n)
+    check(all(not (L.eval('PLAYS[%d].on' % i) and L.eval('PLAYS[%d].on' % (i + 1))) for i in range(1, L.eval('#PLAYS'))),
+          "...one at a time")
+    L.execute('N3 = #PLAYS; for i = 1, 40 do if #PLAYS > N3 then break end run(0.1) end; LAST = PLAYS[#PLAYS]; '
+              'H.dead = true; IN = {}; run(0.3)')
+    check(L.eval('#PLAYS > N3') and L.eval('LAST.stopped') is True,
+          "it dies mid-bark: the bark stops at once (dead hounds drop out of the query too)")
+    check(L.eval('LATE') == 0, "never a call on a bark whose sound already ended (its component is gone then)")
+    L.execute('N1 = #PLAYS; run(5)')
+    check(L.eval('#PLAYS') == L.eval('N1'), "...and it never barks again")
+    check("1 near bark(s)" in L.eval('dg.status()'), "counted in the status (%s)" % L.eval('dg.status()'))
+    L.execute('LOADED = false; util.find = function(p) return StaticFindObject(p) end; H = hound(500); IN = { H }; N2 = #PLAYS; run(5, -20)')
+    check(L.eval('#PLAYS') == L.eval('N2'), "no pak: quiet, nothing loaded from Lua")
+
+
+def human_copies_hold_the_hosts_weapon():
+    """User 2026-10-28: raiders' weapons are invisible on the guest - the AI start-up that arms them needs the AI
+    controller a copy never gets. The copy is armed with the host's weapon class through the game's Equip Holdable."""
+    print("human_copies_hold_the_hosts_weapon")
+    L = lua()
+    L.execute(FAKES + r"""
+        package.loaded["mirror.game"] = { player = function() return nil end, world = function() return nil end,
+                                          on_world_reset = function() end, keybind = function() end }
+        package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
+        package.loaded["mirror.loader"] = { want = function() end }
+        GUN = obj({ GetFullName = function() return "BlueprintGeneratedClass /Game/AI/W/BP_AIWeapon_M4.BP_AIWeapon_M4_C" end })
+        StaticFindObject = function(p) if p == "/Game/AI/W/BP_AIWeapon_M4.BP_AIWeapon_M4_C" then return GUN end end
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        zombies = require("mirror.zombies")
+        EQUIPS, KILLED = {}, 0
+        local held = obj({ K2_DestroyActor = function() KILLED = KILLED + 1 end, GetClass = function() return
+            obj({ GetFullName = function() return "BlueprintGeneratedClass /Game/AI/W/BP_AIWeapon_Axe.BP_AIWeapon_Axe_C" end }) end })
+        AI = obj({ ["Holdable Actor"] = held, ["Attached Holdables"] = { GetArrayNum = function() return 0 end, Empty = function() EMPTIED = true end } })
+        AI["Equip Holdable"] = function(self, c) EQUIPS[#EQUIPS + 1] = c end
+        Z = obj({ BP_AIComponent = AI })
+        C = { z = Z, fam = "human" }
+    """)
+    L.execute('zombies.arm_copy(C, "/Game/AI/W/BP_AIWeapon_M4.BP_AIWeapon_M4_C")')
+    check(L.eval('#EQUIPS') == 1 and L.eval('EQUIPS[1] == GUN'), "the copy equips the host's weapon class (the game's Equip Holdable)")
+    check(L.eval('KILLED') == 1 and L.eval('EMPTIED') is True, "...after its old one is taken away")
+    L.execute('EQUIPS = {}; zombies.arm_copy(C, "/Game/AI/W/BP_AIWeapon_Nope.BP_AIWeapon_Nope_C")')
+    check(L.eval('#EQUIPS') == 0, "a weapon class not loaded here is never loaded from Lua (empty hands)")
+    L.execute('EQUIPS = {}; zombies.arm_copy(C, "-")')
+    check(L.eval('#EQUIPS') == 0 and L.eval('C.weapon') == "-", "the host's empty hands: nothing in the copy's")
 
 
 def zombie_copies_take_the_hosts_look():
@@ -1070,7 +1433,7 @@ def nests_keep_real_health():
             util.cdo = function() return ksl end
             function nest(x, std, cur, max)
                 local n = obj({ ["IsDestroyed?"] = false, ["PrimaryInfestation?"] = false, ["CanDamagePrimary?"] = true,
-                                DamageComponent = { StandardHealthValue = std, CurrentHealth = cur, MaxHealth = max },
+                                DamageComponent = obj({ StandardHealthValue = std, CurrentHealth = cur, MaxHealth = max }),
                                 K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end })
                 n.GetClass = function() return obj({ GetFullName = function() return "BlueprintGeneratedClass /Game/Infestation/BP_Infestation.BP_Infestation_C" end }) end
                 n.Damage_Object = function(self, amt) KILLS[#KILLS + 1] = amt
@@ -1081,7 +1444,10 @@ def nests_keep_real_health():
             end
             A = nest(0, 3000, 3000, 3000)
             BAD = nest(5000, 1500000, 750000, 3000)
-            util.instances = function(cls) if cls == "BP_Infestation_C" then return { A, BAD }, true end return {}, true end
+            -- a pinned nest whose DamageComponent is already gone (a load still running): never written
+            STALE = nest(9000, 1500000, 750000, 3000)
+            STALE.DamageComponent.IsValid = function() return false end
+            util.instances = function(cls) if cls == "BP_Infestation_C" then return { A, BAD, STALE }, true end return {}, true end
             infest = require("mirror.infest")
             infest.init({}, role, {}, function() return true end)
             for i = 1, 10 do infest.tick(0.1) end
@@ -1096,6 +1462,8 @@ def nests_keep_real_health():
           "host: nests keep their real health (no million-point pin)")
     check(L.eval("dc(BAD).StandardHealthValue") == 3000 and L.eval("dc(BAD).CurrentHealth") == 1500,
           "a nest saved with a pinned million-point health gets its real health back (game defaults x difficulty, same %)")
+    check(L.eval("dc(STALE).StandardHealthValue") == 1500000 and L.eval("dc(STALE).MaxHealth") == 3000,
+          "a nest whose DamageComponent is no longer valid is neither read nor written")
     L.execute('INBOX = { "' + "BP_Infestation_C@0,0,0" + ' 500" }; infest.tick(0.1)')
     check(L.eval("dc(A).CurrentHealth") == 2500 and L.eval("#TIMERS") == 0 and L.eval("#KILLS") == 0,
           "host: a guest hit lowers the real health, no waves above 2/3")
@@ -1264,7 +1632,7 @@ def goto_and_bring_move_only_your_own_player():
         L = lua()
         L.execute(FAKES + r"""
             NOTES = {}
-            package.loaded["mirror.notify"] = { show = function(t) NOTES[#NOTES + 1] = t end }
+            package.loaded["mirror.notify"] = { show = function(t) NOTES[#NOTES + 1] = t end, clear = function() end }
             SENT, INBOX = {}, {}
             package.loaded["mirror.events"] = evmock { new = function() return {
                 send = function(self, m) SENT[#SENT + 1] = m end,
@@ -2303,6 +2671,41 @@ def unanswered_join_keeps_the_friends_list():
           "while the host hasn't accepted, the tab keeps the friends list and hides the chat")
     check(L.eval("M2.in_coop") is True and L.eval("M2.show_chat") is True, "once connected it shows the co-op rows")
     check(L.eval("CMDS[#CMDS]") == "join 765", "asking the same host again re-sends the request (%s)" % L.eval("CMDS[#CMDS]"))
+    # a request nobody answers stops by itself after 2 minutes (one still waiting after 13 min was accepted into a Realm)
+    L = lua()
+    L.execute(r"""
+        local any = { __index = function() return function() end end }
+        local function stub(t) return setmetatable(t or {}, any) end
+        for _, n in ipairs({ "notify", "menu_backups", "instance", "hostrules", "mysettings",
+                             "modlist", "itemclean", "names", "voice", "chat", "teleport", "compat", "version" }) do
+            package.loaded["mirror." .. n] = stub()
+        end
+        SAID, STOPPED, ERRS = {}, 0, {}
+        package.loaded["mirror.notify"] = stub({ show = function(m) SAID[#SAID + 1] = m end, clear = function() end })
+        package.loaded["mirror.util"] = stub({ safe = function(f, n, ...) local ok, e = pcall(f, ...); if not ok then ERRS[#ERRS + 1] = tostring(n) .. ": " .. tostring(e) end; return ok, e end })
+        package.loaded["mirror.game"] = stub({ on_tick = function(f) TICK = f end })
+        ROLE, CONNECTED = nil, false
+        package.loaded["mirror.link"] = stub({ kind = function() return "steam" end, peer_name = function() return "Bob" end,
+            lobby = function() return { hosts = { { id = "765", name = "Bob" } } } end, bridge_cmd = function() return true end })
+        package.loaded["mirror.session"] = stub({ state = function() return "idle" end })
+        package.loaded["mirror.phase1"] = stub({ started = function() return ROLE end, connected = function() return CONNECTED end,
+            init = function(c, r) ROLE = r end, stop = function() STOPPED = STOPPED + 1 end })
+        package.loaded["mirror.journal_tab"] = stub({ configure = function(t) TAB = t end })
+        ModifierKey = { CONTROL = 1 }
+        CLOCK = 1000
+        os.clock = function() return CLOCK end
+        menu = require("mirror.menu")
+        menu.init({})
+        TAB.act.join("765", "Bob")
+        CLOCK = 1100; TICK(0.1)
+    """)
+    check(L.eval("STOPPED") == 0, "after 100 s the request is still waiting")
+    L.execute("CLOCK = 1121; TICK(0.1)")
+    said = list(L.eval("SAID").values())
+    check(L.eval("STOPPED") == 1 and any("didn't answer within 2 minutes" in s for s in said),
+          "after 2 minutes without an answer it stops asking and says so (%s)" % said[-1:])
+    L.execute("CLOCK = 1500; TICK(0.1)")
+    check(L.eval("STOPPED") == 1, "...once")
 
 
 def bag_put_back_after_a_take_reaches_the_host():
@@ -3884,6 +4287,7 @@ SPLIT_FAKES = r"""
         handing = function() return (HANDING or 0) > 0 end,
         handover_done = function() if (HANDING or 0) > 0 then HANDING = HANDING - 1 end; return (HANDING or 0) == 0 end,
         cancel_handover = function() CANCELLED = (CANCELLED or 0) + 1; HANDING = 0 end,
+        taking_over = function() return TAKEOVER == true end,
         -- hand-back: the host spawns what the guest offers (TAKE_TICKS evaluations), then merges with "H key id"
         begin_taking = function() TAKING = TAKE_TICKS or 0; TAKES = (TAKES or 0) + 1 end,
         take_offer = function(body) OFFERS_SEEN = (OFFERS_SEEN or 0) + 1 end,
@@ -4045,6 +4449,10 @@ def load_split_switches_only_when_both_agree():
     check(G.eval('RESET') == "p8", "guest out of the world: the host's state is read fresh on the next join")
     G.execute('SPLIT = false; INWORLD = true; blobs_in.p8 = "m 9"; run(0.6)')
     check(G.eval('blobs_out.p8g') == "m 9 0" and G.eval('SPLIT') is False, "guest: answers the host's epoch after a rejoin")
+    # a Realm takeover in place runs its own hand-over: the old host's last "merged" must not call it off or merge
+    G.execute('SPLIT = true; TAKEOVER = true; HANDING = 3; CANCELLED = 0; blobs_in.p8 = "m 10"; run(0.6)')
+    check(G.eval('CANCELLED') == 0 and G.eval('SPLIT') is True and G.eval('HANDING') == 3,
+          "guest taking a Realm over: split leaves the hand-over and the split alone")
 
 
 def load_split_hands_the_ai_to_the_guest():
@@ -4159,6 +4567,34 @@ def load_split_hands_the_ai_to_the_guest():
           % (L.eval('QUEUED'), L.eval('AFTER_SPLIT'), L.eval('LEFT_ON')))
     check(L.eval('REENABLE_FRAMES') >= 2, "the split turns its spawners back on over frames (100 a frame, %d frames)"
           % L.eval('REENABLE_FRAMES'))
+    # Realm takeover in place: hand-over first, then the stopped spawners and people's spawn volumes run again
+    L.execute(r"""
+        zombies.set_split(false); zombies._test.sweep(10)
+        S3 = spawner(); RESTARTED = 0
+        V1 = obj({ ["Stop Spawning"] = function(self) self.stopped = true end,
+                   ["Restart Spawning"] = function(self) self.stopped = false; RESTARTED = RESTARTED + 1 end })
+        SPAWNERS = { S3 }
+        util.instances = function(c) if c == "BP_AISpawner_Master_C" then return SPAWNERS end
+                                     if c == "BP_AISpawningVolume_Prefab_C" then return { V1 } end return {} end
+        LIST = {}
+        for i = 1, 6 do zombies._test.sweep(10) end   -- (spawners and volumes: every 5th pass)
+        STOPPED_BEFORE = S3.IsSpawningStopped and V1.stopped
+        zombies.begin_takeover()
+        READY_FIRST = zombies.takeover_ready()
+        zombies._test.handover()
+        READY_AFTER_HANDOVER = zombies.takeover_ready()
+        zombies._test.reenable(100)
+        READY = zombies.takeover_ready()
+        KEEP = zombies.taking_over()
+        zombies.end_takeover()
+    """)
+    check(L.eval('STOPPED_BEFORE') is True, "guest merged: the sweep stopped a spawner and a spawn volume")
+    check(L.eval('READY_FIRST') is False and L.eval('READY_AFTER_HANDOVER') is False and L.eval('READY') is True,
+          "takeover: ready only once the hand-over is done and the spawners are back on")
+    check(L.eval('S3.IsSpawningStopped') is False and L.eval('V1.stopped') is False and L.eval('RESTARTED') == 1,
+          "takeover: the spawner runs again and the spawn volume restarted once")
+    check(L.eval('KEEP') is True and L.eval('zombies.taking_over()') is False and L.eval('zombies.is_split()') is False,
+          "takeover ends with no split state left for the host's code")
 
 def reliable_events_survive_pauses_and_restarts():
     print("reliable_events_survive_pauses_and_restarts")
@@ -4457,6 +4893,337 @@ PEERS_FAKES = r'''
 '''
 
 
+def airdrops_follow_the_host():
+    """User 2026-10-29: airdrops aren't synced - each game's BP_EventManager flies its own plane and drops its own random
+    crates. The host sends where its crates came to rest; the guest gets the same crate on that spot (shared loot finds
+    a container by class + position) and its own planes are taken away."""
+    print("airdrops_follow_the_host")
+
+    def side(role):
+        L = lua()
+        L.execute(FAKES + r"""
+            util = require("mirror.util")
+            WORLD = {}
+            util.instances = function(cls) local l = {} for _, a in ipairs(WORLD[cls] or {}) do if not a.gone then l[#l + 1] = a end end return l end
+            function actor(cls, at)
+                local a = obj({ cls = cls, at = { X = at.X, Y = at.Y, Z = at.Z }, physics = true })
+                a.K2_GetActorLocation = function(self) return self.at end
+                a.K2_GetActorRotation = function() return { Pitch = 0, Yaw = 30, Roll = 0 } end
+                a.K2_DestroyActor = function(self) self.gone = true end
+                a.K2_SetActorLocationAndRotation = function(self, l) self.at = { X = l.X, Y = l.Y, Z = l.Z } end
+                a.K2_GetRootComponent = function(self) return { SetSimulatePhysics = function(_, on) self.physics = on end } end
+                WORLD[cls] = WORLD[cls] or {}; table.insert(WORLD[cls], a); return a
+            end
+            StaticFindObject = function(p) return obj({ path = p }) end
+            FindFirstOf = function() return obj({ ReferencedObjects = { GetArrayNum = function() return 0 end } }) end
+            package.loaded["mirror.game"] = { on_world_reset = function() end,
+                world = function() return { SpawnActor = function(_, cls, l) return actor(cls.path:match("%%.(.+)$"), l) end } end }
+            JOINED = true
+            airdrops = require("mirror.airdrops")
+            airdrops.init({}, "%s", { in_world = function() return JOINED end }, function() return true end)
+        """ % role)
+        return L
+
+    H, G = side("host"), side("guest")
+    H.execute('C = actor("AirdropContainer_Military_C", { X = 1000, Y = 2000, Z = 5000 }); airdrops.tick(3)')
+    check(H.eval('blobs_out.airdrops') in (None, "-"), "a falling crate isn't sent yet (%r)" % H.eval('blobs_out.airdrops'))
+    H.execute('C.at = { X = 1000.25, Y = 2000.5, Z = 300.75 }; airdrops.tick(3); airdrops.tick(3)')
+    sent = H.eval('blobs_out.airdrops') or ""
+    check(sent.startswith("AirdropContainer_Military_C 1000.25 2000.50 300.75"), "a crate at rest is sent with its exact spot (%r)" % sent)
+    G.execute('PLANE = actor("AirdropAircraft_C", { X = 0, Y = 0, Z = 50000 }); blobs_in.airdrops = ...', sent)
+    G.execute('for i = 1, 5 do airdrops.tick(3) end')
+    check(G.eval('PLANE.gone') is True, "the guest's own airdrop plane is taken away")
+    check(G.eval('#util.instances("AirdropContainer_Military_C")') == 1, "the host's crate is spawned here")
+    check(G.eval('util.instances("AirdropContainer_Military_C")[1].at.Z') > 300.75, "...a little above its spot, so it lands")
+    G.execute('local a = util.instances("AirdropContainer_Military_C")[1]; a.at = { X = 1003, Y = 1998, Z = 301 }')
+    G.execute('os_clock = os.clock; os.clock = function() return os_clock() + 10 end; for i = 1, 3 do airdrops.tick(3) end; os.clock = os_clock')
+    a = G.eval('util.instances("AirdropContainer_Military_C")[1]')
+    check(abs(a.at.X - 1000.25) < 1e-6 and abs(a.at.Y - 2000.5) < 1e-6 and abs(a.at.Z - 300.75) < 1e-6 and a.physics is False,
+          "once landed it is put on the host's exact spot and held there (the loot ids match)")
+    G.execute('for i = 1, 5 do airdrops.tick(3) end')
+    check(G.eval('#WORLD.AirdropContainer_Military_C') == 1, "and only spawned once")
+    G.execute('blobs_in.airdrops = "-"; airdrops.tick(3)')
+    check(G.eval('util.instances("AirdropContainer_Military_C")[1]') is None, "the host's crate gone: the copy goes too")
+
+
+def event_sites_follow_the_host():
+    """User 2026-10-29: plane crashes aren't synced - every BP_PrefabSpawner rolls its own chance in each game and the
+    event manager fires dynamic ones on its own timer. The host sends its prefabs; the guest removes its own others and
+    spawns the host's at the same spot. Settlements (camps.lua) and quest prefabs are left alone."""
+    print("event_sites_follow_the_host")
+
+    def side(role):
+        L = lua()
+        L.execute(FAKES + r"""
+            util = require("mirror.util")
+            ALL, SPAWNERS = {}, {}
+            util.instances = function(cls)
+                local src = cls == "BP_PrefabSpawner_C" and SPAWNERS or ALL
+                local l = {} for _, a in ipairs(src) do if not a.gone then l[#l + 1] = a end end return l end
+            util.class_name = function(a) return a.cls end
+            -- a spawner standing on a site, with its marker (as the game's BP_PrefabSpawner)
+            function spawner(x, y, marker)
+                local s = obj({ at = { X = x, Y = y, Z = 100 }, DistanceToDiscoverPrefab = 5000, ["Marker?"] = true,
+                                ["Marker Texture"] = obj({ GetFullName = function() return "Texture2D /Game/UI/Crash.Crash" end }),
+                                ["Marker Title"] = { ToString = function() return "Plane Crash" end },
+                                ["Marker Description"] = { ToString = function() return "A military plane went down" end } })
+                s.K2_GetActorLocation = function(self) return self.at end
+                s.K2_DestroyActor = function(self) self.gone = true end
+                s.Marker = marker
+                SPAWNERS[#SPAWNERS + 1] = s; return s
+            end
+            util.class_path = function(a) return "/Game/Prefabs/X/" .. a.cls:gsub("_C$", "") .. "." .. a.cls end
+            function prefab(cls, x, y)
+                local a = obj({ cls = cls, at = { X = x, Y = y, Z = 100 } })
+                a.K2_GetActorLocation = function(self) return self.at end
+                a.K2_GetActorRotation = function() return { Pitch = 0, Yaw = 90, Roll = 0 } end
+                a.K2_DestroyActor = function(self) self.gone = true end
+                ALL[#ALL + 1] = a; return a
+            end
+            MARKER_CDO = obj({})
+            FText = function(s) return "FText:" .. s end
+            NOT_LOADED = {}   -- paths the game hasn't loaded (StaticFindObject finds nothing)
+            StaticFindObject = function(p)
+                if NOT_LOADED[p] then return nil end
+                if p:find("Default__BP_Marker_C", 1, true) then return MARKER_CDO end
+                if p:find("Default__GameFunctionLibrary_C", 1, true) then return obj({ XpMultiplierCalc = function() return 50 end }) end
+                return obj({ cls = p:match("%%.(.+)$") })
+            end
+            MARKERS, XP = {}, 0
+            ME = obj({ K2_GetActorLocation = function() return ME_AT end }); ME_AT = { X = 0, Y = 0, Z = 0 }
+            package.loaded["mirror.game"] = { on_world_reset = function() end, player = function() return ME end,
+                controller = function() return { LevellingComponent = { AddXP = function(_, n) XP = XP + n end } } end,
+                world = function() return { SpawnActor = function(_, c, l)
+                    if c.cls == "BP_Marker_C" then
+                        local m = obj({ title = MARKER_CDO.MarkerTitle, at = l }); m.K2_DestroyActor = function(self) self.gone = true end
+                        MARKERS[#MARKERS + 1] = m; return m
+                    end
+                    return prefab(c.cls, l.X, l.Y) end } end }
+            JOINED = true
+            prefabs = require("mirror.prefabs")
+            prefabs.init({}, "%s", { in_world = function() return JOINED end }, function() return true end)
+            function n(cls) local k = 0 for _, a in ipairs(util.instances()) do if a.cls == cls then k = k + 1 end end return k end
+        """ % role)
+        return L
+
+    H, G = side("host"), side("guest")
+    H.execute('prefab("Prefab_CrashedMilitaryPlane_C", 5000, 6000); spawner(5000, 6000); prefab("Prefab_Settlement2_C", 1, 2000); '
+              'prefab("Prefab_Quest_BanditCamp1_C", 3000, 3000); prefab("Prefab_AbandonedConvoy_C", 0, 0); prefabs.tick(5)')
+    sent = H.eval('blobs_out.prefabs') or ""
+    check(sent.startswith("Prefab_CrashedMilitaryPlane_C /Game/Prefabs/X/Prefab_CrashedMilitaryPlane.Prefab_CrashedMilitaryPlane_C 5000.00 6000.00")
+          and "Settlement" not in sent and "Quest" not in sent and "Convoy" not in sent,
+          "the host sends its event sites (no settlements, quest prefabs or origin templates) (%r)" % sent)
+    check(sent.endswith("\t/Game/UI/Crash.Crash\t5000\t1\tPlane Crash\tA military plane went down"),
+          "...with its spawner's map marker (%r)" % sent)
+    # (a container's BeginPlay loads the loot tables it walks: one not in memory = a load inside our SpawnActor,
+    # the DBG-016 freeze - and a site whose class isn't loaded yet is tried again later, not given up)
+    G.execute('GI = obj({ ReferencedObjects = { n = 0, GetArrayNum = function(self) return self.n end } }); '
+              'setmetatable(GI.ReferencedObjects, { __newindex = function(t, k, v) rawset(t, k, v); t.n = k end }); '
+              'FindFirstOf = function(c) if c == "SD_GameInstance_C" then return GI end end; '
+              'TABLE = "/Game/Inventory/Containers/LootTables/DA_LootTable_Bunker.DA_LootTable_Bunker"; '
+              'PLANE = "/Game/Prefabs/X/Prefab_CrashedMilitaryPlane.Prefab_CrashedMilitaryPlane_C"; '
+              'NOT_LOADED[TABLE] = true; NOT_LOADED[PLANE] = true')
+    G.execute('prefab("Prefab_CrashedHelicopter01_C", 9000, 9000); OWN_MARK = obj({}); OWN_MARK.K2_DestroyActor = function(self) self.gone = true end; '
+              'OWN_SP = spawner(9000, 9000, OWN_MARK); prefab("Prefab_Settlement3_C", 7, 7000); '
+              'prefab("Prefab_Quest_BanditCamp2_C", 4000, 4000); blobs_in.prefabs = ...; prefabs.tick(5)', sent)
+    check(G.eval('n("Prefab_CrashedHelicopter01_C")') == 1 and G.eval('n("Prefab_CrashedMilitaryPlane_C")') == 0,
+          "nothing changes in the first seconds after arriving")
+    G.execute('for i = 1, 6 do prefabs.tick(5) end')
+    check(G.eval('n("Prefab_CrashedHelicopter01_C")') == 0, "the guest's own crash site is removed")
+    check(G.eval('n("Prefab_CrashedMilitaryPlane_C")') == 0, "the host's site's class isn't loaded here: not spawned")
+    G.execute('NOT_LOADED[PLANE] = nil; for i = 1, 6 do prefabs.tick(5) end')
+    check(G.eval('n("Prefab_CrashedMilitaryPlane_C")') == 0,
+          "class loaded, one container loot table not: still not spawned (no load inside SpawnActor)")
+    G.execute('NOT_LOADED[TABLE] = nil; for i = 1, 16 do prefabs.tick(5) end')
+    check(G.eval('GI.ReferencedObjects.n') == 30, "every loot table in memory: all 30 pinned (%s)" % G.eval('GI.ReferencedObjects.n'))
+    check(G.eval('OWN_SP.gone') is True and G.eval('OWN_MARK.gone') is True,
+          "...with its spawner and map marker (no marker for a site that isn't there)")
+    check(G.eval('n("Prefab_CrashedMilitaryPlane_C")') == 1, "the host's crashed plane is spawned at its spot")
+    # DBG-20261028-004: a BP_Marker spawned from Lua with the spawner's look written into its class defaults
+    # crashed the guest at every join - without a spawner here the site gets no map icon, and nothing is written
+    check(G.eval('#MARKERS') == 0, "...without a spawner here: no marker spawned from Lua (it crashed the game)")
+    check(G.eval('MARKER_CDO.MarkerTitle') != "FText:Plane Crash", "the marker class's defaults are never written")
+    check(G.eval('n("Prefab_Settlement3_C")') == 1 and G.eval('n("Prefab_Quest_BanditCamp2_C")') == 1,
+          "settlements and quest prefabs are left alone")
+    G.execute('for i = 1, 6 do prefabs.tick(5) end')
+    check(G.eval('n("Prefab_CrashedMilitaryPlane_C")') == 1, "and only once")
+
+
+def new_realm_character_gets_the_starting_kit():
+    """User 2026-10-29: new Realm characters had no starter gear - the pocket repair always used InitNoStartingItems.
+    A character without any inventory file gets the game's own kit; a stored one that arrives empty never does."""
+    print("new_realm_character_gets_the_starting_kit")
+    for fresh in (True, False):
+        L = lua()
+        L.execute('''
+            CALLS = {}
+            local n = 0
+            local arr = function(k) return { GetArrayNum = function() return k end } end
+            JIG = { ContainersSettings = arr(22), LocalJSIContainers = arr(0), MainContainersIDs = arr(0) }
+            JIG.MainJigContainers = setmetatable({}, { __len = function() return n end })
+            function JIG:ResetInitComponent() CALLS[#CALLS + 1] = "reset" end
+            function JIG:InitNoStartingItems() CALLS[#CALLS + 1] = "nokit"; n = 22 end
+            function JIG:InitializeJigComponent() CALLS[#CALLS + 1] = "init"; n = 22 end
+            PLAYER = { BP_JigMultiplayer = JIG, SetStartingItems = function() CALLS[#CALLS + 1] = "kit" end }
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, keybind = function() end,
+                                              on_tick = function() end, player_hook = function() end, on_ready = function() end }
+            SAVED = 0
+            package.loaded["mirror.session"] = { save_now = function() SAVED = SAVED + 1 end }
+            NOTES = {}
+            package.loaded["mirror.notify"] = { show = function(m) NOTES[#NOTES + 1] = m end, clear = function() end }
+            invdiag = require("mirror.invdiag")
+            invdiag.live_containers = function() return #JIG.MainJigContainers end
+        ''')
+        L.execute('invdiag.ensure_pockets("test", %s)' % ("true" if fresh else "false"))
+        calls = list(L.eval('CALLS').values())
+        if fresh:
+            check(calls == ["reset", "kit", "init"], "fresh: the game's starting kit is set, then the inventory built (%s)" % calls)
+            check(L.eval('#NOTES') == 0, "fresh: no 'missing its pockets' note")
+        else:
+            check(calls == ["reset", "nokit"], "stored character: empty pockets only, no items from nothing (%s)" % calls)
+        check(L.eval('SAVED') == 1, "saved after the repair")
+
+
+def realm_takes_the_creators_difficulty():
+    """User 2026-10-28: make the difficulties match - a new Realm plays at the difficulty of the save its creator is in,
+    not the New Game page's. The live values are the Difficulty.* / Loot.* cvars (names from UserSettings.ini)."""
+    print("realm_takes_the_creators_difficulty")
+    d = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(d, "SurrounDead", "Saved", "Config", "Windows"))
+        with open(os.path.join(d, "SurrounDead", "Saved", "Config", "Windows", "UserSettings.ini"), "w") as f:
+            f.write("[Settings]\nVideo.Gamma=1.2\nDifficulty.Permadeath=false\nDifficulty.XPMultiplier=1.5\n"
+                    "Loot.General=1.5\nLoot.Food&Drink=1.5\nDifficulty.ZombieAmount=1.0\n")
+        L = lua()
+        L.execute(FAKES + r"""
+            package.loaded["mirror.game"] = { world = function() return WORLD end }
+            WORLD = {}
+            LIVE = { ["Difficulty.Permadeath"] = false, ["Difficulty.XPMultiplier"] = 1.5121, ["Loot.General"] = 1.5,
+                     ["Loot.Food&Drink"] = 1.5, ["Difficulty.ZombieAmount"] = 1.0, ["Video.Gamma"] = 1.2 }
+            CMDS = {}
+            local k = obj({})
+            k.GetConsoleVariableBoolValue = function(self, n) return LIVE[n] end
+            k.GetConsoleVariableFloatValue = function(self, n) return LIVE[n] end
+            k.ExecuteConsoleCommand = function(self, w, c) CMDS[#CMDS + 1] = c end
+            util = require("mirror.util")
+            util.cdo = function() return k end
+            ld = require("mirror.localdir")
+            ld.configure({ getenv = function() return DIR end })
+            dif = require("mirror.difficulty")
+        """.replace("DIR", repr(d)))
+        names = L.eval('(function() local t = {} for _, e in ipairs(dif.names()) do t[#t + 1] = e.name .. (e.bool and ":b" or "") end return table.concat(t, " ") end)()')
+        check(names == "Difficulty.Permadeath:b Difficulty.XPMultiplier Loot.General Loot.Food&Drink Difficulty.ZombieAmount",
+              "the difficulty and loot settings come from the game's settings file, video ones don't (%s)" % names)
+        L.execute('SNAP = dif.snapshot()')
+        check(L.eval('SNAP["Difficulty.XPMultiplier"]') == "1.5121" and L.eval('SNAP["Difficulty.Permadeath"]') == "0",
+              "the live values are read (number and on/off)")
+        L.execute('SNAP2 = dif.decode(dif.encode(SNAP)); N = dif.apply(SNAP2)')
+        cmds = sorted(L.eval('CMDS').values())
+        check(L.eval('N') == 5 and "Loot.Food&Drink 1.5" in cmds and "Difficulty.Permadeath 0" in cmds and "Difficulty.ZombieAmount 1" in cmds,
+              "kept and set again in the new world, one console line each (%s)" % cmds)
+        L.execute('CMDS = {}; dif.apply({ ["Difficulty.X; quit"] = "1", ["Loot.General"] = "1 ; exit" })')
+        check(L.eval('#CMDS') == 0, "nothing but a setting name and a number is ever sent to the console")
+        check(L.eval('dif.remember_mine("QuickSave1")') is True, "the player's own difficulty is remembered")
+        mine, name = L.eval('(dif.mine())'), L.eval('select(2, dif.mine())')
+        check(mine is not None and mine["Loot.General"] == "1.5" and name == "QuickSave1", "...with the save it came from")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def zombies_stop_at_arms_length():
+    """User 2026-10-28: zombies clip inside the player (the game's zombie capsule ignores pawns, 15 cm wide)."""
+    print("zombies_stop_at_arms_length")
+    L = lua()
+    L.execute(FAKES + r"""
+        ROLE = nil
+        package.loaded["mirror.phase1"] = { started = function() return ROLE end }
+        TICKS = {}
+        function at(x) return { X = x, Y = 0, Z = 0 } end
+        PLAYER = obj({ K2_GetActorLocation = function() return at(0) end })
+        GHOST = obj({ K2_GetActorLocation = function() return at(5000) end })
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return {} end,
+            on_tick = function(f) TICKS[#TICKS + 1] = f end, on_world_reset = function(f) RESET = f end }
+        package.loaded["mirror.peers"] = { each = function(n, fn) fn({ get = function() return GHOST end }) end }
+        function zombie(x)
+            local cap = obj({ resp = 0, r = 15 })
+            cap.GetCollisionResponseToChannel = function(self, ch) return ch == 2 and cap.resp or 2 end
+            cap.SetCollisionResponseToChannel = function(self, ch, v) if ch == 2 then cap.resp = v end end
+            cap.GetUnscaledCapsuleRadius = function() return cap.r end
+            cap.SetCapsuleRadius = function(self, r) cap.r = r end
+            local z = obj({ CapsuleComponent = cap, x = x })
+            z.K2_GetActorLocation = function() return at(z.x) end
+            return z
+        end
+        Z1, Z2 = zombie(150), zombie(5100)
+        ZOMBIES = { Z1, Z2 }
+        local k = obj({})
+        k.SphereOverlapActors = function(self, w, loc, r, types, cls, ignore, out)
+            for _, z in ipairs(ZOMBIES) do if math.abs(z.x - loc.X) <= r then out[#out + 1] = z end end
+            return true
+        end
+        StaticFindObject = function() return obj({}) end
+        util = require("mirror.util")
+        util.cdo = function() return k end
+        ps = require("mirror.personalspace")
+        ps.init({})
+        function step(n) for i = 1, n or 3 do for _, f in ipairs(TICKS) do f(0.1) end end end
+        step()
+    """)
+    check(L.eval('Z1.CapsuleComponent.resp') == 2 and L.eval('Z1.CapsuleComponent.r') == 28,
+          "single player: a zombie next to me blocks pawns, with a fuller capsule")
+    check(L.eval('Z2.CapsuleComponent.resp') == 0, "...one next to nobody keeps the game's collision")
+    L.execute('Z1.x = 400; step()')
+    check(L.eval('Z1.CapsuleComponent.resp') == 2, "between near and far it stays (no flicker)")
+    L.execute('Z1.x = 600; step()')
+    check(L.eval('Z1.CapsuleComponent.resp') == 0 and L.eval('Z1.CapsuleComponent.r') == 15, "far again: back as the game made it")
+    L.execute('ROLE = "host"; Z1.x = 100; step()')
+    check(L.eval('Z2.CapsuleComponent.resp') == 2 and L.eval('Z1.CapsuleComponent.resp') == 2,
+          "host: zombies at the guest's ghost are kept off it too")
+    L.execute('ROLE = "guest"; step()')
+    check(L.eval('Z1.CapsuleComponent.resp') == 0 and L.eval('Z2.CapsuleComponent.resp') == 0,
+          "guest: its zombies are the host's copies - nothing changed here")
+    check("most at once 2" in L.eval('ps.status()'), "counted in the status")
+    L.execute('package.loaded["mirror.zombies"] = { is_split = function() return true end }; step()')
+    check(L.eval('Z1.CapsuleComponent.resp') == 2, "guest running its own AI (load split): its zombies keep their distance")
+    # the player's spot unreadable for a moment: the ghost's zombies still count as near it (a gap ended the list)
+    L.execute('package.loaded["mirror.zombies"] = nil; ROLE = "host"; Z1.x = 100; step(); '
+              'PLAYER.K2_GetActorLocation = function() error("not ready") end; step()')
+    check(L.eval('Z2.CapsuleComponent.resp') == 2, "host: with the player's spot unreadable, the ghost's zombie stays held")
+
+
+def role_switch_reads_nothing_of_its_own_old_role():
+    """Player report 2026-10-29 11:57: a guest took a Realm over as host; for a moment the bridge was still the guest.
+    The new host read its own guest pose file as the guest's, and the bridge's guest roster (the old host in slot 0)
+    as a third player whose copy wrote mirror_link_guest.txt - "SYMPLYSCK connected" with nobody there, then 30 s
+    later "it runs an OLDER SurrounSync"."""
+    print("role_switch_reads_nothing_of_its_own_old_role")
+    d = tempfile.mkdtemp(prefix="mirror_switch_")
+    os.makedirs(os.path.join(d, "SurrounDead"))
+    sd = os.path.join(d, "SurrounDead")
+    try:
+        L = lua()
+        L.execute(PEERS_FAKES, d)
+        L.execute('''
+            link = require("mirror.link")
+            link.configure({ transport = "steam" }); link.start_lobby()
+            link.open("guest", 1002); link.send(5, "pose as guest"); link.put_blob("hello", "SurrounSync protocol 54 role guest")
+            link.open("host")
+        ''')
+        check(not os.path.exists(os.path.join(sd, "mirror_link_guest.txt")), "guest -> host: my own guest pose file is gone")
+        check(not os.path.exists(os.path.join(sd, "mirror_hello_guest.txt")), "...and my own guest blobs")
+        check(L.eval('link.poll()') is None, "the new host reads no pose of its own as the guest's")
+        L.execute('''
+            peers.start({}, "host")
+            roster("me 1 1001 guest\\npeer guest host 0 1002 connected SYMPLYSCK\\n")
+            peers.tick(1.1)
+        ''')
+        check(L.eval('#STARTED') == 0, "a roster the bridge wrote as a guest starts no copy on the new host (%d)" % L.eval('#STARTED'))
+        L.execute('roster("me 0 1001 host\\npeer host guest 1 1002 connected Ann\\npeer to2 from2 2 1003 connected Bob\\n"); peers.tick(1.1)')
+        check(L.eval('#STARTED') == 1 and L.eval('STARTED[1].out') == "to2", "the bridge's host roster is used once it's there")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def peers_give_every_player_their_own_copy():
     print("peers_give_every_player_their_own_copy")
     d = tempfile.mkdtemp(prefix="mirror_peers_")
@@ -4555,7 +5322,7 @@ def chat_and_voice_reach_every_player():
         L = lua()
         L.execute(PEERS_FAKES, d)
         L.execute('''
-            package.loaded["mirror.notify"] = { show = function() end }
+            package.loaded["mirror.notify"] = { show = function() end, clear = function() end }
             package.preload["mirror.events"] = function(name, tag)
                 local e = {}
                 CH = CH or {}
@@ -4597,7 +5364,7 @@ def settings_pages_cycle_save_and_follow_the_host():
         L.execute('''
             local d = ...
             ROLE = "host"; BLOBS = {}; SEEN = {}
-            package.loaded["mirror.notify"] = { show = function() end }
+            package.loaded["mirror.notify"] = { show = function() end, clear = function() end }
             package.loaded["mirror.peers"] = { each = function(_, fn) fn(package.loaded["mirror.link"], nil) end }
             package.loaded["mirror.link"] = { dir = function() return d end,
                 put_blob = function(n, s) BLOBS[n] = s end,
@@ -4717,8 +5484,9 @@ def mods_switch_restart_and_match_the_host():
         L.execute('package.loaded["mirror.link"] = { dir = function() return W64 end, put_blob = function() end }'
                   '; ms = require("mirror.mysettings")')
         first = L.eval('ms.rows()[1]')
-        check(first.key == "syncfx" and first.tag == "(Experimental)" and first.text == "OFF" and "FPS" in first.hint,
-              "MY SETTINGS starts with (Experimental) SYNCFX GRAPHICS, OFF, with its FPS note")
+        check(first.key == "syncfx" and first.tag == "Optimizes Performance" and first.tag_color.G > first.tag_color.R
+              and first.text == "OFF" and "FPS" not in first.hint and "F6" in first.hint,
+              "MY SETTINGS starts with SYNCFX GRAPHICS tagged 'Optimizes Performance' in green, OFF, no FPS warning")
         L.execute('ml.set("SyncFX", true)')
         first = L.eval('ms.rows()[1]')
         check("SyncFX : 1\r\n" in open(os.path.join(mods, "mods.txt"), newline="").read() and first.text == "ON"
@@ -4728,9 +5496,10 @@ def mods_switch_restart_and_match_the_host():
         shutil.rmtree(d, ignore_errors=True)
 
 
-for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, player_rip_in_a_container_is_a_take, ui_no_room_removal_is_not_a_take, lights_come_back_on_a_respawned_ghost, perf_run_puts_the_outer_step_back, fs_write_is_whole_or_old, utf8_cut_never_splits_a_character, crumb_keeps_the_last_64_steps, unanswered_join_keeps_the_friends_list, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, jig_price_follows_the_traders_table, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, military_trader_follows_the_host,posepack_recovers_lost_packets, link_blob_comes_back_after_reset, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
+for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, player_rip_in_a_container_is_a_take, ui_no_room_removal_is_not_a_take, lights_come_back_on_a_respawned_ghost, perf_run_puts_the_outer_step_back, fs_write_is_whole_or_old, utf8_cut_never_splits_a_character, crumb_keeps_the_last_64_steps, unanswered_join_keeps_the_friends_list, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, jig_price_follows_the_traders_table, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, military_trader_follows_the_host, role_switch_reads_nothing_of_its_own_old_role, new_realm_character_gets_the_starting_kit, realm_takes_the_creators_difficulty, zombies_stop_at_arms_length, human_copies_hold_the_hosts_weapon, hounds_bark_when_they_come_for_you, airdrops_follow_the_host, event_sites_follow_the_host, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, link_restart_puts_the_games_blobs_again, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, tactical_reads_only_lights_the_class_has,
-          vehicles_keep_this_worlds_fuel, harvest_uses_up_nodes_once, zombie_copies_take_the_hosts_look,
+          vehicles_keep_this_worlds_fuel, car_horn_reaches_the_other_game, raiders_can_hit_the_guests_ghost, harvest_uses_up_nodes_once, zombie_spawn_pins_hold_or_refuse,
+          zombie_copies_take_the_hosts_look,
           copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_tooltip_reads_the_item_once, foreach_keeps_temporary_arrays_alive, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
           ghost_swims_without_its_own_water_detection, ghost_never_blocks_cars, audio_spatializes_and_shares_without_echo,
           throws_and_mines_reach_the_other_game, map_pings_reach_the_other_game, keycard_doors_open_on_both_games, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, loose_magazine_picked_up_without_hooks_still_gets_its_rounds, ground_weapon_attachments_reach_the_other_game, ghost_gun_in_hand_is_known, missing_zombie_looks_get_loaded,

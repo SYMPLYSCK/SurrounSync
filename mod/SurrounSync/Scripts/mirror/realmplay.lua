@@ -14,6 +14,7 @@ local fs = require("mirror.fs")
 local hostrules = require("mirror.hostrules")
 local members = require("mirror.realmmembers")
 local link = require("mirror.link")
+local difficulty = require("mirror.difficulty")
 
 local realmplay = {}
 
@@ -23,7 +24,8 @@ local SETTLE = 3.0             -- s in the loaded Realm before it counts as arri
 local S = nil                  -- the Realm session: { id, name, step, ... }
 
 local left_by_menu
-local function say(msg, kind) notify.show(msg, kind or "info") end
+-- key "realm": the Realm session's one live card (opening -> hosting -> saving -> home, or what stopped it)
+local function say(msg, kind, key) notify.show(msg, kind or "info", key) end
 local function step(s) S.step, S.t = s, 0.0; log.info("realmplay: " .. s) end
 
 -- bed names, bag owners and host rules belong to the world: while hosting, the mod uses the Realm's copies
@@ -55,10 +57,16 @@ local function abort(msg)
     if S and S.coop and S.built then slotguard.purge(S.coop) end
     if S and S.logged then slotguard.log_clear() end
     S = nil
-    say(msg, "bad")
+    say(msg, "bad", "realm")
 end
 
 function realmplay.active() return S ~= nil end
+-- my stored Realm character arrived without its inventory: keep the stored one (host here, guest in session.lua)
+function realmplay.character_missing(id)
+    realm.hold_character(id, "arrived without its inventory")
+    say("Your Realm character didn't load with its items. They're kept safe: leave the Realm and join again to get "
+        .. "them back. Anything you pick up until then isn't kept.", "bad")
+end
 -- ADD TO REALM: friends in the Realm I host (who = a friend's name, nil = everyone here) become members
 function realmplay.add_members(who)
     if not (S and S.step == "playing") then say("Host a Realm first.", "info"); return end
@@ -70,7 +78,7 @@ function realmplay.state() return S and S.step or "idle", S and S.id end
 
 local STEP_TEXT = {
     creating = "Creating the Realm...",
-    armed = "Taking you to the New Game screen. Pick your character and the settings, then press PLAY.",
+    armed = "Taking you to the New Game screen. Pick your character, press CONTINUE, then START.",
     new_game = "Starting the Realm's first day...", capturing = "Saving the Realm's first day...",
     claim_new = "Sending the new world to the Realm...",
     claim = "Asking the Realm who's playing...", pending_upload = "Sending your last session first...",
@@ -108,9 +116,39 @@ local function people_text(r, in_session)
     return table.concat(first, "     ")
 end
 
+-- the name of the Realm I host right now (nil = not hosting one)
+function realmplay.hosting() return S and S.step == "playing" and S.name or nil end
+function realmplay.hosting_id() return S and S.step == "playing" and S.id or nil end
+
+-- MY DIFFICULTY (the owner, hosting): the Realm plays at the difficulty of the owner's own save from now on - the
+-- save that follows writes it into the Realm's Difficulties.sav; friends get it with their next join
+function realmplay.use_my_difficulty()
+    if not (S and S.step == "playing") then say("Host the Realm first.", "info"); return end
+    local r = realm.find(S.id)
+    if not (r and r.role == "owner") then say("Only the Realm's owner sets its difficulty.", "info"); return end
+    local snap, from = difficulty.mine()
+    if not snap then say("Load one of your own saves once, then open the Realm again - its difficulty is read there.", "info"); return end
+    local n = difficulty.apply(snap)
+    if n == 0 then say("Couldn't set the difficulty.", "bad"); return end
+    log.info("realmplay: " .. S.id .. " takes the owner's difficulty from " .. tostring(from) .. " (" .. n .. " settings)")
+    session.save_now()
+    say(S.name .. " now plays at your own difficulty" .. (from and (" (" .. from .. ")") or "") .. ". Friends here get it the next time they join.", "good")
+end
+-- a member of the Realm I host (by Steam id): let in without asking
+function realmplay.is_member(steam)
+    local r = S and S.id and realm.find(S.id)
+    for _, p in ipairs((r and r.people) or {}) do
+        if p.steam and tostring(p.steam) == tostring(steam) then return true end
+    end
+    return false
+end
+
 function realmplay.model()
     local svc = realm.service()
     local joined = session and session.realm_joined()
+    -- asked a Realm's host to let me in, no answer yet: the card shows it (CANCEL), not just the CO-OP tab
+    local asking = not joined and session and session.realm_armed and session.realm_armed()
+    if asking and not (menu and menu.asking and menu.asking()) then asking = nil end
     local m = { service = svc, rows = {}, hosting = S ~= nil and S.step == "playing", armed = S ~= nil and S.step == "armed",
                 free = S == nil and not in_coop() }
     m.invite = members.last_invite and members.last_invite() or nil
@@ -144,7 +182,21 @@ function realmplay.model()
         if r and r.name and r.name ~= "" and S.name == realm.code(S.id) then S.name = r.name end
         m.current = { id = S.id, name = S.name, code = S.id and realm.code(S.id) or nil,
                       info = r and plural(r.members or 0, "member") or nil,
-                      people = people_text(r, S.step == "playing") }
+                      people = people_text(r, S.step == "playing"), owner = r ~= nil and r.role == "owner" }
+        -- the first player asking to come in (members don't ask: menu lets them in)
+        if m.hosting and menu and menu.requests then
+            local q = menu.requests()[1]
+            if q then
+                m.request = { id = q.id, name = q.name or "Someone" }
+                m.state = m.request.name .. " wants to join " .. (S.name or "your Realm") .. "."
+            end
+        end
+    elseif asking then
+        local r = realm.find(asking)
+        m.joining = true
+        m.state = "Asked " .. ((r and r.host_name) or "the host") .. " to let you in - waiting..."
+        m.current = { id = asking, name = r and r.name or realm.code(asking), code = realm.code(asking),
+                      info = r and plural(r.members or 0, "member") or nil, people = people_text(r, false) }
     elseif joined then
         local r = realm.find(joined)
         m.state = "You're playing in " .. (r and r.name or "a Realm") .. (r and r.host_name and (", hosted by " .. r.host_name) or "") .. "."
@@ -197,8 +249,9 @@ local function realm_sig()
     return table.concat(parts, "|")
 end
 function realmplay.takeover(id, old_host)
-    takeover = { id = id, old = old_host, at = 0.0, tries = 0 }
-    say("You keep playing in the Realm - opening it as its host...", "info")
+    local r = realm.find(id)
+    takeover = { id = id, old = old_host, old_lease = r and r.host, at = 0.0, tries = 0 }
+    say("You keep playing in the Realm - opening it as its host...", "info", "realm")
 end
 
 function realmplay.start(id, retry)
@@ -212,10 +265,11 @@ function realmplay.start(id, retry)
     if slotguard.log_exists() then say("A co-op session isn't finished yet. Restart the game, then try again.", "bad"); return end
     local cur = session.current_name()
     if not cur or not slotguard.is_own(cur) then say("Load one of your own saves first, then open the Realm.", "bad"); return end
+    util.safe(difficulty.remember_mine, "realmplay.my_difficulty", cur)   -- (MY DIFFICULTY in the Realm uses it)
     local r = realm.find(id)
     S = { id = id, name = r and r.name or realm.code(id), t = 0.0 }
     step("claim")
-    say("Opening " .. S.name .. "...")
+    say("Opening " .. S.name .. "...", "info", "realm")
     realm.send("claim", id, function(ok, w, text)
         if not S or S.id ~= id then return end
         if not ok then abort("Couldn't reach the Realm (" .. text .. ")."); return end
@@ -223,7 +277,7 @@ function realmplay.start(id, retry)
             -- somebody already hosts it: join them like any co-op host (R4)
             local steam, who = w[2], table.concat(w, " ", 3)
             S = nil
-            if retry and retry.old and steam == retry.old then
+            if retry and ((retry.old and steam == retry.old) or (retry.old_lease and steam == retry.old_lease)) then
                 -- (taking over: still the host who just left)
                 retry.at = TAKEOVER_EVERY
                 takeover = retry
@@ -231,7 +285,7 @@ function realmplay.start(id, retry)
             end
             local function join_host()
                 log.info("realmplay: " .. id .. " is hosted by " .. steam .. " - joining")
-                menu.realm_join(steam, who ~= "" and who or nil)
+                menu.realm_join(steam, who ~= "" and who or nil, r and r.name or realm.code(id))
                 session.realm_guest(id)
             end
             if steam and steam ~= "0" and (realm.has_character(id) or realm.starter(id)) then
@@ -319,8 +373,12 @@ local function build()
     if not slotguard.log_write(session_log("building")) then abort("Couldn't record the Realm session."); return end
     S.logged = true
     -- (first time here: the Realm's starter character, or a fresh one the game makes)
-    local character = realm.character(S.id) or realm.starter(S.id)
+    realm.hold_character(S.id, nil)   -- (a held character comes back with its items now)
+    local mine = realm.character(S.id)
+    S.had_char = mine ~= nil
+    local character = mine or realm.starter(S.id)
     S.fresh = character == nil
+    S.fresh_inv = not (character and character["PlayerInfo.sav"])   -- (starting kit if it arrives without pockets)
     local ok, err = slotguard.build_realm(S.coop, w.files, character)
     S.built = true
     if not ok then abort("Couldn't prepare the Realm's save (" .. tostring(err) .. ")."); return end
@@ -330,7 +388,123 @@ local function build()
     log.info(string.format("realmplay: %s generation %d in %s, %s character, home is %s", S.id, S.gen, S.coop,
         S.fresh and "a fresh" or "my Realm", own))
     step("loading")
+    -- (EMS cached an empty PlayerInfo for this slot at game start: the load would ignore the Realm character's file)
+    session.forget_cached_player(S.coop)
     session.load_slot(S.coop)
+end
+
+-- ---- taking a Realm over in place: its host left while I was its guest ----
+-- No load. The host's zombies here become mine where they stand (zombies.begin_takeover); then the co-op session
+-- hands its slots over (session.promote_realm) and this is a Realm session as if I had opened it: my world is the
+-- Realm's from now on, also over the old host's last upload (user's choice 2026-10-28). A second later the mod
+-- hosts (the guest-side modules wind down first, as when leaving). Uploads wait for the lease: the old host keeps it
+-- until its final upload, or up to 120 s after a crash; meanwhile I play on and my saves stay in my co-op save.
+local HANDOVER_MAX = 10.0      -- s for the zombies to become mine; whatever is left goes like on a leave
+local SETTLE_GUEST = 1.0       -- s between leaving the session and hosting
+local CLAIM_EVERY = 5.0        -- s between claims while the old host still holds the Realm
+
+function realmplay.promote(id, old_host)
+    if not (realm.enabled() and realm.valid_id(id)) or S then return false end
+    local r = realm.find(id)
+    -- the old host as the server names lease holders (the Realm list's host), and as the link knows it: the two
+    -- needn't match (kit test network: link id 1001, lease id 76561197960266730 - the guest took the old host's
+    -- answer for another member's and left)
+    S = { id = id, name = r and r.name or realm.code(id), t = 0.0, old = old_host, old_lease = r and r.host,
+          promoted = true }
+    step("handover")
+    require("mirror.zombies").begin_takeover()
+    -- (no message of its own: the old host's goodbye or the host-gone countdown has just said what happens)
+    return true
+end
+
+local function promote_failed(why)
+    log.warn("realmplay: can't take the Realm over here (" .. why .. ") - going home, then opening it from there")
+    require("mirror.zombies").end_takeover()
+    S = nil
+    session.promote_failed()
+end
+
+local function promote_tick()
+    local zombies = require("mirror.zombies")
+    if S.step == "handover" then
+        if not (zombies.takeover_ready() or S.t >= HANDOVER_MAX) then return end
+        if S.t >= HANDOVER_MAX then log.warn("realmplay: zombie hand-over not finished after 10 s - switching anyway") end
+        local t = session.promote_realm()
+        if not t then return promote_failed("the co-op session isn't in the Realm any more") end
+        -- (before the guest side winds down and forgets them: the old host's car is part of this world now)
+        util.safe(require("mirror.vehicles").keep_made_cars, "realmplay.keep_cars")
+        local r = realm.find(S.id)
+        S.own, S.own_stamp, S.coop = t.own, t.own_stamp, t.coop
+        -- (the generation my world came from, near enough until the claim says: a crash meanwhile keeps it pending)
+        S.gen = (r and r.gen) or realm.head(S.id) or 0
+        S.built, S.claiming, S.claim_in, S.claims, S.pockets = true, true, 0.0, 0, true
+        S.logged = slotguard.log_write(session_log("joined"))
+        if not S.logged then log.error("realmplay: the Realm session isn't recorded - a crash now keeps only the save") end
+        local w = realm.world(S.id)
+        local live, why = open_live(w and w.side)
+        if not live then log.warn("realmplay: the Realm's side files aren't open yet (" .. tostring(why) .. ")") end
+        step("switching")
+    elseif S.step == "switching" then
+        if S.t < SETTLE_GUEST then return end
+        menu.realm_host()
+        zombies.end_takeover()
+        step("playing")
+        S.last_up = S.clock
+        log.info(string.format("realmplay: took %s over in %s (home is %s, from generation %d)", S.id, S.coop, S.own, S.gen))
+        say("You're hosting " .. S.name .. " now. Members can join you from the REALMS tab.", "good", "realm")
+    end
+end
+
+-- the claim after a takeover in place: the old host holds the Realm until its final upload (or its lease lapses)
+local function claim_tick(dt)
+    S.claim_in = S.claim_in - dt
+    if S.claim_wait or S.claim_in > 0 or not bridge_up() then return end
+    S.claim_wait, S.claims = true, S.claims + 1
+    local id = S.id
+    realm.send("claim", id, function(ok, w, text)
+        if not S or S.id ~= id then return end
+        S.claim_wait = false
+        S.claim_in = CLAIM_EVERY
+        if not ok then
+            if S.claims % 12 == 1 then log.warn("realmplay: claim after the takeover failed (" .. text .. ") - retrying") end
+            return
+        end
+        if w[1] == "hosted" then
+            local steam, who = w[2], table.concat(w, " ", 3)
+            -- (a holder I can't tell apart from the old host - its lease id unknown - is waited for as long as a
+            -- crashed host's lease can last)
+            local old = steam == S.old or steam == S.old_lease or steam == "0"
+            if old or (not S.old_lease and S.claims * CLAIM_EVERY < 150) then
+                if S.claims == 1 or S.claims % 12 == 0 then log.info("realmplay: the old host still holds " .. id .. " - waiting") end
+                return
+            end
+            -- another member took it first (two guests, one Realm): my session can't count - home, then join them
+            log.info("realmplay: " .. id .. " is hosted by " .. tostring(steam) .. " now - leaving to join them")
+            S.claiming, S.lost, S.rejoin = false, true, true
+            say((who ~= "" and who or "Someone else") .. " hosts " .. S.name .. " now. Taking you there...", "info", "realm")
+            realmplay.leave()
+            return
+        end
+        S.claiming, S.leased = false, true
+        S.server_gen = tonumber(w[2]) or 0
+        S.gen = S.server_gen
+        slotguard.log_write(session_log("joined"))
+        -- (nothing kept from an earlier session goes up: this world is newer than all of it)
+        if realm.pending(id) then realm.drop_pending(id) end
+        log.info("realmplay: " .. id .. " is mine now (generation " .. S.gen .. ") - my world goes up with the next save")
+        S.last_up, S.save_in = -math.huge, 2.0
+        -- the side files (bed names, bag owners, host rules) are the old host's newest: they come with its world
+        if S.gen > 0 and realm.head(id) ~= S.gen then
+            realm.send("download", id, function(got, d, why)
+                if not S or S.id ~= id then return end
+                local gen, err = nil, why
+                if got and d[1] ~= "none" then gen, err = realm.accept_download(id, tonumber(d[1]) or 0) end
+                local wd = gen and realm.world(id)
+                if wd then open_live(wd.side)
+                else log.warn("realmplay: the Realm's newest side files didn't arrive (" .. tostring(err) .. ")") end
+            end)
+        end
+    end)
 end
 
 -- ---- in the Realm ----
@@ -368,6 +542,8 @@ local function upload(final, done)
 end
 
 local function playing_tick(dt)
+    -- (taken over in place: no lease yet - saves wait in the co-op save, the claim decides)
+    if S.claiming then claim_tick(dt); return end
     -- after a bridge restart the lease isn't heartbeated until we say so
     local lease = realm.lease(S.id)
     S.resume_in = (S.resume_in or 0) - dt
@@ -406,7 +582,7 @@ local function arrived_tick(dt)
     step("playing")
     S.last_up = S.clock
     menu.realm_host()
-    say("You're hosting " .. S.name .. ". Members can join you from the REALMS tab.", "good")
+    say("You're hosting " .. S.name .. ". Members can join you from the REALMS tab.", "good", "realm")
     if S.fresh then S.save_in = 5.0 end
 end
 
@@ -415,7 +591,7 @@ end
 function realmplay.leave()
     if not S then return end
     if S.step ~= "playing" then say("One moment, please.", "info"); return end
-    say("Saving " .. S.name .. " and taking you home...")
+    say("Saving " .. S.name .. " and taking you home...", "info", "realm")
     step("stopping")
     if menu.role() == "host" then menu.realm_stop("You left " .. S.name .. ". The Realm is saved.") end
 end
@@ -453,8 +629,11 @@ local function ending_tick(dt)
     elseif S.step == "going_home" then
         if session.current_name() == S.own and not session.loading() and util.valid(game.player()) then
             log.info("realmplay: home in " .. S.own)
-            say("Back in your own world.", "good")
+            local again = S.rejoin and S.id
             S = nil
+            -- (taken over in place, but another member won the Realm: join them from home)
+            if again then realmplay.start(again)
+            else say("Back in your own world.", "good", "realm") end
         elseif S.clock - S.home_at > 120 then
             log.warn("realmplay: still not home after 120 s")
             S = nil
@@ -512,10 +691,15 @@ local function hook_play() util.ensure_hook(PLAY, play_fn, nil, true) end
 local function arm(id, name)
     S = { id = id, name = name or realm.code(id), own = S and S.own or session.current_slot(), t = 0.0 }
     if not slotguard.is_own(S.own) then S = nil; say("Load one of your own saves first, then create the Realm.", "bad"); return end
+    -- the Realm plays at the difficulty of the save the creator is in now (not the New Game page's)
+    local ok, snap = util.safe(difficulty.snapshot, "realmplay.difficulty_snapshot")
+    S.diff = ok and snap or nil
+    util.safe(difficulty.remember_mine, "realmplay.my_difficulty", S.own)
     step("armed")
     S.auto = "leave"   -- the mod takes the player to the game's New Game screen itself (CANCEL stops it)
     util.safe(hook_play, "realmplay.hook_play")
-    say("Taking you to the New Game screen for " .. S.name .. ". Pick your character and the world's settings, then press PLAY.", "good")
+    say("Taking you to the New Game screen for " .. S.name .. ". Pick your character, press CONTINUE, then START"
+        .. (S.diff and " - the Realm gets the difficulty of the save you're in now." or "."), "good", "realm")
 end
 
 -- ---- the way to the New Game screen (what the pause screen's MAIN MENU and the main menu's NEW GAME do) ----
@@ -696,7 +880,7 @@ local function capture()
         step("playing")
         S.last_up = S.clock
         menu.realm_host()
-        say(S.name .. " is ready, and you're hosting it. Members can join you from the REALMS tab.", "good")
+        say(S.name .. " is ready, and you're hosting it. Members can join you from the REALMS tab.", "good", "realm")
         upload(false)
     end)
 end
@@ -719,6 +903,10 @@ local function create_tick(dt)
         if session.loading() or not util.valid(game.player()) then S.t = 0.0; return end
         if S.t < NEW_WORLD_SETTLE then return end
         if session.current_name() ~= S.coop then session.point_at(S.coop) end
+        if S.diff then
+            local ok, n = util.safe(difficulty.apply, "realmplay.difficulty", S.diff)
+            log.info("realmplay: the new Realm takes the creator's difficulty (" .. tostring(ok and n or 0) .. " settings)")
+        end
         step("capturing")
         session.save_now()
     elseif S.step == "capturing" then
@@ -763,7 +951,8 @@ local function tick(dt)
     elseif S.step == "playing" then
         if not S.pockets and S.t >= 5.0 and not session.saving() then
             S.pockets = true
-            util.safe(require("mirror.invdiag").ensure_pockets, "realmplay.pockets", "hosting a Realm")
+            local ok, gave = util.safe(require("mirror.invdiag").ensure_pockets, "realmplay.pockets", "hosting a Realm", S.fresh_inv == true)
+            if ok and gave == true and S.had_char and not S.fresh_inv then realmplay.character_missing(S.id) end
         end
         if S.save_in then
             S.save_in = S.save_in - dt
@@ -779,6 +968,8 @@ local function tick(dt)
         playing_tick(dt)
     elseif S.step == "stopping" or S.step == "ending_save" or S.step == "going_home" then
         ending_tick(dt)
+    elseif S.step == "handover" or S.step == "switching" then
+        promote_tick()
     end
 end
 
@@ -827,7 +1018,7 @@ function realmplay.init(c)
     session.set_realm_slot(function()
         if not (S and S.coop and S.built) then return nil, nil end
         local inside = S.step == "playing" or S.step == "stopping" or S.step == "ending_save"
-            or S.step == "new_game" or S.step == "capturing" or S.step == "claim_new"
+            or S.step == "new_game" or S.step == "capturing" or S.step == "claim_new" or S.step == "switching"
         return inside and S.coop or nil, S.coop
     end)
     session.on_main_menu(function()

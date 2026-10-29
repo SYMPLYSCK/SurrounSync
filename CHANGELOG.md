@@ -2,32 +2,69 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 0.14.1 (2026-10-29)
+
+**SyncFX grows up, Realms stop reloading, and a long list of co-op fixes.** Plays with friends on 0.14.0, but get everyone on 0.14.1 to get all of it.
+
+**SyncFX: eight looks that live up to their names**
+- Every preset is now its own look, not just Dread turned up or down: Nightmare's crimson sky and blood moon, Cinematic's teal and orange with god rays, Vibrant's turquoise days and magenta sunsets in clear air, Moody's cold blue-grey overcast, Realistic's true colors, Clean's sharp picture, Subtle's quiet version of Dread.
+- The scary world events (strange events, flickering wrecks and lamps, horns, night screams, burning zombies) belong to Dread and Nightmare. The other presets are calm.
+- Nights are far less dark in Dread and Moody, so you can actually play them.
+- New: now and then a zombie in sight bursts into flames, and screams and howls carry through the night (Dread and Nightmare).
+- SyncFX now comes installed and ready, but switched off: the game looks exactly as it always did until you press F8 (or open its menu with F6). It remembers your choice. Already using it? It stays on.
+- Damage numbers are only hidden while SyncFX is on.
+
+**Realms that never reload**
+- When the Realm host leaves, a player who is still there takes over right where they stand. No loading screen, nobody sent home.
+- Items no longer vanish from Realm characters, and ending a Realm while moving no longer freezes the game.
+- Realms and co-op are kept apart: Realm members get in by themselves, others wait for LET IN or DECLINE on the REALMS card, a JOINING card has a CANCEL button, and new Realm characters start with the starting kit.
+- Creating a Realm uses the difficulty of your own world, and the owner can change it with MY DIFFICULTY.
+
+**The world you share is the host's world**
+- Airdrops: the guest sees the host's crates land in the same spots, and no longer gets planes of its own.
+- Crash sites and event sites, with their map markers and discovery XP, follow the host's world.
+- Raiders carry the same weapon on both screens, and their bullets no longer pass through your friend.
+- Zombies can no longer walk through you or stand inside you.
+- Hounds bark and growl when they come for you.
+- Cars the host makes for a guest's drive are not saved into the host's world any more, and a driver always sees their own car lights.
+
+**Fewer surprises**
+- New notifications in the top right: clear cards that update in place instead of stacking up. Missed one? Ctrl+F9 or /messages shows the history.
+- Message boxes such as the update prompt were blank - they show their text again.
+- A false "your friend has an OLDER SurrounSync" message is gone.
+- A New Game no longer saves into a co-op slot.
+- A guest crash a few seconds after going home is fixed, and so is a host freeze when load splitting hands zombies back.
+- Join requests expire after 2 minutes, and a request for co-op can no longer land you in a Realm (or the other way round).
+- A new SurrounSync intro plays when the game starts (your own intro is kept and comes back if you uninstall).
+
 ## 0.14.0 (2026-10-28)
 
-A big stability update, plus a graphics mod you can switch on. It has everything from 0.13.3 to 0.13.9 (they were never released on their own - their notes are below). Works with friends on 0.13.2 and newer, but update everyone to get the fixes.
+**The biggest SurrounSync update yet.** Seven versions' worth of fixes that never shipped on their own (0.13.3 to 0.13.9), a fresh round of freeze and crash fixes on top, Realms that keep running when the host leaves - and a brand-new graphics mod built right in. Works with friends on 0.13.2 and newer, but get everyone on 0.14.0 to get all of it. The full notes for 0.13.3 - 0.13.9 are in CHANGELOG.md.
 
-**New: SyncFX graphics (experimental)**
-- A darker, foggier, scarier look for SurrounDead, with its own menu in game (F6): presets (Dread, Subtle, Nightmare, Clean, Cinematic, Realistic, Vibrant, Moody), sliders for fog, sky, camera and lights, and a before/after switch.
-- It's off and costs nothing until you switch it on: handbook (J), CO-OP, gear, MY SETTINGS, SYNCFX GRAPHICS. It starts with the game, so switch it, then restart.
-- It can lower your FPS. If the game runs slow, switch it off the same way. It only changes your own screen.
+**NEW: SyncFX - make SurrounDead terrifying (experimental)**
+- One switch turns the world darker, foggier and a lot scarier: wrong-colored skies, living fog and drifting fog banks, dead street lights that sputter back on, wrecked cars whose headlights stutter in the dark, zombie eyes glowing at night, and strange events that roll in a few times a week.
+- Its own in-game menu (F6) with 8 presets - Dread, Subtle, Nightmare, Clean, Cinematic, Realistic, Vibrant and Moody - sliders for fog, sky, camera and lights, and a Before/After switch to see the difference instantly.
+- Zero cost until you want it: it ships switched off. Handbook (J), CO-OP, gear, MY SETTINGS, SYNCFX GRAPHICS - flip it on and restart the game.
+- Experimental: it can lower your FPS on slower PCs (switch it off the same way). It only changes your own screen, so friends can play with or without it.
 
-**Freezes and crashes**
-- Joining a friend or going home could freeze the game for good (the game waited on an animation task that waited on the mod). Loads no longer wait on that.
-- Hearing the other players' one-shot sounds (shots, tools) is off for now: hooking the game's sound functions could freeze a game after a car crash or a death.
-- The host could freeze when load splitting handed zombies back. (Load splitting is still an experimental host rule, off by default.)
-- Freezes and crashes now leave much more evidence in bug reports (see 0.13.9).
+**Way fewer freezes and crashes**
+- The big one is gone: joining a friend or heading home could freeze the game for good. Loads no longer get stuck.
+- A freeze after a car crash or a death is fixed: hearing the other players' one-shot sounds (shots, tools) is switched off for now, because hooking the game's sound functions caused it.
+- The host no longer freezes when load splitting hands zombies back (load splitting is still an experimental host rule, off by default).
+- And if anything does go wrong, bug reports now capture far more evidence, so fixes land faster.
 
-**Realms**
-- A Realm keeps going when the host leaves: a guest takes it over instead of everyone being sent home.
-- Realm characters that arrived with no pockets get them back, so taking and wearing items works again.
-- A Realm host who closes the game frees the Realm at once instead of after 2 minutes.
-- Visitors can leave from the REALMS tab (LEAVE REALM), and the REALMS tab has its own chat. The Realm list updates as soon as someone joins or leaves.
+**Realms that keep going**
+- Host left? The Realm carries on - a guest takes it over instead of everyone being sent home.
+- Realm characters that arrived with empty pockets get them back, so taking and wearing items works again.
+- A host who closes the game frees the Realm instantly instead of after 2 minutes.
+- Leave right from the REALMS tab, chat right from the REALMS tab, and the Realm list updates the moment someone joins or leaves.
 
-**Co-op**
-- Bounties bought before a friend joined now show on their map too, and "X joined your world" shows again.
+**Better co-op all round**
+- Shared map pings and military laptop scans, keycard doors that open for everyone, and no more ghost grenades or duplicated items when ripping clothes in a shared container (from 0.13.5 - 0.13.9).
+- Bounties bought before a friend joined now show on their map too, and "X joined your world" is back.
 - The other player's stomp shows again without hurting you, and a stomp in PvP is one hit, not an instant kill.
-- Chat: typing / shows the commands and the players' names, and Enter sends the message.
-- The updater treats a download that was cut off as a failure instead of running a broken setup.
+- Chat: type / to see every command and the players' names, then press Enter to send.
+- The updater refuses a download that was cut off instead of running a broken setup.
 
 ## 0.13.9 (2026-10-27)
 

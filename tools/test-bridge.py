@@ -323,6 +323,36 @@ def main():
               "the guest shows the host's name, not [unknown] (got %r)" % log_of(B, "mirror_peer_guest.name").strip())
         check(wait_for(lambda: log_of(A, "mirror_peer_host.name").strip() == "Test-guest", 15),
               "the host shows the guest's name (got %r)" % log_of(A, "mirror_peer_host.name").strip())
+
+        # The game writes its hello right after queuing the role command, and only once: a bridge that clears
+        # the files of its new role's suffix loses it, and every guest then says "it runs an OLDER SurrounSync"
+        # (player report 2026-10-28 20:38:32: the host's every blob arrived but hello).
+        print("9. a guest who becomes the host keeps the game's own hello")
+        for p in procs:
+            p.kill(); p.wait()
+        procs.clear()
+        for d in (A, B):
+            for f in os.listdir(d):
+                os.remove(os.path.join(d, f))
+        procs.append(start("auto", B))
+        time.sleep(1.0)
+        procs.append(start("auto", A))
+        check(wait_for(lambda: "role idle" in log_of(A, "mirror_lobby.txt"), 10), "(setup) both bridges idle")
+        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "host")
+        put_blob(B, "look", "host", "old host look")
+        check(wait_for(lambda: "role host" in log_of(B, "mirror_lobby.txt"), 10), "(setup) B hosts")
+        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "join 0")
+        check(wait_for(lambda: "request" in log_of(B, "mirror_lobby.txt"), 15), "(setup) A asks to join")
+        req = [l for l in log_of(B, "mirror_lobby.txt").splitlines() if l.startswith("request ")][0].split()[1]
+        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "accept " + req)
+        check(wait_for(lambda: get_blob(A, "look", "host"), 15) == "old host look", "(setup) the old host's look reached A")
+        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+        put_blob(A, "hello", "host", "A hosts now")
+        check(wait_for(lambda: "role host" in log_of(A, "mirror_lobby.txt"), 10), "(setup) A switched to host")
+        time.sleep(1.0)
+        check(get_blob(A, "hello", "host") == "A hosts now", "guest -> host: the game's new hello is kept")
+        check(get_blob(A, "look", "host") is None, "guest -> host: the old host's look is cleared (not sent on as A's own)")
+        # (a bridge restart while hosting still clears "_host" at start: link.lua puts the game's blobs again)
     finally:
         for p in procs:
             try:

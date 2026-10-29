@@ -69,6 +69,15 @@ end
 function slotguard.is_own(n)
     return slotguard.valid_name(n) and not slotguard.is_coop(n) and savefs.exists(dir(n) .. "\\Player.sav")
 end
+-- A save name with no folder at all, for the game's New Game to save into (nothing there to overwrite).
+function slotguard.free_own_name()
+    if not saves_dir then return nil end
+    for i = 1, 50 do
+        local n = i == 1 and "SaveSlot" or ("SaveSlot" .. i)
+        if not savefs.dir_exists(dir(n)) then return n end
+    end
+    return nil
+end
 
 function slotguard.stamp(slot)
     if not slotguard.valid_name(slot) then return nil end

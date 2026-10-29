@@ -39,7 +39,7 @@ jobs:
         shell: pwsh
         run: |
           $failed = @()
-          foreach ($t in 'test-sync', 'test-saves', 'test-journal-ui', 'test-realm-lua', 'test-setup', 'test-report',
+          foreach ($t in 'test-sync', 'test-saves', 'test-journal-ui', 'test-realm-lua', 'test-takeover', 'test-setup', 'test-report',
                          'test-bridge', 'test-bridge-4p', 'test-link-e2e', 'test-realms') {
             Write-Host "== $t"
             python tools/$t.py

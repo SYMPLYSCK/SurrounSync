@@ -23,6 +23,14 @@ function link.open(my_role, tags)
     return path(me), path(peer)
 end
 
+-- my own pose file and these blobs under my current tag, before switching roles: the new role reads exactly those
+-- names (a guest who becomes host reads "_guest"), and they'd come back as the other player's
+function link.remove_mine(names)
+    if not (dir and me) then return end
+    os.remove(path(me))
+    for name in pairs(names or {}) do os.remove(dir .. "\\mirror_" .. name .. "_" .. me .. ".txt") end
+end
+
 local MAX_AGE = 5
 
 function link.send(seq, line)

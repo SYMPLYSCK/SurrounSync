@@ -102,7 +102,7 @@ local function compare(theirs)
         for i = 1, math.min(3, #warn) do names[#names + 1] = (warn[i].name:gsub("^pak:", "")) end
         notify.show(string.format("Mod check: %s%s differ%s between you and %s - they can change shared play and cause "
             .. "differences. Open J -> MODS to match them.", table.concat(names, ", "), #warn > 3 and (" +" .. (#warn - 3)) or "",
-            #warn == 1 and "s" or "", who), "bad")
+            #warn == 1 and "s" or "", who), "warn", "modcheck")
     end
 end
 

@@ -76,17 +76,18 @@ function mysettings.toggle(key)
 end
 
 -- SyncFX, the graphics mod: on top of MY SETTINGS when it's installed. Its switch is the mod itself (mods.txt,
--- through modlist), so it takes effect when the game starts next.
+-- through modlist), so it takes effect when the game starts next. Loaded, SyncFX itself starts switched off until
+-- the player presses F8 (it remembers that).
 mysettings.SYNCFX = "SyncFX"
-mysettings.SYNCFX_ROW = { key = "syncfx", tag = "(Experimental)", label = "SYNCFX GRAPHICS",
-    hint = "Scarier graphics, own menu (F6). Can lower your FPS." }   -- one line on the page
+mysettings.SYNCFX_ROW = { key = "syncfx", tag = "Optimizes Performance", tag_color = { R = 0.06, G = 0.30, B = 0.08, A = 1.0 },
+    label = "SYNCFX GRAPHICS", hint = "F8 in game turns it on, F6 menu." }   -- one line on the page
 
 local function syncfx_row()
     local ok, installed, on, pending = pcall(function() return require("mirror.modlist").state(mysettings.SYNCFX) end)
     if not ok or not installed then return nil end
     local r = mysettings.SYNCFX_ROW
-    return { key = r.key, tag = r.tag, label = r.label, text = on and "ON" or "OFF",
-             hint = pending and ((on and "On" or "Off") .. " from your next game start. Can lower FPS.") or r.hint }
+    return { key = r.key, tag = r.tag, tag_color = r.tag_color, label = r.label, text = on and "ON" or "OFF",
+             hint = pending and ((on and "On" or "Off") .. " from your next game start.") or r.hint }
 end
 
 function mysettings.rows()

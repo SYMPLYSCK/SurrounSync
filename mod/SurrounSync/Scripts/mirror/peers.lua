@@ -216,6 +216,10 @@ local function read_roster()
     local link = require("mirror.link")
     local s = read_file(link.dir() .. "\\mirror_roster.txt")
     if not s or s == roster_text or not s:find("END\n", 1, true) then return end
+    -- written while the bridge still had my old role (a guest who just became host): its players aren't mine -
+    -- the old host in slot 0 started a copy that wrote the guest's pose file (player report 2026-10-29)
+    local bridge_role = s:match("\nme %d+ %d+ (%a+)")
+    if bridge_role and bridge_role ~= role then return end
     roster_text = s
     local live = {}
     for line in s:gmatch("[^\n]+") do

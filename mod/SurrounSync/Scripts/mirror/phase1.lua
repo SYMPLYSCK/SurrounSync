@@ -215,7 +215,7 @@ local function status()
         role, rx_count / cfg.phase1.status_interval, age,
         ghost.exists() and ghost.kind() or "none",
         ((gl and pl) and string.format(" %.0f m from you", util.dist(gl, pl) / 100) or "")
-        .. " | zombies: " .. zombies.status() .. " | " .. fire.status() .. " | " .. drops.status() .. " | " .. world.status() .. " | " .. require("mirror.camps").status() .. " | " .. doors.status() .. " | " .. infest.status() .. " | " .. horde.status() .. " | " .. split.status() .. " | " .. power.status() .. " | " .. audio.status() .. " | " .. loot.status() .. " | " .. builds.status() .. " | " .. pings.status() .. " | " ..corpses.status() .. " | " .. deathbags.status() .. " | " .. tactical.status() .. " | " .. throwables.status() .. " | " .. vehicles.status() .. " | " .. harvest.status() .. " | " .. pvp.status() .. " | " .. require("mirror.itemclean").status() .. " | find misses " .. util.find_misses))
+        .. " | zombies: " .. zombies.status() .. " | " .. fire.status() .. " | " .. drops.status() .. " | " .. world.status() .. " | " .. require("mirror.camps").status() .. " | " .. require("mirror.airdrops").status() .. " | " .. require("mirror.prefabs").status() .. " | " .. doors.status() .. " | " .. infest.status() .. " | " .. horde.status() .. " | " .. split.status() .. " | " .. power.status() .. " | " .. audio.status() .. " | " .. loot.status() .. " | " .. builds.status() .. " | " .. pings.status() .. " | " ..corpses.status() .. " | " .. deathbags.status() .. " | " .. tactical.status() .. " | " .. throwables.status() .. " | " .. vehicles.status() .. " | " .. harvest.status() .. " | " .. pvp.status() .. " | " .. require("mirror.personalspace").status() .. " | " .. require("mirror.dogs").status() .. " | " .. require("mirror.itemclean").status() .. " | find misses " .. util.find_misses))
     rx_count = 0
 end
 
@@ -292,14 +292,14 @@ local function on_tick(dt)
         if mate then
             log.info("phase1: " .. who .. " (another guest) connected")
         elseif role == "guest" then
-            if session.state() == "joined" then notify.show("Reconnected to " .. who .. ".", "good") end
+            if session.state() == "joined" then notify.show("Reconnected to " .. who .. ".", "good", "link") end
         else
             log.info("phase1: " .. who .. " connected")
         end
     elseif connected and now - last_rx > 30 and not (busy_where(peer_where) or busy_where(session.where())) then
         connected = false
         if mate then log.info("phase1: lost " .. link.peer_name() .. " (another guest)")
-        else notify.show("Lost connection to " .. link.peer_name() .. ".", "bad") end
+        else notify.show("Lost connection to " .. link.peer_name() .. ".", "bad", "link") end
     end
 
     -- (a mate is another guest: only the host's goodbye ends the session)
@@ -309,10 +309,11 @@ local function on_tick(dt)
             bye_seen = bye
             local said = tonumber(bye:match("^stop (%d+)") or "")
             if session.state() == "joined" and session.realm_joined() then
-                notify.show(link.peer_name() .. " left the Realm. You keep playing in it - you'll host it now, one moment...", "info")
+                -- (the Realm session's live card: realmplay says "You're hosting ..." in it once the takeover is done)
+                notify.show(link.peer_name() .. " left the Realm. You stay right here and host it now - one moment...", "info", "realm")
                 session.realm_host_left()
             elseif session.state() == "joined" then
-                notify.show(link.peer_name() .. " ended the session. Taking you home with your character...", "info")
+                notify.show(link.peer_name() .. " ended the session. Taking you home with your character...", "info", "trip")
                 session.go_home_now()
             elseif said and opened_at and said < opened_at then
                 -- the host's goodbye from before this link (it stopped earlier, then hosted again): old news.
@@ -346,11 +347,11 @@ local function on_tick(dt)
             -- (a join goes loading -> arriving -> joined: only "loading" here never announced the guest)
             if w == "joined" and (was == "loading" or was == "arriving") and not guest_announced then
                 guest_announced = true
-                notify.show(who .. " joined your world.", "good")
+                notify.show(who .. " joined " .. (require("mirror.realmplay").hosting() or "your world") .. ".", "good")
                 util.safe(pings.resend_mine, "pings.resend_mine")
             elseif (guest_announced and (w == "leaving" or w == "own")) or (w == "own" and was == "loading") then
                 guest_announced = false
-                notify.show(who .. " left your world.", "info")
+                notify.show(who .. " left " .. (require("mirror.realmplay").hosting() or "your world") .. ".", "info")
                 session.checkpoint("guest left")
             end
         end
@@ -458,7 +459,7 @@ local function on_tick(dt)
                     log.info("phase1: the other game runs the same SurrounSync protocol (" .. PROTOCOL .. ")")
                 else
                     local key = not v and "version_differs" or v < PROTOCOL and "peer_older" or "me_older"
-                    notify.show(require("mirror.i18n").t(key, link.peer_name()), "bad")
+                    notify.show(require("mirror.i18n").t(key, link.peer_name()), "bad", "version")
                     log.error(string.format("phase1: PROTOCOL MISMATCH - this game %d, the other %s. Restart the game that wasn't "
                         .. "restarted after the last update; until then sync is unreliable.", PROTOCOL, tostring(v)))
                 end
@@ -467,8 +468,7 @@ local function on_tick(dt)
             if b ~= peer_build then
                 peer_build = b
                 if b and my_build and b ~= my_build then
-                    notify.show(link.peer_name() .. " has a different version of SurrounDead. Update the game on both PCs in Steam.", "bad")
-                    notify.show(require("mirror.i18n").t("game_build", link.peer_name()), "bad")
+                    notify.show(require("mirror.i18n").t("game_build", link.peer_name()), "bad", "game_build")
                     log.error("phase1: GAME BUILD MISMATCH - this game " .. my_build .. ", the other " .. b
                         .. ". The joined world can break; both players need the same game update.")
                 elseif b and my_build then
@@ -480,7 +480,7 @@ local function on_tick(dt)
         if peer_protocol == nil and not hello_missing_logged and first_rx and now - first_rx > 30 then
             hello_missing_logged = true
             log.error("phase1: the other game sends poses but no protocol announcement - it runs an OLDER SurrounSync; restart it")
-            notify.show(require("mirror.i18n").t("peer_older", link.peer_name()), "bad")
+            notify.show(require("mirror.i18n").t("peer_older", link.peer_name()), "bad", "version")
         end
     end
     local theirs = link.get_blob("look")
@@ -541,6 +541,8 @@ local function on_tick(dt)
     perf.run("drops", util.safe, drops.tick, "drops.tick", dt)
     perf.run("world", util.safe, world.tick, "world.tick", dt)
     perf.run("camps", util.safe, require("mirror.camps").tick, "camps.tick", dt)
+    perf.run("airdrops", util.safe, require("mirror.airdrops").tick, "airdrops.tick", dt)
+    perf.run("prefabs", util.safe, require("mirror.prefabs").tick, "prefabs.tick", dt)
     perf.run("doors", util.safe, doors.tick, "doors.tick", dt)
     perf.run("infest", util.safe, infest.tick, "infest.tick", dt)
     perf.run("horde", util.safe, horde.tick, "horde.tick", dt)
@@ -678,6 +680,8 @@ function phase1.init(c, r, peer_id, t)
     drops.init(cfg, role, session)
     world.init(cfg, role, session, phase1.connected)
     require("mirror.camps").init(cfg, role, session, phase1.connected)
+    require("mirror.airdrops").init(cfg, role, session, phase1.connected)
+    require("mirror.prefabs").init(cfg, role, session, phase1.connected)
     doors.init(cfg, role, session, phase1.connected)
     infest.init(cfg, role, session, same_world)
     horde.init(cfg, role, session, same_world)

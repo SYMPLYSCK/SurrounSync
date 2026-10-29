@@ -256,15 +256,18 @@ local function open_box(o)
     vb:AddChildToVerticalBox(label(tree, o.title, font, 20))
     local box = o.message and label(tree, o.message, font, 16)
         or new(o.multiline and "MultiLineEditableTextBox" or "EditableTextBox", tree)
-    -- black text on the light box, typing or not (the default focused/unfocused colours are a pale grey),
-    -- like the handbook's own input boxes; set before the box is first drawn
-    local ink = { SpecifiedColor = BLACK, ColorUseRule = 0 }
-    pcall(function() box.WidgetStyle.ForegroundColor = ink end)
-    pcall(function() box.WidgetStyle.FocusedForegroundColor = ink end)
-    pcall(function() box.WidgetStyle.TextStyle.ColorAndOpacity = ink end)
-    pcall(function() box:SetForegroundColor(BLACK) end)
-    pcall(function() box:SetText(FText(o.text or "")) end)
-    pcall(function() box:SetHintText(FText(o.hint or "")) end)
+    if not o.message then
+        -- black text on the light box, typing or not (the default focused/unfocused colours are a pale grey),
+        -- like the handbook's own input boxes; set before the box is first drawn. (A message is a white label on
+        -- the dark box: this used to blank it - SetText(o.text) over the message, then black on black.)
+        local ink = { SpecifiedColor = BLACK, ColorUseRule = 0 }
+        pcall(function() box.WidgetStyle.ForegroundColor = ink end)
+        pcall(function() box.WidgetStyle.FocusedForegroundColor = ink end)
+        pcall(function() box.WidgetStyle.TextStyle.ColorAndOpacity = ink end)
+        pcall(function() box:SetForegroundColor(BLACK) end)
+        pcall(function() box:SetText(FText(o.text or "")) end)
+        pcall(function() box:SetHintText(FText(o.hint or "")) end)
+    end
     if o.message then pcall(function() box:SetAutoWrapText(true) end); pcall(function() box.WrapTextAt = 560 end) end
     pcall(function() box.MinimumDesiredWidth = o.multiline and 520 or 320 end)
     local bs

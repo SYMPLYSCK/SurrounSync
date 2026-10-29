@@ -153,7 +153,8 @@ static class SetupTest
             Ok(SurrounSyncShared.Release.Download(Serve(1000, 1000), dl, null, out err) && new FileInfo(dl).Length == 1000,
                "complete download succeeds (" + err + ")");
 
-            // SyncFX in the setup: a new install has it off; an update keeps the player's on/off and settings
+            // SyncFX in the setup: a new install has it loaded (switched off by SyncFX's own default); an update keeps
+            // the player's on/off and settings, and a SyncFX that ran before 0.14.1 (always on when loaded) stays on
             string fxMods = Path.Combine(root, "fxgame", "Mods");
             Directory.CreateDirectory(fxMods);
             var ms = new MemoryStream();
@@ -167,17 +168,82 @@ static class SetupTest
             using (var za = new System.IO.Compression.ZipArchive(ms, System.IO.Compression.ZipArchiveMode.Read, true))
                 inst.InstallSyncFx(za, fxMods, rec);
             string fx = Path.Combine(fxMods, "SyncFX");
-            Ok(File.ReadAllText(Path.Combine(fxMods, "mods.txt")) == "SurrounSync : 1\r\nSyncFX : 0\r\n" && File.Exists(Path.Combine(fx, "Scripts", "main.lua"))
-               && rec["syncfx"] == "ours", "new install: SyncFX unpacked and listed OFF in mods.txt");
-            File.WriteAllText(Path.Combine(fxMods, "mods.txt"), "SurrounSync : 1\r\nSyncFX : 1\r\n");
-            W(Path.Combine(fx, "SyncFX.user.ini"), "grain = 20");
+            string fxUser = Path.Combine(fx, "SyncFX.user.ini");
+            Ok(File.ReadAllText(Path.Combine(fxMods, "mods.txt")) == "SurrounSync : 1\r\nSyncFX : 1\r\n" && File.Exists(Path.Combine(fx, "Scripts", "main.lua"))
+               && rec["syncfx"] == "ours" && !File.Exists(fxUser), "new install: SyncFX unpacked and loaded, no on/off written (starts off)");
+            Action<string, string, string> update = (version, list, user) =>
+            {
+                rec["version"] = version;
+                File.WriteAllText(Path.Combine(fxMods, "mods.txt"), list);
+                if (user == null) { if (File.Exists(fxUser)) File.Delete(fxUser); } else W(fxUser, user);
+                ms.Position = 0;
+                using (var za = new System.IO.Compression.ZipArchive(ms, System.IO.Compression.ZipArchiveMode.Read, true))
+                    inst.InstallSyncFx(za, fxMods, rec);
+            };
             W(Path.Combine(fx, "Scripts", "gone.lua"), "old");
-            ms.Position = 0;
-            using (var za = new System.IO.Compression.ZipArchive(ms, System.IO.Compression.ZipArchiveMode.Read, true))
-                inst.InstallSyncFx(za, fxMods, rec);
-            Ok(File.ReadAllText(Path.Combine(fxMods, "mods.txt")).Contains("SyncFX : 1") && File.ReadAllText(Path.Combine(fx, "SyncFX.user.ini")) == "grain = 20"
+            update("0.14.0", "SurrounSync : 1\r\nSyncFX : 1\r\n", "grain = 20");
+            Ok(File.ReadAllText(Path.Combine(fxMods, "mods.txt")).Contains("SyncFX : 1") && File.ReadAllText(fxUser) == "grain = 20\r\nenabled = on\r\n"
                && !File.Exists(Path.Combine(fx, "Scripts", "gone.lua")) && File.ReadAllText(Path.Combine(fx, "Scripts", "main.lua")) == "new",
-               "update: player's ON and SyncFX.user.ini kept, old scripts replaced");
+               "update from 0.14.0 with SyncFX on: settings kept, it stays on (enabled = on added), old scripts replaced");
+            update("0.14.0", "SurrounSync : 1\r\nSyncFX : 1\r\n", null);
+            Ok(File.ReadAllText(fxUser) == "enabled = on\r\n", "update from 0.14.0, SyncFX on, no settings file yet: it stays on");
+            update("0.14.0", "SurrounSync : 1\r\nSyncFX : 1\r\n", "enabled = off\r\n");
+            Ok(File.ReadAllText(fxUser) == "enabled = off\r\n", "update: a saved on/off is never overwritten");
+            update("0.14.1", "SurrounSync : 1\r\nSyncFX : 1\r\n", "grain = 20");
+            Ok(File.ReadAllText(fxUser) == "grain = 20", "update from 0.14.1+: nothing added (its on/off is SyncFX's own)");
+            update("0.14.0", "SurrounSync : 1\r\nSyncFX : 0\r\n", null);
+            Ok(File.ReadAllText(Path.Combine(fxMods, "mods.txt")).Contains("SyncFX : 0") && !File.Exists(fxUser),
+               "update with SyncFX not loaded: the player's OFF kept, nothing written");
+
+            // SurrounSync's content: the intro (the player's own kept and put back), the sound pak, BPModLoaderMod
+            string cg = Path.Combine(root, "cgame"), cmods = Path.Combine(cg, "Mods");
+            string movies = Path.Combine(cg, "SurrounDead", "Content", "Movies"), intro = Path.Combine(movies, "UE5 Intro.mp4");
+            Directory.CreateDirectory(cmods);
+            W(intro, "theirs");
+            File.WriteAllText(Path.Combine(cmods, "mods.txt"), "SurrounSync : 1\r\n");
+            var cms = new MemoryStream();
+            using (var za = new System.IO.Compression.ZipArchive(cms, System.IO.Compression.ZipArchiveMode.Create, true))
+                foreach (var n in new[] { "content/Movies/UE5 Intro.mp4", "content/Paks/LogicMods/SurrounSyncSounds.pak",
+                                          "game/ue4ss/Mods/BPModLoaderMod/Scripts/main.lua" })
+                    using (var w = new StreamWriter(za.CreateEntry(n).Open())) w.Write("ours");
+            var crec = new Dictionary<string, string>();
+            for (int i = 0; i < 2; i++)
+            {
+                cms.Position = 0;
+                using (var za = new System.IO.Compression.ZipArchive(cms, System.IO.Compression.ZipArchiveMode.Read, true))
+                    inst.InstallContent(za, cg, cmods, crec);
+            }
+            string pak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncSounds.pak");
+            Ok(File.ReadAllText(intro) == "ours" && File.ReadAllText(intro + ".surrounsync-original") == "theirs",
+               "content: our intro in, the player's own kept (also after an update)");
+            Ok(File.Exists(pak) && File.Exists(Path.Combine(cmods, "BPModLoaderMod", "Scripts", "main.lua"))
+               && File.ReadAllText(Path.Combine(cmods, "mods.txt")).Contains("BPModLoaderMod : 1"),
+               "content: the sound pak in LogicMods, BPModLoaderMod added and switched on where it was missing");
+            inst.RemoveContent(cg, cmods, crec);
+            Ok(File.ReadAllText(intro) == "theirs" && !File.Exists(intro + ".surrounsync-original") && !File.Exists(pak)
+               && !Directory.Exists(Path.Combine(cmods, "BPModLoaderMod")) && !File.ReadAllText(Path.Combine(cmods, "mods.txt")).Contains("BPModLoaderMod"),
+               "uninstall: the player's intro back, our pak and BPModLoaderMod gone");
+            W(Path.Combine(cmods, "BPModLoaderMod", "Scripts", "main.lua"), "their loader");
+            File.WriteAllText(Path.Combine(cmods, "mods.txt"), "SurrounSync : 1\r\nBPModLoaderMod : 0\r\n");
+            cms.Position = 0;
+            using (var za = new System.IO.Compression.ZipArchive(cms, System.IO.Compression.ZipArchiveMode.Read, true))
+                inst.InstallContent(za, cg, cmods, crec);
+            inst.RemoveContent(cg, cmods, crec);
+            Ok(File.ReadAllText(Path.Combine(cmods, "BPModLoaderMod", "Scripts", "main.lua")) == "their loader"
+               && File.ReadAllText(Path.Combine(cmods, "mods.txt")).Contains("BPModLoaderMod : 0"),
+               "a player's own BPModLoaderMod and its on/off are never touched");
+            // a game without an intro of its own: ours goes again at uninstall (nothing of the player's to put back)
+            File.Delete(intro);
+            var nrec = new Dictionary<string, string>();
+            for (int i = 0; i < 2; i++)
+            {
+                cms.Position = 0;
+                using (var za = new System.IO.Compression.ZipArchive(cms, System.IO.Compression.ZipArchiveMode.Read, true))
+                    inst.InstallContent(za, cg, cmods, nrec);
+            }
+            bool introIn = File.ReadAllText(intro) == "ours" && !File.Exists(intro + ".surrounsync-original");
+            inst.RemoveContent(cg, cmods, nrec);
+            Ok(introIn && !File.Exists(intro), "no intro of the game's own: ours in, and gone again at uninstall (also after an update)");
         }
         finally
         {

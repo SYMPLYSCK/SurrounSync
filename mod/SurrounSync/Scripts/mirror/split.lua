@@ -300,6 +300,8 @@ local function guest_tick(dt)
         return
     end
     was_in = true
+    -- (a Realm takeover in place runs the hand-over itself: the old host's merge must not call it off)
+    if zombies.taking_over() then return end
     answer_in = answer_in - dt
     if answer_in > 0 then return end
     answer_in = 0.5

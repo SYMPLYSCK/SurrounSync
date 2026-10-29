@@ -809,7 +809,7 @@ package.loaded["mirror.link"] = {
 }
 package.loaded["mirror.ghost"] = { exists = function() return false end, destroy = function() end,
     location = function() return nil end, is = function() return false end, get = function() return nil end }
-package.loaded["mirror.notify"] = { show = function(m) NOTES[#NOTES + 1] = m end }
+package.loaded["mirror.notify"] = { show = function(m) NOTES[#NOTES + 1] = m end, clear = function() end }
 ASKS = {}
 package.loaded["mirror.names"] = { ask = function(o) ASKS[#ASKS + 1] = o; return true end,
     asking = function() return false end }
@@ -823,6 +823,7 @@ CFG = { diagnostics = false,
 session = require("mirror.session")
 function TICK(n, dt)
     for _ = 1, n or 1 do
+        require("mirror.util").new_frame()   -- one game frame each, like game.lua
         session.tick(dt or 0.5)
         if SAVING > 0 then SAVING = SAVING - 1 end
     end
@@ -856,7 +857,7 @@ def joined_session(L, tmp):
     L.execute('TICK(6)')
     before = snapshot(tmp, "S1")
     host_answers(L)
-    L.execute('TICK(2)')
+    L.execute('TICK(4)')
     return before
 
 
@@ -910,7 +911,7 @@ def stray_rt(L, tmp, coop_files=True):
 
 
 def run_ticks(L, n=12):
-    L.execute('for _ = 1, %d do for _, fn in ipairs(TICKS) do fn(0.5) end; session.tick(0.5) end' % n)
+    L.execute('for _ = 1, %d do require("mirror.util").new_frame(); for _, fn in ipairs(TICKS) do fn(0.5) end; session.tick(0.5) end' % n)
 
 
 @test
@@ -920,6 +921,19 @@ def stray_startup_points_continue_at_own_save(L, tmp):
     check(L.eval('CURRENT') == "S1", "startup: Continue no longer loads the co-op slot (%s)" % L.eval('CURRENT'))
     L.execute('CURRENT = "S1"; session.preinit(CFG)')
     check(L.eval('CURRENT') == "S1", "an own save stays the current save")
+
+
+@test
+def stray_startup_without_any_own_save_points_at_a_free_name(L, tmp):
+    """report 2026-10-28: no own save at all (new player / saves deleted) - Continue stayed on the co-op slot, New Game
+    saved into it, and Realms / hosting said 'leftover co-op save' for every new world"""
+    session_rt(L, tmp, own=COOP)
+    L.execute('EMSLIB.GetSortedSaveSlots = function() return { "%s" } end' % COOP)
+    L.execute('local p = PLAYER; PLAYER = nil; session.preinit(CFG); PLAYER = p')
+    check(L.eval('CURRENT') == "SaveSlot", "startup: the current save is a fresh own name (%s)" % L.eval('CURRENT'))
+    os.makedirs(os.path.join(saves(tmp, "Saved"), "SaveSlot"))   # a folder the game left, no Player.sav
+    L.execute('CURRENT = "%s"; local p = PLAYER; PLAYER = nil; session.preinit(CFG); PLAYER = p' % COOP)
+    check(L.eval('CURRENT') == "SaveSlot2", "a name whose folder exists is never used (%s)" % L.eval('CURRENT'))
 
 
 @test
@@ -1126,7 +1140,7 @@ def session_bad_host_world_refused(L, tmp):
     L.execute('TICK(6)')
     bad = world_files(); bad["Level.sav"] = b"GVAS not ours" * 4
     host_answers(L, bad)
-    L.execute('TICK(2)')
+    L.execute('TICK(4)')
     check(L.eval('session.state()') == "idle" and not os.path.exists(os.path.join(saves(tmp), COOP, "Level.sav")),
           "bad host world: not joined, nothing written")
     check(L.eval('note_has(...)', "arrived damaged. Please try again."), "player told")
@@ -1262,6 +1276,7 @@ end
 function LAST(verb) for i = #SENT, 1, -1 do if SENT[i]:match("^realm %d+ (%S+)") == verb then return SENT[i] end end end
 function RTICK(n, dt)
     for _ = 1, n or 1 do
+        require("mirror.util").new_frame()
         for _, fn in ipairs(TICKS) do fn(dt or 0.5) end
         session.tick(dt or 0.5)
         if SAVING > 0 then SAVING = SAVING - 1 end
@@ -1332,7 +1347,7 @@ def realmplay_host_session(L, tmp):
     L.execute('RTICK(6)')
     check(L.eval('LAST("upload")').endswith(" 4"), "final upload at the end")
     L.eval('ANSWER("upload", "ok 4 1234")')
-    L.execute('RTICK(2)')
+    L.execute('RTICK(4)')   # (the home load runs 2 frames after go_home)
     check(L.eval('LAST("release")') is not None, "lease released")
     check(L.eval('LOADS[#LOADS]') == "S1", "back in the own save")
     check(not os.path.exists(os.path.join(saves(tmp), "mirror_coop_session.txt")), "session log gone")
@@ -1653,7 +1668,7 @@ def realm_starter_travels_and_is_used(L, tmp):
     L.execute('session.init(CFG, "guest", function() return true end)')
     L.execute('session.realm_guest(...); session.request_toggle(); TICK(6)', REALM)
     host_answers(L, world_files(b"realmhost"))
-    L.execute('TICK(2)')
+    L.execute('TICK(4)')
     check(snapshot(tmp, COOP).get("Player.sav") == sc["Player.sav"], "first visit: the starter character")
 
 
@@ -1695,8 +1710,36 @@ def realm_guest_session(L, tmp, character=None):
     L.execute('TICK(6)')
     before = snapshot(tmp, "S1")
     host_answers(L, world_files(b"realmhost"))
-    L.execute('TICK(2)')
+    L.execute('TICK(4)')
     return before, rdir
+
+
+@test
+def realm_character_held_after_an_empty_arrival(L, tmp):
+    # K3YBOARD32 2026-10-29: the stored Realm character loaded without its inventory (EMS cache, DBG-20261028-001),
+    # the mod gave it empty pockets, and the next saves wrote the empty character over the good one for good.
+    # Held, the good one stays on disk and the next Realm load brings it back.
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    rdir = os.path.join(link_dir, "Saved", "SurrounSyncRealms", REALM)
+    rc, empty = realm_character(b"member"), realm_character(b"empty")
+    L.execute('rm = require("mirror.realm")')
+    check(first(L.eval('rm.store_character(...)', REALM, lua_files(L, rc))) is True, "(setup) the good character is stored")
+    L.eval('rm.hold_character(..., "arrived without its inventory")', REALM)
+    r = L.eval('(function(...) local a, b = rm.store_character(...); return tostring(a) .. " " .. tostring(b) end)(...)',
+               REALM, lua_files(L, empty))
+    check(r == "true held", "held: storing reports done without writing (%s)" % r)
+    with open(os.path.join(rdir, "character", "Player.sav"), "rb") as f:
+        check(f.read() == rc["Player.sav"], "the good character is still on disk")
+    check(os.path.exists(os.path.join(rdir, "character_hold.txt")), "the hold is a file (a restart keeps it)")
+    L.execute('session.init(CFG, "guest", function() return true end); session.realm_guest(...)', REALM)
+    L.execute('session.request_toggle(); TICK(6)')
+    host_answers(L, world_files(b"realmhost"))
+    L.execute('TICK(4)')
+    check(L.eval('rm.character_held(...)', REALM) is False, "the next Realm join clears the hold")
+    check(snapshot(tmp, COOP).get("Player.sav") == rc["Player.sav"], "...and plays the kept character, items and all")
 
 
 @test
@@ -1724,11 +1767,86 @@ def realm_guest_plays_realm_character(L, tmp):
     L.execute('session.request_toggle()')
     L.execute('TICK(6)')
     host_answers(L)
-    L.execute('TICK(2)')
+    L.execute('TICK(4)')
     t = first(L.eval('require("mirror.slotguard").log_read()'))
     check(t is not None and t["realm"] is None, "normal session log has no Realm")
     check(t is not None and snapshot(tmp, t["coop"]).get("Player.sav") == snapshot(tmp, "S1")["Player.sav"],
           "a later normal join carries the own character")
+
+
+@test
+def realm_guest_load_reads_the_realm_character_not_emss_cache(L, tmp):
+    """Player report 2026-10-28: EMS caches a PlayerInfo for every slot folder at game start (an emptied co-op slot
+    gets an empty one); a Realm join wrote the Realm character's PlayerInfo.sav and loaded the slot, the game took the
+    cached empty one - 0 containers, empty pockets saved, and the empty character stored on leave."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    rc = realm_character(b"member")
+    check(first(L.eval('require("mirror.realm").store_character(...)', REALM, lua_files(L, rc))) is True, "(setup) stored")
+    L.execute('''
+        local function save(name) return { name = name, IsValid = function() return true end } end
+        local entries = { { k = "PlayerInfo@cso@S1", o = save("own") } }
+        for i = 1, 8 do entries[#entries + 1] = { k = "PlayerInfo@cso@SurrounSync_Session_" .. i, o = save("coop" .. i) } end
+        EMSOBJ.CachedCustomSaves = { ForEach = function(_, fn)
+            for _, e in ipairs(entries) do fn(e.k, { get = function() return e.o end }) end
+        end }
+        RESETS = {}
+        EMSLIB.ResetCustomSave = function(_, _, obj, kind) RESETS[#RESETS + 1] = { name = obj.name, kind = kind, loads = #LOADS } end''')
+    L.execute('session.init(CFG, "guest", function() return true end)')
+    L.execute('session.realm_guest(...)', REALM)
+    L.execute('session.request_toggle()')
+    L.execute('TICK(6)')
+    loads0 = L.eval('#LOADS')
+    host_answers(L, world_files(b"realmhost"))
+    L.execute('TICK(4)')
+    t = first(L.eval('require("mirror.slotguard").log_read()'))
+    coop = t and t["coop"]
+    want = "coop" + coop.rsplit("_", 1)[1] if coop else None
+    resets = [(L.eval('RESETS[%d].name' % i), L.eval('RESETS[%d].kind' % i), L.eval('RESETS[%d].loads' % i))
+              for i in range(1, L.eval('#RESETS') + 1)]
+    check(L.eval('#LOADS') > loads0 and L.eval('LOADS[#LOADS]') == coop, "(setup) the Realm's co-op save was loaded (%s)" % coop)
+    check(resets == [(want, 1, loads0)],
+          "only that co-op slot's cached PlayerInfo is dropped (ClearMemory), before its load: %s" % resets)
+
+
+@test
+def load_runs_frames_after_animation_leaves_the_workers(L, tmp):
+    """Report 2026-10-29 12:00:43 (ending a Realm while running): the cvars only stop new parallel animation tasks;
+    destroying + loading in the same call waited for one already running in a hooked function -> deadlock on the Lua
+    lock. The save name is set at once, the destroy + load LOAD_FRAMES frames later."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.init(CFG, "guest", function() return true end)')
+    n0 = L.eval('#LOADS')
+    check(L.eval('session.load_slot("S1")') is True, "load_slot accepts the load")
+    check(L.eval('CURRENT') == "S1", "the save name is set at once")
+    check(L.eval('#LOADS') == n0, "no load in the same call")
+    L.execute('TICK(1)')
+    check(L.eval('#LOADS') == n0, "...nor the next frame")
+    L.execute('TICK(1)')
+    check(L.eval('#LOADS') == n0 + 1 and L.eval('LOADS[#LOADS]') == "S1", "the load runs 2 frames later")
+    L.execute('TICK(3)')
+    check(L.eval('#LOADS') == n0 + 1, "and only once")
+
+
+@test
+def save_before_a_pending_load_never_reaches_the_next_save(L, tmp):
+    """Hardening 2026-10-28: load_slot sets the next save's name at once, the old world runs 2 more frames. A save then
+    holds the OLD world (the co-op world, when leaving) and went into the next save - the own one. It goes to the
+    scratch slot; the load still reads the slot it was asked for."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.init(CFG, "guest", function() return true end)')
+    before = snapshot(tmp, "S1")
+    n0 = L.eval('#LOADS')
+    L.execute('session.load_slot("S1"); require("mirror.save_guard").run_before_save(); PC:SaveGameToSlot()')
+    check(snapshot(tmp, "S1") == before, "the own save is untouched by the old world's save")
+    check(L.eval('CURRENT') == L.eval('CFG.phase2.coop_slot'), "the save went to the scratch slot (%s)" % L.eval('CURRENT'))
+    L.execute('TICK(4)')
+    check(L.eval('#LOADS') == n0 + 1 and L.eval('LOADS[#LOADS]') == "S1", "the load still runs, of S1")
+    check(L.eval('CURRENT') == "S1", "and the game is pointed at S1 again (%s)" % L.eval('CURRENT'))
 
 
 @test
@@ -1921,10 +2039,11 @@ def hostgone_countdown_then_home(L, tmp):
     joined_session(L, tmp)
     host_state(L, "gone")
     L.execute('TICK(1)')
-    check(L.eval('note_has(...)', "Host's game closed. Returning you home in 30 seconds..."), "countdown message")
+    check(L.eval('note_has(...)', "Host's game closed. You go home with your character in 30 seconds."), "countdown message")
     check(L.eval('session.host_gone()') == 30, "host_gone() = seconds left (%s)" % L.eval('session.host_gone()'))
     L.execute('TICK(58)')
     check(L.eval('session.state()') == "joined", "still there at 29 s")
+    check(L.eval('note_has(...)', "in 2 seconds."), "the live card counted down every second")
     L.execute('TICK(10)')
     check(L.eval('session.state()') == "idle" and L.eval('LOADS[#LOADS]') == "S1", "after 30 s the normal leave ran: home")
 
@@ -2133,6 +2252,41 @@ def review_i6_host_checkpoints_only_with_guest(L, tmp):
 
 
 @test
+def join_kind_must_match_the_hosts_world(L, tmp):
+    # 2026-10-28: a co-op request still waiting when the friend opened a Realm was auto-accepted (Realm member)
+    # and the guest walked into the Realm with its own character and gear. The guest says which join it is; the
+    # host refuses the wrong kind before sending any world.
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('package.loaded["mirror.phase1"] = { stop = function() STOPPED = true end }')
+    L.execute('session.init(CFG, "guest", function() return true end); session.request_toggle(); TICK(6)')
+    req = L.eval('BLOBS_OUT["req"]') or ""
+    check(req.startswith("join ") and req.endswith(" coop"), "a co-op join says so (%s)" % req)
+    nonce = req.split(" ")[1]
+    L.eval('(function(n) BLOBS_IN["joinwhy"] = n .. " realm"; BLOBS_IN["world"] = "fail " .. n end)(...)', nonce)
+    L.execute('TICK(2)')
+    check(L.eval('session.state()') == "idle" and L.eval('STOPPED') is True,
+          "refused because the host plays a Realm: stays home and drops the link")
+    check(L.eval('note_has(...)', "is playing a Realm right now"), "and is told to use the REALMS tab")
+
+    L2 = fresh(tmp)
+    session_rt(L2, tmp)
+    L2.execute('HOSTING = 7; package.loaded["mirror.realmplay"] = { hosting_id = function() return HOSTING end, '
+               'hosting = function() return HOSTING and "Camp" end }')
+    L2.execute('session.init(CFG, "host", function() return true end)')
+    L2.execute('BLOBS_IN["req"] = "join 100 coop"; TICK(1)')
+    check(L2.eval('BLOBS_OUT["world"]') == "fail 100" and L2.eval('BLOBS_OUT["joinwhy"]') == "100 realm",
+          "hosting a Realm: a co-op join is refused before any world is sent")
+    L2.execute('BLOBS_OUT = {}; BLOBS_IN["req"] = "join 101 realm 7"; TICK(1)')
+    check(L2.eval('BLOBS_OUT["world"]') is None and L2.eval('note_has(...)', "is joining Camp"),
+          "a join to this Realm goes ahead")
+    L2.execute('BLOBS_OUT = {}; HOSTING = nil; BLOBS_IN["req"] = "join 102 realm 7"; TICK(1)')
+    check(L2.eval('BLOBS_OUT["joinwhy"]') == "102 notrealm", "a Realm join to a host not running that Realm is refused")
+    L2.execute('BLOBS_OUT = {}; BLOBS_IN["req"] = "join 103"; TICK(1)')
+    check(L2.eval('BLOBS_OUT["world"]') is None, "an older guest's plain co-op request still joins a co-op host")
+
+
+@test
 def review_i7_leave_waits_for_respawn(L, tmp):
     joined_session(L, tmp)
     L.execute('PLAYER["PlayerDead?"] = true; session.request_toggle(); TICK(20)')
@@ -2154,18 +2308,43 @@ def notify_paced_deduped_keyed(L, tmp):
         notify.configure({})
         function RUN(s) for _ = 1, math.floor(s / 0.1 + 0.5) do notify.tick(0.1) end end
     ''')
-    L.execute('notify.show("joined the host", "good"); notify.show("joined the host", "good"); RUN(30)')
-    check(L.eval('#SHOWN') == 1, "the same message twice in a row is shown once (%d)" % L.eval('#SHOWN'))
-    check(L.eval('SHOWN[1].text') == "Co-op: Joined the host", "prefixed, first letter capitalized (%s)" % L.eval('SHOWN[1].text'))
-    L.execute('SHOWN = {}; notify.show("a"); notify.show("b"); notify.show("c"); RUN(1)')
-    check(L.eval('#SHOWN') == 1, "pop-ups are paced, not all at once")
-    L.execute('RUN(5)')
-    check(L.eval('#SHOWN') == 3, "...and all arrive")
-    L.execute('SHOWN = {}; notify.show("x"); notify.show("home in 30 s", "bad", "cd"); notify.show("home in 25 s", "bad", "cd"); RUN(6)')
-    texts = [L.eval('SHOWN[%d].text' % i) for i in range(1, L.eval('#SHOWN') + 1)]
-    check(texts == ["Co-op: X", "Co-op: Home in 25 s"], "a keyed message replaces the queued one with the same key (%s)" % texts)
-    L.execute('SHOWN = {}; notify.show("bad thing", "bad"); notify.show("fine thing", "good"); RUN(6)')
-    check(L.eval('SHOWN[1].delay') > L.eval('SHOWN[2].delay'), "errors stay on screen longer")
+    L.execute('T = notify._test; function N() return #T.cards() end; function C(i) return T.cards()[i] end')
+    L.execute('notify.show("joined the host", "good"); notify.show("joined the host", "good"); RUN(0.1)')
+    check(L.eval('N()') == 1 and L.eval('C(1).count') == 2, "the same message twice: one card, counted x2")
+    check(L.eval('C(1).text') == "Joined the host", "first letter capitalized (%s)" % L.eval('C(1).text'))
+    L.execute('RUN(30); T.reset(); for _, s in ipairs({ "a", "b", "c", "d", "e" }) do notify.show(s) end; RUN(0.1)')
+    check(L.eval('N()') == 4 and L.eval('#T.waiting()') == 1, "four cards at once, the moment they happen; the fifth waits")
+    L.execute('notify.show("e"); RUN(5.2)')
+    check(L.eval('N()') == 1 and L.eval('C(1).text') == "E", "the fifth shows as soon as a card is free")
+    check(L.eval('C(1).count') == 2, "...counted x2: it came again while it waited (kit: the repeat was lost)")
+    L.execute('T.reset(); notify.show("x"); notify.show("home in 30 s", "bad", "cd", nil, { progress = 1, sticky = true }); '
+              'notify.show("y"); notify.show("home in 25 s", "bad", "cd", nil, { progress = 0.8, sticky = true }); RUN(0.1)')
+    check(L.eval('N()') == 3 and L.eval('C(2).text') == "Home in 25 s" and L.eval('C(2).progress') == 0.8,
+          "a keyed message changes its card in place (same spot, new text and bar)")
+    L.execute('RUN(20)')
+    check(L.eval('N()') == 1 and L.eval('C(1).key') == "cd", "a sticky card stays while the others time out")
+    L.execute('notify.show("they let you in", "good", "cd")')
+    L.execute('notify.clear("cd", true)')
+    check(L.eval('N()') == 1, "clear(key, only_sticky) leaves a card that shows how it ended")
+    L.execute('notify.clear("cd")')
+    check(L.eval('N()') == 0, "clear(key) takes it away")
+    L.execute('T.reset(); for _, s in ipairs({ "a", "b", "c", "d" }) do notify.show(s) end; notify.show("disk full", "bad"); RUN(0.1)')
+    check(L.eval('N()') == 4 and L.eval('C(4).text') == "Disk full" and L.eval('C(1).text') == "B",
+          "a problem never waits behind info: the oldest info card makes room")
+    L.execute('T.reset(); notify.show("bad thing", "bad"); notify.show("fine thing", "good"); RUN(0.1)')
+    check(L.eval('C(1).till') > L.eval('C(2).till'), "problems stay on screen longer")
+    check(L.eval('#notify.history()') >= 2 and L.eval('notify.history()[#notify.history()].text') == "Fine thing",
+          "every message goes into the history")
+    L.execute('T.reset(); for s = 30, 1, -1 do notify.show("home in " .. s, "bad", "cd") end; notify.show("other"); '
+              'notify.show("home in 0", "bad", "cd")')
+    check(L.eval('#notify.history()') == 2 and L.eval('notify.history()[2].text') == "Home in 0",
+          "a live card's updates are one history entry, its newest state (a countdown isn't 30 lines)")
+    # no cards here (the widget can't be built): the game's pop-up, one at a time, with the heading
+    L.execute('T.reset(); SHOWN = {}; T.view.broken = true; notify.show("a"); notify.show("b"); RUN(0.1)')
+    check(L.eval('#SHOWN') == 1 and L.eval('SHOWN[1].text') == "SURROUNSYNC: A", "fallback: the game's pop-up (%s)"
+          % (L.eval('SHOWN[1] and SHOWN[1].text')))
+    L.execute('RUN(2)')
+    check(L.eval('#SHOWN') == 2, "...one after the other")
 
 
 @test

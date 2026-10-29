@@ -240,6 +240,7 @@ local class_miss, class_hit = {}, {}
 local starved_q, starved_in, starved_n = {}, {}, 0
 function util.starved_lookups() return starved_n, #starved_q end
 function util.recheck_hooks() next_check, backoff, class_miss, class_hit = {}, {}, {}, {}; starved_q, starved_in = {}, {} end
+function util.frame() return frame_no end
 function util.new_frame()
     frame_no = frame_no + 1
     local e = table.remove(starved_q, 1)

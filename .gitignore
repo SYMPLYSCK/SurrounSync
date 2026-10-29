@@ -13,6 +13,9 @@ tools/lint/luapkg/
 # game dumps and decompiled Blueprints
 research/
 
+# source sounds for SurrounSyncSounds.pak (Pixabay downloads: not passed on as files of their own)
+tools/sounds/wav/
+
 # bug report webhook (secret)
 tools/report-webhook.txt
 tools/testpkg/

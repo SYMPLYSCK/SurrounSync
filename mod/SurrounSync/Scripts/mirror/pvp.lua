@@ -34,9 +34,9 @@ local FLESH = "/Game/Blueprints/Materials/PlayerImpact.PlayerImpact"
 local ECR_BLOCK, QUERY_ONLY = 2, 1
 local TRACE_CHANNELS = { 3 }
 for ch = 8, 25 do TRACE_CHANNELS[#TRACE_CHANNELS + 1] = ch end
-local function make_hittable(g)
+local function block_like_player(g)
     local p = game.player()
-    if not util.valid(p) then return false end
+    if not util.valid(p) then return nil end
     local copied = {}
     util.safe(function()
         g.Mesh:SetCollisionEnabled(QUERY_ONLY)
@@ -49,6 +49,11 @@ local function make_hittable(g)
             end
         end
     end, "pvp.hittable")
+    return copied
+end
+local function make_hittable(g)
+    local copied = block_like_player(g)
+    if not copied then return false end
     local flesh = StaticFindObject(FLESH)
     local fok = util.valid(flesh) and pcall(function() g.Mesh:SetPhysMaterialOverride(flesh) end)
     log.info("pvp: ghost mesh now blocks trace channels " .. (#copied > 0 and table.concat(copied, ",") or "(none!)")
@@ -150,8 +155,73 @@ local function apply_hit(payload)
     else log.warn("pvp: ApplyDamage failed: " .. tostring(err)) end
 end
 
+-- Raiders (BP_SmartAIComponent Range Attack / Basic Melee Attack Collision / Active Melee Detect, decompiled) trace
+-- their attacks on the "Weapons" channel (DefaultEngine.ini: ECC_GameTraceChannel10 = 23) and take the damage from
+-- the bone they hit. Without PvP the guest's ghost answers Visibility only, so their shots went through it and never
+-- hurt the guest (DBG-20261028-003). While a raider has the ghost as its attack target, the mesh blocks what the
+-- real player's mesh blocks - without the flesh surface, so a bullet of ours stops there like on a wall, no damage.
+-- (UE4SS runs a BP function's hook after the function: Set BB Attack Target's hook reads the target it just set,
+-- the poll below sees when it changes away)
+local SAI = "/Game/SmartAI/Blueprints/AI/Components/BP_SmartAIComponent.BP_SmartAIComponent_C"
+local COVER_POLL, MAX_HUNTERS = 0.25, 32
+local hunters = {}   -- address -> SmartAI component that set the ghost as its attack target
+local cover = { on = false, gen = nil, poll = 0.0, hook_in = 0.0, targeted = 0, times = 0 }
+
+local function targets_ghost(comp, g)
+    local t, dead = nil, false
+    pcall(function() t = comp["Attack Target"] end)
+    pcall(function() dead = comp.Dead == true end)
+    return not dead and util.same(t, g)
+end
+
+local function on_set_target(self)
+    local g, comp = ghost.get(), util.obj(self)
+    if not (g and comp and targets_ghost(comp, g)) then return end
+    local a = util.addr(comp)
+    if not a or hunters[a] then return end
+    local n = 0
+    for _ in pairs(hunters) do n = n + 1 end
+    if n >= MAX_HUNTERS then return end
+    hunters[a] = comp
+    cover.targeted = cover.targeted + 1
+end
+local set_target_fn = function(self) util.safe(on_set_target, "pvp.raider_target", self) end
+
+local function cover_poll()
+    local g = ghost.get()
+    if cover.on and (not g or ghost.generation() ~= cover.gen or pvp.on()) then cover.on = false end   -- (new mesh / PvP's own)
+    if not g then hunters = {}; return end
+    local engaged = false
+    for a, comp in pairs(hunters) do
+        if not (util.valid(comp) and util.addr(comp) == a) then hunters[a] = nil
+        elseif targets_ghost(comp, g) then engaged = true
+        else hunters[a] = nil end
+    end
+    if pvp.on() then return end
+    if engaged and not cover.on then
+        local copied = block_like_player(g)
+        if copied then
+            cover.on, cover.gen, cover.times = true, ghost.generation(), cover.times + 1
+            log.info("pvp: a raider is after the other player - their ghost blocks weapon traces " .. table.concat(copied, ",") .. " (no PvP damage)")
+        end
+    elseif not engaged and cover.on then
+        cover.on = false
+        ghost.restore_mesh()
+        log.info("pvp: no raider after the other player any more - ghost back to no-PvP collision")
+    end
+end
+
+local function cover_tick(dt)
+    if role ~= "host" then return end
+    cover.hook_in = cover.hook_in - dt
+    if cover.hook_in <= 0 then cover.hook_in = 2.0; util.ensure_hook(SAI .. ":Set BB Attack Target", set_target_fn) end
+    cover.poll = cover.poll - dt
+    if cover.poll <= 0 then cover.poll = COVER_POLL; cover_poll() end
+end
+
 function pvp.tick(dt)
     util.safe(sync_ghost, "pvp.sync")
+    util.safe(cover_tick, "pvp.cover", dt)
     check_in = check_in - dt
     if check_in <= 0 then
         check_in = 2.0
@@ -168,12 +238,14 @@ function pvp.tick(dt)
 end
 
 function pvp.status()
-    return string.format("pvp %s | hits sent %d, taken %d, blocked %d", pvp.on() and "on" or "off", stats.sent, stats.taken, stats.blocked)
+    return string.format("pvp %s | hits sent %d, taken %d, blocked %d | raiders after the other player %d, cover %s (%d times)",
+        pvp.on() and "on" or "off", stats.sent, stats.taken, stats.blocked, cover.targeted, cover.on and "on" or "off", cover.times)
 end
 
 function pvp.init(r, same_world_fn)
     role = r
     same_world = same_world_fn or same_world
+    game.on_world_reset(function() hunters, cover.on = {}, false end)
     game.player_hook("ReceiveAnyDamage", function(self, Damage, DamageType, InstigatedBy, DamageCauser)
         util.safe(on_ghost_damage, "pvp.capture", self, Damage, DamageType, InstigatedBy, DamageCauser)
     end)

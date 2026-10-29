@@ -321,8 +321,23 @@ function realm.character(id)
 end
 
 -- all files or none; a file the new character doesn't have is removed afterwards
+-- A stored character that arrived without its inventory (a bad load: EMS's cached PlayerInfo, DBG-20261028-001)
+-- is held: the empty one never replaces it, so the next good load has the items again. A file, so a crash or a
+-- restart keeps the hold; the next Realm load clears it (realmplay build, session's Realm join).
+local HOLD = "character_hold.txt"
+function realm.hold_character(id, why)
+    local f = realm.dir(id) .. "\\" .. HOLD
+    if not why then os.remove(f); return true end
+    if not ensure(realm.dir(id)) then return nil end
+    log.warn("realm: " .. id .. " character held (" .. why .. ") - the stored one is kept")
+    return fs.write(f, why .. "\n")
+end
+function realm.character_held(id) return savefs.exists(realm.dir(id) .. "\\" .. HOLD) end
+
 function realm.store_character(id, files)
     if not (files and files["Player.sav"]) then return nil, "no character to store" end
+    -- (held: done as far as every caller is concerned - a leave or a crash recovery must not retry forever)
+    if realm.character_held(id) then log.info("realm: " .. id .. " character is held - not stored"); return true, "held" end
     local dir = sub(id, "character")
     if not (ensure(realm.dir(id)) and ensure(dir)) then return nil, "can't make " .. dir end
     local set = {}

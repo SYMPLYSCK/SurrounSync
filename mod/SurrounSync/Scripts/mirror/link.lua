@@ -70,8 +70,13 @@ function link.restart_bridge(extra)
     for _, c in ipairs(extra or {}) do after_restart[#after_restart + 1] = c end
     return true
 end
+-- this game's blobs as last put: a bridge starting idle clears the "_host" files (another session's leftovers),
+-- the hosting game's own among them, and one-shot blobs (hello) never came again - every guest then read
+-- "it runs an OLDER SurrounSync" (player report 2026-10-28)
+local own_blobs = {}
 local function resend_after_restart()
     if not after_restart or not link.bridge_alive() then return end
+    for name, text in pairs(own_blobs) do backend.put_blob(name, text) end
     for _, c in ipairs(after_restart) do cmd_queue[#cmd_queue + 1] = c end
     after_restart = nil
 end
@@ -81,7 +86,13 @@ function link.set_join_password(pw) join_password = tostring(pw or ""):gsub("[\r
 
 function link.open(role, peer_id, t)
     if not backend then link.configure({ transport = "file" }) end
+    -- the other role reads my old role's file names; the bridge clears them only once it has switched too
+    -- (player report 2026-10-29: the new host read its own guest pose -> "connected", then "OLDER SurrounSync")
+    if kind == "steam" and auto and not t and bridge_role and bridge_role ~= role and backend.remove_mine then
+        backend.remove_mine(own_blobs)
+    end
     tags = t
+    own_blobs = {}
     local a, b = backend.open(role, t)
     bridge_role = role
     if kind == "steam" and not t then
@@ -134,7 +145,10 @@ function link.poll()
     return nil
 end
 
-function link.put_blob(name, text) return backend.put_blob(name, text) end
+function link.put_blob(name, text)
+    if kind == "steam" and auto and not tags then own_blobs[name] = text end
+    return backend.put_blob(name, text)
+end
 
 function link.get_blob(name)
     if not sim() then return backend.get_blob(name) end

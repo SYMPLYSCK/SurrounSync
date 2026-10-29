@@ -26,8 +26,11 @@ namespace SurrounSyncSetup
 
         const string ModPath = "game/ue4ss/Mods/SurrounSync/";
         const string FxPath = "game/ue4ss/Mods/SyncFX/";   // the graphics mod: installed off, switched in MY SETTINGS
+        const string BpPath = "game/ue4ss/Mods/BPModLoaderMod/";   // UE4SS's loader of Paks\LogicMods (the dog sounds)
+        const string ContentPath = "content/";             // into SurrounDead\Content: the intro movie, the sound pak
+        const string Intro = "Movies/UE5 Intro.mp4";
         // UE4SS's own files (the mods are installed on their own)
-        static bool NotAMod(ZipArchiveEntry e) { string n = N(e); return !n.StartsWith(ModPath) && !n.StartsWith(FxPath); }
+        static bool NotAMod(ZipArchiveEntry e) { string n = N(e); return !n.StartsWith(ModPath) && !n.StartsWith(FxPath) && !n.StartsWith(BpPath); }
         public static string RecordFile { get { return Path.Combine(Release.AppDir, "install.txt"); } }
 
         static byte[] payloadBytes;
@@ -151,10 +154,14 @@ namespace SurrounSyncSetup
             catch { return false; }
         }
 
-        // SyncFX, the graphics mod. A new install has it off (no cost until the player switches it on in MY SETTINGS);
-        // an update keeps their on/off and their SyncFX.user.ini / .calib.ini (only Scripts is replaced).
+        // SyncFX, the graphics mod. A new install has it loaded but switched off (its own default): the game looks as it
+        // does, at no cost, until the player presses F8 or switches it on in its F6 menu. An update keeps their mods.txt
+        // on/off and their SyncFX.user.ini / .calib.ini (only Scripts is replaced). Before 0.14.1 a loaded SyncFX was
+        // always on (its on/off wasn't saved), so those players get "enabled = on" written for them.
         internal void InstallSyncFx(ZipArchive z, string mods, Dictionary<string, string> rec)
         {
+            string prev;
+            rec.TryGetValue("version", out prev);   // the version installed before this one (rewritten at the end)
             bool inside = false;
             foreach (var e in z.Entries) if (N(e).StartsWith(FxPath)) { inside = true; break; }
             if (!inside) return;
@@ -166,9 +173,88 @@ namespace SurrounSyncSetup
             rec["syncfx"] = "ours";
             string txt = Path.Combine(mods, "mods.txt");
             string list = File.Exists(txt) ? File.ReadAllText(txt) : "";
-            if (Regex.IsMatch(list, "^\\s*SyncFX\\s*:", RegexOptions.Multiline)) { Log("Updated SyncFX (your on/off choice is kept)."); return; }
-            File.AppendAllText(txt, (list.Length > 0 && !list.EndsWith("\n") ? "\r\n" : "") + "SyncFX : 0\r\n");
-            Log("Installed SyncFX (experimental graphics) - off. Switch it on in the handbook: CO-OP, gear, MY SETTINGS.");
+            if (Regex.IsMatch(list, "^\\s*SyncFX\\s*:", RegexOptions.Multiline))
+            {
+                if (Regex.IsMatch(list, "^\\s*SyncFX\\s*:\\s*1\\s*$", RegexOptions.Multiline) && OlderThan(prev, "0.14.1")) KeepSyncFxOn(fx);
+                Log("Updated SyncFX (your on/off choice is kept).");
+                return;
+            }
+            File.AppendAllText(txt, (list.Length > 0 && !list.EndsWith("\n") ? "\r\n" : "") + "SyncFX : 1\r\n");
+            Log("Installed SyncFX (experimental graphics) - switched off. Press F8 in the game to switch it on (F6 opens its menu).");
+        }
+
+        static bool OlderThan(string v, string than)
+        {
+            Version a, b;
+            if (v == null || !Version.TryParse(v, out a)) return true;
+            return Version.TryParse(than, out b) && a < b;
+        }
+
+        // A SyncFX that ran before 0.14.1 was on whenever it was loaded: keep it that way unless the file already says.
+        static void KeepSyncFxOn(string fx)
+        {
+            string user = Path.Combine(fx, "SyncFX.user.ini");
+            string text = File.Exists(user) ? File.ReadAllText(user) : "";
+            if (Regex.IsMatch(text, "^\\s*enabled\\s*=", RegexOptions.Multiline | RegexOptions.IgnoreCase)) return;
+            File.AppendAllText(user, (text.Length > 0 && !text.EndsWith("\n") ? "\r\n" : "") + "enabled = on\r\n");
+        }
+
+        // SurrounSync's own game content: the startup intro (the player's own is kept once as .surrounsync-original and
+        // put back by uninstall) and SurrounSyncSounds.pak in Paks\LogicMods, loaded by UE4SS's BPModLoaderMod (added
+        // when this UE4SS lacks it; a player's own BPModLoaderMod and its on/off are left alone).
+        internal void InstallContent(ZipArchive z, string game, string mods, Dictionary<string, string> rec)
+        {
+            string content = Path.Combine(game, "SurrounDead", "Content");
+            if (!Directory.Exists(content)) return;
+            bool hasIntro = false;
+            foreach (var e in z.Entries) if (N(e) == ContentPath + Intro) { hasIntro = true; break; }
+            if (hasIntro)
+            {
+                string intro = Path.Combine(content, Intro.Replace('/', '\\')), orig = intro + ".surrounsync-original";
+                string v;
+                bool ours = rec.TryGetValue("intro", out v) && v == "ours";
+                if (File.Exists(intro) && !ours && !File.Exists(orig)) File.Copy(intro, orig);
+                // (no intro of the game's own to keep: uninstall then removes ours instead of leaving it behind)
+                if (!File.Exists(intro) && !ours) rec["intro_none"] = "1";
+                rec["intro"] = "ours";
+            }
+            Extract(z, ContentPath, content, null);
+            rec["sounds"] = "ours";
+            if (!PayloadHasIn(z, BpPath)) return;
+            string bp = Path.Combine(mods, "BPModLoaderMod");
+            if (Directory.Exists(bp)) return;
+            Extract(z, BpPath, bp, null);
+            EnableMod(mods, "BPModLoaderMod");
+            rec["bploader"] = "ours";
+            Log("Installed UE4SS's BPModLoaderMod (loads SurrounSync's sounds).");
+        }
+        static bool PayloadHasIn(ZipArchive z, string prefix)
+        {
+            foreach (var e in z.Entries) if (N(e).StartsWith(prefix)) return true;
+            return false;
+        }
+
+        internal void RemoveContent(string game, string mods, Dictionary<string, string> rec)
+        {
+            string content = Path.Combine(game, "SurrounDead", "Content"), v;
+            if (rec.TryGetValue("sounds", out v) && v == "ours")
+            {
+                TryDelete(Path.Combine(content, "Paks", "LogicMods", "SurrounSyncSounds.pak"));
+                Log("Removed SurrounSync's sounds.");
+            }
+            if (rec.TryGetValue("intro", out v) && v == "ours")
+            {
+                string intro = Path.Combine(content, Intro.Replace('/', '\\')), orig = intro + ".surrounsync-original";
+                if (File.Exists(orig)) { TryDelete(intro); File.Move(orig, intro); Log("Put the game's own intro back."); }
+                else if (rec.TryGetValue("intro_none", out v) && v == "1") { TryDelete(intro); Log("Removed SurrounSync's intro."); }
+            }
+            if (mods != null && rec.TryGetValue("bploader", out v) && v == "ours")
+            {
+                string bp = Path.Combine(mods, "BPModLoaderMod");
+                if (!IsLink(bp) && Directory.Exists(bp)) DeleteDir(bp);
+                DisableMod(mods, "BPModLoaderMod");
+            }
+            rec.Remove("sounds"); rec.Remove("intro"); rec.Remove("intro_none"); rec.Remove("bploader");
         }
 
         // PDS and its pak, only when an older setup installed them ("ours" in the record); a PDS the player
@@ -271,6 +357,7 @@ namespace SurrounSyncSetup
                     if (on) { DisableMod(mods, c); Log("Switched off " + c + " (an older multiplayer mod - it fights with SurrounSync)."); }
                 }
                 InstallSyncFx(z, mods, rec);
+                InstallContent(z, game, mods, rec);
                 Progress(55);
 
                 // Older setups could install PDS (blood and gore) and its pak; this setup no longer ships them.
@@ -385,6 +472,7 @@ namespace SurrounSyncSetup
                         if (!IsLink(fx)) DisableMod(mods, "SyncFX");
                     }
                     RemoveOldPds(game, mods, rec);
+                    RemoveContent(game, mods, rec);
                     if (rec.TryGetValue("ue4ss", out v) && v == "ours")
                     {
                         var others = OtherMods(mods);

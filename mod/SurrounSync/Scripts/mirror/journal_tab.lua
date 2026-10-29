@@ -28,7 +28,7 @@ local GEAR_TEX = "/Game/UI/Textures/over_250_survival_flat_icons/gear.gear"
 local CLOSE_TEX = "/Game/UI/Textures/CrossX.CrossX"
 local INK = { R = 0.12, G = 0.08, B = 0.06, A = 1.0 }
 local SETTING_ROWS = 10   -- MY SETTINGS: SyncFX on top of the 9 others
-local TAG_COLOR = { R = 0.6, G = 0.13, B = 0.0, A = 1.0 }   -- burnt orange "(Experimental)" in front of a label
+local TAG_COLOR = { R = 0.6, G = 0.13, B = 0.0, A = 1.0 }   -- burnt orange tag in front of a label (a row's tag_color wins)
 local MOD_ROWS = 9
 local REALM_ROWS = 3   -- per page on the lined note (more Realms: < PREV / NEXT >)
 -- the MODS tab: one ribbon below CO-OP (label spot found in-game; the ribbon art is yellow, so a tint can only
@@ -379,7 +379,7 @@ local function build_settings(page)
     u.set_rows = {}
     for i = 1, SETTING_ROWS do
         local row = new("HorizontalBox", S.tree, "SettingRow"); vadd(u.set_box, row, i == 1 and 8 or 2)
-        local tag = text("", 26, TAG_COLOR)   -- e.g. "(Experimental)": collapsed on rows without one
+        local tag = text("", 26, TAG_COLOR)   -- e.g. SyncFX's "Optimizes Performance": collapsed on rows without one
         local label = text("", 26)
         local b, bt = button("OFF", 26, DARK_RED)
         hadd(row, tag); hadd(row, label); hadd(row, b, 24)
@@ -520,9 +520,9 @@ local function build_realms(page, qtree, qpage, itree, ipage)
     tilt(here, TILT.piece)
     place(cv, here, 440.0, 472.0, nil, nil, 6)
     u.realms_here = here
-    u.realms_friends = button("ADD FRIENDS HERE", 20, DARK_RED); hadd(here, u.realms_friends)
+    u.realms_friends, u.realms_friends_t = button("ADD FRIENDS HERE", 20, DARK_RED); hadd(here, u.realms_friends)
     u.realms_end, u.realms_end_t = button("END REALM", 20, DARK_RED); hadd(here, u.realms_end, 24)
-    u.realms_cancel = button("CANCEL", 20, DARK_RED); hadd(here, u.realms_cancel, 24)
+    u.realms_cancel, u.realms_cancel_t = button("CANCEL", 20, DARK_RED); hadd(here, u.realms_cancel, 24)
     -- (two lines: a third ran into the folder's tab; measured in-game it starts under END REALM's bottom)
     u.realms_hint = text("Saved to its server after your saves and at END REALM. Everyone keeps their own Realm "
         .. "character; your own saves stay untouched.", 14, GREY, 500)
@@ -574,6 +574,8 @@ local function build_realms(page, qtree, qpage, itree, ipage)
     local tr = new("HorizontalBox", S.tree, "RealmToolRow"); vadd(tools, tr, 8)
     u.realms_cur_invite = button("INVITE CODE", 22, DARK_RED); hadd(tr, u.realms_cur_invite)
     u.realms_cur_key = button("COPY MY KEY", 22, DARK_RED); hadd(tr, u.realms_cur_key, 30)
+    -- the owner, hosting: the Realm takes the difficulty of their own save (collapsed for everyone else)
+    u.realms_my_diff = button("MY DIFFICULTY", 22, DARK_RED); hadd(tr, u.realms_my_diff, 30)
     vadd(tools, text("INVITE CODE copies a one-time code for a friend who isn't here (it works for 7 days). Friends "
         .. "playing with you right now join with ADD FRIENDS HERE.", 15, GREY, 540), 8)
     vadd(tools, text("COPY MY KEY copies your membership, to play this Realm from another PC. Keep it private.", 15, GREY, 540), 6)
@@ -678,7 +680,7 @@ local function refresh_realms()
     end
     if cur then
         set(u.realms_cur_kind, m.hosting and "YOU'RE HOSTING" or (m.armed and "NEW REALM")
-            or (m.visiting and "YOU'RE VISITING") or "YOUR REALM")
+            or (m.visiting and "YOU'RE VISITING") or (m.joining and "JOINING") or "YOUR REALM")
         set(u.realms_people, cur.people or "Loading the member list...")
         local talk = m.hosting == true or m.visiting == true
         vis_hit(u.realms_chat_row, talk)
@@ -695,12 +697,21 @@ local function refresh_realms()
         set(u.realms_cur_name, cur.name or "")
         set(u.realms_cur_info, (cur.code or "") .. (cur.info and ("   |   " .. cur.info) or ""))
         set(u.realms_cur_state, m.state or "")
+        -- a player asking to come in: ADD FRIENDS HERE turns into LET <NAME> IN, CANCEL into DECLINE (a Realm's join
+        -- requests are answered here, not on the CO-OP tab)
+        local q = m.hosting and m.request or nil
         vis_hit(u.realms_friends, m.hosting == true)
-        -- (a visiting member leaves here too, like LEAVE CO-OP, instead of switching to the CO-OP tab)
-        vis_hit(u.realms_end, m.hosting == true or m.visiting == true)
-        vis_hit(u.realms_cancel, m.armed == true)
+        local qn = q and q.name:upper() or nil
+        if qn and #qn > 10 then qn = util.utf8_cut(qn, 9) .. "." end
+        set(u.realms_friends_t, qn and ("LET " .. qn .. " IN") or "ADD FRIENDS HERE")
+        -- (a visiting member leaves here too, like LEAVE CO-OP; one still asking to come in cancels here)
+        vis_hit(u.realms_end, m.hosting == true or m.visiting == true or m.joining == true)
+        vis_hit(u.realms_cancel, m.armed == true or q ~= nil)
+        vis_hit(u.realms_my_diff, m.hosting == true and cur.owner == true)
+        set(u.realms_cancel_t, q and "DECLINE" or "CANCEL")
         if u.realms_end_armed and clock > u.realms_end_armed + 4 then u.realms_end_armed = nil end
-        set(u.realms_end_t, m.visiting and "LEAVE REALM" or (u.realms_end_armed and "SURE? END IT" or "END REALM"))
+        set(u.realms_end_t, m.joining and "CANCEL" or m.visiting and "LEAVE REALM"
+            or (u.realms_end_armed and "SURE? END IT" or "END REALM"))
         return
     end
     local line = m.state or m.note or ""
@@ -745,6 +756,7 @@ local function refresh_settings(m)
         if o then
             vis(r.tag, o.tag ~= nil)
             set(r.tag, o.tag and (o.tag .. " ") or "")
+            if o.tag and o.tag_color ~= r.tag_color then r.tag_color = o.tag_color; style_text(r.tag, 26, o.tag_color or TAG_COLOR) end
             set(r.label, o.label .. ":")
             set(r.btn_t, o.text or "OFF")
             set(r.hint, o.hint)
@@ -1107,7 +1119,11 @@ function journal_tab.tick(dt)
         local cur = rm.current
         local c_fr, c_end, c_cancel = clicked(u.realms_friends), clicked(u.realms_end), clicked(u.realms_cancel)
         local c_inv, c_key = clicked(u.realms_cur_invite), clicked(u.realms_cur_key)
-        if rm.hosting and c_fr then a.realm_friends() end
+        local q = rm.hosting and rm.request or nil
+        if q and c_fr then a.accept(q.id, q.name); ctx.refresh_now = true
+        elseif rm.hosting and c_fr then a.realm_friends() end
+        if q and c_cancel then a.decline(q.id, q.name); ctx.refresh_now = true end
+        if rm.joining and c_end then a.cancel_join(); ctx.refresh_now = true end
         if rm.hosting and c_end then
             -- END REALM sends everyone home: the first press asks
             if u.realms_end_armed then u.realms_end_armed = nil; a.realm_end() else u.realms_end_armed = clock end
@@ -1123,6 +1139,7 @@ function journal_tab.tick(dt)
         if rm.armed and c_cancel then a.realm_cancel(); ctx.refresh_now = true end
         if cur and cur.id and c_inv then a.realm_invite(cur.id) end
         if cur and cur.id and c_key then a.realm_key(cur.id) end
+        if clicked(u.realms_my_diff) and rm.hosting and cur and cur.owner then a.realm_my_difficulty(); ctx.refresh_now = true end
         local function typed(box)
             local txt = ""
             pcall(function() txt = box:GetText():ToString() end)

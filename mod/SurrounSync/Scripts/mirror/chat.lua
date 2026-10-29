@@ -32,6 +32,7 @@ end
 function chat.send(text)
     text = clean(text)
     if text == "" then return false, "empty" end
+    if text:lower():match("^/messages?%s*$") or text:lower():match("^/msgs%s*$") then notify.open_history(); return true end
     if text:sub(1, 1) == "/" then require("mirror.teleport").command(text); return true end
     local t = os.clock()
     if t - sends.last < SEND_GAP then

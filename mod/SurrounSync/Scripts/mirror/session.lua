@@ -82,6 +82,15 @@ local function tp_target()
     return tp.home.loc
 end
 local inv_fix = nil
+local realm_fresh = false   -- the Realm join's character had no inventory file (build_coop_slot)
+local realm_had = false     -- ...and it was my own stored Realm character (not the starter): build_coop_slot
+-- a Realm's name for the player's messages (Realms are their own thing: no "co-op" or "their world" in them)
+local function realm_name(id)
+    if not id then return nil end
+    local rm = require("mirror.realm")
+    local r = rm.find(id)
+    return (r and r.name and r.name ~= "") and r.name or rm.code(id)
+end
 local home_check = nil
 
 local function base() return require("mirror.localdir").get() end
@@ -374,24 +383,44 @@ function session.anim_on_game_thread(on)
     end
 end
 
+-- The cvars only stop NEW parallel animation tasks: the ones this frame already started still run, and destroying
+-- the player's meshes / loading waited for them while one sat in a hooked Blueprint function, waiting for our
+-- Lua lock - the freeze came back with the cvars set in the same call (report 2026-10-29 12:00:43, ending a Realm
+-- while running). So the destroy + load run LOAD_FRAMES frames after the cvars; the save name is set at once.
+local LOAD_FRAMES = 2
+local pending_load = nil
+local function load_now()
+    local slot = pending_load.slot
+    pending_load = nil
+    ghost.destroy("level reload")
+    local p = game.player()
+    pcall(function() p:ClearUI() end)
+    pcall(function() p:DestroyActors() end)
+    local gi = FindFirstOf("SD_GameInstance_C")
+    if not util.valid(gi) then log.error("session: no SD_GameInstance_C - " .. slot .. " not loaded"); return end
+    -- (a save meanwhile was sent to the scratch slot, which moved the name: the load reads the slot it was asked for)
+    pcall(function() lib():SetCurrentSaveGameName(game.world(), slot) end)
+    own_load = true
+    mark_world_load()
+    local ok, err = pcall(function() gi:Event_LoadLevel(gi.CurrentLevel) end)
+    own_load = false
+    log.info("session: Event_LoadLevel -> " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
+end
+local LOAD_SAVE_WAIT = 120   -- frames a load waits for a save that started meanwhile to finish
+local function load_tick()
+    if not pending_load then return end
+    local waited = util.frame() - pending_load.frame
+    if waited >= LOAD_FRAMES and (not saving() or waited >= LOAD_FRAMES + LOAD_SAVE_WAIT) then load_now() end
+end
 local function load_slot(slot)
     if session.hold_autosave then session.hold_autosave() end
     session.anim_on_game_thread(true)
     local w = game.world()
     local okn = pcall(function() lib():SetCurrentSaveGameName(w, slot) end)
     log.info(string.format("session: SetCurrentSaveGameName(%s) -> %s", slot, tostring(okn)))
-    ghost.destroy("level reload")
-    local p = game.player()
-    pcall(function() p:ClearUI() end)
-    pcall(function() p:DestroyActors() end)
-    local gi = FindFirstOf("SD_GameInstance_C")
-    if not util.valid(gi) then log.error("session: no SD_GameInstance_C"); return false end
-    own_load = true
-    mark_world_load()
-    local ok, err = pcall(function() gi:Event_LoadLevel(gi.CurrentLevel) end)
-    own_load = false
-    log.info("session: Event_LoadLevel -> " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
-    return ok
+    if not util.valid(FindFirstOf("SD_GameInstance_C")) then log.error("session: no SD_GameInstance_C"); return false end
+    pending_load = { slot = slot, frame = util.frame() }
+    return true
 end
 
 local function say_later(msg, kind) later_notes[#later_notes + 1] = { msg, kind } end
@@ -585,16 +614,33 @@ local host_since = nil   -- os.time() this game started hosting (session.init)
 local function host_tick(dt)
     local req = link.get_blob("req")
     if req then
-        local n = req:match("^join (%S+)")
+        local n, kind, rid = req:match("^join (%S+)%s*(%S*)%s*(%S*)")
         local age = n and link.peer_age(tonumber(n) or 0)
         -- (older than this hosting: a guest who took a Realm over read back its own join request from when it joined)
         if n and (age > 300 or (host_since and age > os.time() - host_since + 5)) then
             log.info("session: ignoring stale join request " .. n)
             n = nil
         end
+        -- The join must be the kind this world is: a co-op join brings the guest's own character (and its items) in,
+        -- a Realm join the Realm's character. A co-op request still waiting when this game opened a Realm had its
+        -- members auto-accepted, and the guest walked into the Realm with its own gear (2026-10-28). The guest says
+        -- which it is ("join <nonce> coop" / "join <nonce> realm <id>"; older versions say neither = co-op).
+        local hid = n and require("mirror.realmplay").hosting_id()
+        local wrong = n and ((hid and not (kind == "realm" and rid == tostring(hid)) and "realm")
+            or (not hid and kind == "realm" and "notrealm")) or nil
+        if wrong then
+            log.info("session: join " .. n .. " refused - " .. (wrong == "realm" and "a co-op join while I host a Realm"
+                or "a Realm join while I'm not hosting that Realm") .. " (" .. tostring(kind) .. " " .. tostring(rid) .. ")")
+            link.put_blob("joinwhy", n .. " " .. wrong)
+            link.put_blob("world", "fail " .. n)
+            notify.show(link.peer_name() .. (wrong == "realm" and " asked for a co-op join - you're hosting a Realm, so they stay home."
+                or " asked to join a Realm you aren't hosting - they stay home."), "info")
+            n = nil
+        end
         if n then
             log.info("session: join request " .. n .. " - saving")
-            notify.show(link.peer_name() .. " is joining your world...", "info")
+            local rn = require("mirror.realmplay").hosting()
+            notify.show(link.peer_name() .. " is joining " .. (rn or "your world") .. "...", "info")
             host_job = { nonce = n, t = 0.0 }
             -- trade/build messages from before this save are in the world the guest gets: they skip them
             events.set_cut(os.time())
@@ -631,7 +677,12 @@ local function build_coop_slot(own, files)
     if realm_id then
         -- my Realm character (none yet = the game makes a fresh one), never the own save's
         local rm = require("mirror.realm")
-        local character = rm.character(realm_id) or rm.starter(realm_id)
+        rm.hold_character(realm_id, nil)   -- (a held character comes back with its items now)
+        local mine = rm.character(realm_id)
+        realm_had = mine ~= nil
+        local character = mine or rm.starter(realm_id)
+        -- (no inventory file: a new character here - the starting kit if it arrives without pockets)
+        realm_fresh = not (character and character["PlayerInfo.sav"])
         log.info("session: Realm " .. realm_id .. " - " .. (character and "my Realm character" or "a fresh character"))
         ok, err = slotguard.build_realm(coop, files, character)
     else
@@ -684,7 +735,7 @@ local function unplanned_exit(cur, before_load)
             slotguard.log_write(t)
             local pose = parse_pose(t.home)
             tp = pose and { goal = "home", home = pose, settle = 0.0, tries = 0 } or nil
-            notify.show("Bringing your co-op character home...", "info")
+            notify.show(t.realm and "Saving your Realm character..." or "Bringing your co-op character home...", "info")
             if not before_load then home_reload = { slot = t.own, t = 0.0 } end
         else
             slotguard.log_clear()
@@ -719,8 +770,9 @@ local function keep_coop_slot(why)
     local ok = pcall(function() lib():SetCurrentSaveGameName(game.world(), coop) end)
     log.info(string.format("session: %s picked slot %s while joined - kept the co-op slot %s (%s)", why, cur, coop,
         tostring(ok)))
-    notify.show("You're in " .. link.peer_name() .. "'s world, so the game saves to the co-op session. Your own save "
-        .. "gets your character when you leave.", "info")
+    notify.show(realm_id and ("You're in " .. realm_name(realm_id) .. ", so the game saves to the Realm. Your own saves "
+        .. "stay as they are.") or ("You're in " .. link.peer_name() .. "'s world, so the game saves to the co-op session. "
+        .. "Your own save gets your character when you leave."), "info")
     return ok
 end
 local world_slot = nil
@@ -751,6 +803,10 @@ local function unstick_continue(at_menu)
     local cur = ems_current_name()
     if not is_coop(cur) then return end
     local to = (recovered_own and slotguard.is_own(recovered_own) and recovered_own) or own_newest()
+    -- no own save at all (a new player, or every save deleted): New Game saves into the current name, so the new
+    -- world became a "leftover co-op save" that Realms and hosting refuse (player report 2026-10-28) - a name
+    -- with no save folder takes its place
+    if not to then to = slotguard.free_own_name() end
     if not to then log.warn("session: the game's current save is the co-op save " .. cur .. " and no own save was found"); return end
     local ok = point_at(to)
     log.info(string.format("session: the game's current save was the co-op save %s outside a session - pointed it at %s (%s)",
@@ -802,6 +858,20 @@ local function firewall(why)
     if keep_coop_slot(why) then return end
     local cur = ems_current_name()
     if not cur or cur == "" then return end
+    -- A load is set (the name is the next world's already) but the old world still runs for a few frames: this save
+    -- holds the OLD world and would land in the next world's save - the own save, when leaving co-op. The scratch
+    -- slot takes it and is emptied; load_now points the game at its slot again.
+    if pending_load then
+        local scratch = cfg.phase2.coop_slot
+        if cur ~= scratch then
+            local ok = point_at(scratch)
+            restore_name = restore_name or cur
+            discard_pending = true
+            log.warn(string.format("session: firewall - a save started just before loading %s; sent to the scratch slot %s (%s)",
+                tostring(pending_load.slot), scratch, tostring(ok)))
+        end
+        return
+    end
     -- in a Realm every save goes into its co-op save (the Save menu's "new save" picks another slot first)
     local rs, realm_coop = realm_slot()
     if rs and not level_loading then
@@ -958,45 +1028,94 @@ player_dead = function()
     return dead or alive_for < 3.0
 end
 
--- A Realm goes on without its host: a guest whose host left goes home with its Realm character stored, then opens
--- the Realm itself (realmplay.takeover) and keeps playing there as its new host.
+-- A Realm goes on without its host. A guest whose host left takes the Realm over where it stands: its world becomes
+-- the Realm's (realmplay.promote, no load). When that can't start, it goes home with its Realm character stored,
+-- then opens the Realm itself (realmplay.takeover) and keeps playing there as its new host.
 local takeover = nil
+local function old_host()
+    local l = link.lobby()
+    return l and l.peer and l.peer.id or nil
+end
 local function arm_takeover()
     if not realm_id then return end
-    local l = link.lobby()
-    takeover = { id = realm_id, host = l and l.peer and l.peer.id or nil }
+    takeover = { id = realm_id, host = old_host() }
     log.info("session: the Realm's host left - I'll open " .. realm_id .. " myself once home")
+end
+-- (true while realmplay hands the host's zombies over, a second or so: no host-gone countdown meanwhile)
+local promoting = false
+local function take_over_here()
+    if not (realm_id and state == "joined" and not tp) then return false end
+    local ok, started = util.safe(require("mirror.realmplay").promote, "realmplay.promote", realm_id, old_host())
+    promoting = ok and started == true
+    return promoting
+end
+-- the takeover in place couldn't finish: home, then open the Realm from there (the old way)
+function session.promote_failed()
+    promoting = false
+    if state ~= "joined" then return end
+    arm_takeover()
+    want_toggle = true
 end
 function session.realm_host_left()
     if state ~= "joined" then return end
+    gone = nil
+    if take_over_here() then return end
     arm_takeover()
-    gone, want_toggle = nil, true
+    want_toggle = true
+end
+
+-- Realm takeover in place: this session ends here without a load or any file touched. realmplay takes the slots
+-- and the session log over in the same frame (the save firewall then sends saves to its co-op save, as before).
+function session.promote_realm()
+    if not (realm_id and state == "joined" and not tp and coop and own_slot) then return nil end
+    local t = { realm = realm_id, own = own_slot, own_stamp = own_stamp, coop = coop }
+    log.info(string.format("session: taking %s over here - %s stays loaded, home is %s", realm_id, coop, own_slot))
+    state, realm_id, want_toggle, gone, takeover, promoting = "idle", nil, false, nil, nil, false
+    inv_fix, bed_fix, home_check, coop_player, home_reload, leave_try = nil, nil, nil, nil, nil, nil
+    carry.join, carry.leave = nil, nil
+    return t
 end
 
 local function watch_host(dt)
-    if state ~= "joined" then gone, paused_told = nil, false; return end
+    if state ~= "joined" then gone, paused_told, promoting = nil, false, false; return end
+    if promoting then return end
     local ps = peer_state()
     if ps == "gone" or (gone and ps ~= "ok") then
-        gone = gone or { left = cfg.save and cfg.save.host_gone_countdown or 30, next_msg = 0.0 }
+        if not gone then
+            local total = cfg.save and cfg.save.host_gone_countdown or 30
+            gone = { left = total, total = total }
+            notify.clear("hostpaused")
+        end
         if gone.waiting then return end
-        local secs = math.ceil(gone.left)
-        if not gone.told or (secs <= 10 and gone.told > 10) then
+        -- one live card, counting down every second (the bar runs out with it)
+        local secs = math.max(0, math.ceil(gone.left))
+        if secs ~= gone.told then
             gone.told = secs
-            notify.show(string.format(realm_id and "%s's game closed. You keep playing in the Realm: hosting it yourself in %d seconds..."
-                or "%s's game closed. Returning you home in %d seconds...", link.peer_name(), secs), "bad", "hostgone")
+            local when = secs > 0 and string.format("in %d second%s", secs, secs == 1 and "" or "s") or "as soon as you respawn"
+            notify.show(string.format(realm_id and "%s's game closed. You keep playing in the Realm - you host it yourself %s."
+                or "%s's game closed. You go home with your character %s.", link.peer_name(), when), "bad", "hostgone", nil,
+                { progress = gone.left / gone.total, sticky = true })
         end
         gone.left = gone.left - dt
         if gone.left <= 0 and not player_dead() then
+            gone = nil
+            notify.clear("hostgone")
+            if take_over_here() then return end
             log.info("session: host gone - going home")
             arm_takeover()
-            gone, want_toggle = nil, true
+            want_toggle = true
         end
     elseif ps == "ok" then
-        if gone then notify.show(link.peer_name() .. " is back.", "good"); gone = nil end
+        if gone then
+            notify.clear("hostgone")
+            notify.show(link.peer_name() .. " is back.", "good")
+            gone = nil
+        end
+        if paused_told then notify.clear("hostpaused") end
         paused_told = false
     elseif ps == "paused" and not paused_told then
         paused_told = true
-        notify.show(link.peer_name() .. "'s game isn't responding (paused, loading or frozen).", "info")
+        notify.show(link.peer_name() .. "'s game isn't responding (paused, loading or frozen).", "warn", "hostpaused", nil, { sticky = true })
     end
 end
 
@@ -1004,10 +1123,16 @@ function session.host_gone() return gone and not gone.waiting and math.ceil(gone
 function session.go_home_now()
     if state ~= "joined" then return end
     if gone then arm_takeover() end   -- (the host-gone countdown's GO HOME NOW: a Realm still goes on)
+    notify.clear("hostgone")
     gone, want_toggle = nil, true
 end
 function session.wait_for_host()
-    if gone then gone.waiting = true; notify.show("Waiting for " .. link.peer_name() .. ". Choose Leave in the handbook's CO-OP tab (J) when you want to go home.", "info") end
+    if gone then
+        gone.waiting = true
+        -- (in the countdown's place)
+        notify.show("Waiting for " .. link.peer_name() .. ". " .. (realm_id and "Choose LEAVE REALM in the handbook's REALMS tab (J)"
+            or "Choose Leave in the handbook's CO-OP tab (J)") .. " when you want to go home.", "info", "hostgone")
+    end
 end
 
 restore_home_bed = function()
@@ -1110,7 +1235,9 @@ local function guest_tick(dt)
             log.warn("session: join refused before saving - this world is the co-op save " .. ems_current_name())
             session.offer_own_save()
         elseif state == "idle" then
-            notify.show("Joining " .. link.peer_name() .. "'s world...", "info")
+            -- (the join's live card, as the menu's "accepted - joining")
+            notify.show(armed_realm and ("Joining " .. realm_name(armed_realm) .. "...")
+                or ("Joining " .. link.peer_name() .. "'s world..."), "info", "join_wait")
             log.info("session: joining - saving my own world first")
             home = home_now()
             home_bed = beds.read()
@@ -1130,7 +1257,8 @@ local function guest_tick(dt)
             log.info("session: leaving - saving into the co-op slot")
             carry.leave = not realm_id and carried() or nil
             if carry.leave then log.info("session: taking " .. carry.leave .. " item stack(s) home") end
-            notify.show("Leaving " .. link.peer_name() .. "'s world...", "info")
+            notify.show(realm_id and ("Leaving " .. realm_name(realm_id) .. "...")
+                or ("Leaving " .. link.peer_name() .. "'s world..."), "info", "trip")
             local hb = own_slot and beds.get(beds.home_key(own_slot))
             if hb then
                 log.info("session: respawn point back to your own world's" .. (beds.apply(hb) and "" or " - FAILED"))
@@ -1179,8 +1307,10 @@ local function guest_tick(dt)
                 link.reset_blob("world")
                 link.reset_blob("joincut")
                 link.reset_blob("hostbed") -- read once per join: a rejoin's unchanged bed would come back nil
+                link.reset_blob("joinwhy")
                 world_in, world_ready, world_shown, world_poll = {}, nil, 0, 0
-                link.put_blob("req", "join " .. nonce)
+                -- (the host refuses a join of the wrong kind: a co-op join into its Realm, or the reverse)
+                link.put_blob("req", "join " .. nonce .. (realm_id and (" realm " .. tostring(realm_id)) or " coop"))
                 state, wait = "requested", 0.0
                 log.info("session: join requested (" .. nonce .. ")")
             end
@@ -1206,8 +1336,17 @@ local function guest_tick(dt)
         if jn == nonce then events.set_cut(link.same_clock() and tonumber(js) or (os.time() - link.peer_age(tonumber(js)) - 2)) end
         local w = link.get_blob("world")
         if w and w == "fail " .. nonce then
-            log.error("session: host could not export its world")
-            notify.show(link.peer_name() .. " couldn't send their world. Please try again.", "bad")
+            local wn, why = (link.get_blob("joinwhy") or ""):match("^(%S+) (%S+)$")
+            if wn == nonce and (why == "realm" or why == "notrealm") then
+                log.info("session: the host refused this " .. (realm_id and "Realm" or "co-op") .. " join (" .. why .. ") - staying home")
+                notify.show(why == "realm" and (link.peer_name() .. " is playing a Realm right now - join it from the handbook's REALMS tab (J). You stay in your world.")
+                    or (link.peer_name() .. " isn't hosting that Realm right now. You stay in your world."), "info")
+                -- (no link to a world I'm not in: no ghost there, no "stopped hosting" later)
+                require("mirror.phase1").stop()
+            else
+                log.error("session: host could not export its world")
+                notify.show(link.peer_name() .. " couldn't send their world. Please try again.", "bad")
+            end
             state = "idle"
         elseif w then
             local n, host_slot, count = w:match("^ready (%S+) (.+) (%d+)$")
@@ -1225,8 +1364,10 @@ local function guest_tick(dt)
                     notify.show("The world from " .. link.peer_name() .. " arrived damaged. Please try again.", "bad")
                     state = "idle"
                 elseif own and not is_coop(own) and build_coop_slot(own, world_in) then
-                    -- (a Realm character's PlayerInfo is read from its file: the slot is unused this run)
-                    if not realm_id then ems_share_player(coop, own) end
+                    -- a Realm character's PlayerInfo is in the file: EMS cached one for every slot folder at game
+                    -- start (an emptied co-op slot: an empty one), and the load took that - 0 containers, the
+                    -- character's items gone (player report 2026-10-28). Dropped, the load reads the file.
+                    if realm_id then ems_forget_player(coop) else ems_share_player(coop, own) end
                     if home_bed then beds.set(beds.home_key(own), home_bed) end
                     host_world = beds.world_key(link.peer_name(), host_slot, own)
                     tp = { goal = "host", settle = 0.0, tries = 0, host_pos = peer_locator() or ghost.location() }
@@ -1288,7 +1429,8 @@ local function guest_tick(dt)
                     elseif leave_try.n >= 10 then
                         leave_try = nil
                         log.error("session: couldn't copy the character home: " .. tostring(err))
-                        notify.show("Couldn't bring your character home. Your save is unchanged and you're still in co-op. Try Leave again.", "bad")
+                        notify.show(realm_id and "Couldn't save your Realm character. You're still in the Realm. Try LEAVE REALM again."
+                            or "Couldn't bring your character home. Your save is unchanged and you're still in co-op. Try Leave again.", "bad")
                         state, bed_fix = "joined", { t = 0.0 }
                     end
                 end
@@ -1328,7 +1470,9 @@ local function guest_tick(dt)
                             tp.goal == "host" and "joined - next to the host" or "left - back home", d / 100))
                         if tp.goal == "host" then
                             coop_player = game.player()
-                            notify.show("Joined " .. link.peer_name() .. "'s world. Leave any time with Ctrl+F10 or the handbook's CO-OP tab (J).", "good")
+                            notify.show(realm_id and ("You're in " .. realm_name(realm_id) .. ", hosted by " .. link.peer_name()
+                                .. ". Leave any time with Ctrl+F10 or LEAVE REALM in the handbook's REALMS tab (J).")
+                                or ("Joined " .. link.peer_name() .. "'s world. Leave any time with Ctrl+F10 or the handbook's CO-OP tab (J)."), "good", "join_wait")
                         end
                         if tp.goal == "host" then
                             inv_fix, bed_fix = { t = 0.0 }, { t = 0.0 }
@@ -1341,8 +1485,9 @@ local function guest_tick(dt)
                         tp = nil
                     elseif tp.tries >= 3 then
                         log.warn(string.format("session: teleport %s didn't stick after 3 tries (%.0f m off)", what, d / 100))
-                        notify.show(tp.goal == "host" and ("Joined " .. link.peer_name() .. "'s world, but couldn't place you next to them.")
-                            or "Back in your own world, but not at the spot you left from.", "info")
+                        notify.show(tp.goal == "host" and ((realm_id and ("You're in " .. realm_name(realm_id))
+                            or ("Joined " .. link.peer_name() .. "'s world")) .. ", but couldn't place you next to " .. link.peer_name() .. ".")
+                            or "Back in your own world, but not at the spot you left from.", "info", tp.goal == "host" and "join_wait" or "trip")
                         if tp.goal == "host" then inv_fix, bed_fix = { t = 0.0 }, { t = 0.0 }
                         else
                             if restore_home_bed() then save_now() end
@@ -1374,11 +1519,16 @@ local function guest_tick(dt)
             local have = carried()
             if carry.leave and carry.leave > 0 and have >= 0 and have < carry.leave then
                 log.warn(string.format("session: home with %d of %d item stacks", have, carry.leave))
-                notify.show(string.format("Warning: you came home with %d of your %d items. A copy of your co-op character is in "
-                    .. "Backups (handbook J, CO-OP tab). Please report this with your SurrounSync log.", have, carry.leave), "bad")
-            elseif have >= 0 then
-                log.info(string.format("session: home with %d item stack(s) (left with %s)", have, tostring(carry.leave)))
-                notify.show("Back in your own world. Your character came home with you.", "good")
+                notify.show(string.format("Warning: you came home with %d of your %d item stacks. A copy of your co-op character is in "
+                    .. "Backups (handbook J, CO-OP tab). Please report this with your SurrounSync log.", have, carry.leave), "bad", "trip")
+            else
+                if have >= 0 then
+                    log.info(string.format("session: home with %d item stack(s) (left with %s)", have, tostring(carry.leave)))
+                end
+                -- (items not countable here: home all the same - nothing is claimed about them)
+                notify.show(realm_id and ("Back in your own world. Your Realm character stays in " .. realm_name(realm_id) .. ".")
+                    or (have >= 0 and "Back in your own world. Your character came home with you." or "Back in your own world."),
+                    "good", "trip")
             end
             carry.leave, home_check = nil, nil
             if takeover then
@@ -1403,7 +1553,7 @@ local function guest_tick(dt)
                 local have = carried()
                 if carry.join and carry.join > 0 and have >= 0 and have < carry.join then
                     log.warn(string.format("session: brought %d of %d item stacks into the co-op world", have, carry.join))
-                    notify.show(string.format("Warning: you arrived with %d of your %d items. Your own save is untouched and backed up. "
+                    notify.show(string.format("Warning: you arrived with %d of your %d item stacks. Your own save is untouched and backed up. "
                         .. "Leave to return to it.", have, carry.join), "bad")
                 elseif have >= 0 then
                     log.info(string.format("session: arrived with %d item stack(s)", have))
@@ -1411,7 +1561,10 @@ local function guest_tick(dt)
                 carry.join = nil
             end
         elseif inv_fix.done and inv_fix.t >= 5.0 then
-            util.safe(invdiag.ensure_pockets, "invdiag.pockets", "after the join")
+            local ok, gave = util.safe(invdiag.ensure_pockets, "invdiag.pockets", "after the join", realm_id ~= nil and realm_fresh)
+            if ok and gave == true and realm_id and realm_had and not realm_fresh then
+                util.safe(require("mirror.realmplay").character_missing, "realmplay.character_missing", realm_id)
+            end
             util.safe(invdiag.snapshot, "invdiag", "after inventory reload")
             inv_fix = nil
         end
@@ -1462,6 +1615,7 @@ local function install_firewall()
             util.ensure_hook("/Game/Blueprints/SD_GameInstance.SD_GameInstance_C:Event_LoadLevel", on_load, nil, true)
         end
         util.safe(firewall_tick, "session.firewall_tick")
+        util.safe(load_tick, "session.load_tick")
         if stray_wait then
             stray_wait = stray_wait - (dt or 0)
             if stray_wait <= 0 then
@@ -1549,6 +1703,7 @@ local function checkpoint_tick(dt)
 end
 
 function session.tick(dt)
+    util.safe(load_tick, "session.load_tick")
     if state == "idle" then util.safe(track_ground, "session.ground", dt) end
     flush_notes()
     checkpoint_tick(dt)
@@ -1565,6 +1720,8 @@ end
 
 function session.state() return state end
 function session.save_now() return save_now() end
+-- before loading a slot whose PlayerInfo file was just written (a Realm's co-op save): EMS must read the file
+function session.forget_cached_player(slot) return ems_forget_player(slot) end
 -- for Realms (realmplay.lua): the same slot tools the join uses
 function session.saving() return saving() end
 function session.load_slot(slot) return load_slot(slot) end
@@ -1573,6 +1730,7 @@ function session.current_slot() return current_slot(nil) end
 function session.next_coop_slot() configure_store(); return next_coop_slot(true) end
 -- the next join (menu.realm_join) is into this Realm: it plays the Realm character, not the own save's
 function session.realm_guest(id) armed_realm = id end
+function session.realm_armed() return armed_realm end
 function session.realm_joined() return state ~= "idle" and realm_id or nil end
 function session.loading() return level_loading end
 function session.saves_dir() return saves_dir() end

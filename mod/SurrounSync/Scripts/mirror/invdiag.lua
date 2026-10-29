@@ -90,14 +90,24 @@ end
 -- up. InitNoStartingItems builds the default pockets like a new character's, without the starting kit, so no item
 -- is made from nothing. Only when there are no containers at all. (InitializeJigComponent is a DoOnce that already
 -- ran at spawn with nothing loaded: ResetInitComponent opens it again, else the call does nothing.)
-function invdiag.ensure_pockets(why)
+-- fresh = the character came without any inventory file (a Realm's starter or first visit): it gets the game's own
+-- starting kit like a New Game character (the player's SetStartingItems fills ContainersSettings[].StartingItems,
+-- InitializeJigComponent spawns them - InitNoStartingItems is that call with the lists emptied). A stored
+-- character that arrives empty never does: that would make items from nothing.
+function invdiag.ensure_pockets(why, fresh)
     if invdiag.live_containers() ~= 0 then return false end
     local settings, linked = -1, 0
     local ok, err = pcall(function()
-        local c = game.player().BP_JigMultiplayer
+        local p = game.player()
+        local c = p.BP_JigMultiplayer
         settings = c.ContainersSettings:GetArrayNum()
         c:ResetInitComponent()
-        c:InitNoStartingItems()
+        if fresh then
+            p:SetStartingItems()
+            c:InitializeJigComponent()
+        else
+            c:InitNoStartingItems()
+        end
         -- the inventory screen's grids got their container ids at spawn, when there were none: give them the new ones
         -- like the game's own load does (LocalJSIContainers[i].ContainerID = MainContainersIDs[i]), else every item
         -- taken shows as a flashing icon that can't be used (kit 2026-10-27: 0 of 22 grids matched before this)
@@ -107,12 +117,12 @@ function invdiag.ensure_pockets(why)
             linked = linked + 1
         end
     end)
-    log.warn(string.format("invdiag: %s - the character had no inventory containers; gave it empty pockets (%d container "
-        .. "setting(s), %d grid(s) linked): %s, %d container(s) now", why, settings, linked, ok and "ok" or tostring(err),
-        invdiag.live_containers()))
+    log.warn(string.format("invdiag: %s - the character had no inventory containers; gave it %s (%d container "
+        .. "setting(s), %d grid(s) linked): %s, %d container(s) now", why, fresh and "the starting kit" or "empty pockets",
+        settings, linked, ok and "ok" or tostring(err), invdiag.live_containers()))
     if ok and invdiag.live_containers() > 0 then
         util.safe(require("mirror.session").save_now, "invdiag.pockets_save")
-        require("mirror.notify").show("Your character was missing its pockets - fixed.", "info")
+        if not fresh then require("mirror.notify").show("Your character was missing its pockets - fixed.", "info") end
     end
     return true
 end

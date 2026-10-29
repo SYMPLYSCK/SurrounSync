@@ -6,6 +6,7 @@ local game = require("mirror.game")
 local ghost = require("mirror.ghost")
 local link = require("mirror.link")
 local notify = require("mirror.notify")
+local events = require("mirror.events")
 
 local vehicles = {}
 
@@ -58,6 +59,22 @@ local stats = { moved = 0, added = 0, removed = 0, spawners = 0 }
 local apply_ride, seat_point, physics, seat_of, P
 local function shared() return role == "host" or (session and session.in_world()) end
 local KSL = "/Script/Engine.Default__KismetSystemLibrary"
+
+-- Horn: the game's Horn (BP_VehicleMaster, decompiled) plays Cue_Horn at the car and reports a noise of 8500 there -
+-- in the honker's game only. Each honk goes to the other game: it plays the horn at that car, and on the host its
+-- zombies hear it (the guest's zombies are copies of the host's).
+local HORN_CUE = "/Game/Audio/VehicleSounds/Sounds/Cue/Car/Cue_Horn.Cue_Horn"
+local HORN_RANGE = 8500
+local HEARING = "/Script/AIModule.Default__AISense_Hearing"
+local GS = "/Script/Engine.Default__GameplayStatics"
+local horns = nil   -- (made at the first tick: loot.lua requires this module for car names)
+local horn_stats = { sent = 0, played = 0, wrecks = 0 }
+local horn_hook_in = 0.0
+-- SyncFX's wreck horns (a parked wreck honks when you walk up) are a noise for zombies too; SyncFX writes each one
+-- here. A guest's zombies are the host's copies, so a guest sends its wrecks' honks on to the host.
+local FX_NOISE = "ue4ss\\Mods\\SyncFX\\noise.txt"
+local FX_POLL, FX_MAX_AGE = 0.5, 5
+local fx_seen, fx_in = nil, 0.0
 local function alive(a)
     if not util.valid(a) then return false end
     local ksl, ok, r = util.cdo(KSL), false, false
@@ -315,16 +332,18 @@ physics = function(car, on)
 end
 
 local retired = {}
+local UNDER_MAP = -500000
 -- Extra cars are hidden and parked under the map, never destroyed - a half-destroyed car
--- crashed the game.
+-- crashed the game. Never saved either: a guest who takes over a Realm in place saves this world for real.
 local function retire(car, n)
     retired[n] = true
+    pcall(function() util.cdo("/Script/EasyMultiSave.Default__EMSFunctionLibrary"):SetActorSaveProperties(car, true, false, true, 0) end)
     physics(car, false)
     pcall(function() car:SetActorHiddenInGame(true) end)
     pcall(function() car:SetActorEnableCollision(false) end)
     pcall(function() car:SetActorTickEnabled(false) end)
     local l = transform(car)
-    if l then place_hard(car, { X = l.X, Y = l.Y, Z = -500000 }, { Pitch = 0, Yaw = 0, Roll = 0 }) end
+    if l then place_hard(car, { X = l.X, Y = l.Y, Z = UNDER_MAP }, { Pitch = 0, Yaw = 0, Roll = 0 }) end
     retired[n] = true
 end
 
@@ -338,6 +357,29 @@ local function place_when_near(car, l, r)
 end
 local pending = {}
 local made_for_drive = {}
+local EMS = "/Script/EasyMultiSave.Default__EMSFunctionLibrary"
+local made_cars = {}   -- cars made here for the other player's drive (kept out of saves, removed when they leave)
+-- the other player left: the cars made for their drives go (one this game's player sits in stays, unsaved)
+local function remove_made_cars()
+    for _, a in ipairs(made_cars) do
+        if util.valid(a) and not (driving and util.same(a, driving)) then
+            pcall(function() a:K2_DestroyActor() end)
+            log.info("vehicles: removed a car made for the other player's drive")
+        end
+    end
+    made_cars = {}
+end
+-- a Realm takeover in place (realmplay.promote): this world is the Realm's now, so a car made here for the old
+-- host's drive is a real car of it - saved again like any other (the old host's world had it), never removed
+function vehicles.keep_made_cars()
+    local n = 0
+    for _, a in ipairs(made_cars) do
+        if util.valid(a) and pcall(function() util.cdo(EMS):SetActorSaveProperties(a, false, false, false, 0) end) then n = n + 1 end
+    end
+    made_cars = {}
+    if n > 0 then log.info("vehicles: " .. n .. " car(s) made for the old host's drive belong to this world now") end
+    return n
+end
 local parked = {}
 local MIN_DELAY, MAX_DELAY = 0.08, 0.35
 local function add_car(n, cp, l, r, sc, sf, sh)
@@ -391,7 +433,8 @@ local function host_list()
         if alive(v) then
             local l, r = transform(v)
             local cp = class_path(v)
-            if l and cp then lines[#lines + 1] = n .. " " .. cp .. " " .. fmt(l, r) .. " " .. state_of(v) end
+            -- (a car retired while this game was a guest, still parked under the map after a Realm takeover)
+            if l and cp and l.Z > UNDER_MAP / 2 then lines[#lines + 1] = n .. " " .. cp .. " " .. fmt(l, r) .. " " .. state_of(v) end
         end
     end
     table.sort(lines)
@@ -638,10 +681,18 @@ local function unseat_ghost()
     seated_as = nil
 end
 
+-- Lights the game's own way: TurnOnOffLights flips LightsOn? and sets the Lights' intensity (it never touches their
+-- visibility). They used to be shown/hidden here (SetVisibility): the driver's own switch then lit hidden lights - the
+-- other player saw them, the driver didn't (user 2026-10-29, both directions).
 local function car_effects(car, eng, lit)
     pcall(function() if eng then car.EngineSound:Activate(false) else car.EngineSound:Deactivate() end end)
-    pcall(function() car.LightLeft:SetVisibility(lit, true) end)
-    pcall(function() car.LightRight:SetVisibility(lit, true) end)
+    -- (shown again: a car hidden by an older version gets its lights back)
+    pcall(function() car.LightLeft:SetVisibility(true, true) end)
+    pcall(function() car.LightRight:SetVisibility(true, true) end)
+    if lit == nil then return end   -- (the driver got out: the lights stay as they were, like in their game)
+    local on
+    pcall(function() on = car["LightsOn?"] == true end)
+    if on ~= nil and on ~= lit then pcall(function() car:TurnOnOffLights() end) end
 end
 
 local function release_peer_car(final_l, final_r)
@@ -655,7 +706,7 @@ local function release_peer_car(final_l, final_r)
         else
             follow_mode(c, false)
         end
-        car_effects(c, false, false)
+        car_effects(c, false, nil)
     end
     if peer.tow and alive(peer.tow.car) then follow_mode(peer.tow.car, false) end
     unseat_ghost()
@@ -721,6 +772,10 @@ local function apply_drive(body)
                     if mine then cars[mine] = a end
                     unknown[n] = nil
                     stats.added = stats.added + 1
+                    -- only there to show the other player driving: never part of this world's saves, and gone when
+                    -- they leave (it was saved into the host's world - cars the host never had, report 2026-10-29)
+                    pcall(function() util.cdo(EMS):SetActorSaveProperties(a, true, false, true, 0) end)
+                    made_cars[#made_cars + 1] = a
                     log.info("vehicles: the other player drives a car this game didn't have (" .. (cp:match("([%w_]+)$") or cp) .. ") - made it")
                     c = a
                 else
@@ -896,6 +951,71 @@ function vehicles.drive_sample(body)
     util.safe(apply_drive, "vehicles.drive", body)
 end
 
+-- (only the car this game's player drives: Horn runs from the driver's input)
+local function on_horn(self)
+    local car = util.obj(self)
+    if not (car and driving and util.same(car, driving)) then return end
+    local l
+    pcall(function() l = car:K2_GetActorLocation() end)
+    if not l then return end
+    horns:send(string.format("%.0f %.0f %.0f", l.X, l.Y, l.Z))
+    horn_stats.sent = horn_stats.sent + 1
+end
+local horn_fn = function(self) util.safe(on_horn, "vehicles.horn", self) end
+
+local function host_noise(loc, range)
+    if role ~= "host" then return end
+    local h, g = util.cdo(HEARING), ghost.get()
+    if h and g then pcall(function() h:ReportNoiseEvent(g, loc, 1.0, g, range, FName("Noise")) end) end
+end
+
+local function play_horn(payload)
+    local wreck = payload:sub(1, 2) == "N "
+    local x, y, z, r
+    if wreck then x, y, z, r = payload:match("^N (%S+) (%S+) (%S+) (%S+)$")
+    else x, y, z = payload:match("^(%S+) (%S+) (%S+)$") end
+    local loc = x and { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
+    if not (loc and loc.X and loc.Y and loc.Z) then return end
+    if wreck then
+        -- (the guest's game played the honk; here only the zombies hear it)
+        host_noise(loc, math.min(tonumber(r) or HORN_RANGE, HORN_RANGE))
+        horn_stats.wrecks = horn_stats.wrecks + 1
+        return
+    end
+    if peer and alive(peer.car) then pcall(function() loc = util.vec(peer.car:K2_GetActorLocation()) end) end
+    local gs, cue, ctx = util.cdo(GS), util.find(HORN_CUE), game.player()
+    if gs and cue and ctx then
+        pcall(function() gs:PlaySoundAtLocation(ctx, cue, loc, { Pitch = 0, Yaw = 0, Roll = 0 }, 1.0, 1.0, 0.0, nil, nil, nil, nil) end)
+    end
+    host_noise(loc, HORN_RANGE)
+    horn_stats.played = horn_stats.played + 1
+end
+
+-- guest: SyncFX's newest wreck honk, once, if it is fresh ("<time> <n> <x> <y> <z> <range>")
+local function relay_wreck_honks(dt)
+    fx_in = fx_in - dt
+    if fx_in > 0 then return end
+    fx_in = FX_POLL
+    local f = io.open(FX_NOISE, "r")
+    if not f then return end
+    local line = f:read("l")
+    f:close()
+    if not line or line == fx_seen then return end
+    fx_seen = line
+    local t, x, y, z, r = line:match("^(%d+) %d+ (%S+) (%S+) (%S+) (%S+)")
+    if not t or math.abs(os.time() - tonumber(t)) > FX_MAX_AGE then return end
+    horns:send(string.format("N %s %s %s %s", x, y, z, r))
+    horn_stats.sent = horn_stats.sent + 1
+end
+
+local function horn_tick(dt)
+    horns = horns or events.new("horn", 8, 2)
+    horn_hook_in = horn_hook_in - dt
+    if horn_hook_in <= 0 then horn_hook_in = 2.0; util.ensure_hook(MASTER .. ":Horn", horn_fn) end
+    if role == "guest" and not mate then relay_wreck_honks(dt) end
+    horns:pump(function(p) util.safe(play_horn, "vehicles.play_horn", p) end)
+end
+
 function vehicles.tick(dt)
     if not (cfg and cfg.mirror_vehicles) then return end
     now = now + dt
@@ -910,17 +1030,19 @@ function vehicles.tick(dt)
         if not inside then
             release_peer_car(); peer_rides = nil; unseat_ghost()
             alias, rev, driving, retired, frozen, unknown, wake_at, pending = {}, {}, nil, {}, {}, {}, {}, {}
-            made_for_drive, parked = {}, {}
+            made_for_drive, parked, made_cars = {}, {}, {}
             known_state, told, applied_state = {}, {}, {}
         end
     end
     if not in_world then return end
+    util.safe(horn_tick, "vehicles.horn_tick", dt)
     if role == "host" then
         local guest_here = session and session.guest_in_world and session.guest_in_world()
         if not guest_here and (peer or peer_rides) then
             release_peer_car(); peer_rides = nil; unseat_ghost()
             log.info("vehicles: the other player left - their car and seat let go")
         end
+        if not guest_here and #made_cars > 0 then remove_made_cars() end
         if guest_here then
             car_hook_in = car_hook_in - dt
             if car_hook_in <= 0 then car_hook_in = 2.0; util.ensure_hook(MASTER .. ":ReceiveBeginPlay", on_car_begin) end
@@ -1037,14 +1159,16 @@ function vehicles.busy()
 end
 
 function vehicles.status()
-    return string.format("vehicles: car updates received %d | driving %s | the other player's car %s | cars moved %d, added %d, removed %d, spawners stopped %d",
-        stats.samples or 0, driving and tostring(peer_name(driving)) or "-", peer and peer.name or "-", stats.moved, stats.added, stats.removed, stats.spawners)
+    return string.format("vehicles: car updates received %d | driving %s | the other player's car %s | cars moved %d, added %d, removed %d, spawners stopped %d | horns sent %d, played %d, wreck honks heard %d",
+        stats.samples or 0, driving and tostring(peer_name(driving)) or "-", peer and peer.name or "-", stats.moved, stats.added, stats.removed, stats.spawners,
+        horn_stats.sent, horn_stats.played, horn_stats.wrecks)
 end
 
 -- The old world's cars are gone (respawn/reload): drop them, keep what the other game told us.
 local function forget_world()
     cars, alias, rev, retired, frozen, unknown, wake_at, pending = {}, {}, {}, {}, {}, {}, {}, {}
     made_for_drive, parked, known_state, near_cars, state_keys, state_idx = {}, {}, {}, {}, {}, 0
+    made_cars = {}
     driving, riding, entered_with, peer, master_cls = nil, nil, nil, nil, nil
     seated, seated_as, ghost_collide_at = false, nil, nil
     scan_age, list_sent, pass, entered_at, applied_at = math.huge, nil, 0, now, -100.0
