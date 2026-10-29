@@ -339,13 +339,21 @@ function view.legacy()
     end
 end
 
+-- The cards widget goes, off the screen too: a load can keep the old one on screen (kit 2026-10-29: after going home
+-- the guest's "Leaving ..." and mod-check cards stayed frozen for good while new messages went to a new widget).
+local function drop_view()
+    local old = view.w
+    view.w, view.slots, view.built_for, dirty = nil, {}, nil, true
+    if util.valid(old) then pcall(function() old:RemoveFromParent() end) end
+end
+
 local function view_ok()
     if view.broken then return false end
     local pc
     pcall(function() pc = game.controller() end)
     if not util.valid(pc) then return false end
     if util.valid(view.w) and view.built_for == util.addr(pc) then return true end
-    view.w, view.slots, dirty = nil, {}, true
+    drop_view()
     local ok, built = pcall(view.build)
     if not ok then
         view.broken = true
@@ -388,8 +396,8 @@ end
 
 function notify.init()
     game.keybind("F9", { ModifierKey.CONTROL }, function() util.safe(notify.open_history, "notify.history") end)
-    -- (a load removes the old world's widgets: the next message builds the cards again)
-    game.on_world_reset(function() view.w, view.slots, view.built_for, dirty = nil, {}, nil, true end)
+    -- (the next message builds the cards again, in the new world)
+    game.on_world_reset(drop_view)
 end
 
 -- tests: the logic without the engine

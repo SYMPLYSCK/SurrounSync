@@ -2348,6 +2348,34 @@ def notify_paced_deduped_keyed(L, tmp):
 
 
 @test
+def notify_old_cards_leave_the_screen(L, tmp):
+    # kit 2026-10-29: after going home the guest's "Leaving ..." and mod-check cards stayed frozen on screen for good -
+    # the load kept the old widget on screen and the cards were only forgotten, never taken off
+    L.execute(r'''
+        RESETS, REMOVED = {}, 0
+        ModifierKey = ModifierKey or { CONTROL = 2 }
+        local function obj(addr) return { IsValid = function() return true end, GetAddress = function() return addr end,
+                                          RemoveFromParent = function() REMOVED = REMOVED + 1 end } end
+        PC = obj(1)
+        package.loaded["mirror.game"] = { player = function() return PC end, controller = function() return PC end,
+            keybind = function() end, on_world_reset = function(fn) RESETS[#RESETS + 1] = fn end }
+        notify = require("mirror.notify")
+        notify.configure({}); notify.init()
+        T = notify._test
+        function RUN(s) for _ = 1, math.floor(s / 0.1 + 0.5) do notify.tick(0.1) end end
+        T.view.w, T.view.built_for = obj(9), 1
+    ''')
+    L.execute('for _, fn in ipairs(RESETS) do fn() end')
+    check(L.eval('REMOVED') == 1 and L.eval('T.view.w') is None, "a world reset takes the old cards off the screen")
+    L.execute('T.view.w, T.view.built_for = { IsValid = function() return false end }, 1; for _, fn in ipairs(RESETS) do fn() end')
+    check(L.eval('REMOVED') == 1, "...a widget already gone with its world is left alone")
+    L.execute('T.view.w, T.view.built_for, T.view.broken = { IsValid = function() return true end, '
+              'RemoveFromParent = function() REMOVED = REMOVED + 1 end }, 1, false; PC = { IsValid = function() return true end, '
+              'GetAddress = function() return 2 end }; notify.show("after the load"); RUN(0.1)')
+    check(L.eval('REMOVED') == 2, "a new player controller: the old widget goes before new cards are built")
+
+
+@test
 def util_callsite_tells_callers_apart(L, tmp):
     L.execute('''
         local util = require("mirror.util")
