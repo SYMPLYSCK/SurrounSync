@@ -2,6 +2,31 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 0.14.2 (2026-10-29)
+
+**Fewer freezes, Realms that let everyone in, and SyncFX light that stays in its room.** Plays with friends on 0.14.0 and 0.14.1, but get everyone on 0.14.2 for the freeze fixes.
+
+**No more freezes on saving**
+- The game could freeze for good when a host left a Realm, or when someone joined right after a Realm loaded. Saves now start a moment later, outside the mod's own work, and the second save when leaving a Realm waits for the first one to finish.
+
+**Realms**
+- The second and later friends can join a Realm again. Before, everyone after the first friend was told the Realm wasn't being hosted.
+- Realm cards show a friend as here only when their game really is in the Realm, not while a join is still on its way.
+- Co-op and Realms are kept apart: inside a Realm the CO-OP tab stays empty, and the REALMS page has everything a Realm needs - teleport requests with ACCEPT / DECLINE, the host's KICK and VOICE next to the chat.
+
+**Co-op**
+- After a Realm host switch your friend no longer shows up as having an older SurrounSync.
+- Leaving a friend's world closes the connection cleanly once everything you did has arrived.
+- The offer to continue a leftover co-op save comes once per game run, not on every respawn.
+- Your friend's noise maker keeps drawing zombies for its whole run, like your own.
+- A possible crash when a hound died right after a short bark is fixed (the game's latest experimental update).
+
+**SyncFX**
+- Lamps, wreck headlights and muzzle flashes no longer shine through walls. A lamp only lights while it casts shadows, so on lower graphics settings fewer lamps light at once.
+- Wreck headlights are half as bright.
+- Rooms are no longer darker or foggier than outside.
+- The F6 menu opens in the world even while SyncFX is switched off.
+
 ## 0.14.1 (2026-10-29)
 
 **I apologize for the spam patches.** This download now also fixes a crash when switching SyncFX on, a "host's game closed" message that could stay stuck on screen, and the REALMS tab's join requests - if you installed 0.14.1 earlier today, download it again.
