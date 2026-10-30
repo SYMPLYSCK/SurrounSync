@@ -19,6 +19,9 @@ local SHARED = {
     slotguard = true, backups = true, beds = true, bedtags = true, names = true, jig = true, instance = true,
     loader = true, hostrules = true, mysettings = true, modlist = true, localdir = true, uepath = true, status = true, itemclean = true, devtest = true, invdiag = true, probe = true, recorder = true,
     phase0 = true, peers = true, xp = true,
+    -- one Realm per game: a copy's own realmplay was never started and said it hosted nothing, so every join after
+    -- the first friend's was refused "isn't hosting that Realm right now" (player report 2026-10-29)
+    realmplay = true,
 }
 -- What a mate instance (another guest, seen from a guest) gets its own copy of; the rest is the host link's.
 local PRESENCE = {

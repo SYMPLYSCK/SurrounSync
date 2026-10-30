@@ -834,9 +834,30 @@ function devtest.watch(cfg)
     -- (ExecuteInGameThread from here: commands still run outside the player's tick, as before)
     local ticking, poll_in = false, 0.0
     local god_in = 0.0
+    -- UE4SS 3.0.1 runs every mod's ExecuteInGameThread actions from one shared queue; if it stops draining, the
+    -- commands below go unanswered while the hooks keep ticking (DBG-20261029-004): a no-op every 2 s says when
+    local probe_in, probe_posted, probe_said = 2.0, nil, nil
     game.on_tick(function(dt)
         ticks = ticks + 1
         ticking = true
+        local now = os.clock()
+        if probe_posted then
+            if now - probe_posted > 3 and probe_said ~= probe_posted then
+                probe_said = probe_posted
+                log.warn(string.format("devtest: ExecuteInGameThread queue stalled - a no-op posted %.1f s ago has not run", now - probe_posted))
+            end
+        else
+            probe_in = probe_in - dt
+            if probe_in <= 0 then
+                probe_in, probe_posted = 2.0, now
+                ExecuteInGameThread(function()
+                    if probe_said == probe_posted then
+                        log.warn(string.format("devtest: ExecuteInGameThread queue running again after %.1f s", os.clock() - probe_posted))
+                    end
+                    probe_posted = nil
+                end)
+            end
+        end
         god_in = god_in - dt
         if god and god_in <= 0 then
             god_in = 1.0

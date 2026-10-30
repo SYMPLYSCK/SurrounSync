@@ -13,6 +13,9 @@ local dogs = {}
 
 local DIR = "/Game/Mods/SurrounSyncSounds/"
 local SOUNDS = { bark1 = "DogBark1", bark2 = "DogBark2", growl = "DogGrowl", fit = "DogBarking" }
+-- Their lengths in seconds (the WAVs in tools/sounds/wav). UE 5.6 has no SoundBase.Duration property to read, and a
+-- guessed length longer than the sound would let stop() reach a component that has already freed itself.
+local LENGTHS = { bark1 = 0.51, bark2 = 0.76, growl = 1.71, fit = 2.9 }
 local HOUND = "/Game/AI/Zombies/Dog/BP_Zombie_Dog.BP_Zombie_Dog_C"
 local KSL = "/Script/Engine.Default__KismetSystemLibrary"
 local GS = "/Script/Engine.Default__GameplayStatics"
@@ -56,15 +59,15 @@ local function play(h, kind)
     local snd, gs, root = sound(kind), util.cdo(GS), nil
     pcall(function() root = h.z:K2_GetRootComponent() end)
     if not (util.valid(snd) and gs and util.valid(root)) then return false end
-    local len, pitch = 2.0, 0.92 + math.random() * 0.16
-    pcall(function() local d = tonumber(snd.Duration); if d and d > 0 and d < 60 then len = d end end)
+    local len, pitch = LENGTHS[kind] or 0.4, 0.92 + math.random() * 0.16
     local comp
     pcall(function()
         comp = gs:SpawnSoundAttached(snd, root, FName("None"), { X = 0, Y = 0, Z = 30 }, { Pitch = 0, Yaw = 0, Roll = 0 }, 0,
             true, 1.0, pitch, 0.0, nil, nil, true)
     end)
     if not util.valid(comp) then return false end
-    h.snd, h.snd_until = comp, clock + len / pitch
+    -- (0.1 s short of the end: the audio side may finish, and the component free itself, a moment before our clock)
+    h.snd, h.snd_until = comp, clock + len / pitch - 0.1
     return true
 end
 

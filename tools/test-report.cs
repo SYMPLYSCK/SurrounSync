@@ -222,6 +222,9 @@ static class TestReport
         Log(d, "mirror_log.txt", new[] { L("13:00:00", "INFO", "phase1[host]: rx 20/s"),
                                         L("13:00:01", "INFO", "save at C:\\Users\\" + Environment.UserName + "\\AppData\\Local\\SurrounDead"),
                                         L("13:00:02", "WARN", Tactical) }, DateTime.Now);
+        // Create only trusts a folder that has the game program; without it it packs the real install's logs
+        // (or none on a machine without the game, like CI)
+        File.WriteAllText(Path.Combine(d, "win64", Game.Exe), "");
         string outDir = Path.Combine(d, "out");
         Directory.CreateDirectory(outDir);
         Report.OutDir = outDir;
@@ -236,7 +239,9 @@ static class TestReport
             string rep = new StreamReader(a.GetEntry("report.txt").Open()).ReadToEnd();
             Check(rep.Contains("PLAYER SUMMARY") && rep.Contains("DEVELOPER DIAGNOSTICS") && rep.Contains("SYSTEM DETAILS"), "report.txt has both levels and the old system details");
             Check(rep.Contains("Your message: My car vanished") && !rep.Contains("secret1"), "the message is included, its password hidden");
-            string log = new StreamReader(a.GetEntry("game/mirror_log.txt").Open()).ReadToEnd();
+            var entry = a.GetEntry("game/mirror_log.txt");
+            string log = entry == null ? "" : new StreamReader(entry.Open()).ReadToEnd();
+            Check(log.Contains("phase1[host]: rx 20/s"), "the packed log is the given game folder's, not another install's");
             Check(Environment.UserName.Length < 2 || !log.Contains("\\Users\\" + Environment.UserName + "\\"), "packed logs are scrubbed");
         }
         var g = Run(d);

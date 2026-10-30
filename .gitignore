@@ -1,3 +1,6 @@
+# private notes and prompts: never in the repo
+*prompt*.md
+
 # build output
 dist/
 mod/SurrounSync/bridge/

@@ -266,17 +266,50 @@ local function current_slot(exclude)
     return nil, "none"
 end
 
+local function direct_save()
+    local pc = game.controller()
+    local ok = pcall(function() pc:SaveGameToSlot() end)
+    log.info("session: SaveGameToSlot -> " .. tostring(ok))
+    return ok
+end
+
+-- The game's save runs from the engine's timer one frame later, not inside our Lua call: UE4SS holds its Lua lock
+-- for every call from Lua, and a save that waits on loading threads - which take that lock to build objects - never
+-- returned (player reports 2026-10-30: a host froze leaving a Realm, and on a join right after the Realm loaded;
+-- DBG-20261027-006). A save asked for counts as saving until it starts (our hook on it, or the save system busy);
+-- after 1 s it runs directly. (Our own hook: save_guard's are only there once co-op has run.)
+local SAVE_FN = "/Game/Blueprints/BP_PlayerController.BP_PlayerController_C:SaveGameToSlot"
+local save_asked, save_started_at = nil, -1
+-- (one function for the life of the mod: ensure_hook knows a hook by it, a new closure each call would add hooks)
+local function on_save_started() save_started_at = os.clock() end
+local function check_asked()
+    if not save_asked then return end
+    local busy = false
+    pcall(function() busy = lib():IsSavingOrLoading(game.world()) end)
+    if save_started_at >= save_asked or busy then
+        save_asked = nil
+    elseif os.clock() - save_asked > 1.0 then
+        save_asked = nil
+        log.warn("session: the engine's timer didn't start the save within 1 s - saving now")
+        direct_save()
+    end
+end
+
 local function saving()
+    check_asked()
+    if save_asked then return true end
     local busy = false
     pcall(function() busy = lib():IsSavingOrLoading(game.world()) end)
     return busy
 end
 
 local function save_now()
-    local pc = game.controller()
-    local ok = pcall(function() pc:SaveGameToSlot() end)
-    log.info("session: SaveGameToSlot -> " .. tostring(ok))
-    return ok
+    local pc, k = game.controller(), util.cdo("/Script/Engine.Default__KismetSystemLibrary")
+    local ok = k and util.valid(pc) and pcall(function() k:K2_SetTimer(pc, "SaveGameToSlot", 0.001, false, false, 0.0, 0.0) end)
+    if not ok then return direct_save() end
+    save_asked = os.clock()
+    log.info("session: save asked (the engine runs SaveGameToSlot next frame)")
+    return true
 end
 
 local PLAYER_SAVES = { playerinfo = true }
@@ -836,14 +869,21 @@ end
 function session.stray_coop()
     return state == "idle" and is_coop(world_slot or ems_current_name()) and not slotguard.log_exists()
 end
+-- once per leftover save per game run: a player who stayed in it got the offer again on every respawn (report
+-- 0.13.2, 5x in 20 minutes); a join from it is still refused with its own message
+local stray_offered = {}
 function session.offer_own_save()
+    local slot = tostring(world_slot)
+    if stray_offered[slot] then return end
     local own = own_newest()
     if not own then
+        stray_offered[slot] = true
         notify.show(i18n.t("stray_none"), "bad")
         return
     end
     local names = require("mirror.names")
     if names.asking() then return end
+    stray_offered[slot] = true
     log.info("session: leftover co-op save " .. tostring(world_slot) .. " - offering the own save " .. own)
     names.ask({ title = i18n.t("stray_title"), message = i18n.t("stray_msg", own), ok = i18n.t("stray_ok"), cursor = true,
                 done = function() if session.stray_coop() then load_slot(own) end end })
@@ -1127,6 +1167,9 @@ local function watch_host(dt)
 end
 
 function session.host_gone() return gone and not gone.waiting and math.ceil(gone.left) or nil end
+-- os.clock() when the last leave was done (home, items counted), nil after a new join; forget_home() clears it
+function session.home_since() return state == "idle" and carry.home_at or nil end
+function session.forget_home() carry.home_at = nil end
 function session.go_home_now()
     if state ~= "joined" then return end
     if gone then arm_takeover() end   -- (the host-gone countdown's GO HOME NOW: a Realm still goes on)
@@ -1254,6 +1297,7 @@ local function guest_tick(dt)
             if realm_id then shared_save = nil end
             -- (a Realm character has its own items: nothing of mine to count in or out)
             carry.join = not realm_id and carried() or nil
+            carry.home_at = nil
             log.info(realm_id and ("session: joining Realm " .. realm_id .. " with my Realm character")
                 or ("session: carrying " .. carry.join .. " item stack(s) into the co-op world"))
             join_slot, join_stamp = ems_current_name(), nil
@@ -1542,6 +1586,8 @@ local function guest_tick(dt)
                 local t = takeover
                 takeover = nil
                 util.safe(require("mirror.realmplay").takeover, "realmplay.takeover", t.id, t.host)
+            else
+                carry.home_at = os.clock()   -- (menu.lua ends the link once the host has read everything sent)
             end
         end
     end
@@ -1620,8 +1666,10 @@ local function install_firewall()
         if hook_in <= 0 then
             hook_in = 2.0
             util.ensure_hook("/Game/Blueprints/SD_GameInstance.SD_GameInstance_C:Event_LoadLevel", on_load, nil, true)
+            util.ensure_hook(SAVE_FN, on_save_started, nil, true)
         end
         util.safe(firewall_tick, "session.firewall_tick")
+        util.safe(check_asked, "session.check_asked")
         util.safe(load_tick, "session.load_tick")
         if stray_wait then
             stray_wait = stray_wait - (dt or 0)

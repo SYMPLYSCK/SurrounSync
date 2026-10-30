@@ -96,16 +96,21 @@ local function in_coop()
 end
 
 -- "Ann (owner) - hosting   Bob - here   Cy" : every member of the Realm, the ones playing first.
--- here = in this session with me (my name + the players the bridge has connected), hosting = holds the lease.
+-- here = in this world with me (my name + the players whose game says it is in it), hosting = holds the lease.
 -- The members, the ones playing first: { label = "Ann (owner) - hosting", on = true } (on: in the session right now).
+-- "here" = in this world by that player's own word (where: joined, or host), not merely connected: a friend whose join
+-- never finished (the host froze in its join save) stayed connected at home and showed as "here" (user, 2026-10-30)
+local HERE = { joined = true, host = true }
 local function people_list(r, in_session)
     if not r or not r.people or #r.people == 0 then return nil end
     local on = {}
     local l = in_session and link.lobby() or nil
     if l then
         if l.name and l.name ~= "" then on[l.name] = true end
-        if l.peer and l.peer.connected and l.peer.name then on[l.peer.name] = true end
-        for _, p in ipairs(l.players or {}) do if p.state ~= "connecting" then on[p.name] = true end end
+        pcall(require("mirror.peers").each, "mirror.phase1", function(p1, inst)
+            local name = inst and inst.name or (l.peer and l.peer.name)
+            if name and p1.peer_where and HERE[p1.peer_where()] then on[name] = true end
+        end)
     end
     local first, rest = {}, {}
     for _, p in ipairs(r.people) do
@@ -624,9 +629,18 @@ end
 
 local function ending_tick(dt)
     if S.step == "stopping" then
-        if menu.role() then return end            -- the guests are being sent home
+        if menu.role() then S.stopped_for = 0; return end            -- the guests are being sent home
+        -- co-op just stopped (its ghost and copies are being destroyed) and the leave's first save may still run: a
+        -- SaveGameToSlot from Lua right then never returned - a host's game froze leaving a solo Realm (player
+        -- report 2026-10-30 12:23, the UE4SS Lua-lock deadlock of DBG-20261027-006); wait until both are over
+        S.stopped_for = (S.stopped_for or 0) + dt
+        if S.stopped_for < 0.5 or (session.saving() and S.stopped_for < 20) then return end
         step("ending_save")
-        session.save_now()
+        if session.saving() then
+            log.warn("realmplay: the leave's first save still runs after 20 s - leaving with what it writes")
+        else
+            session.save_now()
+        end
     elseif S.step == "ending_save" then
         if S.t < 1.5 or session.saving() then return end
         step("ending_upload")
@@ -1058,5 +1072,7 @@ function realmplay.init(c)
     booted, list_wanted = os.time(), true   -- (the first list goes once the bridge is up)
     log.info("realmplay: Realms on")
 end
+
+realmplay._people_list = people_list   -- (tests)
 
 return realmplay

@@ -142,6 +142,23 @@ local function leave()
     else notify.show("You're not in someone else's world.", "info") end
 end
 
+-- Home after a leave: the link to the host ends too (2026-10-29: the CO-OP tab still said "connected to" the host),
+-- once the host has read every reliable message this game sent - a take it never read would leave the item on both
+-- sides. A host that stays silent doesn't hold it forever.
+local LEAVE_LINK_MIN, LEAVE_LINK_MAX = 3, 60
+local function leave_link_tick()
+    local home = session.home_since and session.home_since()
+    if not home or my_role() ~= "guest" or pending_join then return end
+    local waited = os.clock() - home
+    if waited < LEAVE_LINK_MIN then return end
+    local left = require("mirror.events").unconfirmed()
+    if left > 0 and waited < LEAVE_LINK_MAX then return end
+    session.forget_home()
+    if left > 0 then log.warn("menu: home - " .. left .. " message(s) the host never confirmed; disconnecting after " .. LEAVE_LINK_MAX .. " s")
+    else log.info("menu: home and everything confirmed by the host - disconnecting") end
+    p1().stop()
+end
+
 -- stop asking to join (the request is still waiting for the host): the REALMS tab's CANCEL on a pending Realm join
 local function cancel_join(message)
     if my_role() ~= "guest" or session.state() ~= "idle" then return end
@@ -173,6 +190,21 @@ local function players_text(l, only_guests)
     end
     if #out == 0 and l and l.peer then out[1] = l.peer.name .. (l.peer.connected and "" or " (connecting)") end
     return #out > 0 and table.concat(out, ", ") or nil
+end
+
+-- The Realm this game plays right now, if any. A Realm runs on the co-op session, so without this the CO-OP tab
+-- showed it as "In K3YBOARD32's world" with LEAVE CO-OP (user, 2026-10-30).
+local function current_realm()
+    local r = my_role()
+    if r == "host" then
+        local name = require("mirror.realmplay").hosting()
+        return name and { name = name, hosting = true } or nil
+    end
+    local id = r == "guest" and session.realm_joined and session.realm_joined()
+    if not id then return nil end
+    local realm = require("mirror.realm")
+    local found = realm.find and realm.find(id)
+    return { name = (found and found.name) or (realm.code and realm.code(id)) or "the Realm", hosting = false }
 end
 
 local function status_text()
@@ -257,7 +289,14 @@ local function model()
     end
     m.status = status_text()
     local who = link.peer_name()
-    if not r then
+    -- A Realm is fully separate from co-op (user, 2026-10-30): while in one this page shows no session and has no
+    -- controls - the Realm's hosting, players, chat, teleports and leave are on the REALMS tab
+    local rlm = current_realm()
+    m.realm_session = rlm ~= nil
+    if rlm then
+        m.headline, m.detail = "NOT IN CO-OP", "You're playing a Realm - it has everything on the REALMS tab."
+        m.status = m.detail
+    elseif not r then
         m.headline, m.detail = "NOT IN CO-OP", "Host a game so friends can join you, or join a friend who is hosting."
     elseif r == "host" then
         local names = players_text(l)
@@ -273,13 +312,13 @@ local function model()
         m.headline = p1().connected() and ("CONNECTED TO " .. who:upper()) or "LOOKING FOR THE HOST..."
         m.detail = "Choose JOIN to enter their world."
     end
-    m.requests = (r == "host" and l and l.requests) or {}
-    m.allowed = (r == "host" and l and l.allowed) or 0
-    m.show_host = r == nil or (r == "guest" and session.state() == "idle")
-    m.show_join_local = (not steam and r ~= "host") or (r == "guest" and session.state() == "idle")
-    m.show_leave = r == "guest" and session.state() == "joined"
-    m.show_stop = r == "host"
-    m.show_chat = m.in_coop
+    m.requests = (r == "host" and not rlm and l and l.requests) or {}
+    m.allowed = (r == "host" and not rlm and l and l.allowed) or 0
+    m.show_host = not rlm and (r == nil or (r == "guest" and session.state() == "idle"))
+    m.show_join_local = not rlm and ((not steam and r ~= "host") or (r == "guest" and session.state() == "idle"))
+    m.show_leave = not rlm and r == "guest" and session.state() == "joined"
+    m.show_stop = not rlm and r == "host"
+    m.show_chat = m.in_coop and not rlm
     m.password_on = r == "host" and l and l.password or false
     m.chat = require("mirror.chat").recent(3)
     m.tp = require("mirror.teleport").pending()
@@ -521,6 +560,7 @@ local function tick(dt)
     if bridge_check_in == 1.0 then watch_requests(); watch_release() end
     if want_host then want_host = false; host() end
     stopping_tick(dt)
+    leave_link_tick()
     if want_join then
         local i = want_join; want_join = nil
         local h = ((link.lobby() or {}).hosts or {})[i]

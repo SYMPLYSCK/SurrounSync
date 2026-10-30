@@ -578,6 +578,14 @@ local function build_realms(page, qtree, qpage, itree, ipage)
     local rq = new("HorizontalBox", S.tree, "RealmRequestRow"); vadd(req, rq, 6)
     u.realms_req_accept = button("ACCEPT", 26, GREEN); hadd(rq, u.realms_req_accept)
     u.realms_req_decline = button("DECLINE", 26, DARK_RED); hadd(rq, u.realms_req_decline, 40)
+    -- a teleport asked for, answered here (a Realm has nothing on the CO-OP tab: fully separate, user 2026-10-30)
+    local tpb = new("VerticalBox", S.tree, "RealmTeleport"); vadd(tools, tpb)
+    u.realms_tp = tpb
+    vadd(tpb, text("TELEPORT", 26, DARK_RED))
+    u.realms_tp_t = text("", 18, BLACK, 540); vadd(tpb, u.realms_tp_t, 2)
+    local tpr = new("HorizontalBox", S.tree, "RealmTeleportRow"); vadd(tpb, tpr, 6)
+    u.realms_tp_accept = button("ACCEPT", 26, GREEN); hadd(tpr, u.realms_tp_accept)
+    u.realms_tp_decline = button("DECLINE", 26, DARK_RED); hadd(tpr, u.realms_tp_decline, 40)
     -- every member, the ones playing first; who's online in green (one label each, two rows at most)
     u.realms_who = text("WHO'S IN", 26, DARK_RED); vadd(tools, u.realms_who, 14)
     u.realms_people = text("", 16, INK, 540); vadd(tools, u.realms_people, 2)
@@ -588,6 +596,15 @@ local function build_realms(page, qtree, qpage, itree, ipage)
             local t = text("", 16, INK); hadd(row, t, i > 1 and 18 or nil)
             u.realms_names[#u.realms_names + 1] = t
         end
+    end
+    -- the host: a guest here can be sent off (two clicks, like the CO-OP tab's KICK)
+    local kr = new("HorizontalBox", S.tree, "RealmKickRow"); vadd(tools, kr, 4)
+    u.realms_kick_row = kr
+    hadd(kr, text("KICK", 18, DARK_RED))
+    u.realms_kicks = {}
+    for i = 1, 3 do
+        local b, t = button("", 16, GREY); hadd(kr, b, i == 1 and 12 or 10)
+        u.realms_kicks[i] = { btn = b, t = t }
     end
     -- (hidden while a request is up: the folder has room for one or the other, and chat must stay on the page)
     local bring = new("VerticalBox", S.tree, "RealmBring"); vadd(tools, bring, 14)
@@ -605,8 +622,9 @@ local function build_realms(page, qtree, qpage, itree, ipage)
     -- (two lines: a third ran past the folder's bottom edge, measured in-game)
     local rc = new("HorizontalBox", S.tree, "RealmChatRow"); vadd(tools, rc, 2)
     hadd(rc, text("CHAT", 20, DARK_RED))
-    u.realms_chat_input = input("RealmChatInput", "say something", 17, 300); hadd(rc, u.realms_chat_input, 12)
+    u.realms_chat_input = input("RealmChatInput", "say something", 17, 230); hadd(rc, u.realms_chat_input, 12)
     u.realms_chat_send = button("SEND", 20); hadd(rc, u.realms_chat_send, 12)
+    u.realms_voice, u.realms_voice_t = button("VOICE: OFF", 16); hadd(rc, u.realms_voice, 10)
     u.realms_chat_row = rc
     u.realms_chat_lines = {}
     for i = 1, 2 do local t = text("", 14, BLACK, 540); vadd(tools, t, 0); u.realms_chat_lines[i] = t end
@@ -738,8 +756,31 @@ local function refresh_realms()
         -- answered here, not on the CO-OP tab); BRING FRIENDS makes room for it
         local q = m.hosting and m.request or nil
         vis_hit(u.realms_req, q ~= nil)
-        vis_hit(u.realms_bring, q == nil)
         if q then set(u.realms_req_t, (q.name or "Someone") .. " wants to join " .. (cur.name or "your Realm") .. ".") end
+        -- a teleport asked for, the host's KICK list and VOICE: a Realm's, so here and not on the CO-OP tab
+        local cm = talk and ctx.model and ctx.model() or {}
+        S.realms_coop = cm
+        local tp = cm.tp
+        vis_hit(u.realms_tp, tp ~= nil)
+        if tp then set(u.realms_tp_t, tp.who .. (tp.kind == "goto" and " wants to teleport to you." or " wants to bring you to them.")) end
+        -- (the folder has room for one box: a request or a teleport hides BRING FRIENDS for its moment)
+        vis_hit(u.realms_bring, q == nil and tp == nil)
+        local guests = m.hosting and cm.guests or {}
+        vis_hit(u.realms_kick_row, #guests > 0)
+        for i, k in ipairs(u.realms_kicks) do
+            local p = guests[i]
+            vis_hit(k.btn, p ~= nil)
+            if p then
+                if k.armed and (k.armed.id ~= p.id or clock > k.armed.at + 4) then k.armed = nil end
+                local nm = p.name or "?"
+                if #nm > 12 then nm = util.utf8_cut(nm, 11) .. "." end
+                set(k.t, k.armed and "SURE?" or nm)
+            end
+        end
+        -- (the KICK row takes the second chat line's room: three lines ran past the folder's bottom, measured in-game)
+        if #guests > 0 then vis(u.realms_chat_lines[2], false) end
+        vis_hit(u.realms_voice, talk)
+        if talk then set(u.realms_voice_t, cm.voice_label or "VOICE: OFF") end
         vis_hit(u.realms_friends, m.hosting == true)
         -- (a visiting member leaves here too, like LEAVE CO-OP; one still asking to come in cancels here)
         vis_hit(u.realms_end, m.hosting == true or m.visiting == true or m.joining == true)
@@ -993,8 +1034,10 @@ local function refresh()
     vis_hit(u.join_local, m.show_join_local)
     vis_hit(u.leave, m.show_leave)
     vis_hit(u.stop, m.show_stop)
-    vis_hit(u.go_home, m.host_gone)
-    vis_hit(u.wait, m.host_gone)
+    -- in a Realm this page has no session and no controls: the REALMS tab has all of it (fully separate, user 2026-10-30)
+    local inert = m.realm_session == true
+    vis_hit(u.go_home, m.host_gone and not inert)
+    vis_hit(u.wait, m.host_gone and not inert)
     -- in co-op the join section can't be used: hidden, so the players, chat and teleport rows fit the folder
     -- (with players listed, the chat ran past the bottom of the page)
     local coop = m.in_coop == true
@@ -1006,20 +1049,20 @@ local function refresh()
         vis_hit(f.row, h ~= nil)
         if h then set(f.name, h.label or h.name); vis_hit(f.btn, h.joinable ~= false) end
     end
-    vis_hit(u.public, m.public_state ~= nil)
+    vis_hit(u.public, m.public_state ~= nil and not inert)
     if m.public_state then
         set(u.public_t, "PUBLIC: " .. ((m.public_state == "on" and "ON") or (m.public_state == "creating" and "...")
             or (m.public_state == "failed" and "FAILED") or "OFF"))
     end
     set(u.pw_label, m.password_on and "PASSWORD (ON):" or "PASSWORD:")
     vis(u.chat_title, m.show_chat)
-    vis_hit(u.voice_btn, m.show_voice); vis_hit(u.voice_vol, m.show_voice)
+    vis_hit(u.voice_btn, m.show_voice and not inert); vis_hit(u.voice_vol, m.show_voice and not inert)
     if m.show_voice then set(u.voice_t, m.voice_label or "VOICE: OFF"); set(u.voice_vol_t, m.voice_vol or "VOL 100%") end
     vis_hit(u.report, m.show_report)
     vis_hit(u.update, m.update ~= nil)
     if m.update then set(u.update_t, "UPDATE TO " .. m.update) end
     vis_hit(u.chat_row, m.show_chat)
-    vis_hit(u.tp_row, m.tp ~= nil)
+    vis_hit(u.tp_row, m.tp ~= nil and not inert)
     if m.tp then set(u.tp_name, m.tp.who .. (m.tp.kind == "goto" and " wants to teleport to you" or " wants to bring you to them")) end
     for i, t in ipairs(u.chat_lines) do
         local c = (m.chat or {})[i]
@@ -1037,7 +1080,7 @@ local function refresh()
         vis_hit(q.row, r ~= nil)
         if r then set(q.name, r.name) end
     end
-    local guests = m.guests or {}
+    local guests = (not inert and m.guests) or {}
     vis(u.guests_title, #guests > 0)
     for i, g in ipairs(u.guests) do
         local p = guests[i]
@@ -1172,6 +1215,21 @@ function journal_tab.tick(dt)
             pcall(function() txt = u.realms_chat_input:GetText():ToString() end)
             if a.chat_send(txt) then pcall(function() u.realms_chat_input:SetText(FText("")) end) end
             ctx.refresh_now = true
+        end
+        -- teleports, voice and KICK for a Realm live here (S.realms_coop: the co-op model as of the last refresh)
+        local cm = S.realms_coop or {}
+        local c_tp_yes, c_tp_no, c_voice = clicked(u.realms_tp_accept), clicked(u.realms_tp_decline), clicked(u.realms_voice)
+        if (rm.hosting or rm.visiting) and cm.tp then
+            if c_tp_yes then a.tp_accept(); ctx.refresh_now = true end
+            if c_tp_no then a.tp_decline(); ctx.refresh_now = true end
+        end
+        if (rm.hosting or rm.visiting) and c_voice then a.voice(); ctx.refresh_now = true end
+        for i, k in ipairs(u.realms_kicks) do
+            local p = rm.hosting and (cm.guests or {})[i] or nil
+            if clicked(k.btn) and p then
+                if k.armed and k.armed.id == p.id then k.armed = nil; a.kick(p.id, p.name) else k.armed = { id = p.id, at = clock } end
+                ctx.refresh_now = true
+            end
         end
         if rm.armed and c_cancel then a.realm_cancel(); ctx.refresh_now = true end
         if cur and cur.id and c_inv then a.realm_invite(cur.id) end

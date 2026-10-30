@@ -32,6 +32,9 @@ local FX = {
 }
 local SEND_EVERY = 1 / 15
 local FIRE_TIME = 10.0
+-- The noise maker keeps calling the AI (its Event_Noise timer, kit 2026-10-29: every 2 s from 5 to 19 s after it
+-- goes off; the actor itself lingers longer). The other player's one does that here for as long, or until its "E".
+local LURE_EVERY, LURE_MAX = 2.0, 20.0
 local OWN_REACH = 250
 
 local cfg
@@ -41,6 +44,7 @@ local counter = 0
 local copies = {}
 local made = {}
 local fires = {}
+local lures = {}   -- n -> { loc, next, until }: the other player's noise maker still calling the AI
 local now, send_in = 0.0, 0.0
 local diag_left = 5
 
@@ -238,11 +242,12 @@ local function apply(p)
             local loc = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
             if loc.X == 0 and loc.Y == 0 and loc.Z == 0 then loc = loc_of(c.actor) or c.to end
             go_off(c.cls, loc)
+            if KINDS[c.cls] == "noise" then lures[n] = { loc = loc, next = now + LURE_EVERY, ["until"] = now + LURE_MAX } end
             remove_copy(n)
         end
     elseif k == "E" then
         local n = p:match("^E (%d+)$")
-        if n then remove_copy(n) end
+        if n then remove_copy(n); lures[n] = nil end
     end
 end
 
@@ -264,6 +269,13 @@ local function follow(dt)
             pcall(function() fi.emitter:Deactivate() end)
             pcall(function() fi.sound:Deactivate() end)
             table.remove(fires, i)
+        end
+    end
+    for n, l in pairs(lures) do
+        if now >= l["until"] then lures[n] = nil
+        elseif now >= l.next then
+            l.next = now + LURE_EVERY   -- (not l.next + 2: after a hitch, one call, not a burst catching up)
+            noise(l.loc, 15000)
         end
     end
 end
@@ -288,11 +300,14 @@ function throwables.status()
     local m, c = 0, 0
     for _ in pairs(mine) do m = m + 1 end
     for _ in pairs(copies) do c = c + 1 end
-    return string.format("throwables: thrown %d, mine now %d | the other player's flying %d, fires %d", counter, m, c, #fires)
+    local lu = 0
+    for _ in pairs(lures) do lu = lu + 1 end
+    return string.format("throwables: thrown %d, mine now %d | the other player's flying %d, fires %d, noise makers calling %d",
+        counter, m, c, #fires, lu)
 end
 
 -- Respawn/reload: the old world's objects are freed - drop them without touching them.
-local function forget_world() mine, copies, made, fires = {}, {}, {}, {} end
+local function forget_world() mine, copies, made, fires, lures = {}, {}, {}, {}, {} end
 function throwables.init(c) cfg = c; game.on_world_reset(forget_world) end
 
 return throwables

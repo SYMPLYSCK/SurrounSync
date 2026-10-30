@@ -975,6 +975,57 @@ def stray_world_offers_one_click_load(L, tmp):
 
 
 @test
+def saves_run_from_the_engines_timer_not_inside_lua(L, tmp):
+    # player reports 2026-10-30 12:23 + 12:42: a host's game froze in SaveGameToSlot called from our Lua (a Realm
+    # leave, a join right after the Realm loaded). UE4SS holds its Lua lock for the whole call; a save that waits on
+    # loading threads, which take that lock to build objects, never returns (DBG-20261027-006 family). The engine's
+    # timer runs the game's own save one frame later with no Lua call open.
+    stray_rt(L, tmp)
+    L.execute('session.init(CFG, "guest", function() return true end)')
+    L.execute('''
+        TIMERS = {}
+        KSL = { IsValid = function() return true end,
+                K2_SetTimer = function(_, o, f, t, loop) TIMERS[#TIMERS + 1] = { o = o, f = f, t = t, loop = loop } end }
+        local sfo = StaticFindObject
+        function StaticFindObject(p) if p:find("KismetSystemLibrary", 1, true) then return KSL end return sfo(p) end
+        n0 = SAVES
+        session.save_now()
+    ''')
+    check(L.eval('SAVES') == L.eval('n0'), "no save inside the Lua call")
+    check(L.eval('#TIMERS') == 1 and L.eval('TIMERS[1].o == PC') and L.eval('TIMERS[1].f') == "SaveGameToSlot"
+          and L.eval('TIMERS[1].loop') is False, "the game's own SaveGameToSlot is put on the engine's timer, once")
+    check(L.eval('session.saving()') is True, "a save asked for counts as saving until it runs (a join exports after it)")
+    L.execute('PC[TIMERS[1].f](PC)')
+    check(L.eval('SAVES') == L.eval('n0') + 1, "the timer's call saves")
+    L.execute('SAVING = 0; REAL_CLOCK = os.clock; CLK = REAL_CLOCK(); os.clock = function() return CLK end')
+    L.execute('TIMERS = {}; n2 = SAVES; session.save_now(); CLK = CLK + 0.5')
+    check(L.eval('session.saving()') is True and L.eval('SAVES') == L.eval('n2'), "0.5 s: still waiting for the engine")
+    L.execute('CLK = CLK + 0.6; session.saving(); SAVING = 0; CLK = CLK + 5; session.saving()')
+    check(L.eval('SAVES') == L.eval('n2') + 1, "never started: one direct save after 1 s, no more (%d)" % (L.eval('SAVES') - L.eval('n2')))
+    L.execute('n3 = SAVES; session.save_now(); SAVING = 1; session.saving(); SAVING = 0; CLK = CLK + 5; session.saving()')
+    check(L.eval('SAVES') == L.eval('n3'), "the save system busy = the asked save started: no fallback save on top")
+    L.execute('os.clock = REAL_CLOCK')
+    L.execute('KSL.K2_SetTimer = function() error("no timer") end; n1 = SAVES; session.save_now()')
+    check(L.eval('SAVES') == L.eval('n1') + 1, "no timer to be had: saved at once, as before")
+
+
+@test
+def stray_offer_comes_once_per_save(L, tmp):
+    # report 0.13.2 21:20-21:41: a player who stayed in the leftover save got the offer again on every respawn (5x)
+    stray_rt(L, tmp)
+    L.execute('session.init(CFG, "guest", function() return true end)')
+    L.execute('CURRENT = "%s"; for _, fn in ipairs(NEW_PLAYER) do fn() end' % COOP)
+    run_ticks(L)
+    check(L.eval('#ASKS') == 1, "offered once")
+    L.execute('for _, fn in ipairs(NEW_PLAYER) do fn() end')   # respawn: the same save loads again, offer ignored
+    run_ticks(L)
+    check(L.eval('#ASKS') == 1, "not asked again for the same save after a reload (%d)" % L.eval('#ASKS'))
+    L.execute('ASKS[1].done()')
+    run_ticks(L, 2)
+    check(L.eval('LOADS[#LOADS]') == "S1", "the first offer's button still loads the own save")
+
+
+@test
 def stray_main_menu_load_fixes_continue_only_there(L, tmp):
     # the save system may not exist at mod start: the main menu's map load is the second chance
     stray_rt(L, tmp, coop_files=False)
@@ -1444,6 +1495,18 @@ def realmplay_members_and_left_guest(L, tmp):
     check(L.eval('#require("mirror.realm").find("7K2M9P4Q1Z").people') == 3, "a member line of another Realm is not attached")
     L.execute('ROLE = "host"; session.realm_joined = function() return nil end; M = realmplay.model()')
     check(L.eval('M.free') is False, "hosting: not free")
+    # user 2026-10-30: a friend whose join never finished stayed connected at home and the host's card said "here"
+    L.execute('''
+        package.loaded["mirror.phase1"] = { peer_where = function() return WHERE end }
+        package.loaded["mirror.link"].lobby = function() return { name = "Ann B", peer = { name = "Test-guest", connected = true } } end
+        function PEOPLE() local s = {} for i, e in ipairs(realmplay._people_list(require("mirror.realm").find("7K2M9P4Q1Z"), true)) do s[i] = e.label end return table.concat(s, " | ") end
+        WHERE = "own"
+    ''')
+    check(L.eval('PEOPLE()') == "Ann B (owner) - hosting | Cy | Test-guest",
+          "connected but at home: not here (%r)" % L.eval('PEOPLE()'))
+    L.execute('WHERE = "joined"')
+    check(L.eval('PEOPLE()') == "Ann B (owner) - hosting | Test-guest - here | Cy",
+          "joined: here (%r)" % L.eval('PEOPLE()'))
 
 
 @test

@@ -299,6 +299,9 @@ local function on_tick(dt)
     elseif connected and now - last_rx > 30 and not (busy_where(peer_where) or busy_where(session.where())) then
         connected = false
         if mate then log.info("phase1: lost " .. link.peer_name() .. " (another guest)")
+        elseif role == "host" and peer_where == "own" then
+            -- (a guest that went home ends its link a moment later: "X left your world" already said it)
+            log.info("phase1: " .. link.peer_name() .. " went home and disconnected")
         else notify.show("Lost connection to " .. link.peer_name() .. ".", "bad", "link") end
     end
 
@@ -648,7 +651,7 @@ function phase1.init(c, r, peer_id, t)
     link.configure(cfg)
     local mine, theirs = link.open(role, peer_id, tags)
     opened_at = os.time()
-    link.put_blob("hello", "SurrounSync protocol " .. PROTOCOL .. " role " .. role .. (my_build and (" build " .. my_build) or ""))
+    link.put_blob("hello", "SurrounSync protocol " .. PROTOCOL .. " role " .. role .. (my_build and (" build " .. my_build) or ""), true)
     notify.configure(cfg)
     if mate then
         anim.init(cfg)

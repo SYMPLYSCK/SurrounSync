@@ -81,6 +81,13 @@ local function resend_after_restart()
     after_restart = nil
 end
 
+-- kept blobs (the hello) are put again every KEEP_S while the link is open: a guest's link came back on the same
+-- Steam session after a Realm host switch and the host's bridge sent everything again but its one-shot hello ->
+-- "WarFare has an older SurrounSync" (player report 2026-10-29 17:57). The bridge sends a blob only when its text
+-- changed for that player, so on a working link the repeats cost a file write and nothing on the network.
+local KEEP_S = 10
+local kept, keep_in = {}, KEEP_S
+
 local join_password = ""
 function link.set_join_password(pw) join_password = tostring(pw or ""):gsub("[\r\n]", "") end
 
@@ -93,6 +100,7 @@ function link.open(role, peer_id, t)
     end
     tags = t
     own_blobs = {}
+    kept, keep_in = {}, KEEP_S
     local a, b = backend.open(role, t)
     bridge_role = role
     if kind == "steam" and not t then
@@ -116,6 +124,11 @@ function link.tick(dt)
     resend_after_restart()
     flush_cmds()
     now = now + dt
+    keep_in = keep_in - dt
+    if keep_in <= 0 then
+        keep_in = KEEP_S
+        for name, text in pairs(kept) do backend.put_blob(name, text) end
+    end
     if backend.tick then backend.tick(dt) end
     if sim() then
         local seq, payload = backend.poll()
@@ -145,8 +158,9 @@ function link.poll()
     return nil
 end
 
-function link.put_blob(name, text)
+function link.put_blob(name, text, keep)
     if kind == "steam" and auto and not tags then own_blobs[name] = text end
+    if keep then kept[name] = text end
     return backend.put_blob(name, text)
 end
 

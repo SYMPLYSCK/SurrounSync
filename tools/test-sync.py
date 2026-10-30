@@ -123,6 +123,34 @@ def link_restart_puts_the_games_blobs_again():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def link_keeps_putting_the_hello():
+    """Player report 2026-10-29 17:57: the host switched in a 3-player Realm, the guest's link came back on the same
+    Steam session and the host's bridge sent everything again but the hello (its one-shot file was missing or older
+    than its bridge) - 30 s later "WarFare has an older SurrounSync". A kept blob is put again every 10 s; the bridge
+    sends it only when its text changed for that player, so on a working link that costs nothing."""
+    print("link_keeps_putting_the_hello")
+    L = lua()
+    d = tempfile.mkdtemp()
+    try:
+        L.execute('local d = ...; package.loaded["mirror.localdir"] = { get = function() return d end }', d)
+        L.execute('link = require("mirror.link"); link.configure({ transport = "steam" }); link.start_lobby()')
+        L.execute('link.open("host"); link.put_blob("hello", "SurrounSync protocol 54 role host", true)')
+        hello = os.path.join(d, "mirror_hello_host.txt")
+        os.remove(hello)   # lost: the other side's bridge never gets it again
+        L.execute('for _ = 1, 50 do link.tick(0.1) end')
+        check(not os.path.exists(hello), "not put again within 5 s")
+        L.execute('for _ = 1, 51 do link.tick(0.1) end')
+        body = open(hello, "rb").read().decode() if os.path.exists(hello) else None
+        check(body == "SurrounSync protocol 54 role host\nEND\n", "put again within 10 s (%r)" % body)
+        L.execute('link.put_blob("look", "a"); link.open("guest")')
+        os.remove(os.path.join(d, "mirror_look_host.txt")) if os.path.exists(os.path.join(d, "mirror_look_host.txt")) else None
+        L.execute('for _ = 1, 110 do link.tick(0.1) end')
+        check(not os.path.exists(hello), "after a role switch the old role's hello isn't put again")
+        check(not os.path.exists(os.path.join(d, "mirror_look_host.txt")), "...and a blob put without keep never is")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def clockmap_quiet_places_without_stats():
     print("clockmap_quiet_places_without_stats")
     L = lua()
@@ -1190,7 +1218,9 @@ def hounds_bark_when_they_come_for_you():
         package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return {} end,
             on_tick = function(f) TICKS[#TICKS + 1] = f end, on_world_reset = function() end }
         LOADED = true
-        StaticFindObject = function(p) if p:find("SurrounSyncSounds") and not LOADED then return nil end return obj({ p = p, Duration = 0.8 }) end
+        -- (UE 5.6 has no SoundBase.Duration to read: the mod can't see a sound's length; each plays for its WAV's length)
+        LEN = { DogBark1 = 0.51, DogBark2 = 0.76, DogGrowl = 1.71, DogBarking = 2.9 }
+        StaticFindObject = function(p) if p:find("SurrounSyncSounds") and not LOADED then return nil end return obj({ p = p }) end
         T = 0
         function hound(x) local d = obj({ x = x, dead = false, speed = 0 })
             d.K2_GetActorLocation = function() return { X = d.x, Y = 0, Z = 0 } end
@@ -1202,11 +1232,11 @@ def hounds_bark_when_they_come_for_you():
         k.SphereOverlapActors = function(self, w, loc, r, t, cls, ign, out)
             for _, d in ipairs(IN) do if math.abs(d.x - loc.X) <= r then out[#out + 1] = d end end end
         local gs = obj({})
-        -- (a sound plays for its Duration at its pitch, then the component destroys itself: IsPlaying/Stop on it
+        -- (a sound plays for its length at its pitch, then the component destroys itself: IsPlaying/Stop on it
         -- afterwards are calls on a dead object - counted as LATE)
         LATE = 0
         gs.SpawnSoundAttached = function(self, snd, root, _, _, _, _, _, _, pitch)
-            local c = obj({ on = true, p = snd.p, t_end = T + snd.Duration / pitch })
+            local c = obj({ on = true, p = snd.p, t_end = T + LEN[snd.p:match("([%w_]+)$")] / pitch })
             c.IsPlaying = function() if T >= c.t_end then LATE = LATE + 1 end return c.on end
             c.Stop = function() if T >= c.t_end then LATE = LATE + 1 end c.on = false; c.stopped = true end
             PLAYS[#PLAYS + 1] = c
@@ -1236,6 +1266,12 @@ def hounds_bark_when_they_come_for_you():
     L.execute('N1 = #PLAYS; run(5)')
     check(L.eval('#PLAYS') == L.eval('N1'), "...and it never barks again")
     check("1 near bark(s)" in L.eval('dg.status()'), "counted in the status (%s)" % L.eval('dg.status()'))
+    # a short near bark (0.5-0.8 s) has ended and freed its component; the hound dies 0.3 s later
+    L.execute('H = hound(1500); IN = { H }; N4 = #PLAYS; for i = 1, 200 do if #PLAYS > N4 then break end run(0.1, -5) end; '
+              'B = PLAYS[#PLAYS]; for i = 1, 30 do if not B.on then break end run(0.1) end; run(0.3); '
+              'H.dead = true; IN = {}; run(0.3)')
+    check(L.eval('#PLAYS > N4') and L.eval('B.on') is False and L.eval('LATE') == 0,
+          "a hound dying after its short bark ended: no call on the freed component (%s calls)" % L.eval('LATE'))
     L.execute('LOADED = false; util.find = function(p) return StaticFindObject(p) end; H = hound(500); IN = { H }; N2 = #PLAYS; run(5, -20)')
     check(L.eval('#PLAYS') == L.eval('N2'), "no pak: quiet, nothing loaded from Lua")
 
@@ -2635,6 +2671,48 @@ def crumb_keeps_the_last_64_steps():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def coop_tab_in_a_realm_has_nothing_of_it():
+    # user 2026-10-30: co-op and Realms are fully separate - in a Realm the CO-OP tab said "In K3YBOARD32's world"
+    # with LEAVE CO-OP; now it shows no session and no controls (the REALMS tab has all of it)
+    print("coop_tab_in_a_realm_has_nothing_of_it")
+    L = lua()
+    L.execute(r"""
+        local any = { __index = function() return function() end end }
+        local function stub(t) return setmetatable(t or {}, any) end
+        for _, n in ipairs({ "util", "game", "notify", "menu_backups", "instance", "hostrules", "mysettings",
+                             "modlist", "itemclean", "names", "voice", "chat", "teleport", "compat", "version" }) do
+            package.loaded["mirror." .. n] = stub()
+        end
+        ROLE, STATE, REALM_ID, HOSTING = "guest", "joined", nil, nil
+        package.loaded["mirror.link"] = stub({ kind = function() return "steam" end, peer_name = function() return "K3YBOARD32" end,
+            lobby = function() return { players = {} } end, bridge_cmd = function() return true end })
+        package.loaded["mirror.session"] = stub({ state = function() return STATE end, realm_joined = function() return REALM_ID end })
+        package.loaded["mirror.phase1"] = stub({ started = function() return ROLE end, connected = function() return true end })
+        package.loaded["mirror.realmplay"] = stub({ hosting = function() return HOSTING end })
+        package.loaded["mirror.realm"] = stub({ find = function(id) return id == "7K2M9P4Q1Z" and { name = "Camp Test" } or nil end,
+            code = function(id) return "R-" .. id end })
+        package.loaded["mirror.journal_tab"] = stub({ configure = function(t) TAB = t end })
+        ModifierKey = { CONTROL = 1 }
+        menu = require("mirror.menu")
+        menu.init({})
+        M = TAB.model()
+    """)
+    check(L.eval("M.headline") == "IN K3YBOARD32'S WORLD" and L.eval("M.show_leave") is True,
+          "plain co-op: the host's world and LEAVE CO-OP, as before")
+    def inert(who):
+        check(L.eval("M.headline") == "NOT IN CO-OP" and L.eval("M.realm_session") is True
+              and "K3YBOARD32" not in L.eval("M.detail") and "K3YBOARD32" not in L.eval("M.status"),
+              "%s: the CO-OP tab shows no session (%s / %s)" % (who, L.eval("M.headline"), L.eval("M.detail")))
+        check(not any(L.eval("M." + k) for k in ("show_leave", "show_stop", "show_host", "show_join_local", "show_chat"))
+              and L.eval("#M.requests") == 0 and L.eval("M.allowed") == 0, "%s: and no co-op controls" % who)
+    L.execute('REALM_ID = "7K2M9P4Q1Z"; M = TAB.model()')
+    inert("a Realm guest")
+    L.execute('ROLE, REALM_ID, HOSTING = "host", nil, "Camp Test"; M = TAB.model()')
+    inert("a Realm host")
+    L.execute('HOSTING = nil; M = TAB.model()')
+    check(L.eval("M.headline") == "HOSTING" and L.eval("M.show_stop") is True, "plain hosting unchanged")
+
+
 def unanswered_join_keeps_the_friends_list():
     # player report: asking to join someone who never accepts switched the CO-OP tab to just the chat - the
     # friends list and code box were gone (role was "guest" from the moment of asking)
@@ -2706,6 +2784,51 @@ def unanswered_join_keeps_the_friends_list():
           "after 2 minutes without an answer it stops asking and says so (%s)" % said[-1:])
     L.execute("CLOCK = 1500; TICK(0.1)")
     check(L.eval("STOPPED") == 1, "...once")
+    # home after a leave: the link to the host ends too, once the host confirmed everything this game sent
+    # (2026-10-29: the CO-OP tab still said "connected to" the host after leaving)
+    print("home_after_a_leave_disconnects_once_confirmed")
+    L = lua()
+    L.execute(r"""
+        local any = { __index = function() return function() end end }
+        local function stub(t) return setmetatable(t or {}, any) end
+        for _, n in ipairs({ "notify", "menu_backups", "instance", "hostrules", "mysettings",
+                             "modlist", "itemclean", "names", "voice", "chat", "teleport", "compat", "version" }) do
+            package.loaded["mirror." .. n] = stub()
+        end
+        STOPPED, ERRS, HOME, UNCONF, STATE = 0, {}, nil, 2, "idle"
+        package.loaded["mirror.hostrules"] = stub({ my_value = function() return "4" end })
+        package.loaded["mirror.util"] = stub({ error_count = function() return 0 end,
+            safe = function(f, n, ...) local ok, e = pcall(f, ...); if not ok then ERRS[#ERRS + 1] = tostring(n) .. ": " .. tostring(e) end; return ok, e end })
+        package.loaded["mirror.game"] = stub({ on_tick = function(f) TICK = f end })
+        ROLE, CONNECTED = "guest", true
+        package.loaded["mirror.link"] = stub({ kind = function() return "steam" end, peer_name = function() return "Bob" end,
+            lobby = function() return { hosts = {} } end, bridge_cmd = function() return true end })
+        package.loaded["mirror.session"] = stub({ state = function() return STATE end,
+            home_since = function() return STATE == "idle" and HOME or nil end, forget_home = function() HOME = nil end })
+        package.loaded["mirror.events"] = stub({ unconfirmed = function() return UNCONF end })
+        package.loaded["mirror.phase1"] = stub({ started = function() return ROLE end, connected = function() return CONNECTED end,
+            init = function(c, r) ROLE = r end, stop = function() STOPPED = STOPPED + 1; ROLE = nil end })
+        package.loaded["mirror.journal_tab"] = stub({ configure = function(t) TAB = t end })
+        ModifierKey = { CONTROL = 1 }
+        CLOCK = 1000
+        os.clock = function() return CLOCK end
+        menu = require("mirror.menu")
+        menu.init({})
+        HOME = 1000
+        CLOCK = 1001; TICK(0.1)
+    """)
+    check(L.eval("STOPPED") == 0, "just home: the link stays a moment")
+    L.execute("CLOCK = 1010; TICK(0.1)")
+    check(L.eval("STOPPED") == 0, "two messages the host hasn't confirmed yet: the link stays")
+    L.execute("UNCONF = 0; CLOCK = 1011; TICK(0.1)")
+    check(L.eval("STOPPED") == 1 and L.eval("HOME") is None, "all confirmed: disconnected (NOT IN CO-OP), once")
+    L.execute("ROLE = 'guest'; HOME = 2000; UNCONF = 5; CLOCK = 2059; TICK(0.1)")
+    check(L.eval("STOPPED") == 1, "a host that never confirms: still waiting at 59 s")
+    L.execute("CLOCK = 2061; TICK(0.1)")
+    check(L.eval("STOPPED") == 2, "...and disconnected after 60 s anyway")
+    L.execute("ROLE = 'guest'; HOME = 3000; UNCONF = 0; STATE = 'joining'; CLOCK = 3010; TICK(0.1)")
+    check(L.eval("STOPPED") == 2, "joining again before it ended: the link stays")
+    check(L.eval("#ERRS") == 0, "no errors (%s)" % list(L.eval("ERRS").values()))
 
 
 def bag_put_back_after_a_take_reaches_the_host():
@@ -3219,6 +3342,30 @@ def throws_and_mines_reach_the_other_game():
     check(not any(m.startswith("throws:S ") for m in L.eval('SENT').values()),
           "the other player's grenade shown next to me is not sent back as mine (%s)" % list(L.eval('SENT').values()))
     check("flying 1" in L.eval('throwables.status()'), "...and it is shown once")
+    # experimental 2026-10-29: the noise maker calls the AI every 2 s until the game destroys it ("E")
+    L.execute(r"""
+        NOISES = 0
+        local base = util.cdo
+        util.cdo = function(p) if p:find("AISense_Hearing") then return { ReportNoiseEvent = function() NOISES = NOISES + 1 end } end return base(p) end
+        INBOX.throws = { "S 8 BP_Throwable_NoiseMaker 300 0 0" }; throwables.tick(0.1)
+        INBOX.throws = { "X 8 300 0 0" }; throwables.tick(0.1)
+        N_OFF = NOISES
+        for i = 1, 50 do throwables.tick(0.1) end
+        N_5S = NOISES
+        INBOX.throws = { "E 8" }; throwables.tick(0.1)
+        for i = 1, 100 do throwables.tick(0.1) end
+        N_AFTER_E = NOISES
+        INBOX.throws = { "S 9 BP_Throwable_NoiseMaker 300 0 0" }; throwables.tick(0.1)
+        INBOX.throws = { "X 9 300 0 0" }; throwables.tick(0.1)
+        N9 = NOISES
+        for i = 1, 400 do throwables.tick(0.1) end
+        N9_END = NOISES - N9
+        util.cdo = base; BOOMS = 0
+    """)
+    check(L.eval('N_OFF') == 1 and L.eval('N_5S') == 3,
+          "the other player's noise maker keeps calling the AI here every 2 s (%d, then %d after 5 s)" % (L.eval('N_OFF'), L.eval('N_5S')))
+    check(L.eval('N_AFTER_E') == L.eval('N_5S'), "...and stops when theirs is gone")
+    check(L.eval('N9_END') == 9, "...and on its own after 20 s, as long as the game's own calls (%d calls)" % L.eval('N9_END'))
     # Land mines: one placed in each game; ours goes off -> the other game shows it and loses its copy.
     L.execute(r"""
         builds = require("mirror.builds")
@@ -4637,6 +4784,12 @@ def reliable_events_survive_pauses_and_restarts():
     A.execute('ch:send("T 2")'); run(4)
     check(B.eval('GOT[42]') == "T 2" and B.eval('#GOT') == 42, "later messages still arrive once")
     check(A.eval('#ch.recent') <= 1, "acked messages are dropped from the sender's history")
+    # (a guest that went home ends its link only when this is 0: a take the host never read would be a dupe)
+    check(A.eval('events.unconfirmed()') == 0, "everything A sent is confirmed by B")
+    A.execute('ch:send("T 3")')
+    check(A.eval('events.unconfirmed()') == 1, "...a new message stays unconfirmed until B reads it")
+    run(4)
+    check(A.eval('events.unconfirmed()') == 0, "...and is confirmed once B has read it")
     C = side(1200)                     # B restarted: a fresh game must not replay the old session
     A.execute('ch.recent = { "1 7 900 T old" }; ch.ids = { { id = 7, t = 0 } }; ch.dirty = true')
     A.execute('tick(0.25)'); ship(A, C); C.execute('tick(0.25)')
@@ -5243,6 +5396,10 @@ def peers_give_every_player_their_own_copy():
         check((read("mirror_look_host.txt") or "").startswith("main") and (read("mirror_look_to2.txt") or "").startswith("copy"),
               "the copy writes to<slot> files, the main link keeps the two-player names")
         check(L.eval('inst.require("mirror.util") == require("mirror.util")'), "shared helpers (util) are the same module")
+        # player report 2026-10-29: a Realm took its creator + one friend, then every further join got "isn't hosting
+        # that Realm right now" - the copy's own realmplay was never started and said it hosted nothing
+        check(L.eval('inst.require("mirror.realmplay") == require("mirror.realmplay")'),
+              "a copy asks the game's own realmplay which Realm it hosts")
         check(L.eval('inst.require("mirror.events") ~= require("mirror.events")'), "per-player state (events) is a copy")
         check(L.eval('debug.getinfo(inst.require("mirror.events").new, "S").short_src:sub(-4) == "#to2"'),
               "a copy's chunk name ends with its tag, so call-site keyed hook/tick slots stay apart")
@@ -5496,7 +5653,7 @@ def mods_switch_restart_and_match_the_host():
         shutil.rmtree(d, ignore_errors=True)
 
 
-for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, player_rip_in_a_container_is_a_take, ui_no_room_removal_is_not_a_take, lights_come_back_on_a_respawned_ghost, perf_run_puts_the_outer_step_back, fs_write_is_whole_or_old, utf8_cut_never_splits_a_character, crumb_keeps_the_last_64_steps, unanswered_join_keeps_the_friends_list, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, jig_price_follows_the_traders_table, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, military_trader_follows_the_host, role_switch_reads_nothing_of_its_own_old_role, new_realm_character_gets_the_starting_kit, realm_takes_the_creators_difficulty, zombies_stop_at_arms_length, human_copies_hold_the_hosts_weapon, hounds_bark_when_they_come_for_you, airdrops_follow_the_host, event_sites_follow_the_host, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, link_restart_puts_the_games_blobs_again, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
+for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, player_rip_in_a_container_is_a_take, ui_no_room_removal_is_not_a_take, lights_come_back_on_a_respawned_ghost, perf_run_puts_the_outer_step_back, fs_write_is_whole_or_old, utf8_cut_never_splits_a_character, crumb_keeps_the_last_64_steps, unanswered_join_keeps_the_friends_list, coop_tab_in_a_realm_has_nothing_of_it, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, jig_price_follows_the_traders_table, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, military_trader_follows_the_host, role_switch_reads_nothing_of_its_own_old_role, new_realm_character_gets_the_starting_kit, realm_takes_the_creators_difficulty, zombies_stop_at_arms_length, human_copies_hold_the_hosts_weapon, hounds_bark_when_they_come_for_you, airdrops_follow_the_host, event_sites_follow_the_host, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, link_restart_puts_the_games_blobs_again, link_keeps_putting_the_hello, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, tactical_reads_only_lights_the_class_has,
           vehicles_keep_this_worlds_fuel, car_horn_reaches_the_other_game, raiders_can_hit_the_guests_ghost, harvest_uses_up_nodes_once, zombie_spawn_pins_hold_or_refuse,
           zombie_copies_take_the_hosts_look,

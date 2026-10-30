@@ -87,6 +87,18 @@ function events:send(payload)
     self.dirty = true
 end
 
+-- How many messages on reliable channels this game sent that the other game hasn't confirmed reading yet (a guest
+-- that went home keeps the link until this is 0: a take the host never read would leave the item on both sides).
+function events.unconfirmed()
+    read_acks()
+    local n = 0
+    for name, ch in pairs(reliable) do
+        local a = acked[name] or 0
+        for _, e in ipairs(ch.ids) do if e.id > a then n = n + 1 end end
+    end
+    return n
+end
+
 -- drop what the other game has read already (reliable channels)
 function events:trim()
     local a = acked[self.name]

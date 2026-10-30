@@ -213,8 +213,34 @@ def handover_times_out():
     check(L.eval('count("session.promote_realm")') == 1, "a hand-over that never finishes doesn't hold the takeover up")
 
 
+def leaving_saves_once_coop_and_the_first_save_are_over():
+    # player report 2026-10-30 12:23: a host left a solo Realm and the game froze. The leave's second save ran 2 ms
+    # after co-op stopped (ghost and copies being destroyed) while the first one still ran: SaveGameToSlot from Lua
+    # never returned (UE4SS Lua-lock deadlock family, DBG-20261027-006)
+    print("leaving_saves_once_coop_and_the_first_save_are_over")
+    L = fresh()
+    L.execute('realmplay.promote(RID, "76561100"); run(1.0); READY = true; run(0.1); run(1.3)')
+    check(L.eval('realmplay.hosting()') == "Camp Test", "hosting the Realm")
+    L.execute('realmplay.leave()')
+    check(L.eval('st()') == "stopping", "leaving")
+    L.execute('n0 = count("session.save_now"); SAVING = true; ROLE = nil; run(0.1)')
+    check(L.eval('count("session.save_now") - n0') == 0, "no save in the moment co-op stops")
+    L.execute('run(1.0)')
+    check(L.eval('count("session.save_now") - n0') == 0, "no save while the leave's first save still runs")
+    L.execute('SAVING = false; run(0.6)')
+    check(L.eval('count("session.save_now") - n0') == 1 and L.eval('st()') == "ending_save",
+          "saves once both are over (%d)" % L.eval('count("session.save_now") - n0'))
+    # a save that never reports done doesn't keep the player in the Realm
+    L = fresh()
+    L.execute('realmplay.promote(RID, "76561100"); run(1.0); READY = true; run(0.1); run(1.3); realmplay.leave()')
+    L.execute('n0 = count("session.save_now"); SAVING = true; ROLE = nil; run(20.5)')
+    check(L.eval('st()') == "ending_save" and L.eval('count("session.save_now") - n0') == 0,
+          "a save still running after 20 s: on with what it writes, no second save into it")
+
+
 for t in (clean_end_takes_over_in_place, another_member_won_the_realm, no_old_host_known_waits_out_the_lease,
-          old_host_known_by_its_lease_id, session_gone_falls_back_home, handover_times_out):
+          old_host_known_by_its_lease_id, session_gone_falls_back_home, handover_times_out,
+          leaving_saves_once_coop_and_the_first_save_are_over):
     try:
         t()
     except Exception as e:

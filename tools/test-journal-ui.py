@@ -236,12 +236,14 @@ def realms_page():
     # a non-member asking to come in: its own JOIN REQUEST box in the folder with ACCEPT / DECLINE (members are let
     # in by menu.lua). 2026-10-29: the host found no way to let a friend in when it was a relabelled button
     L.execute('MODEL.request = { id = "1002", name = "Bob" }; TICK(6)')
-    # (the CO-OP tab's request rows have ACCEPT / DECLINE buttons too, built first: the Realm folder's are the last ones)
-    L.execute('''RACCEPT, RDECLINE = nil, nil
+    # (the CO-OP tab's request rows have ACCEPT / DECLINE buttons too, built first; the Realm folder's request box comes
+    # next and its TELEPORT box last: the request's are the second-to-last ones)
+    L.execute('''local acc, dec = {}, {}
         for _, o in ipairs(ALL) do
-            if o.cls == "/Script/UMG.Button" and LABEL(o) == "ACCEPT" then RACCEPT = o end
-            if o.cls == "/Script/UMG.Button" and LABEL(o) == "DECLINE" then RDECLINE = o end
-        end''')
+            if o.cls == "/Script/UMG.Button" and LABEL(o) == "ACCEPT" then acc[#acc + 1] = o end
+            if o.cls == "/Script/UMG.Button" and LABEL(o) == "DECLINE" then dec[#dec + 1] = o end
+        end
+        RACCEPT, RDECLINE = acc[#acc - 1], dec[#dec - 1]''')
     check(L.eval('TEXT_SHOWN("JOIN REQUEST")') is True and L.eval('TEXT_SHOWN("Bob wants to join Our Farm.")') is True,
           "a join request: JOIN REQUEST, who and where")
     # (the buttons show with their box: they never get a visibility of their own)
@@ -259,6 +261,31 @@ def realms_page():
     L.execute('MODEL.request = nil; TICK(6)')
     check(L.eval('SHOWN(BOX("RealmRequest"))') is False and L.eval('SHOWN(BOX("RealmBring"))') is True,
           "no request: the box goes, BRING FRIENDS is back")
+    # user 2026-10-30: a Realm is fully separate from co-op - its teleports, KICK and VOICE are here, not on CO-OP
+    L.execute('''COOP.tp = { who = "Ann", kind = "bring" }; COOP.guests = { { id = "1003", name = "Dee" } }
+        COOP.voice_label = "VOICE: ON"; TICK(6)
+        TACCEPT, TDECLINE = nil, nil
+        for _, o in ipairs(ALL) do
+            if o.cls == "/Script/UMG.Button" and LABEL(o) == "ACCEPT" then TACCEPT = o end
+            if o.cls == "/Script/UMG.Button" and LABEL(o) == "DECLINE" then TDECLINE = o end
+        end''')
+    check(L.eval('SHOWN(BOX("RealmTeleport"))') is True and L.eval('TEXT_SHOWN("Ann wants to bring you to them.")') is True
+          and L.eval('SHOWN(BOX("RealmBring"))') is False, "a teleport asked for: its own box on the REALMS page")
+    L.execute('CLICK(TACCEPT)')
+    check(L.eval('LAST_ACT("tp_accept")') is not None, "...ACCEPT takes the teleport")
+    L.execute('CLICK(TDECLINE)')
+    check(L.eval('LAST_ACT("tp_decline")') is not None, "...DECLINE turns it down")
+    check(L.eval('SHOWN(BOX("RealmKickRow"))') is True, "the host's KICK row lists the guests")
+    L.execute('CLICK(BUTTON("Dee"))')
+    check(L.eval('LAST_ACT("kick")') is None, "first KICK press only asks")
+    L.execute('TICK(6); CLICK(BUTTON("SURE?"))')
+    k = L.eval('LAST_ACT("kick")')
+    check(k is not None and k[2] == "1003", "second press sends that guest off")
+    L.execute('CLICK(BUTTON("VOICE: ON"))')
+    check(L.eval('LAST_ACT("voice")') is not None, "VOICE on the REALMS page")
+    L.execute('COOP.tp, COOP.guests = nil, {}; TICK(6)')
+    check(L.eval('SHOWN(BOX("RealmTeleport"))') is False and L.eval('SHOWN(BOX("RealmKickRow"))') is False
+          and L.eval('SHOWN(BOX("RealmBring"))') is True, "nothing asked, nobody to kick: those rows go")
     # who's in: one label each, online in green
     L.execute('''MODEL.current.people_list = { { short = "Ann (host)", on = true }, { short = "Bob", on = true },
         { short = "Cy", on = false } }; TICK(6)''')
