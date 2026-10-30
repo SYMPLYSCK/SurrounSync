@@ -5,7 +5,7 @@
 <h1 align="center">SurrounSync</h1>
 
 <p align="center">
-  Co-op for SurrounDead. Play together over Steam, no server or port forwarding needed.<br>
+  Co-op for SurrounDead. Up to four players over Steam, no server or port forwarding needed.<br>
   <a href="https://github.com/SYMPLYSCK/SurrounSync/releases/latest">Download</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
   <a href="#troubleshooting">Help</a>
@@ -13,14 +13,18 @@
 
 ---
 
-SurrounSync is a [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) mod that adds two-player co-op to SurrounDead.
-Both of you run the normal single-player game, and the mod keeps the two games in sync: the other player, the
-zombies and AI, loot, doors, cars, weather and so on.
+SurrounSync is a [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) mod that adds co-op for up to four players to
+SurrounDead. Everyone runs the normal single-player game, and the mod keeps the games in sync: the other players,
+the zombies and AI, loot, doors, cars, weather, airdrops and so on.
 
-- **Bring your own character.** You join your friend's world with your own gear and inventory, and when you
-  leave you go back to your own world with whatever you picked up.
-- **Same fight on both screens.** The host's zombies, bandits, soldiers, bosses and animals are the real ones and
-  the guest sees exact copies. Hits, kills, loot, damage, bleeding and infection all count on both sides.
+- **Bring your own character.** You join a friend's world with your own gear and inventory, and when you leave
+  you go back to your own world with whatever you picked up.
+- **Same fight on every screen.** The host's zombies, bandits, soldiers, bosses and animals are the real ones and
+  the guests see exact copies. Hits, kills, loot, damage, bleeding and infection all count for everyone.
+- **Realms.** A shared world that lives online, not on one player's PC. Any member can open it and play on, and
+  when the host leaves, a player who is still there takes over without a loading screen. See [Realms](#realms).
+- **SyncFX.** An optional graphics mod comes with it: moodier skies and fog, film looks, flickering lamps and
+  wrecks, muzzle flash light. It's installed switched off. See [SyncFX](#syncfx).
 - **Your saves are safe.** Your own world is saved and backed up before you join, and it's never touched while
   you're away. See [Save safety](#save-safety).
 
@@ -32,17 +36,18 @@ zombies and AI, loot, doors, cars, weather and so on.
 - Internet: under 0.5 Mbit/s each way. Ping matters more than speed: players in the same region get the
   smoothest game, and across continents it still works with a little delay. Wired or good Wi-Fi helps. No ports
   to open.
-- The host's PC runs all the AI for both players, so let the faster PC host.
-- BOTH PLAYERS MUST BE ON 0.8 EXPERIMENTAL!
+- The host's PC runs all the AI for everyone, so let the fastest PC host.
+- EVERYONE MUST BE ON THE GAME'S EXPERIMENTAL BRANCH (0.8)! In Steam: SurrounDead → Properties → Betas →
+  experimental. The setup tells you if you're on another one.
 
 ## Install
 
-Both players need the same SurrounSync version.
+Everyone needs the same SurrounSync version.
 
 1. Close SurrounDead.
 2. Download **SurrounSyncSetup.exe** from the [latest release](https://github.com/SYMPLYSCK/SurrounSync/releases/latest) and run it.
-3. Click **INSTALL**. It finds the game on its own (or use *Browse*), installs UE4SS if you don't have it yet, and the
-   mod.
+3. Click **INSTALL**. It finds the game on its own (or use *Browse*), installs UE4SS if you don't have it yet, the
+   mod, and SyncFX (switched off).
 
 When it's done, the setup checks your PC and tells you if anything is off, with what to do about it. You can run
 that check again any time with the **Check** button.
@@ -55,14 +60,46 @@ installed and nothing else. Your saves and backups stay.
 1. Start SurrounDead through Steam and load one of your saves.
 2. Press **J** to open the handbook and go to the **CO-OP** tab. Your **friend code** is shown there.
 3. One of you clicks **HOST A GAME**.
-4. The other one clicks **JOIN** next to the host's name, or types the host's friend code under **JOIN WITH A
-   CODE**, or picks a public game.
-5. The host gets a pop-up and a sound, and accepts the request in their CO-OP tab.
+4. The others click **JOIN** next to the host's name, or type the host's friend code under **JOIN WITH A CODE**,
+   or pick a public game.
+5. The host gets a pop-up and a sound, and accepts each request in their CO-OP tab.
 6. The guest's game saves and then loads into the host's world, right next to them.
 7. To go home, click **LEAVE CO-OP** (or press **Ctrl+F10**). You end up where you were when you joined.
 
 You don't need to restart to switch roles. Once you're back home you can host, and a host with nobody in their
 world can join someone else.
+
+The host sets the rules for their world in the CO-OP tab: max players (2-4), PvP, item cleanup, who may join
+without asking, teleports, and whether guests can change the weather.
+
+## Realms
+
+A Realm is a world you share with a group of friends (up to 16 members). It's stored online, so it doesn't depend
+on one person's PC: whoever is online opens it and the others join, and everyone has their own Realm character
+there. Each player's own single-player world stays separate and untouched.
+
+1. Press **J**, open the **REALMS** tab and click **NEW REALM**. It starts as a new world with your world's
+   difficulty.
+2. Click **INVITE** to get an invite code. Your friend adds it in their REALMS tab under **ADD REALM**. A code works
+   once, for 7 days.
+3. Any member can open the Realm. Other members get in by themselves, anyone else shows up as a **JOIN REQUEST**
+   with ACCEPT and DECLINE.
+4. When the host leaves, a player who is still there takes over the Realm where they stand. Nobody is sent home.
+
+Inside a Realm the CO-OP tab stays empty: chat, voice, teleports, kicks and leaving are all on the REALMS page.
+
+## SyncFX
+
+SyncFX is a graphics mod that comes with the setup, switched off. The game looks exactly as it always did until
+you turn it on.
+
+- **F8** switches it on or off (it remembers your choice). **F6** opens its menu.
+- Presets: Dread (the default), Nightmare, Cinematic, Vibrant, Moody, Realistic, Clean and Subtle. Each sets its
+  own sky, fog and colors, and you can fine-tune every part.
+- Dread and Nightmare add scary events: lamps and wrecked cars that flicker on, horns, screams in the night,
+  burning zombies.
+- It costs some performance. The menu has a quality setting for slower PCs.
+- It only changes how your own game looks, so friends can play with or without it.
 
 ## What's synced
 
@@ -72,16 +109,19 @@ world can join someone else.
 | **Combat** | shots, impacts, blood and gore (with PDS, if both players installed it), grenades and projectiles, hits and kills, damage and medical effects (bleeding, infection, radiation) |
 | **AI** | zombies, bosses, bandits, soldiers, scavengers and animals: looks, movement, health, deaths, corpses. XP goes to whoever made the kill |
 | **Loot** | corpses, containers, storage and crates, dropped items, death bags. Guns keep their magazines and attachments |
-| **World** | time and weather, doors, building, generators and lights, cars (driving, passengers, fuel, damage) |
+| **World** | time and weather, doors, keycard doors, building, generators and lights, cars (driving, up to four seats, fuel, damage), airdrops, crash and event sites |
 | **Your character** | inventory and quest progress go with you into the co-op world and back, beds in both worlds |
-| **Other** | chat, passwords, public games, voice chat (experimental) |
+| **Other** | chat, map pings, teleports, passwords, public games, voice chat (experimental) |
 
 ## Keys
 
 | Key | |
 |---|---|
 | **J** → CO-OP | co-op menu |
+| **J** → REALMS | Realms |
 | **Ctrl+F10** | leave the host's world |
+| Ctrl+F9 | notification history |
+| F8 / F6 | SyncFX on/off / its menu |
 | Ctrl+H, Ctrl+1–3 | host / join a hosting friend, if the menu won't open |
 | Ctrl+F11 | write an inventory report to the log |
 | Ctrl+F12 | write the connection status to the log |
@@ -122,27 +162,33 @@ Run **SurrounSync Setup → Check** first. It catches most problems and tells yo
 
 | Problem | Fix |
 |---|---|
-| No CO-OP tab | Usually an old game version: update SurrounDead in Steam (Properties → Betas → None, then Verify integrity of game files), then run the setup's REPAIR. A different UE4SS version from another mod can also cause it. |
+| No CO-OP tab | Usually the wrong game version: switch SurrounDead to the experimental branch in Steam (Properties → Betas → experimental, then Verify integrity of game files), then run the setup's REPAIR. A different UE4SS version from another mod can also cause it. |
 | "The Steam connection isn't running" | Start Steam before the game. If it's running, your antivirus may have removed `SurrounSyncBridge.exe`. Restore it, allow it, and run REPAIR. |
 | Friend isn't listed | They have to click **HOST A GAME** first, or you can use their friend code. |
-| "Different version of SurrounSync" | Both of you update to the newest version. |
+| "Different version of SurrounSync" | Everyone updates to the newest version. |
 | Game crashes at start after a game update | Probably an old `.pak` mod in `Content\Paks\~mods`. Move it out of the `Paks` folder. |
 | Anything else | Send a [bug report](#bug-reports). |
 
 ## Known limitations
 
-- Two players per session.
-- Traders and quests aren't synced yet, and zombies only hear the other player's gunshots and explosions.
-- Mods that change the same systems (other co-op or inventory mods) haven't been tested. The CO-OP tab lists mods
-  that differ between you and your friend.
+- Four players in a world at most.
+- Traders and quests aren't synced yet, and zombies only hear the other players' gunshots, explosions and noise
+  makers.
+- Load splitting (a guest far from the host runs the zombies around them) is still experimental.
+- Mods that change the same systems (other co-op or inventory mods) haven't been tested. The settings page lists
+  mods that differ between you and your friends.
 
 ## How it works
 
-Each game stays single-player. The mod sends what changes between the two games: player positions 30 times a
+Each game stays single-player. The mod sends what changes between the games: player positions 30 times a
 second, zombie snapshots 15 times a second, and events like shots, hits, loot and doors as they happen.
-`SurrounSyncBridge.exe` carries this over Steam's peer-to-peer networking. When the guest joins, the host's world
-save is sent over and the guest loads it with their own character. The host's game runs all the AI, the guest's
-copies follow along, and the guest's hits are applied to the host's zombies.
+`SurrounSyncBridge.exe` carries this over Steam's peer-to-peer networking. When a guest joins, the host's world
+save is sent over and the guest loads it with their own character. The host's game runs all the AI, the guests'
+copies follow along, and the guests' hits are applied to the host's zombies.
+
+A Realm's world is kept on a small server (`realms-backend/`, a Cloudflare Worker). The member who opens it
+downloads the newest copy and uploads it again as they play, so the next host carries on from there. The game
+traffic itself still goes player to player over Steam.
 
 More detail in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -152,6 +198,7 @@ More detail in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 mod/SurrounSync/   the mod as it goes into ue4ss/Mods (Lua scripts and the built bridge)
 bridge/            SurrounSyncBridge (Steam networking) and code shared with the setup
 installer/         SurrounSyncSetup.exe and its icon
+realms-backend/    the Realms server (Cloudflare Worker, D1 database, R2 storage)
 tools/             build, release, tests, lint and a one-PC test setup
 docs/              how it works, development notes
 ```
