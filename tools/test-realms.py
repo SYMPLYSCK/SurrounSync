@@ -179,6 +179,13 @@ def main():
     server = start_backend()
     a, b = B("A", 1002), B("B", 1003)
     try:
+        # an id can itself start with R (1 in 32): read as an id, not as a code losing its R (CI 2026-10-30: the
+        # server turned RWE288BGVE into WE288BGVE and refused every request for that Realm)
+        for form in ("RWE288BGVE", "rwe288bgve", "R-RWE28-8BGVE", "RRWE288BGVE", "R-ABCDE-FGHJK"):
+            st, body = http("GET", "/realms/" + form)
+            check(b"not a Realm code" not in body, "Realm id/code %s is read: %d %s" % (form, st, body[:80]))
+        st, body = http("GET", "/realms/WE288BGVE")
+        check(st == 400 and b"not a Realm code" in body, "a 9-character id is still refused: %d %s" % (st, body[:80]))
         a.start(); b.start()
         check(a.state().startswith("realms on "), "A: Realms switched on by --realms-url")
 

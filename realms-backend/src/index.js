@@ -84,9 +84,11 @@ function int(v, field, min, max) {
     if (!Number.isInteger(v) || v < min || v > max) fail(400, "bad_input", `${field} must be a whole number ${min}-${max}`);
     return v;
 }
-// Realm ids travel as codes (R-XXXXX-XXXXX, any case, dashes optional) or bare ids.
+// Realm ids travel as codes (R-XXXXX-XXXXX, any case, dashes optional) or bare ids. The code's R goes only
+// when 11 characters are left: a bare id can itself start with R (RWE288BGVE lost its R and was refused).
 function realmId(v) {
-    const s = String(v || "").toUpperCase().replace(/^R-?/, "").replace(/-/g, "");
+    let s = String(v || "").toUpperCase().replace(/-/g, "");
+    if (s.length === 11 && s[0] === "R") s = s.slice(1);
     if (!/^[0-9A-HJKMNP-TV-Z]{10}$/.test(s)) fail(400, "bad_input", "not a Realm code");
     return s;
 }
