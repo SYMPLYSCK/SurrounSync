@@ -224,6 +224,21 @@ local function run(cmd)
         end
         log.info("devtest: takeout " .. item.da:match("([%w_]+)$") .. " from " .. container_name(a) .. ": "
             .. (moved and "done" or ("FAILED " .. tostring(err))) .. " - now " .. describe(fa))
+    elseif cmd == "dropout" then
+        -- like a player dragging the nearest container's first item onto the ground: the game's drop request on the
+        -- container's own component, HandleServerDropRequest(item, count, the player's component) - count -1 = all
+        -- (decompiled BP_JigComponent; user 2026-10-30: in a Realm a drop out of storage stayed in the guest's copy)
+        local a = nearest_container(6)
+        local fa, fb
+        pcall(function() fa = a.BP_JigMultiplayer end)
+        pcall(function() fb = game.player().BP_JigMultiplayer end)
+        local item = fa and jig.contents_of(fa)[1]
+        if not (item and util.valid(fb)) then log.info("devtest: dropout - no item in a container within 6 m"); return end
+        local n0 = #jig.contents_of(fa)
+        local ok, err = pcall(function() fa:HandleServerDropRequest(jig.guid(item.uid), -1, fb) end)
+        log.info("devtest: dropout " .. item.da:match("([%w_]+)$") .. " from " .. container_name(a) .. ": "
+            .. (ok and "done" or ("FAILED " .. tostring(err))) .. " - " .. n0 .. " -> " .. #jig.contents_of(fa)
+            .. " item(s), now " .. describe(fa))
     elseif cmd == "rearrange" or cmd == "rearrange r" then
         -- like a player dragging the container's first item to another free cell (rotated with "r")
         local a = nearest_container(6)
@@ -437,7 +452,7 @@ function devtest.watch(cfg)
             end
             local list = {}
             for _, t in ipairs({ "4x4Jeep", "APC", "Ambulance", "BigRig", "Buggy", "Charger", "DamagedSedan", "FlatbedTruck", "GolfCart",
-                                 "Humvee", "ModifiedPickupUtilityTruck", "PickupTruck", "RV", "SUV", "Sheriff", "SwatVan", "Truck",
+                                 "Humvee", "Humvee2", "ModifiedPickupUtilityTruck", "PickupTruck", "RV", "SUV", "Sheriff", "SwatVan", "Truck",
                                  "PickupUtilityTruck", "Van" }) do
                 for _, v in ipairs(FindAllOf("Vehicle_" .. t .. "_C") or {}) do
                     if util.valid(v) then
@@ -552,6 +567,28 @@ function devtest.watch(cfg)
                 end)
             end
             log.info(string.format("devtest: count %s = %d (%d visible)", arg, n, vis))
+        elseif cmd:find("^walkcost ") then
+            -- walkcost <class>: FindAllOf (every UObject) against the engine's GetAllActorsOfClass (the level's
+            -- actors only) - measurement before util.instances could use the second
+            local t0 = os.clock()
+            local all = FindAllOf(arg) or {}
+            local t1 = os.clock()
+            local klass
+            for _, o in ipairs(all) do
+                if util.valid(o) and not o:GetFullName():find("Default__", 1, true) then klass = o:GetClass(); break end
+            end
+            local n2, t2, t3, err = -1, 0, 0, "no instance to take the class from"
+            if klass then
+                local out = {}
+                t2 = os.clock()
+                local ok, e = pcall(function()
+                    StaticFindObject("/Script/Engine.Default__GameplayStatics"):GetAllActorsOfClass(game.player(), klass, out)
+                end)
+                t3 = os.clock()
+                n2, err = #out, ok and "" or tostring(e)
+            end
+            log.info(string.format("devtest: walkcost %s FindAllOf %d in %.1f ms | GetAllActorsOfClass %d in %.1f ms %s",
+                arg, #all, (t1 - t0) * 1000, n2, (t3 - t2) * 1000, err))
         elseif cmd == "markers" then
             local n = 0
             for _, m in ipairs(FindAllOf("BP_Marker_C") or {}) do
@@ -805,10 +842,22 @@ function devtest.watch(cfg)
             log.info("devtest: modtoggle " .. tostring(arg) .. " -> " .. tostring(require("mirror.modlist").toggle(arg)))
         elseif cmd == "ticks" then
             log.info("devtest: player ticks so far " .. tostring(ticks))
+        elseif cmd:find("^loadmodel ") then
+            -- one guarded load of a zombie model / material on the game thread (loader.load_now), to see whether
+            -- loading the looks a guest lacks is safe now (user 2026-10-30; LoadAsset hung/crashed games in October)
+            local n = cmd:match("^loadmodel (%S+)$") or ""
+            local p = n:find("^/Game/") and n
+                or (n:find("^SK_") and ("/Game/PolygonFiles/PolygonCityZombies/Meshes/Characters/Normal/" .. n .. "." .. n))
+                or (n:find("^Mat_") and ("/Game/PolygonFiles/PolygonCityZombies/Materials/Normal/" .. n .. "." .. n))
+            if not p then log.info("devtest: loadmodel - give SK_..., Mat_... or a /Game/ path"); return end
+            local t0 = os.clock()
+            local what, ms = require("mirror.loader").load_now(p)
+            log.info(string.format("devtest: loadmodel %s -> %s (%.0f ms, frame back after %.0f ms)", n, tostring(what), ms or 0,
+                (os.clock() - t0) * 1000))
         elseif cmd == "status" then
             log.info(string.format("devtest: state %s, where %s, playing %s, host_gone %s", tostring(session.state()),
                 tostring(session.where()), tostring(session.playing_slot()), tostring(session.host_gone())))
-        elseif cmd:find("^kill %d+$") or cmd:find("^eval ") or ({ open = 1, corpse = 1, dump = 1, dump2 = 1, move = 1, putin = 1, takeout = 1, addtest = 1, rearrange = 1, ["rearrange r"] = 1 })[cmd] then
+        elseif cmd:find("^kill %d+$") or cmd:find("^eval ") or ({ open = 1, corpse = 1, dump = 1, dump2 = 1, move = 1, putin = 1, takeout = 1, dropout = 1, addtest = 1, rearrange = 1, ["rearrange r"] = 1 })[cmd] then
             container_cmds(cmd)
         else log.info("devtest: unknown command") end
     end
@@ -837,9 +886,43 @@ function devtest.watch(cfg)
     -- UE4SS 3.0.1 runs every mod's ExecuteInGameThread actions from one shared queue; if it stops draining, the
     -- commands below go unanswered while the hooks keep ticking (DBG-20261029-004): a no-op every 2 s says when
     local probe_in, probe_posted, probe_said = 2.0, nil, nil
+    -- at the main menu no player ticks: commands are read by LoopAsync until a world's player ticks steadily. Armed
+    -- at the start and again whenever the game goes to the main menu (its MAIN MENU button destroys every player).
+    local menu_poll, armed_at = false, 0
+    local function poll_menu()
+        if menu_poll then return end
+        menu_poll, armed_at = true, ticks
+        LoopAsync(250, function()
+            -- (a world's player ticking: stop at once - this thread reading while a world runs crashed kit games,
+            -- C-20261027-097; one tick may still come from the old world's last frame)
+            if ticks > armed_at + 1 then
+                menu_poll = false
+                log.info("devtest: commands now read on the game thread")
+                return true
+            end
+            local cmd = take()
+            if cmd then ExecuteInGameThread(function() util.safe(run, "devtest.watch", cmd) end) end
+            return false
+        end)
+    end
+    local function on_level(_, LevelName)
+        local lv
+        pcall(function() lv = LevelName:get():ToString() end)
+        if lv == "MainMenu" then
+            ticking = false
+            log.info("devtest: main menu - commands read by LoopAsync again")
+            poll_menu()
+        end
+    end
+    local level_hook_in = 0.0
     game.on_tick(function(dt)
         ticks = ticks + 1
         ticking = true
+        level_hook_in = level_hook_in - (dt or 0)
+        if level_hook_in <= 0 then
+            level_hook_in = 2.0
+            util.ensure_hook("/Game/Blueprints/SD_GameInstance.SD_GameInstance_C:Event_LoadLevel", on_level, nil, true)
+        end
         local now = os.clock()
         if probe_posted then
             if now - probe_posted > 3 and probe_said ~= probe_posted then
@@ -869,12 +952,7 @@ function devtest.watch(cfg)
         local cmd = take()
         if cmd then ExecuteInGameThread(function() util.safe(run, "devtest.watch", cmd) end) end
     end)
-    LoopAsync(250, function()
-        if ticking then log.info("devtest: commands now read on the game thread"); return true end
-        local cmd = take()
-        if cmd then ExecuteInGameThread(function() util.safe(run, "devtest.watch", cmd) end) end
-        return false
-    end)
+    poll_menu()
     log.info("devtest: watching " .. path)
 end
 

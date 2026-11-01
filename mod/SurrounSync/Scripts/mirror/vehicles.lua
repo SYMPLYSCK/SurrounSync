@@ -12,9 +12,11 @@ local vehicles = {}
 
 local MASTER = "/Game/Blueprints/Vehicles/BP_VehicleMaster.BP_VehicleMaster_C"
 local TYPES = { "4x4Jeep", "APC", "Ambulance", "BigRig", "Buggy", "Charger", "DamagedSedan", "FlatbedTruck", "GolfCart",
-                "Humvee", "ModifiedPickupUtilityTruck", "PickupTruck", "RV", "SUV", "Sheriff", "SwatVan", "Truck",
+                "Humvee", "Humvee2", "ModifiedPickupUtilityTruck", "PickupTruck", "RV", "SUV", "Sheriff", "SwatVan", "Truck",
                 "PickupUtilityTruck", "Van" }
--- all 19 are direct children of BP_VehicleMaster (game files): one walk finds every type's cars
+-- all 20 are direct children of BP_VehicleMaster (game files): one walk finds every type's cars. A type missing here
+-- (Humvee2, new in game update 26303910) is never synced, and splits the walk into one per type: ~19 walks of ~18 ms
+-- in a row right after a join (kit 2026-10-31: "BP_VehicleMaster_C has a child class outside its group")
 local CAR_GROUP = "BP_VehicleMaster_C"
 do
     local members = {}
@@ -86,8 +88,14 @@ local function alive(a)
 end
 local function name_of(a) local n; pcall(function() n = util.fname(a) end); return n end
 local new_car, car_hook_in = false, 0.0
+-- A car made here only to show the other player's drive (its BeginPlay runs inside our SpawnActor) is theirs, not a
+-- car of this world: never announced or listed as one. It was (report 2026-10-30, Realm: "a new car here - telling
+-- the other game" in the same second as "made it"): the guest then made a second car of the copy of its own, and
+-- players ended up seated in a car the other game had released or removed.
+local making_copy = false
+local copy_names = {}   -- name here -> true for those cars
 local function on_car_begin(self)
-    if role ~= "host" or not in_world then return end
+    if role ~= "host" or not in_world or making_copy then return end
     local a
     pcall(function() a = self:get() end)
     if not alive(a) then return end
@@ -184,6 +192,13 @@ local function follow_mode(car, on)
     end
 end
 
+-- The car's HitBox runs zombies over; it is off while the other player drives it here (follow). The game turns it
+-- back on only when the car comes back into its optimization range, never on getting in: left off, the car stayed a
+-- wall to zombies for the next driver (user 2026-10-31: "after a while the zombies become brick walls to vehicles").
+local function hitbox_on(car)
+    if alive(car) then pcall(function() car.HitBoxCollision:SetGenerateOverlapEvents(true) end) end
+end
+
 local function state_of(car)
     local c, f, h = -1, -1, -1
     pcall(function() c = car.VehicleColor end)
@@ -264,7 +279,7 @@ local function fuel_health(car)
     return tonumber(f), tonumber(h)
 end
 
-local known_state, told, applied_state = {}, {}, {}
+local known_state, told, applied_state, waiting_state = {}, {}, {}, {}
 -- Fuel/health/colour changes are watched on the cars near the player 4x a second (a refuel shows live on the
 -- other screen); a slow round over all cars (~400) keeps that near set. It used to check 12 cars per 0.5 s
 -- over all of them: a change at the car you stood at went out up to ~17 s later.
@@ -294,7 +309,7 @@ local function watch_states(dt, busy)
     for mine in pairs(near_cars) do
         local car = cars[mine]
         if not alive(car) then near_cars[mine] = nil
-        elseif not busy(car) then
+        elseif not busy(car) and not waiting_state[peer_name(car) or ""] then
             local n = peer_name(car)
             local st = state_of(car)
             if n and known_state[n] and known_state[n] ~= st then told[n], changed = st, true end
@@ -308,8 +323,27 @@ local function watch_states(dt, busy)
         link.put_blob("carstate", table.concat(lines, "\n"))
     end
 end
+-- A change that came while the car was driven (T10 audit 2026-10-31): the state comes once per change, so a refuel
+-- just before the other player got in was dropped, and that player's state after the drive undid it on both screens.
+-- It waits now and goes on what the car has after the drive: their colour, their fuel/health change added to mine
+-- (taking their state outright would undo the drive).
+local function merged(car, base, st)
+    local c, f, h = st:match("^(%S+) (%S+) (%S+)$")
+    local _, bf, bh = (base or ""):match("^(%S+) (%S+) (%S+)$")
+    local mf, mh = fuel_health(car)
+    local maxf, maxh
+    pcall(function() maxf = tonumber(car.FuelComponent.MaxFuel) end)
+    pcall(function() maxh = tonumber(car.VehicleHealthComponent.MaxHealth) end)
+    local function add(mine, b, theirs, max)
+        mine, b, theirs = tonumber(mine), tonumber(b), tonumber(theirs)
+        if not (mine and b and theirs and mine >= 0 and b >= 0 and theirs >= 0) then return theirs end
+        local v = math.max(0, mine + theirs - b)
+        return max and max > 0 and math.min(v, max) or v
+    end
+    return c, add(mf, bf, f, maxf), add(mh, bh, h, maxh)
+end
 local function apply_states(body, busy, named)
-    for line in body:gmatch("[^\n]+") do
+    for line in (body or ""):gmatch("[^\n]+") do
         local n, st = line:match("^(%S+) (.+)$")
         if n and applied_state[n] ~= st then
             applied_state[n] = st
@@ -318,8 +352,24 @@ local function apply_states(body, busy, named)
                 local c, f, h = st:match("^(%S+) (%S+) (%S+)$")
                 set_state(car, c, f, h)
                 remember_state(n, car)
+                waiting_state[n] = nil
                 log.info("vehicles: the other player changed " .. n .. " (colour/fuel/health " .. st .. ")")
+            elseif car then
+                waiting_state[n] = { st = st, base = waiting_state[n] and waiting_state[n].base or known_state[n] }
             end
+        end
+    end
+    for n, w in pairs(waiting_state) do
+        local car = named(n)
+        if not car then waiting_state[n] = nil
+        elseif not busy(car) then
+            waiting_state[n] = nil
+            local c, f, h = merged(car, w.base, w.st)
+            set_state(car, c, f, h)
+            -- known as their state: what the drive changed on top of it goes back to them
+            known_state[n] = w.st
+            log.info(string.format("vehicles: the other player changed %s while it was driven (%s) - applied after the drive",
+                n, w.st))
         end
     end
 end
@@ -363,11 +413,12 @@ local made_cars = {}   -- cars made here for the other player's drive (kept out 
 local function remove_made_cars()
     for _, a in ipairs(made_cars) do
         if util.valid(a) and not (driving and util.same(a, driving)) then
-            pcall(function() a:K2_DestroyActor() end)
+            -- (a car's anim graph: destroyed once animation is on the game thread, animgate.lua)
+            require("mirror.animgate").destroy(a, "vehicles.remove_made_cars")
             log.info("vehicles: removed a car made for the other player's drive")
         end
     end
-    made_cars = {}
+    made_cars, copy_names = {}, {}
 end
 -- a Realm takeover in place (realmplay.promote): this world is the Realm's now, so a car made here for the old
 -- host's drive is a real car of it - saved again like any other (the old host's world had it), never removed
@@ -376,7 +427,7 @@ function vehicles.keep_made_cars()
     for _, a in ipairs(made_cars) do
         if util.valid(a) and pcall(function() util.cdo(EMS):SetActorSaveProperties(a, false, false, false, 0) end) then n = n + 1 end
     end
-    made_cars = {}
+    made_cars, copy_names = {}, {}   -- (real cars of this world now: listed like any other)
     if n > 0 then log.info("vehicles: " .. n .. " car(s) made for the old host's drive belong to this world now") end
     return n
 end
@@ -430,7 +481,7 @@ end
 local function host_list()
     local lines = {}
     for n, v in pairs(cars) do
-        if alive(v) then
+        if alive(v) and not copy_names[n] then
             local l, r = transform(v)
             local cp = class_path(v)
             -- (a car retired while this game was a guest, still parked under the map after a Realm takeover)
@@ -503,6 +554,18 @@ local function send_drive(dt)
             if pt then pcall(function() p:K2_SetActorLocation(pt, false, {}, true) end) end
         end
         return
+    elseif car and util.same(riding, car) then
+        -- The driver got out and we still sit in it: we stay a passenger. This game seats us in the driver's seat (it
+        -- has only that one), and taking the car over swapped the roles - the driver came back as a passenger of a car
+        -- following us, and their own throttle fought the follow (cars thrown airborne, player review 2026-10-31). It
+        -- stands with its brakes on here until they come back; to drive, get out and in again.
+        pcall(function()
+            local m = car.VehicleMovementComponent
+            m:SetThrottleInput(0)
+            m:SetSteeringInput(0)
+            m:SetHandbrakeInput(true)
+        end)
+        return
     elseif riding then
         riding, ride_seat, seats.name = nil, nil, nil
         link.put_blob("ride", "R -")
@@ -536,7 +599,7 @@ local function send_drive(dt)
             entered_with = { f = f, h = h }
             for i = #wake_at, 1, -1 do if util.same(wake_at[i].car, car) then table.remove(wake_at, i) end end
             frozen[util.addr(car) or 0] = nil
-
+            hitbox_on(car)   -- (my game runs zombies over while I drive)
         end
         if car then log.info("vehicles: driving " .. tostring(peer_name(car)) .. " - the other game follows") end
     end
@@ -700,15 +763,12 @@ local function release_peer_car(final_l, final_r)
     local c = peer.car
     if alive(c) then
         if final_l then place_hard(c, final_l, final_r) end
-        if util.same(riding, c) then
-            pcall(function() c.Mesh:SetPhysicsLinearVelocity({ X = 0, Y = 0, Z = 0 }, false, FName("None")) end)
-            pcall(function() c.HitBoxCollision:SetGenerateOverlapEvents(true) end)
-        else
-            follow_mode(c, false)
-        end
+        -- (we sit in it and stay a passenger (send_drive): brakes back on, it stands until they drive again)
+        follow_mode(c, false)
+        hitbox_on(c)
         car_effects(c, false, nil)
     end
-    if peer.tow and alive(peer.tow.car) then follow_mode(peer.tow.car, false) end
+    if peer.tow and alive(peer.tow.car) then follow_mode(peer.tow.car, false); hitbox_on(peer.tow.car) end
     unseat_ghost()
     peer = nil
 end
@@ -765,11 +825,13 @@ local function apply_drive(body)
                 pending[n] = nil
                 local cls = StaticFindObject(cp)
                 local a
+                making_copy = true
                 if util.valid(cls) then pcall(function() a = game.world():SpawnActor(cls, l, r) end) end
+                making_copy = false
                 if util.valid(a) then
                     local mine = name_of(a)
                     alias[n], rev[mine or ""] = a, n
-                    if mine then cars[mine] = a end
+                    if mine then cars[mine] = a; copy_names[mine] = true end
                     unknown[n] = nil
                     stats.added = stats.added + 1
                     -- only there to show the other player driving: never part of this world's saves, and gone when
@@ -859,6 +921,8 @@ apply_ride = function(body)
     if peer and peer.name == n then
         -- they were driving it and now ride along (someone with a lower slot got in): the driver's copy
         -- follows the car from now on - let go of it without parking it
+        hitbox_on(c)
+        if peer.tow then hitbox_on(peer.tow.car) end
         unseat_ghost(); peer = nil
     end
     peer_rides = n
@@ -1030,8 +1094,8 @@ function vehicles.tick(dt)
         if not inside then
             release_peer_car(); peer_rides = nil; unseat_ghost()
             alias, rev, driving, retired, frozen, unknown, wake_at, pending = {}, {}, nil, {}, {}, {}, {}, {}
-            made_for_drive, parked, made_cars = {}, {}, {}
-            known_state, told, applied_state = {}, {}, {}
+            made_for_drive, parked, made_cars, copy_names = {}, {}, {}, {}
+            known_state, told, applied_state, waiting_state = {}, {}, {}, {}
         end
     end
     if not in_world then return end
@@ -1111,7 +1175,7 @@ function vehicles.tick(dt)
     end
     if ghost.get() then util.safe(watch_states, "vehicles.states", dt, busy) end
     local cs = link.get_blob("carstate")
-    if cs then util.safe(apply_states, "vehicles.carstate", cs, busy, car_named) end
+    if cs or next(waiting_state) then util.safe(apply_states, "vehicles.carstate", cs, busy, car_named) end
     if ghost_collide_at and now >= ghost_collide_at then
         ghost_collide_at = nil
         local g0 = ghost.get()
@@ -1168,7 +1232,7 @@ end
 local function forget_world()
     cars, alias, rev, retired, frozen, unknown, wake_at, pending = {}, {}, {}, {}, {}, {}, {}, {}
     made_for_drive, parked, known_state, near_cars, state_keys, state_idx = {}, {}, {}, {}, {}, 0
-    made_cars = {}
+    made_cars, copy_names = {}, {}
     driving, riding, entered_with, peer, master_cls = nil, nil, nil, nil, nil
     seated, seated_as, ghost_collide_at = false, nil, nil
     scan_age, list_sent, pass, entered_at, applied_at = math.huge, nil, 0, now, -100.0

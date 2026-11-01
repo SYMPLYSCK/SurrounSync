@@ -3,6 +3,8 @@
 local log = require("mirror.log")
 local util = require("mirror.util")
 local link = require("mirror.link")
+local sleep = require("mirror.sleep")
+local worldset = require("mirror.worldset")
 
 local world = {}
 
@@ -105,6 +107,12 @@ local function differ(a, b)
     return false
 end
 -- Live values move by themselves while weather blends: only a clear difference counts.
+local JUMP, JUMP_CONFIRM = 1.0, 1.5   -- a live weather field moving more than this at once waits for the next look (~2 s)
+local jump = nil                     -- { vals, since }: the host's live weather that jumped, not applied yet
+local function jumped(a, b)
+    for i = 1, #FIELDS do if math.abs((a[i] or 0) - (b[i] or 0)) > JUMP then return true end end
+    return false
+end
 local function differ_live(a, b)
     if not (a and b) then return true end
     for i = 1, #FIELDS do if math.abs((a[i] or 0) - (b[i] or 0)) > 0.25 then return true end end
@@ -233,7 +241,7 @@ local function guest_tick()
         if not t then t, n, l = msg:match("^([^|]+)|([^|]*)|(.*)$") end
         if t then host = { tod = tonumber(t), name = n, label = l, vals = parse_values(v), asset = a ~= "0", live = parse_values(g), moon = m and m == "1" } end
     end
-    if not host or not session.in_world() then matched, mine_set = nil, nil; restore_guest_settings(); return end
+    if not host or not session.in_world() then matched, mine_set, jump = nil, nil, nil; restore_guest_settings(); return end
     local s, w = actors()
     hold_guest_settings(s, w)
     util.ensure_hook(EM .. ":SetBloodMoon", moon_fn)
@@ -297,9 +305,15 @@ local function guest_tick()
         -- the same preset name with a different live state showed rain + snow here under the host's clear sky.
         local g = global_state(w)
         local have = g and values_of(g) or nil
+        local same_jump = jump and not differ_live(jump.vals, host.live)
         if have and not differ_live(have, host.live) then
-            matched = "live"
+            matched, jump = "live", nil
+        elseif matched == "live" and have and jumped(have, host.live) and not (same_jump and now - jump.since >= JUMP_CONFIRM) then
+            -- (a sudden jump away from the host's weather we matched waits for a second look: the host read zeros while
+            -- it stalled - rain gone and back 2 s later on the guest, live 2026-10-30 00:29:19)
+            if not same_jump then jump = { vals = host.live, since = now } end
         elseif not want or differ_live(want.vals, host.live) or now - want.at > RETRY then
+            jump = nil
             want = { vals = host.live, at = now }
             local ok, ws = apply_values(w, host.live, "Host")
             if ok then
@@ -346,12 +360,35 @@ local function guest_tick()
     end
 end
 
+-- World settings (worldset.lua): the host's as the "diff" blob, kept (a guest whose link comes back gets it again);
+-- the guest's game runs them while in the host's world.
+local diff_sent, diff_host = nil, nil
+local function host_diff()
+    local text = worldset.host_text()
+    if text and text ~= diff_sent then
+        diff_sent = text
+        link.put_blob("diff", text, true)
+    end
+end
+local function guest_diff()
+    local text = peer_live() and link.get_blob("diff") or nil
+    if text then diff_host = text end
+    if diff_host then worldset.follow(diff_host, link.peer_name()) end
+end
+
 function world.tick(dt)
     now = now + dt
+    util.safe(sleep.tick, "sleep.tick", dt)
     tick_in = tick_in - dt
     if tick_in > 0 then return end
     tick_in = SEND_EVERY
-    if role == "host" then host_tick() elseif role == "guest" then guest_tick() end
+    if role == "host" then
+        util.safe(host_diff, "world.host_diff")
+        host_tick()
+    elseif role == "guest" then
+        util.safe(guest_diff, "world.guest_diff")
+        guest_tick()
+    end
 end
 
 function world.status()
@@ -362,13 +399,15 @@ end
 
 function world.init(c, r, s, connected)
     restore_guest_settings()
+    diff_sent, diff_host = nil, nil
     cfg, role, session = c, r, s
     peer_live = connected or peer_live
     if cfg.world_sync == false then role = "off" end
+    sleep.init(role, peer_live)
     log.info("world: " .. (role == "host" and "sending time + weather" or role == "guest" and "copying the host's time + weather while joined" or "off"))
 end
 
 -- the old world's sky/weather actors are freed with it
-function world.forget() sky, weather, events_mgr, moon, em_next = nil, nil, nil, false, 0 end
+function world.forget() sky, weather, events_mgr, moon, em_next = nil, nil, nil, false, 0; sleep.forget() end
 
 return world

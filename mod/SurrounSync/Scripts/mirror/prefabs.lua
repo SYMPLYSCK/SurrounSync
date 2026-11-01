@@ -32,7 +32,7 @@ local role, session
 local peer_live = function() return true end
 local tick_in, joined_for = 0.0, 0.0
 local last_sent, want, pending = nil, nil, nil
-local destroyed = {}         -- addresses already destroyed here (still listed until the engine lets go)
+local destroyed = {}         -- actors already destroyed here, still listed until the engine lets go (util.mark)
 local spawned_here = {}      -- line -> true: spawned once in this world (never again, even if it isn't seen)
 local stats = { removed = 0, spawned = 0, sent = 0, no_marker = 0 }
 
@@ -45,7 +45,7 @@ local function present()
     local out = {}
     for _, a in ipairs(util.instances("PrefabMaster_C", { PARENT })) do
         local k = util.addr(a)
-        if k and not destroyed[k] and util.valid(a) then
+        if k and not util.marked(destroyed, a, k) then
             local cls = util.class_name(a)
             local l, r
             pcall(function() l, r = a:K2_GetActorLocation(), a:K2_GetActorRotation() end)
@@ -177,31 +177,48 @@ local function diff(have, host)
     return extra, missing
 end
 
+-- (one site spawned per check: a site is a prefab with dozens of child actors, and the first check after a join
+-- spawned 4 in one frame - a 468 ms hitch in the kit 2026-10-29. While there is work, checks come BUSY_EVERY apart.)
+local MAX_SPAWNS, BUSY_EVERY, MAX_MISSES = 1, 1.0, 1
+local busy = false
 local function fix(extra, missing)
-    local steps = 0
+    local steps, spawns = 0, 0
     for _, p in ipairs(extra) do
         if steps >= MAX_STEPS then return end
-        steps = steps + 1
-        destroyed[util.addr(p.a) or 0] = true
+        steps, busy = steps + 1, true
+        util.mark(destroyed, p.a)
         drop_spawner(p)
-        if pcall(function() p.a:K2_DestroyActor() end) then
+        -- (a site's child actors can be animated: destroyed once animation is on the game thread, animgate.lua)
+        if util.valid(p.a) then
+            require("mirror.animgate").destroy(p.a, "prefabs.remove")
             stats.removed = stats.removed + 1
             log.info("prefabs: removed " .. p.cls .. " - the host's world doesn't have it")
         end
     end
+    local misses = util.find_misses
     for _, w in ipairs(missing) do
-        if steps >= MAX_STEPS then return end
+        if steps >= MAX_STEPS or spawns >= MAX_SPAWNS then return end
+        -- (a lookup of a class not loaded here costs ~15 ms: the host's ~12 such sites were looked up at every check,
+        -- 42-49 ms every 5 s live 2026-10-30. util.find asks a missing path again only after 2 s doubling up to 60 s,
+        -- and one new miss per check keeps those from all coming due in the same frame.)
+        if util.find_misses - misses >= MAX_MISSES then return end
         if not spawned_here[w.key] then
             -- (only a class already loaded here: loading one from Lua can stall the game, L-014; tried again later)
-            local cls = w.path ~= "-" and StaticFindObject(w.path) or nil
+            local cls = util.find(w.path)
+            local unpinned = loottables.missing() > 0
             if not util.valid(cls) then
                 log.every("prefabs.nocls." .. w.cls, 60, "prefabs: " .. w.cls .. " isn't loaded here - not spawning it yet")
             elseif not loottables.ready() then
                 -- (its containers' BeginPlay would load the missing loot tables inside our SpawnActor: loottables.lua)
                 log.every("prefabs.tables", 60, string.format("prefabs: %d container loot table(s) not loaded yet - "
                     .. "the host's event sites come once the game has them", loottables.missing()))
+            elseif unpinned then
+                -- (the tables were looked up and pinned just now: the spawn waits for the next check, not the same
+                -- frame - both together were a 468 ms frame live 2026-10-30 02:34:53)
+                busy = true
+                return
             else
-                steps = steps + 1
+                steps, spawns, busy = steps + 1, spawns + 1, true
                 spawned_here[w.key] = true
                 local a
                 pcall(function()
@@ -218,6 +235,7 @@ local function fix(extra, missing)
 end
 
 local function guest_tick()
+    busy = false
     local body = peer_live() and link.get_blob("prefabs") or nil
     if body then want = parse(body) end
     if not want or joined_for < SETTLE then return end
@@ -227,7 +245,7 @@ local function guest_tick()
     if #extra == 0 and #todo == 0 then pending = nil; return end
     -- the game's spawners may still be rolling: act only on a mismatch that is still there next check
     local sig = #extra .. "|" .. #todo
-    if pending ~= sig then pending = sig; return end
+    if pending ~= sig then pending, busy = sig, pending ~= nil; return end
     fix(extra, todo)
 end
 
@@ -238,7 +256,10 @@ function prefabs.tick(dt)
     if tick_in > 0 then return end
     tick_in = CHECK_EVERY
     if role == "host" then util.safe(host_tick, "prefabs.host")
-    elseif role == "guest" and session and session.in_world() then util.safe(guest_tick, "prefabs.guest") end
+    elseif role == "guest" and session and session.in_world() then
+        util.safe(guest_tick, "prefabs.guest")
+        if busy then tick_in = BUSY_EVERY end
+    end
 end
 
 function prefabs.status()

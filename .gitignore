@@ -21,6 +21,8 @@ tools/sounds/wav/
 
 # bug report webhook (secret)
 tools/report-webhook.txt
+# message of the day admin token (secret, tools/motd.ps1 -Setup)
+tools/motd-token.txt
 tools/testpkg/
 
 # written by the unit tests (names.lua keeps item names next to the game)

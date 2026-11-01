@@ -39,14 +39,14 @@ local MIL_NEAR = 100.0       -- cm: closer than this to the host's spot counts a
 local mil_sent, mil_want, mil_pending = nil, nil, nil
 stats.moved = 0
 
-local destroyed = {}         -- addresses already destroyed here (still listed until the engine lets go)
+local destroyed = {}         -- actors already destroyed here, still listed until the engine lets go (util.mark)
 local spawned_here = {}      -- class -> true: spawned once in this world (never again, even if it isn't seen)
 
 -- a real camp stands somewhere; an empty one at the world origin (no parts, test 2026-10-25) is a template the
 -- game keeps - it can't be destroyed and isn't a camp
 local function real(a)
     local a_addr = util.addr(a)
-    if not a_addr or destroyed[a_addr] then return false end
+    if not a_addr or util.marked(destroyed, a, a_addr) then return false end
     local l
     pcall(function() l = a:K2_GetActorLocation() end)
     return l ~= nil and (math.abs(l.X) > 100 or math.abs(l.Y) > 100 or math.abs(l.Z) > 100)
@@ -97,8 +97,10 @@ local function fix(have, want)
         local list, n = have[cn] or {}, want[cn] or 0
         if #list > n then
             local a = list[#list]
-            destroyed[util.addr(a) or 0] = true
-            if util.valid(a) and pcall(function() a:K2_DestroyActor() end) then
+            util.mark(destroyed, a)
+            -- (a camp's child actors can be animated - its people: destroyed once animation is on the game thread)
+            if util.valid(a) then
+                require("mirror.animgate").destroy(a, "camps.remove")
                 stats.removed = stats.removed + 1
                 log.info("camps: removed " .. cn .. " - the host's world doesn't have it")
             end

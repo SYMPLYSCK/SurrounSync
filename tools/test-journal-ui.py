@@ -49,7 +49,8 @@ local SPECIAL = {
     IsValid = function() return true end,
     GetAddress = function(o) return o.__id end,
     IsPressed = function(o) return PRESSED[o] == true end,
-    IsHovered = function(o) return HOVER[o] == true end,
+    -- (IN_CALL: work UE4SS runs inside the next engine call, like a queued ExecuteInGameThread action)
+    IsHovered = function(o) local f = IN_CALL; IN_CALL = nil; if f then f() end; return HOVER[o] == true end,
     GetText = function(o) return { ToString = function() return o.typed or "" end } end,
     GetVisibility = function(o) return o.props.SetVisibility and o.props.SetVisibility[1] or 0 end,
     GetChildrenCount = function() return 0 end,
@@ -79,8 +80,11 @@ function FText(s) return s end
 function NotifyOnNewObject() end
 
 PLAYER = fake("Player")
+RESETS = {}
+function WORLD_RESET() for _, fn in ipairs(RESETS) do fn() end end
 package.preload["mirror.game"] = function()
-    return setmetatable({ player = function() return PLAYER end }, { __index = function() return function() end end })
+    return setmetatable({ player = function() return PLAYER end, on_world_reset = function(fn) RESETS[#RESETS + 1] = fn end },
+        { __index = function() return function() end end })
 end
 
 ACTS = {}
@@ -227,6 +231,26 @@ def realms_page():
     check(L.eval('LAST_ACT("realm_friends")') is not None, "ADD FRIENDS HERE")
     L.execute('CLICK(BUTTON("INVITE CODE"))')
     check(L.eval('LAST_ACT("realm_invite")[2]') == "4R5BJRNGWF", "INVITE CODE for the current Realm")
+    # user 2026-10-30 'owner rules': the Realm's rules open from the REALMS page (a Realm has nothing on CO-OP)
+    L.execute('''RC = WIDGET("CanvasPanel", "SetVisibility", 4)
+        ICONS = {}
+        for _, o in ipairs(ALL) do if o.wname and o.wname:find("SurrounSync_IconButton_", 1, true) == 1 then ICONS[#ICONS + 1] = o end end
+        GEAR, XB = ICONS[1], ICONS[2]''')
+    check(L.eval('SHOWN(BUTTON("RULES"))') is True, "in a Realm: RULES on the card")
+    L.execute('CLICK(BUTTON("RULES"))')
+    check(L.eval('SHOWN(BOX("Settings"))') is True and L.eval('SHOWN(XB)') is True and L.eval('RC.props.SetVisibility[1]') == 1,
+          "RULES opens the settings page, with its X")
+    L.execute('CLICK(XB)')
+    check(L.eval('SHOWN(BOX("Settings"))') is False and L.eval('RC.props.SetVisibility[1]') == 4,
+          "...and its X goes back to the REALMS page, not CO-OP")
+    check(errors(L) == [], "no errors through the rules page: %s" % errors(L))
+    L.execute('''COOP.realm_session = true
+        for _, o in ipairs(ALL) do if o.cls == "/Script/UMG.Button" and LABEL(o) == "CO-OP" then CTAB = o end end
+        CLICK(CTAB); TICK(6)''')
+    check(L.eval('SHOWN(GEAR)') is False, "the CO-OP page has no gear in a Realm")
+    L.execute('COOP.realm_session = nil; TICK(6)')
+    check(L.eval('SHOWN(GEAR)') is True, "...and has it back outside one")
+    L.execute('CLICK(TAB); TICK(6)')
     L.execute('CLICK(BUTTON("END REALM"))')
     check(L.eval('LAST_ACT("realm_end")') is None, "first END press only asks")
     L.execute('TICK(6)')
@@ -322,7 +346,42 @@ def realms_paging():
     check(errors(L) == [], "no errors: %s" % errors(L))
 
 
-for t in (realms_off_keeps_mods, realms_page, realms_paging):
+def world_reset_inside_a_call():
+    # (live 2026-10-30 13:36:49: a Realm New Game's queued main-menu exit ran inside the tab's IsHovered, the world
+    # reset cleared the tab's state, and the same tick indexed it: "journal_tab.lua:1015 attempt to index a nil value")
+    print("world_reset_inside_a_call")
+    L = make(False)
+    check(L.eval('#RESETS') >= 1, "(setup) the tab registered a world reset handler")
+    L.execute('IN_CALL = WORLD_RESET')
+    ok = L.eval('(pcall(TICK, 1))')
+    check(ok is True, "a world reset inside a call made by the tick doesn't break that tick")
+    check(L.eval('IN_CALL') is None, "(setup) the reset ran inside the tick")
+    ok2 = L.eval('(pcall(TICK, 2))')
+    check(ok2 is True and errors(L) == [], "the next ticks build the tab again without errors: %s" % errors(L))
+
+
+def realms_remove_button():
+    # user 2026-10-30: no way to take a Realm off the list - each row's DELETE / LEAVE / REMOVE asks once, then acts
+    print("realms_remove_button")
+    L = make(True)
+    L.execute('''MODEL = { service = "on", free = true, rows = {
+        { id = "4R5BJRNGWF", name = "Mine", info = "Nobody's on", open = "OPEN", remove = "DELETE" },
+        { id = "7K2M9P4Q1Z", name = "Theirs", info = "LIVE: Ann", open = "JOIN", remove = "LEAVE" },
+        { id = "9ABCDEFGHK", name = "Here", info = "x", open = "OPEN", remove = "LEAVE", here = true } } }''')
+    L.execute('for _, o in ipairs(ALL) do if o.cls == "/Script/UMG.Button" and LABEL(o) == "REALMS" then TAB = o end end')
+    L.execute('CLICK(TAB); TICK(6)')
+    check(L.eval('BUTTON("DELETE") ~= nil and BUTTON("LEAVE") ~= nil') is True, "owner row DELETE, member row LEAVE")
+    check(L.eval('SHOWN(BUTTON("LEAVE", 2))') is False, "not on the Realm I'm in")   # (row 3's: the second LEAVE)
+    L.execute('CLICK(BUTTON("DELETE")); TICK(2)')
+    check(L.eval('LAST_ACT("realm_remove")') is None and L.eval('TEXT_SHOWN("SURE? DELETE")') is True, "the first press asks")
+    L.execute('CLICK(BUTTON("SURE? DELETE")); TICK(2)')
+    check(L.eval('LAST_ACT("realm_remove") and LAST_ACT("realm_remove")[2]') == "4R5BJRNGWF", "the second press deletes that Realm")
+    L.execute('MODEL.free = false; TICK(6)')
+    check(L.eval('SHOWN(BUTTON("LEAVE", 1))') is False, "hidden while in a session")
+    check(errors(L) == [], "no errors: %s" % errors(L))
+
+
+for t in (realms_off_keeps_mods, realms_page, realms_paging, world_reset_inside_a_call, realms_remove_button):
     t()
 print()
 print("%d failure(s)" % len(fails))

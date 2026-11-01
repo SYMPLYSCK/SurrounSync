@@ -115,6 +115,10 @@ interface INet
     string Route(ulong id);
     // bumps each time the connection to id is made again (what went out on the old one may be lost)
     int ConnGen(ulong id);
+    // bytes still waiting on our side to go out to id (a slow link with a backlog is not a dead one)
+    long Queued(ulong id);
+    // the session's state in one line, for the log when its reliable lane dies (DBG-20261030-005: cause still unknown)
+    string Session(ulong id);
     void SetPresence(string role);
     List<KeyValuePair<ulong, string>> FriendsWithPresence(string role);
     int FriendCount();
@@ -187,13 +191,16 @@ class SteamNet : INet
                 if (msg.Callback == CB_P2P_SESSION_REQUEST && msg.ParamSize >= 8)
                 {
                     ulong from = (ulong)Marshal.ReadInt64(msg.Param);
-                    if (onSessionRequest(from)) Accept(from);
+                    if (onSessionRequest(from)) { Accept(from); BumpConn(from); }
                 }
                 else if (msg.Callback == CB_CALL_COMPLETED && msg.ParamSize >= 16) CallDone(msg.Param);
-                else if (smokeLog) log("callback " + msg.Callback + " size " + msg.ParamSize);
                 else if (msg.Callback == CB_P2P_SESSION_FAIL && msg.ParamSize >= 9)
+                {
+                    BumpConn((ulong)Marshal.ReadInt64(msg.Param));
                     log("P2P session failed, error " + Marshal.ReadByte(msg.Param, 8)
                         + " (1 = target not running the bridge, 2 = no rights, 3 = Steam not connected, 4 = timeout)");
+                }
+                else if (smokeLog) log("callback " + msg.Callback + " size " + msg.ParamSize);
             }
             finally { Steam.SteamAPI_ManualDispatch_FreeLastCallback(pipe); }
         }
@@ -203,8 +210,26 @@ class SteamNet : INet
     public void Close(ulong id) { Steam.SteamAPI_ISteamNetworking_CloseP2PSessionWithUser(net, id); }
     public string NameOf(ulong id) { return Steam.S(Steam.SteamAPI_ISteamFriends_GetFriendPersonaName(friends, id)); }
 
+    // A failed session (Steam's callback 1203: timeout, relay lost) drops what was queued on it, reliable blobs too,
+    // and the next send opens a new one; a new session request from a peer means its side started over. Both count
+    // here, so PumpBlobs sends every blob again (T10 audit 2026-10-31: this was always 0 on Steam, the resend never ran).
+    readonly Dictionary<ulong, int> connGens = new Dictionary<ulong, int>();
+    void BumpConn(ulong id) { int g; connGens.TryGetValue(id, out g); connGens[id] = g + 1; }
+    public int ConnGen(ulong id) { int g; connGens.TryGetValue(id, out g); return g; }
+
     // how the session runs: through a Steam relay or direct, and how much is still waiting to go out
-    public int ConnGen(ulong id) { return 0; }
+    public long Queued(ulong id)
+    {
+        Steam.P2PSessionState s;
+        return id != 0 && Steam.SteamAPI_ISteamNetworking_GetP2PSessionState(net, id, out s) ? s.BytesQueued : 0;
+    }
+    public string Session(ulong id)
+    {
+        Steam.P2PSessionState s;
+        if (id == 0 || !Steam.SteamAPI_ISteamNetworking_GetP2PSessionState(net, id, out s)) return "steam session unknown";
+        return string.Format("steam session active {0} connecting {1} error {2} {3} queued {4} B / {5} packets",
+            s.Active, s.Connecting, s.Error, s.UsingRelay != 0 ? "relay" : "direct", s.BytesQueued, s.PacketsQueued);
+    }
     public string Route(ulong id)
     {
         Steam.P2PSessionState s;
@@ -362,6 +387,33 @@ class TestNet : INet
     readonly Dictionary<ulong, int> connGens = new Dictionary<ulong, int>();
     public int ConnGen(ulong id) { lock (qlock) { int g; connGens.TryGetValue(id, out g); return g; } }
     void BumpConn(ulong id) { int g; connGens.TryGetValue(id, out g); connGens[id] = g + 1; }
+    public long Queued(ulong id)
+    {
+        Conn c;
+        lock (qlock) conns.TryGetValue(id, out c);
+        if (c == null) return 0;
+        long n = 0;
+        lock (c.outq) foreach (var f in c.outq) n += f.Length;
+        return n;
+    }
+    public string Session(ulong id) { return "test session queued " + Queued(id) + " B"; }
+    // test faults: SURROUNSYNC_TEST_DEAD_RELIABLE=1 loses every reliable packet to a peer until we close that session
+    // (=2: for good), like the Steam lane of DBG-20261030-005; SURROUNSYNC_TEST_LOSS=0.2 drops 20% of unreliable ones
+    readonly string deadReliable = Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_DEAD_RELIABLE");
+    readonly HashSet<ulong> healed = new HashSet<ulong>();
+    // SURROUNSYNC_TEST_MTU=1200: a reliable packet bigger than that kills the lane to its peer (the live link of
+    // 2026-10-30: everything after the first message Steam had to split never arrived); a restart doesn't help,
+    // the same message goes again
+    readonly int mtu = ParseMtu(Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_MTU"));
+    readonly HashSet<ulong> broken = new HashSet<ulong>();
+    static int ParseMtu(string s) { int v; return s != null && int.TryParse(s, out v) ? v : 0; }
+    readonly double loss = ParseLoss(Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_LOSS"));
+    readonly Random lossRng = new Random(7);
+    static double ParseLoss(string s)
+    {
+        double v;
+        return s != null && double.TryParse(s, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out v) ? v : 0;
+    }
     readonly List<Conn> unnamed = new List<Conn>();                          // host: accepted, id frame not read yet
 
     public TestNet(int port, ulong guestId)
@@ -608,8 +660,15 @@ class TestNet : INet
     public bool Send(ulong to, byte[] data, bool reliable, int channel)
     {
         Conn c;
-        lock (qlock) conns.TryGetValue(to, out c);
+        lock (qlock)
+        {
+            conns.TryGetValue(to, out c);
+            if (c != null && reliable && (deadReliable == "2" || (deadReliable == "1" && !healed.Contains(to)))) return true;
+            if (c != null && reliable && mtu > 0 && data.Length > mtu) broken.Add(to);
+            if (c != null && reliable && broken.Contains(to)) return true;
+        }
         if (c == null || c.dead || c.stream == null) return false;
+        if (!reliable && loss > 0 && lossRng.NextDouble() < loss) return true;
         lock (c.outq) c.outq.Enqueue(Frame(data, channel));
         c.signal.Set();
         return true;
@@ -635,6 +694,7 @@ class TestNet : INet
         {
             Conn c;
             if (conns.TryGetValue(id, out c)) { DropConn(c); conns.Remove(id); }
+            healed.Add(id); broken.Remove(id);
         }
     }
     public bool IsFriend(ulong id) { return Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_STRANGERS") != "1"; }
@@ -840,7 +900,28 @@ class PeerLink
     public readonly VoiceOut voice = new VoiceOut();
     public bool Connected { get { return epoch != null; } }
     public bool liveSent;
+    // Reliable-lane check (DBG-20261030-005: over Steam a guest got the host's heartbeats and poses but none of its
+    // reliable packets): numbered probes go out on the reliable channel, the peer echoes the newest in its 'H'.
+    public long probeN, probeAcked, probeAt, probeWaitSince, closeDue, peerResetAt;
+    public bool peerEchoes;              // their bridge echoes probes (an older one doesn't: no check)
+    public bool peerSplit;               // their bridge puts 'J' pieces together (its 'H' lists "J")
+    public int resets;
+    public string probeIn = null;        // "<their epoch>:<newest probe of theirs>", echoed in our 'H'
+    public string route;                 // direct / relay as last seen (a change is logged)
+    public long routeAt;
+    // Lane still dead after the restarts: blobs go as 'G' parts on the unreliable channel, resent until acked.
+    public bool fallback;
+    public bool hopFallback;             // (a mate) the host's reliable lane to them is dead: the host's roster says so
+    public readonly SortedDictionary<int, GOut> gOut = new SortedDictionary<int, GOut>();
+    public readonly Dictionary<int, GIn> gIn = new Dictionary<int, GIn>();
+    public readonly Dictionary<string, int> gNewestIn = new Dictionary<string, int>();
+    public readonly HashSet<int> gAckDue = new HashSet<int>();
+    public long gAckAt, gInBytes;
+    public readonly Dictionary<int, byte[][]> jIn = new Dictionary<int, byte[][]>();   // reliable pieces being put together
 }
+
+class GOut { public string name; public byte[] z; public int parts, left, cursor; public bool[] acked; public long sentAt; }
+class GIn { public byte[][] parts; public int have; public bool done; public long at, bytes; }
 
 class Bridge
 {
@@ -881,6 +962,14 @@ class Bridge
     const int MAX_INFLATE = CHUNK * MAX_PARTS;
     const double PKT_RATE = 600, PKT_BURST = 3000, BYTE_RATE = 4.0 * 1024 * 1024, BYTE_BURST = 16.0 * 1024 * 1024;
     const int KICK_DROPS = 20; const long KICK_WINDOW = 10000;
+    // probe every PROBE_EVERY ms; a probe unanswered for stallMs while heartbeats arrive and nothing waits to go out
+    // means the reliable lane is dead: restart the session (MAX_RESETS times), then the unreliable fallback
+    // (a joining guest gives up after 120 s without the world: the fallback must be on well before that, ~32 s)
+    const long PROBE_EVERY = 3000; const int MAX_RESETS = 1;
+    long stallMs = 15000;
+    // fallback parts: G_BUDGET per pump pass every G_PUMP ms (~400 packets/s, under the peer's PKT_RATE of 600)
+    const int G_PARTS_MAX = 8000, G_BUDGET = 12, G_IN_MAX = 16; const long G_PUMP = 30, G_IN_BYTES = 24L * 1024 * 1024;
+    int gId;
     byte[] passKey = null;
     byte[] joinKey = null;
     readonly Dictionary<ulong, string> challenges = new Dictionary<ulong, string>();
@@ -1048,6 +1137,9 @@ class Bridge
             else if (args[i] == "--no-game-check") gameCheck = false;
             else if (args[i] == "--test-id" && i + 1 < args.Length) ulong.TryParse(args[++i], out testId);
             else if (args[i] == "--realms-url" && i + 1 < args.Length) realmsUrl = args[++i];
+            else if (args[i] == "--motd-every" && i + 1 < args.Length) int.TryParse(args[++i], out Realms.MotdSeconds);
+            else if (args[i] == "--realm-beat" && i + 1 < args.Length) int.TryParse(args[++i], out Realms.HeartbeatMs);
+            else if (args[i] == "--hosting-stale" && i + 1 < args.Length) int.TryParse(args[++i], out Realms.HostingStaleMs);
             else if (args[i] == "--lobby-smoke") return LobbySmoke();
             else if (args[i] == "--voice-smoke") return VoiceSmoke();
             else if (args[i] == "--list-smoke") return ListSmoke();
@@ -1084,6 +1176,8 @@ class Bridge
                 Log("the old bridge is gone - taking over");
             }
             net = testPort > 0 ? (INet)new TestNet(testPort, testId) : new SteamNet();
+            long sm;
+            if (testPort > 0 && long.TryParse(Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_STALL_MS"), out sm) && sm > 0) stallMs = sm;
             if (!net.Init(Log)) return 2;
             me = net.Me;
             voice.Init(net.SteamUser, Log);
@@ -1187,7 +1281,7 @@ class Bridge
     void Loop()
     {
         long lastScan = -10000, lastGameCheck = 0, lastStatus = 0, lastBlobScan = 0;
-        long lastLobby = -10000, lastCmd = 0, lastPoseRead = 0;
+        long lastLobby = -10000, lastCmd = 0, lastPoseRead = 0, lastGPump = 0;
         int gameMissing = 0;
         while (true)
         {
@@ -1213,7 +1307,9 @@ class Bridge
                 if (t - l.lastHello > 1000 && Reachable(l))
                 {
                     Step("hello"); l.lastHello = t;
-                    SendRaw(l, 'H', epoch + " " + Unix() + " " + role + " " + (!gameCheck || gameMissing == 0 ? "1" : "0"), false);
+                    // (6th: what this bridge understands - "J" = reliable pieces; older bridges ignore the field)
+                    SendRaw(l, 'H', epoch + " " + Unix() + " " + role + " " + (!gameCheck || gameMissing == 0 ? "1" : "0")
+                        + " " + (l.probeIn ?? "-") + " J", false);
                     // Steam only knows the names of your friends ("[unknown]" for anyone else): we say ours
                     if (t - l.lastNameSent > 5000) { l.lastNameSent = t; SendRaw(l, 'N', net.MyName ?? "", false); }
                 }
@@ -1235,6 +1331,8 @@ class Bridge
             {
                 if (t - lastPoseRead >= 10) { Step("pose send"); lastPoseRead = t; foreach (var l in links) if (CanPump(l)) PumpPose(l); }
                 if (t - lastBlobScan > 15) { Step("blob send"); lastBlobScan = t; PumpBlobs(); }
+                Step("lane check"); foreach (var l in new List<PeerLink>(links)) CheckLane(l, t);
+                if (t - lastGPump >= G_PUMP) { Step("fallback send"); lastGPump = t; foreach (var l in links) { GPump(l, t); GAcks(l, t); } }
             }
             Step("ping"); foreach (var l in links) Ping(l, t);
             Step("receive"); Receive(0); Receive(1);
@@ -1494,6 +1592,16 @@ class Bridge
         }
         else if (c == "stop")
         {
+            // the game's goodbye ("bye", written just before this command) goes out first: links were dropped
+            // with it still unread, so guests only lost the connection instead of being taken home (kit
+            // 2026-10-30 12:54, host MAIN MENU with 3 guests: mirror_bye_* written, none arrived)
+            if (links.Count > 0)
+            {
+                Step("stop: last blobs");
+                PumpBlobs();
+                long until = Now() + 400;
+                while (Now() < until) { net.Pump(OnSessionRequest, Log); Thread.Sleep(20); }
+            }
             DropAllLinks("stopped");
             ClearPeerFiles();
             pendingFrom = 0; configuredPeer = 0;
@@ -1770,6 +1878,9 @@ class Bridge
         var sb = new StringBuilder();
         sb.Append("0 ").Append(me).Append(" 0 ").Append(Clean(net.MyName)).Append('\n');
         foreach (var l in links) if (Live(l)) sb.Append(l.slot).Append(' ').Append(l.id).Append(' ').Append(l.gen).Append(' ').Append(Clean(l.name)).Append('\n');
+        // "F <id>": my reliable lane to that guest is dead - the others send to it with resends of their own
+        // (an older guest's parser skips the line: "F" is no slot)
+        foreach (var l in links) if (Live(l) && !l.mate && l.fallback) sb.Append("F ").Append(l.id).Append('\n');
         string body = sb.ToString();
         foreach (var l in links) if (l.Connected) SendRaw(l, 'W', body, true);
         WriteRoster();
@@ -1780,10 +1891,12 @@ class Bridge
     {
         if (from.slot != 0 || from.mate) return;
         var seen = new HashSet<ulong>();
+        var dead = new HashSet<ulong>();
         foreach (var line in body.Split('\n'))
         {
             var f = line.Split(new[] { ' ' }, 4);
             int slot, gen; ulong id;
+            if (f.Length == 2 && f[0] == "F" && ulong.TryParse(f[1], out id)) { dead.Add(id); continue; }
             if (f.Length < 3 || !int.TryParse(f[0], out slot) || !ulong.TryParse(f[1], out id) || !int.TryParse(f[2], out gen)) continue;
             if (id == me) { if (mySlot != slot) { mySlot = slot; Log("I'm guest " + slot + " in " + from.name + "'s game"); WriteLobby(); } continue; }
             if (slot <= 0 || slot > 3) continue;
@@ -1798,6 +1911,13 @@ class Bridge
             }
         }
         foreach (var m in new List<PeerLink>(links)) if (m.mate && !seen.Contains(m.id)) DropLink(m, "left " + from.name + "'s game");
+        foreach (var m in links)
+        {
+            if (!m.mate || m.hopFallback == dead.Contains(m.id)) continue;
+            m.hopFallback = !m.hopFallback;
+            // (what went out reliable since the host's lane died never arrived: everything again, with resends)
+            if (m.hopFallback) { m.sent.Clear(); Log("the host's reliable lane to " + m.name + " is dead - sending to them with our own resends"); }
+        }
         WriteRoster();
     }
 
@@ -1819,7 +1939,18 @@ class Bridge
     // in the game right now: connected and heard from lately (a crashed guest keeps its slot, but leaves the list)
     bool Live(PeerLink l) { return l.Connected && Now() - l.lastRx < 20000; }
 
-    bool CanPump(PeerLink l) { return Reachable(l) && (!l.mate || l.Connected); }
+    // only once their heartbeat came in: blobs the host sent while the Steam session was still being set up
+    // (6 s before 'connected', player report 2026-10-30 13:28) were the start of a reliable lane that never delivered
+    bool CanPump(PeerLink l) { return Reachable(l) && l.Connected; }
+    // Reliable data can't get through: blobs go as 'G' parts with our own resends, small packets twice unreliable.
+    // To a mate that is either hop through the host: mine to the host or the host's to them (T10 audit 2026-10-31:
+    // the host passed reliable mate packets on over its dead lane and they never arrived).
+    bool Fallback(PeerLink l)
+    {
+        if (!l.mate) return l.fallback;
+        var h = HostLink();
+        return l.hopFallback || (h != null && h.fallback);
+    }
 
     static bool NameKnown(string n, ulong id)
     {
@@ -1849,10 +1980,34 @@ class Bridge
         if (found.Count > 0) SetHost(found[0].Key, "Steam friend running SurrounSync as " + other);
     }
 
+    // Reliable messages Steam has to split died on the way to one player (DBG-20261030-005, the player's bridge log
+    // 2026-10-30: every small message arrived, then nothing after the first one bigger than a packet - "lootc", 8 KB).
+    // To a bridge that knows them, a reliable packet over SMALL goes as 'J' pieces that each fit one packet:
+    // 'J' <id:4> <index:2> <count:2> <piece>, put together on the other side and handled as the packet itself.
+    const int SMALL = 1100, PIECE = 1000, J_IN_MAX = 8;
+    int jOutId;
+
     // a packet to one player: straight to them, or for another guest wrapped for the host's bridge to pass on
     bool SendBytesRaw(PeerLink l, byte[] data, bool reliable, int channel)
     {
         bool ok;
+        if (reliable && data.Length > SMALL && l.peerSplit)
+        {
+            int id = ++jOutId, count = (data.Length + PIECE - 1) / PIECE;
+            ok = true;
+            for (int i = 0; i < count && ok; i++)
+            {
+                int off = i * PIECE, len = Math.Min(PIECE, data.Length - off);
+                var p = new byte[9 + len];
+                p[0] = (byte)'J';
+                BitConverter.GetBytes(id).CopyTo(p, 1);
+                BitConverter.GetBytes((ushort)i).CopyTo(p, 5);
+                BitConverter.GetBytes((ushort)count).CopyTo(p, 7);
+                Buffer.BlockCopy(data, off, p, 9, len);
+                ok = SendBytesRaw(l, p, true, channel);
+            }
+            return ok;
+        }
         if (l.mate)
         {
             var h = HostLink();
@@ -1954,6 +2109,8 @@ class Bridge
     {
         byte[] data = Encoding.UTF8.GetBytes(type + body);
         if (!reliable && data.Length > (l.mate ? 1190 : 1200)) reliable = true;
+        // the reliable lane to them is dead: a small packet goes twice on the unreliable one instead
+        if (reliable && data.Length <= (l.mate ? 1190 : 1200) && Fallback(l)) { bool a = SendBytesRaw(l, data, false, 0); return SendBytesRaw(l, data, false, 0) || a; }
         return SendBytesRaw(l, data, reliable, reliable ? 1 : 0);
     }
 
@@ -2130,6 +2287,7 @@ class Bridge
     bool SendBlob(PeerLink l, string name, string body)
     {
         bool ok;
+        if (!LatestWins.Contains(name) && Fallback(l)) return SendGuaranteed(l, name, body);
         byte[] big = body.Length > CHUNK && body.Length <= MAX_INFLATE - 1024 ? Deflate(Encoding.UTF8.GetBytes(epoch + "\n" + name + "\n" + body)) : null;
         if (big != null && big.Length <= CHUNK)
         {
@@ -2172,6 +2330,192 @@ class Bridge
         return ok;
     }
 
+    // DBG-20261030-005: over Steam the guest got the host's heartbeats, poses and pings, but no reliable packet at all
+    // (no hello, no world files) and went home after 120 s, three joins in a row. Each probe goes on the reliable
+    // lane; one unanswered for stallMs, while their heartbeats arrive and nothing waits to go out, means that lane is
+    // dead: both sides close the session (the next packet opens a new one) and send everything again; after
+    // MAX_RESETS of those the blobs go over the unreliable lane with our own acks (GPump / TakeG / TakeGAck).
+    void CheckLane(PeerLink l, long t)
+    {
+        if (l.mate) return;
+        if (l.closeDue != 0 && t >= l.closeDue)
+        {
+            l.closeDue = 0;
+            net.Close(l.id);
+            l.sent.Clear(); l.chunkKey = null; l.chunkParts = null;
+            l.probeWaitSince = 0;
+            return;
+        }
+        if (!l.Connected) return;
+        // a switch between a direct and a relayed session, logged: does the lane die with one?
+        if (t - l.routeAt >= 2000)
+        {
+            l.routeAt = t;
+            var parts = net.Route(l.id).Split(' ');
+            string r = parts.Length > 1 ? parts[1] : "?";
+            if (r == "?") r = l.route;   // (no session state for a moment: not a change)
+            if (l.route != null && r != l.route) Log("route to " + l.name + " changed: " + l.route + " -> " + r + " (" + net.Session(l.id) + ")");
+            l.route = r;
+        }
+        if (l.fallback) return;
+        if (t - l.probeAt >= PROBE_EVERY)
+        {
+            l.probeAt = t;
+            l.probeN++;
+            if (SendRaw(l, 'Q', "p " + epoch + " " + l.probeN, true) && l.probeWaitSince == 0) l.probeWaitSince = t;
+        }
+        if (!l.peerEchoes || l.probeWaitSince == 0) return;
+        // a backlog still going out (the world files at a join over a slow relay) is a slow lane, not a dead one
+        if (net.Queued(l.id) > 0) { l.probeWaitSince = t; return; }
+        if (t - l.probeWaitSince < stallMs || t - l.lastRx > 3000) return;
+        l.probeWaitSince = 0;
+        if (l.resets < MAX_RESETS)
+        {
+            l.resets++;
+            Log("reliable data to " + l.name + " stopped arriving (probe " + l.probeN + " unanswered for " + stallMs / 1000
+                + " s, last answered " + l.probeAcked + ", their heartbeats still arriving; " + net.Session(l.id) + ", rtt "
+                + (l.rtt < 0 ? "?" : ((int)l.rtt).ToString()) + " ms) - restarting the connection (" + l.resets + " of " + MAX_RESETS + ")");
+            SendRaw(l, 'Q', "r", false);
+            l.closeDue = t + 300;
+            return;
+        }
+        l.fallback = true;
+        l.sent.Clear();
+        rosterDirty = true;   // (host: the other guests learn it; a guest: what it sent its mates goes again)
+        foreach (var m in links) if (m.mate && l.slot == 0) m.sent.Clear();
+        Log("reliable data to " + l.name + " still stopped arriving after " + MAX_RESETS
+            + " restarts (" + net.Session(l.id) + ") - sending over the unreliable lane with our own resends");
+    }
+
+    // fallback: a blob deflated, cut into FRAG parts ('G' <id:4> <index:2> <count:2> <part>), resent until acked
+    bool SendGuaranteed(PeerLink l, string name, string body)
+    {
+        byte[] z = Deflate(Encoding.UTF8.GetBytes(epoch + "\n" + name + "\n" + body));
+        int parts = (z.Length + FRAG - 1) / FRAG;
+        if (parts > G_PARTS_MAX)
+        {
+            if (l.loggedTx.Add(" too big " + name)) Log("can't send " + name + " to " + l.name + " on the unreliable lane (" + z.Length + " B compressed)");
+            return false;
+        }
+        // a newer copy of the same blob replaces one still going out
+        foreach (var kv in new List<KeyValuePair<int, GOut>>(l.gOut)) if (kv.Value.name == name) l.gOut.Remove(kv.Key);
+        l.gOut[++gId] = new GOut { name = name, z = z, parts = parts, left = parts, acked = new bool[parts] };
+        l.txBlobs++;
+        return true;
+    }
+
+    void GPump(PeerLink l, long t)
+    {
+        if (l.gOut.Count == 0 || !CanPump(l)) return;
+        int budget = G_BUDGET;
+        long again = Math.Max(1000, l.rtt > 0 ? (long)(l.rtt * 3) : 1000);
+        foreach (var kv in l.gOut)
+        {
+            var m = kv.Value;
+            if (m.cursor == 0 && m.sentAt != 0 && t - m.sentAt < again) continue;
+            while (m.cursor < m.parts && budget > 0)
+            {
+                int i = m.cursor++;
+                if (m.acked[i]) continue;
+                int off = i * FRAG, len = Math.Min(FRAG, m.z.Length - off);
+                var p = new byte[8 + len];
+                BitConverter.GetBytes(kv.Key).CopyTo(p, 0);
+                BitConverter.GetBytes((ushort)i).CopyTo(p, 4);
+                BitConverter.GetBytes((ushort)m.parts).CopyTo(p, 6);
+                Buffer.BlockCopy(m.z, off, p, 8, len);
+                SendBytes(l, 'G', p, false);
+                budget--;
+            }
+            if (m.cursor >= m.parts) { m.cursor = 0; m.sentAt = t; }
+            if (budget == 0) break;
+        }
+    }
+
+    // 'Y' <id:4> <count:2> <bitmap>: the parts of one fallback blob we have (all, once it is complete)
+    void GAcks(PeerLink l, long t)
+    {
+        if (l.gAckDue.Count == 0 || t - l.gAckAt < 50) return;
+        l.gAckAt = t;
+        foreach (int id in l.gAckDue)
+        {
+            GIn g;
+            if (!l.gIn.TryGetValue(id, out g)) continue;
+            int count = g.parts.Length;
+            var p = new byte[6 + (count + 7) / 8];
+            BitConverter.GetBytes(id).CopyTo(p, 0);
+            BitConverter.GetBytes((ushort)count).CopyTo(p, 4);
+            for (int i = 0; i < count; i++) if (g.done || g.parts[i] != null) p[6 + i / 8] |= (byte)(1 << (i % 8));
+            SendBytes(l, 'Y', p, false);
+        }
+        l.gAckDue.Clear();
+    }
+
+    void TakeG(PeerLink l, byte[] data, int o)
+    {
+        if (data.Length - o < 10) return;
+        int id = BitConverter.ToInt32(data, o + 1);
+        int idx = BitConverter.ToUInt16(data, o + 5), count = BitConverter.ToUInt16(data, o + 7);
+        if (count == 0 || count > G_PARTS_MAX || idx >= count) { Dropped(l, "size G"); return; }
+        int len = data.Length - o - 9;
+        GIn g;
+        if (!l.gIn.TryGetValue(id, out g))
+        {
+            g = new GIn { parts = new byte[count][], at = Now() };
+            l.gIn[id] = g;
+        }
+        l.gAckDue.Add(id);
+        if (g.done || g.parts.Length != count || g.parts[idx] != null) return;
+        // bounded: a few blobs in flight, so a bad peer can't make us hold endless half-sent ones
+        while (l.gIn.Count > G_IN_MAX || l.gInBytes + len > G_IN_BYTES)
+            if (!EvictG(l, id)) break;
+        if (l.gInBytes + len > G_IN_BYTES) return;
+        var part = new byte[len];
+        Buffer.BlockCopy(data, o + 9, part, 0, len);
+        g.parts[idx] = part; g.at = Now(); g.bytes += len; l.gInBytes += len;
+        if (++g.have < count) return;
+        var z = new byte[g.bytes];
+        int at = 0;
+        for (int i = 0; i < count; i++) { Buffer.BlockCopy(g.parts[i], 0, z, at, g.parts[i].Length); at += g.parts[i].Length; g.parts[i] = null; }
+        l.gInBytes -= g.bytes; g.bytes = 0; g.done = true;
+        string msg = Inflate(z, 0, MAX_INFLATE);
+        int n1 = msg.IndexOf('\n'), n2 = n1 < 0 ? -1 : msg.IndexOf('\n', n1 + 1);
+        if (n2 < 0) return;
+        BlobEpoch(l, msg.Substring(0, n1));
+        // an older copy of the same blob finishing after a newer one must not overwrite it
+        string name = msg.Substring(n1 + 1, n2 - n1 - 1);
+        int newest;
+        if (l.gNewestIn.TryGetValue(name, out newest) && newest > id) return;
+        l.gNewestIn[name] = id;
+        Handle(l, 'B', msg);
+    }
+
+    // drops the oldest fallback blob other than keep (a complete one first: it only answers late parts)
+    bool EvictG(PeerLink l, int keep)
+    {
+        int victim = 0; bool found = false, victimDone = false; long victimAt = long.MaxValue;
+        foreach (var kv in l.gIn)
+        {
+            if (kv.Key == keep) continue;
+            bool better = !found || (kv.Value.done && !victimDone) || (kv.Value.done == victimDone && kv.Value.at < victimAt);
+            if (better) { victim = kv.Key; victimDone = kv.Value.done; victimAt = kv.Value.at; found = true; }
+        }
+        if (!found) return false;
+        l.gInBytes -= l.gIn[victim].bytes;
+        l.gIn.Remove(victim);
+        return true;
+    }
+
+    void TakeGAck(PeerLink l, byte[] data, int o)
+    {
+        if (data.Length - o < 7) return;
+        int id = BitConverter.ToInt32(data, o + 1), count = BitConverter.ToUInt16(data, o + 5);
+        GOut m;
+        if (!l.gOut.TryGetValue(id, out m) || count != m.parts || data.Length - o - 7 < (count + 7) / 8) return;
+        for (int i = 0; i < count; i++)
+            if (!m.acked[i] && (data[o + 7 + i / 8] & (1 << (i % 8))) != 0) { m.acked[i] = true; m.left--; }
+        if (m.left <= 0) l.gOut.Remove(id);
+    }
+
     void ExpireRequests(long t)
     {
         List<ulong> old = null;
@@ -2190,17 +2534,55 @@ class Bridge
         l.pktTokens = Math.Min(PKT_BURST, l.pktTokens + dt * PKT_RATE);
         l.byteTokens = Math.Min(BYTE_BURST, l.byteTokens + dt * BYTE_RATE);
         int len = data.Length - o;
-        if (l.pktTokens < 1 || l.byteTokens < len) { Dropped(l, "rate"); return false; }
-        l.pktTokens -= 1; l.byteTokens -= len;
+        // a full 'J' piece after the first counts with its message - one packet, as when it came whole (a 256 KB part
+        // is ~260 pieces: counted one by one, a big world drained the burst and a lost piece is never sent again);
+        // its bytes count as always
+        double cost = len == 9 + PIECE && data[o] == (byte)'J' && BitConverter.ToUInt16(data, o + 5) != 0 ? 0 : 1;
+        if (l.pktTokens < cost || l.byteTokens < len) { Dropped(l, "rate"); return false; }
+        l.pktTokens -= cost; l.byteTokens -= len;
         char type = len > 0 ? (char)data[o] : '?';
-        int max = type == 'P' ? MAX_POSE : type == 'H' ? MAX_HELLO : (type == 'B' || type == 'K' || type == 'Z') ? MAX_PART
-                : (type == 'C' || type == 'A' || type == 'R' || type == 'T' || type == 'N') ? 256 : type == 'V' ? 8192 : type == 'F' ? FRAG + 16
-                : type == 'W' ? 1024 : type == 'X' ? MAX_PART + 9 : -1;
+        int max = MaxSize(type);
         // a type this bridge doesn't know (a newer peer's): skipped, never a "drop" - 20 of them kicked the newer
         // player, or on a guest blocked the host (the rate limits above still count it)
         if (max < 0) { Unknown(l, type); return false; }
         if (len > max) { Dropped(l, "size " + type + " " + len + " B"); return false; }
         return true;
+    }
+
+    // the biggest packet of a type we accept (-1: a type this bridge doesn't know)
+    static int MaxSize(char type)
+    {
+        return type == 'P' ? MAX_POSE : type == 'H' ? MAX_HELLO : (type == 'B' || type == 'K' || type == 'Z') ? MAX_PART
+             : (type == 'C' || type == 'A' || type == 'R' || type == 'T' || type == 'N' || type == 'Q') ? 256 : type == 'V' ? 8192
+             : (type == 'F' || type == 'G') ? FRAG + 16 : type == 'Y' ? 1200 : type == 'J' ? PIECE + 16
+             : type == 'W' ? 1024 : type == 'X' ? MAX_PART + 9 : -1;
+    }
+
+    // one 'J' piece; the whole packet once its last piece is in (reliable: they come in order, one packet at a time)
+    byte[] TakeJ(PeerLink l, byte[] data, int o)
+    {
+        if (data.Length - o < 10) return null;
+        int id = BitConverter.ToInt32(data, o + 1);
+        int idx = BitConverter.ToUInt16(data, o + 5), count = BitConverter.ToUInt16(data, o + 7);
+        if (count == 0 || idx >= count || (long)count * PIECE > MAX_PART + 9 + PIECE) { Dropped(l, "size J"); return null; }
+        byte[][] parts;
+        if (!l.jIn.TryGetValue(id, out parts))
+        {
+            if (l.jIn.Count >= J_IN_MAX) l.jIn.Clear();   // (left over from a dropped session: started over)
+            parts = new byte[count][];
+            l.jIn[id] = parts;
+        }
+        if (parts.Length != count || parts[idx] != null) return null;
+        parts[idx] = new byte[data.Length - o - 9];
+        Buffer.BlockCopy(data, o + 9, parts[idx], 0, parts[idx].Length);
+        foreach (var p in parts) if (p == null) return null;
+        l.jIn.Remove(id);
+        int total = 0;
+        foreach (var p in parts) total += p.Length;
+        var whole = new byte[total];
+        int at = 0;
+        foreach (var p in parts) { Buffer.BlockCopy(p, 0, whole, at, p.Length); at += p.Length; }
+        return whole;
     }
 
     readonly HashSet<char> unknownLogged = new HashSet<char>();
@@ -2306,6 +2688,27 @@ class Bridge
             catch (Exception e) { Dropped(l, "bad " + (char)t + " " + e.Message); }
             return;
         }
+        if (t == (byte)'G' || t == (byte)'Y')
+        {
+            try { if (t == (byte)'G') TakeG(l, data, o); else TakeGAck(l, data, o); }
+            catch (Exception e) { Dropped(l, "bad " + (char)t + " " + e.Message); }
+            return;
+        }
+        if (t == (byte)'J')
+        {
+            byte[] whole = null;
+            try { whole = TakeJ(l, data, o); }
+            catch (Exception e) { Dropped(l, "bad J " + e.Message); }
+            // the put-together packet, checked like one that came whole (its type and size), then handled the same way
+            if (whole != null && whole.Length > 0 && whole[0] != (byte)'J')
+            {
+                int max = MaxSize((char)whole[0]);
+                if (max < 0) Unknown(l, (char)whole[0]);
+                else if (whole.Length > max) Dropped(l, "size " + (char)whole[0] + " " + whole.Length + " B");
+                else ProcessPacket(l, whole, 0);
+            }
+            return;
+        }
         string msg = Encoding.UTF8.GetString(data, o, data.Length - o);
         if (msg.Length == 0) return;
         try { Handle(l, msg[0], msg.Substring(1)); } catch (Exception e) { Log("handle " + msg[0] + ": " + e.Message); }
@@ -2317,6 +2720,7 @@ class Bridge
         if (l.blobEpoch != null) Log(l.name + "'s game restarted - cleared its old data");
         l.blobEpoch = ep;
         l.epochNames.Clear();
+        l.gNewestIn.Clear();
         try
         {
             string tail = "_" + l.inTag + ".txt";
@@ -2444,12 +2848,47 @@ class Bridge
                 l.epoch = f[0];
                 Log("connected to " + l.name + " (their session " + l.epoch + ")");
                 l.sent.Clear(); l.lastPose = null;
+                // their bridge (re)started: the lane check and its fallback start over
+                l.fallback = false; l.resets = 0; l.probeWaitSince = 0;
+                l.gOut.Clear(); l.gIn.Clear(); l.gAckDue.Clear(); l.gInBytes = 0; l.jIn.Clear();
                 rosterDirty = true;
                 if (role == "host") l.gen = ++rosterGen;
                 // the host's bridge restarted: what we sent the other guests through it may be lost
                 if (role == "guest" && l.slot == 0) foreach (var m in links) if (m.mate) { m.epoch = null; m.sent.Clear(); m.lastPose = null; }
                 WriteRoster();
                 WriteLobby();
+            }
+            // "<our epoch>:<n>" = the newest of our probes that came through on the reliable lane ("-": none yet)
+            l.peerSplit = f.Length >= 6 && f[5].IndexOf('J') >= 0;
+            if (f.Length >= 5)
+            {
+                l.peerEchoes = true;
+                int c = f[4].IndexOf(':');
+                long n;
+                if (c > 0 && f[4].Substring(0, c) == epoch && long.TryParse(f[4].Substring(c + 1), out n) && n > l.probeAcked)
+                {
+                    l.probeAcked = n; l.resets = 0;
+                    l.probeWaitSince = n >= l.probeN ? 0 : Now();
+                }
+            }
+        }
+        else if (type == 'Q')
+        {
+            var q = body.Split(' ');
+            long ep, n;
+            if (q.Length >= 3 && q[0] == "p" && long.TryParse(q[1], out ep) && long.TryParse(q[2], out n))
+            {
+                // the newest probe of their current session (one of an older session may still trickle in)
+                long had = -1;
+                string pre = ep + ":";
+                if (l.probeIn != null && l.probeIn.StartsWith(pre)) long.TryParse(l.probeIn.Substring(pre.Length), out had);
+                if (n > had) l.probeIn = pre + n;
+            }
+            else if (q[0] == "r" && !l.mate && Now() - l.peerResetAt > 10000)
+            {
+                l.peerResetAt = Now();
+                Log(l.name + "'s bridge restarts the connection (its reliable data stopped reaching us) - restarting ours too");
+                l.closeDue = Now() + 300;
             }
         }
     }

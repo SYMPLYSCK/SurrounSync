@@ -58,8 +58,10 @@ local config = {
         split = {
             split_radius = 40000,    -- players further apart than this ...
             split_after = 10.0,      -- ... for this many seconds -> split
-            merge_radius = 30000,    -- closer than this -> merge (the guest's zombies are handed back first)
-            force_radius = 20000,    -- 4 players, a follower: closer than this -> stop following even mid-fight
+            merge_radius = 30000,    -- closer than this ...
+            merge_after = 3.0,       -- ... for this many seconds -> merge (the guest's zombies are handed back first);
+                                     -- a player driving by no longer ends a split
+            force_radius = 20000,    -- closer than this -> merge at once; 4 players, a follower: stop following even mid-fight
             quiet_radius = 6000,     -- guest: own AI alive this close = fighting (a follower waits for force_radius)
             ack_timeout = 10.0,      -- the guest must take over within this, else stay merged
             retry_after = 30.0,      -- after a failed or blocked attempt
@@ -112,7 +114,7 @@ local config = {
         mirror_aim = true,
         mirror_fire = true,
         view_controller = true,
-        snap_distance = 300,         -- teleport instead of moving when further off than this
+        snap_distance = 300,         -- unused since 2026-10-31: a refused move now always sets the spot (ghost.apply)
         target_tag = "ZombieCanAttack",
         register_invoker = true,
         anim_keepalive_radius = 4000,

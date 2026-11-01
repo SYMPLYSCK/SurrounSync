@@ -12,11 +12,13 @@ local game = require("mirror.game")
 local link = require("mirror.link")
 local events = require("mirror.events")
 local ghost = require("mirror.ghost")
+local animgate = require("mirror.animgate")
 local invdiag = require("mirror.invdiag")
 local notify = require("mirror.notify")
 local i18n = require("mirror.i18n")
 local jig = require("mirror.jig")
 local beds = require("mirror.beds")
+local worldset = require("mirror.worldset")
 
 local session = {}
 
@@ -41,6 +43,7 @@ local state = "idle"
 local hosted_slot, on_host_world_change = nil, nil
 local own_slot = nil
 local join_slot, join_stamp = nil, nil
+local join_resaved, world_ready_clock = false, -100   -- (a join's own save asked again once, right after a load)
 local nonce = nil
 local wait = 0.0
 local want_toggle = false
@@ -107,6 +110,7 @@ function session.data_file(name)
 end
 local world_in, world_ready = {}, nil
 local world_shown, world_poll = 0, 0
+local join_cut, join_marks = nil, nil   -- guest: the host's join cut and save marks (each blob arrives once)
 local JOIN_TIMEOUT = 120
 local own_stamp = nil
 local leave_try = nil
@@ -281,7 +285,17 @@ end
 local SAVE_FN = "/Game/Blueprints/BP_PlayerController.BP_PlayerController_C:SaveGameToSlot"
 local save_asked, save_started_at = nil, -1
 -- (one function for the life of the mod: ensure_hook knows a hook by it, a new closure each call would add hooks)
-local function on_save_started() save_started_at = os.clock() end
+-- (a join's save: the reliable channels' last ids now are exactly what the save holds - events.marks)
+local function on_save_started()
+    save_started_at = os.clock()
+    -- (a save the game starts itself, e.g. sleeping, right after coming home: own world settings first)
+    util.safe(worldset.restore_now, "worldset.restore_now")
+    if host_job and not host_job.marks then
+        host_job.marks = events.marks()
+        -- (after the marks: the guest reads these once it is in, and pairs the saved pickups with the host's drops)
+        util.safe(function() require("mirror.drops").join_started() end, "session.drops_join")
+    end
+end
 local function check_asked()
     if not save_asked then return end
     local busy = false
@@ -295,6 +309,19 @@ local function check_asked()
     end
 end
 
+-- Every copy of this module (a link's, with more than two players) watches the saves it asks for: the hook used to
+-- come with the firewall only, which a copy doesn't install, and a 3-player host's [to2] copy saved again 1 s after
+-- every save it asked for (DBG-20261030-003).
+local save_hook_in = 0.0
+local function watch_saves(dt)
+    save_hook_in = save_hook_in - (dt or 0)
+    if save_hook_in <= 0 then
+        save_hook_in = 2.0
+        util.ensure_hook(SAVE_FN, on_save_started, nil, true)
+    end
+    util.safe(check_asked, "session.check_asked")
+end
+
 local function saving()
     check_asked()
     if save_asked then return true end
@@ -303,12 +330,21 @@ local function saving()
     return busy
 end
 
+-- The save's hook destroys the other player's ghost at once (kept into a save it takes the player's inventory), and
+-- that waits for its animation task: so the timer is set once animation runs on the game thread (animgate.lua,
+-- 2 frames). The save counts as asked from now; the 1 s fallback above still applies.
 local function save_now()
-    local pc, k = game.controller(), util.cdo("/Script/Engine.Default__KismetSystemLibrary")
-    local ok = k and util.valid(pc) and pcall(function() k:K2_SetTimer(pc, "SaveGameToSlot", 0.001, false, false, 0.0, 0.0) end)
-    if not ok then return direct_save() end
+    -- back in the own save after co-op: its own world settings first (the host's would go into Difficulties.sav)
+    util.safe(worldset.restore_now, "worldset.restore_now")
     save_asked = os.clock()
-    log.info("session: save asked (the engine runs SaveGameToSlot next frame)")
+    log.info("session: save asked (the engine runs SaveGameToSlot in a few frames)")
+    require("mirror.animgate").later(function()
+        if not save_asked then return end   -- (it ran meanwhile: the 1 s fallback)
+        local pc, k = game.controller(), util.cdo("/Script/Engine.Default__KismetSystemLibrary")
+        local ok = k and util.valid(pc) and pcall(function() k:K2_SetTimer(pc, "SaveGameToSlot", 0.001, false, false, 0.0, 0.0) end)
+        if not ok then save_asked = nil; direct_save(); return end
+        save_asked = os.clock()
+    end, "session.save_now")
     return true
 end
 
@@ -394,24 +430,14 @@ end
 -- Our loads call the game's Event_LoadLevel from Lua: its OpenLevel waits for animation tasks, and an animation
 -- worker running a Blueprint function the mod hooks waits for the Lua lock that very call holds - the join freeze
 -- (DBG-20261027-006, kit dumps 20:40 and 21:44). For the load, animation runs on the game thread (no task to wait
--- for); the engine's own values come back when the new world is in (on_world_ready).
-local ANIM_CVARS = { "a.ParallelAnimUpdate", "a.ParallelAnimEvaluation" }
-local anim_saved = nil
+-- for); the engine's own values come back when the new world is in (on_world_ready). The switch is animgate.lua,
+-- shared with the zombie copies' Death / mesh swaps / removals.
 function session.anim_on_game_thread(on)
-    local K, w = util.cdo("/Script/Engine.Default__KismetSystemLibrary"), game.world()
-    if not K then return end
-    if on and not anim_saved then
-        anim_saved = {}
-        for _, n in ipairs(ANIM_CVARS) do
-            local v
-            pcall(function() v = K:GetConsoleVariableIntValue(n) end)
-            anim_saved[n] = v or 1
-            pcall(function() K:ExecuteConsoleCommand(w, n .. " 0", nil) end)
-        end
+    if on and not animgate.held("load") then
+        animgate.hold("load")
         log.info("session: animation runs on the game thread for the load")
-    elseif not on and anim_saved then
-        for n, v in pairs(anim_saved) do pcall(function() K:ExecuteConsoleCommand(w, n .. " " .. tostring(v), nil) end) end
-        anim_saved = nil
+    elseif not on and animgate.held("load") then
+        animgate.release("load")
         log.info("session: animation back on its worker threads")
     end
 end
@@ -421,6 +447,17 @@ end
 -- Lua lock - the freeze came back with the cvars set in the same call (report 2026-10-29 12:00:43, ending a Realm
 -- while running). So the destroy + load run LOAD_FRAMES frames after the cvars; the save name is set at once.
 local LOAD_FRAMES = 2
+-- The game's world map. gi.CurrentLevel is the map the game opened last - the Shooting Range once the player tried it
+-- from the main menu - and a co-op or Realm save loaded into it became the range: the Realm's first save uploaded the
+-- range's 2 KB Level over the Realm's base (player report 2026-10-31, DBG-20261031-003; 3 of 3 loads from outside a
+-- world there went to the range).
+local WORLD_MAP = "LongdownValley"
+local function world_map(gi)
+    local cur
+    pcall(function() cur = gi.CurrentLevel:ToString() end)
+    if cur ~= WORLD_MAP then log.warn("session: the game's current map is " .. tostring(cur) .. " - loading " .. WORLD_MAP) end
+    return FName(WORLD_MAP)
+end
 local pending_load = nil
 local function load_now()
     local slot = pending_load.slot
@@ -435,7 +472,7 @@ local function load_now()
     pcall(function() lib():SetCurrentSaveGameName(game.world(), slot) end)
     own_load = true
     mark_world_load()
-    local ok, err = pcall(function() gi:Event_LoadLevel(gi.CurrentLevel) end)
+    local ok, err = pcall(function() gi:Event_LoadLevel(world_map(gi)) end)
     own_load = false
     log.info("session: Event_LoadLevel -> " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
 end
@@ -472,7 +509,11 @@ local function purge_all_coop_slots()
         return
     end
     local keep = t and t.coop
-    local function purge(name) if name ~= keep then slotguard.purge(name) end end
+    local function purge(name)
+        if name == keep then return end
+        slotguard.purge(name)
+        slotguard.remove_empty(name)
+    end
     purge(cfg.phase2.coop_slot)
     for i = 1, cfg.phase2.coop_slots or 1 do purge(coop_name(i)) end
     local lb = cfg.phase2.legacy_coop_slot
@@ -683,6 +724,10 @@ local function host_tick(dt)
     end
     if host_job then
         host_job.t = host_job.t + dt
+        if host_job.marks and not host_job.marks_put then
+            host_job.marks_put = true
+            link.put_blob("joinmarks", host_job.nonce .. "\n" .. host_job.marks)
+        end
         if host_job.t > 1.5 and not saving() then
             host_export(host_job)
             host_job = nil
@@ -745,6 +790,11 @@ local function character_home(t)
     local world, character = slotguard.read_realm(t.coop)
     if not world then return nil, character end
     if not character then return nil, t.coop .. " has no character" end
+    -- (a join that landed in the Shooting Range: its character is the range's - the stored one keeps the items)
+    if game.in_shooting_range() then
+        log.error("session: left the Realm from the Shooting Range - the stored Realm character is kept")
+        return "copied"
+    end
     local ok, err = require("mirror.realm").store_character(t.realm, character)
     if not ok then return nil, err end
     log.info("session: Realm character stored in Realm " .. t.realm)
@@ -753,11 +803,24 @@ end
 
 local exit_check = 0.0
 local home_reload = nil
+-- { t, loaded }: the game went to its main menu while joined (pause menu MAIN MENU, a permadeath quit)
+local menu_exit = nil
 local function unplanned_exit(cur, before_load)
     log.warn("session: left the co-op world through the game's menu (now in " .. tostring(cur) .. ")")
     state, tp, inv_fix = "idle", nil, nil
     local t = slotguard.log_read()
     if not t or not t.coop then return end
+    if not t.realm and not slotguard.has_character(t.coop) then
+        -- (a permadeath quit: the game deleted the co-op save. The own save was never written during the session;
+        -- a retry at the next start could never bring anything home)
+        log.warn("session: " .. t.coop .. " has no character any more (the game deleted it) - " .. tostring(t.own)
+            .. " stays as it was before the join")
+        slotguard.purge(t.coop)
+        slotguard.log_clear()
+        notify.show("The game deleted your co-op character. Your own save " .. tostring(t.own)
+            .. " is as it was before you joined.", "bad")
+        return
+    end
     t.step = "leaving"
     slotguard.log_write(t)
     local r, err = character_home(t)
@@ -845,6 +908,42 @@ local function unstick_continue(at_menu)
     log.info(string.format("session: the game's current save was the co-op save %s outside a session - pointed it at %s (%s)",
         cur, to, tostring(ok)))
 end
+-- The main menu reached while joined: leave the session once no save runs (the co-op save is never read while the
+-- game writes or deletes it). True once handled.
+local function menu_exit_due()
+    if not menu_exit then return true end
+    if saving() then return false end
+    menu_exit = nil
+    if state ~= "joined" then return true end
+    -- (Continue then loads the save the character went home to, not merely the newest own save)
+    local t = slotguard.log_read()
+    if t and slotguard.is_own(t.own) then recovered_own = t.own end
+    unplanned_exit("the main menu", true)
+    util.safe(unstick_continue, "session.unstick_continue", true)
+    -- (phase1 tells the host where I am from the player's tick, and none runs at the menu: the host only saw
+    -- "Lost connection" a minute later, kit 2026-10-30 12:13. The bridge sends the file on its own.)
+    pcall(link.put_blob, "where", session.where())
+    return true
+end
+-- The game's MAIN MENU button destroys every player before the load, so nothing ticks at the menu (kit 2026-10-30
+-- 11:58 + 12:05: the guest stayed joined there, Continue on the co-op save). Polled like realmplay's NEW GAME
+-- press - LoopAsync only posts, the work runs on the game thread - from 1 s on, once no save runs.
+local function poll_menu_exit()
+    if type(LoopAsync) ~= "function" or type(ExecuteInGameThread) ~= "function" then return end
+    local polls, done = 0, false
+    LoopAsync(250, function()
+        if done then return true end
+        ExecuteInGameThread(function()
+            util.safe(function()
+                if done then return end
+                polls = polls + 1
+                -- (a save busy for 2 min: give up here; the tick takes over once a world's player exists)
+                if not menu_exit or (polls >= 4 and menu_exit_due()) or polls >= 480 then done = true end
+            end, "session.menu_exit")
+        end)
+        return false
+    end)
+end
 -- The game's save system may not exist yet when the mod starts: the main menu's load is the second chance,
 -- still before the player can press Continue.
 local menu_hooked = false
@@ -854,7 +953,11 @@ local function hook_main_menu()
     RegisterLoadMapPostHook(function(_, w)
         local n
         pcall(function() n = w:get():GetFullName() end)
-        if type(n) == "string" and n:find("MainMenu", 1, true) then util.safe(unstick_continue, "session.unstick_continue", true) end
+        if menu_exit then log.info("session: map loaded while leaving at the main menu: " .. tostring(n)) end
+        if type(n) == "string" and n:find("MainMenu", 1, true) then
+            if menu_exit then menu_exit.loaded = true end
+            util.safe(unstick_continue, "session.unstick_continue", true)
+        end
     end)
 end
 -- which help message a failed backup gets (the real cause, not always "disk space")
@@ -904,6 +1007,7 @@ local function firewall(why)
     if pending_load then
         local scratch = cfg.phase2.coop_slot
         if cur ~= scratch then
+            slotguard.claim_scratch(scratch)
             local ok = point_at(scratch)
             restore_name = restore_name or cur
             discard_pending = true
@@ -933,6 +1037,7 @@ local function firewall(why)
         -- a half-empty world over either save. Send it to a scratch co-op slot that gets emptied.
         local scratch = cfg.phase2.coop_slot
         if cur ~= scratch then
+            slotguard.claim_scratch(scratch)
             local ok = point_at(scratch)
             restore_name = restore_name or cur
             discard_pending = true
@@ -1017,7 +1122,7 @@ local function on_any_load()
     util.safe(clear_runtime_actors, "session.clear_runtime_actors")
 end
 local function on_world_ready()
-    level_loading, cleared_world = false, false
+    level_loading, cleared_world, world_ready_clock = false, false, os.clock()
     session.anim_on_game_thread(false)
     os.remove(WORLD_LOAD)
     world_slot = ems_current_name()
@@ -1040,6 +1145,7 @@ local function firewall_tick()
         discard_pending = false
         slotguard.adopt(cfg.phase2.coop_slot)
         slotguard.purge(cfg.phase2.coop_slot)
+        slotguard.remove_empty(cfg.phase2.coop_slot)   -- (or the load list shows a save named SurrounSync_Session)
     end
 end
 
@@ -1058,7 +1164,7 @@ local peer_state = function() return "unknown" end
 local player_dead
 function session.set_peer_state(fn) peer_state = fn end
 local gone = nil
-local paused_told = false
+local paused_told = false   -- the host's state last logged: "paused" or "menu" (its name tag shows it)
 
 local alive_for = 0.0
 local dead_told = false
@@ -1076,10 +1182,15 @@ local function old_host()
     local l = link.lobby()
     return l and l.peer and l.peer.id or nil
 end
-local function arm_takeover()
+-- follow: another guest takes the Realm over - once home, wait for them to host it and join them (never claim it
+-- while they may still be taking it, or both host it)
+local function arm_takeover(follow)
     if not realm_id then return end
-    takeover = { id = realm_id, host = old_host() }
-    log.info("session: the Realm's host left - I'll open " .. realm_id .. " myself once home")
+    -- (the old host's lease id now, from the Realm list: once home the list may already show the next host)
+    local r = require("mirror.realm").find(realm_id)
+    takeover = { id = realm_id, host = old_host(), follow = follow, lease = r and r.host }
+    if follow then log.info("session: the Realm's host left - another guest takes " .. realm_id .. " over; I join them once home")
+    else log.info("session: the Realm's host left - I'll open " .. realm_id .. " myself once home") end
 end
 -- (true while realmplay hands the host's zombies over, a second or so: no host-gone countdown meanwhile)
 local promoting = false
@@ -1096,9 +1207,10 @@ function session.promote_failed()
     arm_takeover()
     want_toggle = true
 end
-function session.realm_host_left()
+function session.realm_host_left(follow)
     if state ~= "joined" then return end
     gone = nil
+    if follow then arm_takeover(true); want_toggle = true; return end
     if take_over_here() then return end
     arm_takeover()
     want_toggle = true
@@ -1116,35 +1228,49 @@ function session.promote_realm()
     return t
 end
 
-local function watch_host(dt)
+-- The game's pause menu, closed the way its RESUME button does it (decompiled PauseScreen: HUD.Client_PauseGame(false),
+-- which unpauses, takes the menu off and gives the game its input back). Only when that menu is up.
+local function close_pause_menu()
+    local hud = FindFirstOf("HUD_Game_C")
+    if not (util.valid(hud) and util.valid(hud.PauseMenu)) then return false end
+    hud:Client_PauseGame(false)
+    return true
+end
+
+-- in_menu: from session.menu_tick - no game tick runs (the pause menu), so the trip home can't start here
+local function watch_host(dt, in_menu)
     if state ~= "joined" then
         -- the countdown's cards go with it: a leave some other way (2026-10-29: a friend's game) left
         -- "... in 5 seconds" on screen for good
         if gone then notify.clear("hostgone", true) end
-        if paused_told then notify.clear("hostpaused") end
         gone, paused_told, promoting = nil, false, false
         return
     end
     if promoting then return end
     local ps = peer_state()
-    if ps == "gone" or (gone and ps ~= "ok") then
+    if ps == "gone" or (gone and ps ~= "ok" and ps ~= "menu") then
         if not gone then
             local total = cfg.save and cfg.save.host_gone_countdown or 30
             gone = { left = total, total = total }
-            notify.clear("hostpaused")
         end
         if gone.waiting then return end
         -- one live card, counting down every second (the bar runs out with it)
         local secs = math.max(0, math.ceil(gone.left))
         if secs ~= gone.told then
+            -- (logged at the start and when it runs out; the seconds between only change the card)
+            local quiet = gone.told ~= nil and secs > 0
             gone.told = secs
             local when = secs > 0 and string.format("in %d second%s", secs, secs == 1 and "" or "s") or "as soon as you respawn"
             notify.show(string.format(realm_id and "%s's game closed. You keep playing in the Realm - you host it yourself %s."
                 or "%s's game closed. You go home with your character %s.", link.peer_name(), when), "bad", "hostgone", nil,
-                { progress = gone.left / gone.total, sticky = true })
+                { progress = gone.left / gone.total, sticky = true, quiet = quiet })
         end
         gone.left = gone.left - dt
-        if gone.left <= 0 and not player_dead() then
+        if gone.left <= 0 and in_menu then
+            -- (the next game tick, with the menu closed, goes home)
+            local ok, closed = pcall(close_pause_menu)
+            if ok and closed then log.info("session: host gone - closing the pause menu to go home") end
+        elseif gone.left <= 0 and not player_dead() then
             gone = nil
             notify.clear("hostgone")
             if take_over_here() then return end
@@ -1158,12 +1284,30 @@ local function watch_host(dt)
             notify.show(link.peer_name() .. " is back.", "good")
             gone = nil
         end
-        if paused_told then notify.clear("hostpaused") end
         paused_told = false
-    elseif ps == "paused" and not paused_told then
-        paused_told = true
-        notify.show(link.peer_name() .. "'s game isn't responding (paused, loading or frozen).", "warn", "hostpaused", nil, { sticky = true })
+    elseif ps == "menu" then
+        -- (away.lua: no data because the host sits in the pause/settings menu - no countdown while it does)
+        -- (one the player chose to wait for stays waiting)
+        if gone and gone.waiting then return end
+        if gone then notify.clear("hostgone"); gone = nil end
+        -- (menu / not responding show on the host's name tag, netq.tag - no card: user 2026-10-31)
+        if paused_told ~= "menu" then paused_told = "menu"; log.info("session: " .. link.peer_name() .. " is in the game menu") end
+    elseif ps == "paused" and paused_told ~= "paused" then
+        paused_told = "paused"
+        log.info("session: " .. link.peer_name() .. "'s game isn't responding (paused, loading or frozen)")
     end
+end
+
+-- The pause menu stops every game tick, and the host-gone countdown ran on ticks only: a guest in that menu when the
+-- host's game crashed stayed in its world for good, the menu having no LEAVE CO-OP (user 2026-10-31). phase1's menu
+-- watch (LoopAsync, game thread, about once a second) runs the countdown from there; session.tick restarts its clock.
+local menu_at = nil
+function session.menu_tick()
+    local t = os.clock()
+    local dt = menu_at and math.min(t - menu_at, 2.0) or 0.0
+    menu_at = t
+    if role ~= "guest" then return end
+    watch_host(dt, true)
 end
 
 function session.host_gone() return gone and not gone.waiting and math.ceil(gone.left) or nil end
@@ -1187,6 +1331,9 @@ end
 
 restore_home_bed = function()
     local cur = ems_current_name()
+    -- only into the own world itself: at the main menu after a menu exit the current save already names the own
+    -- save, and the bed went onto the menu's controller and was dropped (kit 2026-10-30 11:53)
+    if level_loading or world_slot ~= cur then return false end
     local hb = cur and cur ~= "" and not is_coop(cur) and beds.get(beds.home_key(cur))
     if not hb then return false end
     local ok = beds.apply(hb)
@@ -1241,7 +1388,23 @@ beds_tick = function(dt)
     end
 end
 
+-- The host's join cut, then its save marks (each blob comes once). The marks can come after the world: they're still
+-- taken while the guest loads in, as it holds the host's messages unread until then.
+local function take_join_cut()
+    local jn, js = (link.get_blob("joincut") or ""):match("^(%S+) (%d+)$")
+    if jn == nonce then join_cut = link.same_clock() and tonumber(js) or (os.time() - link.peer_age(tonumber(js)) - 2) end
+    local mn, mb = (link.get_blob("joinmarks") or ""):match("^(%S+)\n(.*)$")
+    if mn == nonce then join_marks = mb end
+    if join_cut and (jn == nonce or mn == nonce) then events.set_cut(join_cut, join_marks) end
+end
+
 local function guest_tick(dt)
+    if state == "joined" and join_cut and not join_marks and session.joining() then take_join_cut() end
+    if menu_exit then
+        -- (a menu that still has a player ticks: the same exit once the menu has loaded)
+        menu_exit.t = menu_exit.t + dt
+        if menu_exit.loaded or menu_exit.t >= 15.0 then menu_exit_due() end
+    end
     if home_reload then
         home_reload.t = home_reload.t + dt
         if home_reload.t >= 3.0 and not saving() and util.valid(game.player()) then
@@ -1303,7 +1466,7 @@ local function guest_tick(dt)
             join_slot, join_stamp = ems_current_name(), nil
             if join_slot then join_stamp = fs.read(saves_dir() .. "\\" .. join_slot .. "\\Slot.sav") end
             save_now()
-            state, wait = "saving_own", 0.0
+            state, wait, join_resaved = "saving_own", 0.0, false
         elseif state == "joined" then
             log.info("session: leaving - saving into the co-op slot")
             carry.leave = not realm_id and carried() or nil
@@ -1331,6 +1494,12 @@ local function guest_tick(dt)
             local unchanged = own_slot and join_stamp and own_slot == join_slot
                 and fs.read(saves_dir() .. "\\" .. own_slot .. "\\Slot.sav") == join_stamp
             if unchanged and wait < 8.0 then
+            elseif unchanged and not join_resaved and os.clock() - world_ready_clock < 30 then
+                -- (a join 3 s after the world loaded: its save never reached the player, the join was refused - player
+                -- report 2026-10-29 22:29, the automatic rejoin of a Realm's new host; once more, then give up)
+                join_resaved, wait = true, 0.0
+                log.warn("session: the save right after the load didn't write - asking once more")
+                save_now()
             elseif unchanged then
                 log.error("session: your game did NOT save (saving may be blocked here) - not joining, so your save can't get mixed up")
                 notify.show(i18n.t("cant_save_here"), "bad")
@@ -1357,6 +1526,8 @@ local function guest_tick(dt)
                 nonce = tostring(os.time())
                 link.reset_blob("world")
                 link.reset_blob("joincut")
+                link.reset_blob("joinmarks")
+                join_cut, join_marks = nil, nil
                 link.reset_blob("hostbed") -- read once per join: a rejoin's unchanged bed would come back nil
                 link.reset_blob("joinwhy")
                 world_in, world_ready, world_shown, world_poll = {}, nil, 0, 0
@@ -1382,9 +1553,7 @@ local function guest_tick(dt)
             world_shown = got
             log.info(string.format("session: receiving %s's world... %d/%d", link.peer_name(), got, #WORLD_FILES))
         end
-        local jc = link.get_blob("joincut")
-        local jn, js = (jc or ""):match("^(%S+) (%d+)$")
-        if jn == nonce then events.set_cut(link.same_clock() and tonumber(js) or (os.time() - link.peer_age(tonumber(js)) - 2)) end
+        take_join_cut()
         local w = link.get_blob("world")
         if w and w == "fail " .. nonce then
             local wn, why = (link.get_blob("joinwhy") or ""):match("^(%S+) (%S+)$")
@@ -1574,7 +1743,10 @@ local function guest_tick(dt)
                     .. "Backups (handbook J, CO-OP tab). Please report this with your SurrounSync log.", have, carry.leave), "bad", "trip")
             else
                 if have >= 0 then
-                    log.info(string.format("session: home with %d item stack(s) (left with %s)", have, tostring(carry.leave)))
+                    -- (a Realm character stays in the Realm: nothing was carried out, so there is no count to compare)
+                    log.info(string.format("session: home with %d item stack(s) (%s)", have,
+                        carry.leave and ("left with " .. carry.leave)
+                        or (realm_id and "the Realm character stays in the Realm" or "no count taken when leaving")))
                 end
                 -- (items not countable here: home all the same - nothing is claimed about them)
                 notify.show(realm_id and ("Back in your own world. Your Realm character stays in " .. realm_name(realm_id) .. ".")
@@ -1585,7 +1757,7 @@ local function guest_tick(dt)
             if takeover then
                 local t = takeover
                 takeover = nil
-                util.safe(require("mirror.realmplay").takeover, "realmplay.takeover", t.id, t.host)
+                util.safe(require("mirror.realmplay").takeover, "realmplay.takeover", t.id, t.host, t.follow, t.lease)
             else
                 carry.home_at = os.clock()   -- (menu.lua ends the link once the host has read everything sent)
             end
@@ -1660,16 +1832,23 @@ local function install_firewall()
             hosted_slot = nil
             util.safe(on_host_world_change, "session.host_left", "menu")
         end
+        -- a guest at the main menu has left the host's world: it stayed "joined" there (kit 2026-10-30, DBG-20261030-004)
+        -- (a Realm guest too: realmplay's own menu exit is the Realm host's; a guest's character goes to the Realm's
+        -- store through unplanned_exit like every other way out)
+        if lv == "MainMenu" and role == "guest" and state == "joined" and coop and not menu_exit then
+            log.info("session: the game went to the main menu while joined - leaving once it's there")
+            menu_exit = { t = 0.0 }
+            poll_menu_exit()
+        end
     end
     game.on_tick(function(dt)
         hook_in = hook_in - (dt or 0)
         if hook_in <= 0 then
             hook_in = 2.0
             util.ensure_hook("/Game/Blueprints/SD_GameInstance.SD_GameInstance_C:Event_LoadLevel", on_load, nil, true)
-            util.ensure_hook(SAVE_FN, on_save_started, nil, true)
         end
         util.safe(firewall_tick, "session.firewall_tick")
-        util.safe(check_asked, "session.check_asked")
+        watch_saves(dt)
         util.safe(load_tick, "session.load_tick")
         if stray_wait then
             stray_wait = stray_wait - (dt or 0)
@@ -1701,7 +1880,7 @@ function session.init(c, r, connected)
     cfg, role = c, r
     host_since = role == "host" and os.time() or nil
     started = true
-    if not (link.tags and link.tags()) then install_firewall() end
+    if not (link.tags and link.tags()) then install_firewall() else game.on_tick(watch_saves) end
     peer_connected = connected or peer_connected
     configure_store()
     if role == "guest" then
@@ -1758,6 +1937,7 @@ local function checkpoint_tick(dt)
 end
 
 function session.tick(dt)
+    menu_at = nil
     util.safe(load_tick, "session.load_tick")
     if state == "idle" then util.safe(track_ground, "session.ground", dt) end
     flush_notes()
@@ -1788,6 +1968,8 @@ function session.realm_guest(id) armed_realm = id end
 function session.realm_armed() return armed_realm end
 function session.realm_joined() return state ~= "idle" and realm_id or nil end
 function session.loading() return level_loading end
+-- the save this world was loaded from (nil while a level loads): the EMS name moves at load_slot, before the load
+function session.world_save() return (not level_loading) and world_slot or nil end
 function session.saves_dir() return saves_dir() end
 function session.point_at(slot) return point_at(slot) end
 function session.playing_slot()

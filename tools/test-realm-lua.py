@@ -97,6 +97,10 @@ def t_commands(L, tmp):
     seq = lua('realm.send("claim", "%s", function(ok, w, t) RES = { ok = ok, w = w, t = t } end)' % RID)
     check(lua("SENT[1]") == "realm %d claim %s" % (seq, RID), "command line: " + str(lua("SENT[1]")))
     check(lua("realm.busy()") is True, "busy while waiting")
+    # (an answer under this number to another verb - an older request's - is not this claim's)
+    state_file(tmp, "realms on 1\nop %d download ok 7\nEND\n" % seq)
+    lua("realm.tick(1)")
+    check(lua("RES") is None and lua("realm.busy()") is True, "an answer to another verb under the same number is ignored")
     state_file(tmp, "realms on 1\nrealm %s owner - 3 2 - My World\nlease %s held\nop %d claim ok won 3\nEND\n" % (RID, RID, seq))
     lua("realm.tick(1)")
     check(lua("RES and RES.ok") is True and lua("RES.w[1]") == "won" and lua("RES.w[2]") == "3", "answer reaches the callback")
@@ -130,6 +134,14 @@ def t_commands(L, tmp):
     r = lua("realm.find('%s')" % RID)
     check(r.host == "76561197960266730" and r.host_name == "Some One" and r.name == "Big  World", "host + name with spaces")
     check(lua("#realm.list()") == 1, "a broken realm line is skipped")
+    check(lua("realm.rules('%s')" % RID) is None, "no rules line: no rules")
+    state_file(tmp, "realms on 1\nrealm %s owner - 3 2 - My World\nrules %s pvp on debugmenu off\nrules bad\nEND\n" % (RID, RID))
+    lua("realm.tick(5)")
+    check(lua("realm.rules('%s')" % RID) == "pvp on debugmenu off" and lua("realm.rules('bad')") is None,
+          "the owner's rules read from the bridge's rules line (a broken one skipped)")
+    state_file(tmp, "realms on 1\nrealm %s owner - 3 2 - My World\nEND\n" % RID)
+    lua("realm.tick(5)")
+    check(lua("realm.rules('%s')" % RID) is None, "...and gone when the line is")
 
 
 def t_download(L, tmp):

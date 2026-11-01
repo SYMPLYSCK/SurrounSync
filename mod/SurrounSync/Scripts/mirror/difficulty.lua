@@ -78,11 +78,55 @@ function difficulty.decode(text)
     return n > 0 and snap or nil
 end
 
+-- same value: numbers to a few digits (the game keeps floats, the text has 6)
+local function same_value(a, b)
+    if a == b then return true end
+    local x, y = tonumber(a), tonumber(b)
+    return x ~= nil and y ~= nil and math.abs(x - y) <= 1e-4 * math.max(1, math.abs(y))
+end
+-- the settings of `want` that `cur` doesn't run (a setting `cur` lacks counts as differing)
+function difficulty.differing(cur, want)
+    local out, n = {}, 0
+    for name, v in pairs(want or {}) do
+        if not same_value((cur or {})[name], v) then out[name], n = v, n + 1 end
+    end
+    return out, n
+end
+function difficulty.same(cur, want) local _, n = difficulty.differing(cur, want); return want ~= nil and n == 0 end
+
+-- A restore owed to the player's own save: written when a co-op join leaves it (worldset.lua), so the own
+-- values come back in that save after the trip, a crash or a main-menu exit. "loads" is what the join's load
+-- showed: "yes" = a world load sets these from its Difficulties.sav, "no" = it doesn't, "?" = not seen.
+local PENDING = "mirror_difficulty_restore.txt"
+local pending, pending_read = nil, false
+local function pending_path() return localdir.get() .. "\\" .. PENDING end
+function difficulty.pending()
+    if not pending_read then
+        pending_read = true
+        local text = fs.read(pending_path())
+        local slot = text and text:match("^slot ([^\r\n]+)")
+        pending = slot and { slot = slot, loads = text:match("\nloads (%S+)") or "?" } or nil
+    end
+    return pending
+end
+function difficulty.set_pending(slot, loads)
+    local ok = fs.write(pending_path(), "slot " .. tostring(slot) .. "\nloads " .. (loads or "?") .. "\n")
+    -- (kept in memory even when the file couldn't be written: this run still restores)
+    pending, pending_read = { slot = tostring(slot), loads = loads or "?" }, true
+    return ok
+end
+function difficulty.clear_pending()
+    pending, pending_read = nil, true
+    os.remove(pending_path())
+end
+
 -- The player's own difficulty, kept from the last time they were in one of their own saves (for a Realm's owner
--- to give an existing Realm theirs; in the Realm the game runs the Realm's).
+-- to give an existing Realm theirs; in the Realm the game runs the Realm's). Never while a restore is owed: the
+-- game may still run the host's values then.
 local function mine_path() return localdir.get() .. "\\" .. MINE end
-function difficulty.remember_mine(save_name)
-    local snap = difficulty.snapshot()
+function difficulty.remember_mine(save_name, snap)
+    if difficulty.pending() then return false end
+    snap = snap or difficulty.snapshot()
     if not snap then return false end
     local ok = fs.write(mine_path(), "# " .. tostring(save_name) .. "\n" .. difficulty.encode(snap))
     if ok then log.info("difficulty: remembered your own difficulty (" .. tostring(save_name) .. ")") end

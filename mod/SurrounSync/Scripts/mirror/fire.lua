@@ -239,11 +239,18 @@ local hurt_last = -100
 local hurt_warned = false
 
 local zombies_mod
+-- the last damage I took, whatever dealt it: sent with a death (phase1) - the host only ever saw "peer dead"
+local last_hit = nil
+function fire.last_hit() return last_hit end
+
 local function on_hurt(self, Damage, DamageCauser)
     if not util.same(self:get(), game.player()) then return end
     local amt, causer = 0, nil
     pcall(function() amt = Damage:get() end)
     pcall(function() causer = DamageCauser:get() end)
+    if type(amt) == "number" and amt > 0 then
+        last_hit = { cls = util.valid(causer) and util.class_name(causer) or "nothing", amt = amt, at = os.clock() }
+    end
     zombies_mod = zombies_mod or require("mirror.zombies")
     if causer and zombies_mod.is_copy(causer) then return end
     if not util.valid(causer) or util.same(causer, game.player()) then return end
@@ -389,6 +396,34 @@ local LASER_REFRESH = 0.5
 local in_hand, refresh_in = {}, 0.0
 local end_out = {}
 local beam_end = nil
+local beam_gate = { at = -100, pause = -100 }
+-- (every frame while aiming: one function made once - two closures a laser a frame were most of fire's Lua churn,
+-- ~800 KB/s in the kit 2026-10-29)
+local function aim_beam(l)
+    for k in pairs(end_out) do end_out[k] = nil end
+    l:LaserEndPoint(end_out)
+    local v = end_out.Vector or (end_out.X and end_out)
+    if v then
+        beam_end = beam_end or FName("User.Beam End")
+        util.set_beam(util.addr(l) or 0, l.NS_LaserSight, beam_end, v)
+    end
+end
+-- (f.aim's parts, each timed on its own: f.aim took ~36 ms twice a second while aiming with no laser on, live
+-- 2026-10-30 02:37-02:42, and which part was unknown)
+local function aim_beams()
+    for _, l in pairs(driven) do
+        if util.valid(l) then pcall(aim_beam, l) end
+    end
+end
+local function scan_in_hand(p, fresh)
+    for i = #in_hand, 1, -1 do in_hand[i] = nil end
+    for i = 1, #LASERS do
+        if fresh then laser_list[i] = lasers(i) end
+        for _, l in ipairs(laser_list[i] or {}) do
+            if util.valid(l) and laser_in_hand(l, p) then in_hand[#in_hand + 1] = l end
+        end
+    end
+end
 lasers_follow_aim = function(dt)
     local p = game.player()
     if not p then return end
@@ -399,32 +434,22 @@ lasers_follow_aim = function(dt)
     was_ads = ads
     if not (changed or refresh_in <= 0) then
         if not ads then return end
-        for _, l in pairs(driven) do
-            if util.valid(l) then
-                for k in pairs(end_out) do end_out[k] = nil end
-                pcall(function() l:LaserEndPoint(end_out) end)
-                local v = end_out.Vector or (end_out.X and end_out)
-                if v then
-                    beam_end = beam_end or FName("User.Beam End")
-                    pcall(function() l.NS_LaserSight:SetVectorParameter(beam_end, v) end)
-                end
-            end
+        -- (the whole beam update - the game's LaserEndPoint trace and the set - at most 15 a second, and paused 5 s after
+        -- one that took over 20 ms: 90-128 ms each, every frame, for minutes, live 2026-10-30 02:42)
+        local t = os.clock()
+        if t < beam_gate.pause or t - beam_gate.at < 1 / 15 then return end
+        beam_gate.at = t
+        perf.run("f.aim.beam", aim_beams)
+        local d = os.clock() - t
+        if d > 0.02 then
+            beam_gate.pause = t + 5.0
+            log.every("fire.beam_slow", 10, string.format("fire: laser beam update took %.0f ms - paused 5 s", d * 1000))
         end
         return
     end
     refresh_in = LASER_REFRESH
-    for i = #in_hand, 1, -1 do in_hand[i] = nil end
-    for i = 1, #LASERS do
-        for _, l in ipairs(laser_list[i] or {}) do
-            if util.valid(l) and laser_in_hand(l, p) then in_hand[#in_hand + 1] = l end
-        end
-    end
-    if ads and changed and #in_hand == 0 then
-        for i = 1, #LASERS do laser_list[i] = lasers(i) end
-        for i = 1, #LASERS do
-            for _, l in ipairs(laser_list[i]) do if util.valid(l) and laser_in_hand(l, p) then in_hand[#in_hand + 1] = l end end
-        end
-    end
+    perf.run("f.aim.scan", scan_in_hand, p, false)
+    if ads and changed and #in_hand == 0 then perf.run("f.aim.find", scan_in_hand, p, true) end
     local keep = {}
     for _, l in ipairs(in_hand) do
         local k = util.addr(l) or 0

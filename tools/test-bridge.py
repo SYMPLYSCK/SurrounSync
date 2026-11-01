@@ -69,6 +69,11 @@ def log_of(d, name):
         return ""
 
 
+def bridge_logs(d):
+    # (auto role logs to mirror_bridge.log, a fixed --role to mirror_bridge_<role>.log)
+    return "".join(log_of(d, n) for n in ("mirror_bridge.log", "mirror_bridge_host.log", "mirror_bridge_guest.log"))
+
+
 def hammer(path, stop):
     while not stop[0]:
         try:
@@ -353,6 +358,124 @@ def main():
         check(get_blob(A, "hello", "host") == "A hosts now", "guest -> host: the game's new hello is kept")
         check(get_blob(A, "look", "host") is None, "guest -> host: the old host's look is cleared (not sent on as A's own)")
         # (a bridge restart while hosting still clears "_host" at start: link.lua puts the game's blobs again)
+
+        print("10. the host's goodbye written right before 'stop' still reaches the guest")
+        # (kit 2026-10-30 12:54: a host's MAIN MENU wrote mirror_bye_* and then the stop command; the bridge
+        # dropped every link first, so guests only lost the connection instead of being taken home)
+        for p in procs:
+            p.kill(); p.wait()
+        procs.clear()
+        for d in (A, B):
+            for f in os.listdir(d):
+                os.remove(os.path.join(d, f))
+        procs.append(start("auto", A))
+        procs.append(start("auto", B))
+        check(wait_for(lambda: "role idle" in log_of(B, "mirror_lobby.txt"), 10), "(setup) both bridges idle")
+        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+        put_blob(A, "hello", "host", "host hello")
+        check(wait_for(lambda: "role host" in log_of(A, "mirror_lobby.txt"), 10), "(setup) A hosts")
+        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
+        check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 15), "(setup) B asks to join")
+        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "accept 1002")
+        check(wait_for(lambda: get_blob(B, "hello", "host"), 15) == "host hello", "(setup) B is connected")
+        time.sleep(1.0)
+        put_blob(A, "bye", "host", "stop 1793390000")
+        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "stop")
+        check(wait_for(lambda: get_blob(B, "bye", "host"), 10) == "stop 1793390000", "the goodbye arrived before the link closed")
+        check(wait_for(lambda: "role idle" in log_of(A, "mirror_lobby.txt"), 10), "and the host's bridge stopped")
+
+        print("11. the host's reliable lane goes dead: the bridge notices and reconnects")
+        # (player report 2026-10-30 13:28, DBG-20261030-005: over Steam the guest got the host's heartbeats and poses
+        # but none of its reliable blobs - no hello, no world files - and stayed home after 120 s)
+        for p in procs:
+            p.kill(); p.wait()
+        procs.clear()
+        for d in (A, B):
+            for f in os.listdir(d):
+                os.remove(os.path.join(d, f))
+        fast = dict(os.environ, SURROUNSYNC_TEST_STALL_MS="4000")
+        procs.append(start("auto", A, env=dict(fast, SURROUNSYNC_TEST_DEAD_RELIABLE="1")))
+        procs.append(start("auto", B, env=fast))
+        check(wait_for(lambda: "role idle" in log_of(B, "mirror_lobby.txt"), 10), "(setup) both bridges idle")
+        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+        put_blob(A, "hello", "host", "host hello 11")
+        check(wait_for(lambda: "role host" in log_of(A, "mirror_lobby.txt"), 10), "(setup) A hosts")
+        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
+        check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 15), "(setup) B asks to join")
+        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "accept 1002")
+        check(wait_for(lambda: get_blob(B, "hello", "host"), 30) == "host hello 11", "the host's hello arrives after the dead lane")
+        check("stopped arriving" in bridge_logs(A), "the host logged the dead lane and reconnected")
+        check(re.search(r"stopped arriving \(probe \d+ unanswered.*last answered \d+.*test session queued \d+ B, rtt", bridge_logs(A)) is not None,
+              "...with the session's state, the last answered probe and the round trip")
+        put_blob(A, "life", "host", "after the reconnect")
+        check(wait_for(lambda: get_blob(B, "life", "host"), 15) == "after the reconnect", "a blob written later arrives too")
+
+        print("11b. a healthy link with a big blob in flight is never restarted")
+        for p in procs:
+            p.kill(); p.wait()
+        procs.clear()
+        for d in (A, B):
+            for f in os.listdir(d):
+                os.remove(os.path.join(d, f))
+        procs.append(start("host", A, env=fast))
+        procs.append(start("guest", B, ["--peer", "1001"], env=fast))
+        put_blob(A, "hello", "host", "host hello 11b")
+        check(wait_for(lambda: get_blob(B, "hello", "host"), 15) == "host hello 11b", "(setup) connected")
+        for i in range(3):
+            put_blob(A, "file_world_Level.sav", "host", "%d:" % i + world)
+            time.sleep(1.5)
+        time.sleep(6.0)
+        check("connected to" in bridge_logs(A) and "stopped arriving" not in bridge_logs(A) + bridge_logs(B),
+              "no restart on a healthy link")
+        check(wait_for(lambda: (get_blob(B, "file_world_Level.sav", "host") or "").startswith("2:"), 20), "the last world file arrived")
+
+        print("11c. the reliable lane stays dead: blobs go over the unreliable lane (20% lost) with resends")
+        for p in procs:
+            p.kill(); p.wait()
+        procs.clear()
+        for d in (A, B):
+            for f in os.listdir(d):
+                os.remove(os.path.join(d, f))
+        lossy = dict(fast, SURROUNSYNC_TEST_LOSS="0.2")
+        procs.append(start("host", A, env=dict(lossy, SURROUNSYNC_TEST_DEAD_RELIABLE="2")))
+        procs.append(start("guest", B, ["--peer", "1001"], env=lossy))
+        put_blob(A, "hello", "host", "host hello 11c")
+        put_blob(A, "file_world_Level.sav", "host", "11c:" + world)
+        check(wait_for(lambda: get_blob(B, "hello", "host"), 60) == "host hello 11c", "the host's hello arrives")
+        check("still stopped arriving after" in bridge_logs(A), "the host switched to the unreliable lane")
+        check(wait_for(lambda: get_blob(B, "file_world_Level.sav", "host"), 60) == "11c:" + world, "1.5 MB world file arrived intact")
+        for i in range(5):
+            put_blob(A, "life", "host", "state %d" % i)
+            time.sleep(0.1)
+        check(wait_for(lambda: get_blob(B, "life", "host") == "state 4", 20), "the newest of quick changes wins")
+
+        print("11d. a link that loses any reliable packet bigger than one packet: messages go in pieces, the lane never dies")
+        # (DBG-20261030-005, the guest's bridge log 2026-10-30: every small message arrived, nothing after the first
+        # one Steam had to split - "lootc", 8 KB compressed)
+        for p in procs:
+            p.kill(); p.wait()
+        procs.clear()
+        for d in (A, B):
+            for f in os.listdir(d):
+                os.remove(os.path.join(d, f))
+        procs.append(start("host", A, env=dict(fast, SURROUNSYNC_TEST_MTU="1200")))
+        procs.append(start("guest", B, ["--peer", "1001"], env=fast))
+        put_blob(A, "hello", "host", "host hello 11d")
+        lootc = "".join(random.choice(string.ascii_letters) for _ in range(42000))
+        put_blob(A, "lootc", "host", lootc)
+        put_blob(A, "file_world_Level.sav", "host", "11d:" + world)
+        check(wait_for(lambda: get_blob(B, "hello", "host"), 20) == "host hello 11d", "the hello arrives")
+        check(wait_for(lambda: get_blob(B, "lootc", "host"), 20) == lootc, "a 42 KB blob arrives (in pieces)")
+        check(wait_for(lambda: get_blob(B, "file_world_Level.sav", "host"), 60) == "11d:" + world, "the 1.5 MB world file arrives intact")
+        # ~4100 pieces at loopback speed: counted one by one they drained the 3000-packet burst and a lost reliable
+        # piece is never sent again (audit 2026-10-30)
+        huge = "".join(random.choice(string.ascii_letters + string.digits + "+/") for _ in range(4_200_000))
+        put_blob(A, "file_world_Big.sav", "host", huge)
+        check(wait_for(lambda: get_blob(B, "file_world_Big.sav", "host"), 90) == huge, "a 4.2 MB file in ~4100 pieces arrives intact")
+        check("(rate)" not in bridge_logs(B), "...without a rate drop on the receiving side (20 of them cut the player off)")
+        put_blob(A, "life", "host", "after the big ones")
+        check(wait_for(lambda: get_blob(B, "life", "host"), 15) == "after the big ones", "and what comes after it")
+        check("stopped arriving" not in bridge_logs(A), "the lane never died (no restart, no fallback)")
     finally:
         for p in procs:
             try:

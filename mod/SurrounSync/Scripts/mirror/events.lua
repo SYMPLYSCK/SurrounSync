@@ -24,9 +24,29 @@ local reliable = {}          -- name -> channel (reliable channels only)
 local acked = {}             -- name -> highest id of my epoch the other game has read
 local acks_dirty, acks_read_at, acks_sent_at = false, -100, -100
 
+-- Plain channels over Steam (T10 audit 2026-10-31): the age check works in whole seconds plus 2 s of clock slack, so
+-- a shot, impact or hit still played ~max_age+3 s late (after a stall, the whole backlog at once). Each line also
+-- carries the sender's clock (ms); its delay here minus the smallest delay seen lately from that game is how late it
+-- is - the clocks' different starts cancel out (as audio.lua does). And the whole window went out again with every
+-- message (a horde fight: hundreds of KB/s): lines past max_age are dropped before a write (the other game would skip
+-- them anyway) and a channel writes at most PUT_S apart (nothing is lost, the next write carries it).
+local PUT_S = 0.05
+local WINDOW_S = 10          -- the smallest delay is taken over the last one to two windows
+local bases = {}             -- epoch -> { cur, prev, at }
+local function lateness(ep, d, now)
+    local b = bases[ep]
+    if not b then b = { at = now }; bases[ep] = b end
+    if now - b.at >= WINDOW_S then b.prev, b.cur, b.at = b.cur, nil, now end
+    if not b.cur or d < b.cur then b.cur = d end
+    local m = b.cur
+    if b.prev and b.prev < m then m = b.prev end
+    return (d - m) / 1000
+end
+local function clock_ms() return math.floor(os.clock() * 1000) end
+
 function events.new(name, keep, max_age)
     return setmetatable({ name = name, keep = keep or 32, max_age = max_age or 3,
-                          next_id = 0, recent = {}, dirty = false, seen = {} }, events)
+                          next_id = 0, recent = {}, at = {}, dirty = false, put_at = -100, seen = {} }, events)
 end
 
 -- keep: how many messages stay when the other game doesn't read them (not connected / at home)
@@ -37,8 +57,31 @@ function events.reliable(name, keep)
     return ch
 end
 
-function events.set_cut(t) cut = t end
+-- The cut in whole seconds of wall clock missed the join save's edge (T10 audit 2026-10-31): the save runs frames
+-- after the cut, and over Steam the guest's cut came out ~3 s early by the clock-offset slack, so host messages
+-- already in the save were applied again on the guest. The host now notes each reliable channel's last id when the
+-- save starts (events.marks); the guest skips that epoch's messages by id against it, the time cut covers the rest.
+local marks = nil                -- name -> epoch -> last id in the join save
+-- A channel's past_cut(payload) names messages about this game's own state, which no join save holds (a give-back to
+-- my bag): they are applied across the cut while fresh. Skipped, a give-back the host sent between the join request
+-- and its save start left the guest's copy a duplicate (T10 audit 2026-10-31).
+local PAST_CUT_S = 120
+function events.set_cut(t, body)
+    cut, marks = t, nil
+    for name, ep, id in (body or ""):gmatch("(%S+) (%S+) (%d+)") do
+        marks = marks or {}
+        marks[name] = marks[name] or {}
+        marks[name][ep] = tonumber(id)
+    end
+end
 function events.set_hold(fn) hold = fn end
+
+function events.marks()
+    local out = {}
+    for name, ch in pairs(reliable) do out[#out + 1] = name .. " " .. epoch .. " " .. ch.next_id end
+    table.sort(out)
+    return table.concat(out, "\n")
+end
 
 local function read_acks()
     local t = os.clock()
@@ -65,15 +108,16 @@ end
 
 local function drop_oldest(self)
     table.remove(self.recent, 1)
-    if not self.ids then return end
+    if not self.ids then table.remove(self.at, 1); return end
     local e = table.remove(self.ids, 1)
     return e.id > (acked[self.name] or 0) and e or nil
 end
 
 function events:send(payload)
     self.next_id = self.next_id + 1
-    self.recent[#self.recent + 1] = string.format("%s %d %d %s", epoch, self.next_id, os.time(), payload)
+    self.recent[#self.recent + 1] = string.format("%s %d %d:%d %s", epoch, self.next_id, os.time(), clock_ms(), payload)
     if not self.ids then
+        self.at[#self.at + 1] = os.clock()
         if #self.recent > self.keep then drop_oldest(self) end
     else
         local now = os.clock()
@@ -112,27 +156,38 @@ end
 
 function events:pump(fn)
     if self.sure then read_acks() end
-    if self.dirty then
-        self.dirty = false
-        if self.sure then self:trim() end
+    local now = os.clock()
+    if self.dirty and (self.sure or now - self.put_at >= PUT_S) then
+        self.dirty, self.put_at = false, now
+        if self.sure then
+            self:trim()
+        else
+            while self.at[1] and now - self.at[1] > self.max_age do drop_oldest(self) end
+        end
         link.put_blob(self.name, table.concat(self.recent, "\n"))
     end
     -- unread blobs stay: the next read gets the newest body with everything not yet trimmed
     local body = not (self.sure and hold and hold()) and link.get_blob(self.name)
     if body then
         for line in body:gmatch("[^\n]+") do
-            local ep, id, stamp, payload = line:match("^(%S+) (%d+) (%d+) (.*)$")
+            local ep, id, stamp, sent, payload = line:match("^(%S+) (%d+) (%d+):?(%d*) (.*)$")
             id = tonumber(id)
             local last = self.seen[ep]
             if id and id > (last or 0) then
                 self.seen[ep] = id
                 local age = link.peer_age(tonumber(stamp))
+                if not self.sure and sent ~= "" and lateness(ep, clock_ms() - tonumber(sent), now) > self.max_age then
+                    age = math.huge
+                end
                 if self.sure then
                     self.last_ep, acks_dirty = ep, true
                     if last and id > last + 1 then
                         log.every("events.gap." .. self.name, 10, string.format("events: %s missed %d message(s)", self.name, id - last - 1))
                     end
-                    if age <= os.time() - cut + 1 then fn(payload) end
+                    local mark = marks and marks[self.name] and marks[self.name][ep]
+                    local after
+                    if mark then after = id > mark else after = age <= os.time() - cut + 1 end
+                    if after or (self.past_cut and age <= PAST_CUT_S and self.past_cut(payload)) then fn(payload) end
                 elseif age <= self.max_age then
                     fn(payload)
                 end

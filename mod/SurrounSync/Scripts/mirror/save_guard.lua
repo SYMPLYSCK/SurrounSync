@@ -40,10 +40,15 @@ local function drop_stray_bodies()
     local me = require("mirror.game").player()
     if not util.valid(me) then return end
     local peers, n = require("mirror.peers"), 0
+    -- (destroyed now, not through animgate: a player body still there when the save runs can take the player's
+    -- inventory - mod saves close the animation gate first, session.save_now)
     for _, p in ipairs(FindAllOf("BP_PlayerCharacter_C") or {}) do
         local full, ctrl
         local going = true
-        pcall(function() full = p:GetFullName(); ctrl = p.Controller; going = p:IsActorBeingDestroyed() end)
+        -- (a ghost destroyed a moment ago is never touched again: a destroyed actor's next touch can crash, L-vehicles)
+        if not peers.was_ghost(p) then
+            pcall(function() full = p:GetFullName(); ctrl = p.Controller; going = p:IsActorBeingDestroyed() end)
+        end
         if full and not going and not full:find("Default__", 1, true) and not util.same(p, me) and not util.valid(ctrl)
                 and not peers.is_ghost(p) and pcall(function() p:K2_DestroyActor() end) then
             n = n + 1
@@ -55,6 +60,12 @@ end
 local function on_save_start(path)
     log.info("save starting (" .. path:match(":(.+)$") .. ")")
     -- (a guest froze/crashed inside this hook once with no dump: the steps say which part next time)
+    crumb.at("save: waiting destroys")
+    -- (a ghost or body whose destroy waited for the animation gate: gone before the save sees it)
+    util.safe(function()
+        local n = require("mirror.animgate").flush()
+        if n > 0 then log.info("save: " .. n .. " actor(s) waiting for their destroy removed first") end
+    end, "save_guard.flush")
     crumb.at("save: stray bodies")
     util.safe(drop_stray_bodies, "save_guard.stray")
     crumb.at("save: before_save")
@@ -69,7 +80,7 @@ local function on_save_start(path)
         pcall(function() yaw = ghost.get():K2_GetActorRotation().Yaw end)
         saved_pose = { loc = ghost.location(), yaw = yaw }
         crumb.at("save: ghost destroy")
-        ghost.destroy("save")
+        ghost.destroy("save", true)
         pending, since = true, 0.0
     end
 end

@@ -15,6 +15,7 @@ local hostrules = require("mirror.hostrules")
 local members = require("mirror.realmmembers")
 local link = require("mirror.link")
 local difficulty = require("mirror.difficulty")
+local worldset = require("mirror.worldset")
 
 local realmplay = {}
 
@@ -44,6 +45,14 @@ local function close_live()
     S.live = false
     hostrules.use_file(nil)
 end
+
+-- the Realm whose owner sets the rules (hostrules.lua): the one I host, or the one I joined as a guest
+hostrules.set_realm(function()
+    local id = (S and S.live and S.id) or (session and session.realm_joined()) or nil
+    if not id then return nil end
+    local r = realm.find(id)
+    return { id = id, owner = r ~= nil and r.role == "owner", rules = realm.rules(id) }
+end, function(id, rules, cb) realm.send("rules", id .. " " .. rules, cb) end)
 
 local function session_log(st)
     return { step = st, own = S.own, coop = S.coop, own_stamp = S.own_stamp, realm = S.id, gen = tostring(S.gen or 0),
@@ -103,18 +112,25 @@ end
 local HERE = { joined = true, host = true }
 local function people_list(r, in_session)
     if not r or not r.people or #r.people == 0 then return nil end
+    -- (by Steam id as well as name: Steam names only friends, so another guest who isn't my friend is listed by its
+    -- id - by name alone every player but the host stayed grey with 3 or more in the Realm, user 2026-10-30)
     local on = {}
     local l = in_session and link.lobby() or nil
     if l then
         if l.name and l.name ~= "" then on[l.name] = true end
+        if l.id then on[tostring(l.id)] = true end
         pcall(require("mirror.peers").each, "mirror.phase1", function(p1, inst)
+            if not (p1.peer_where and HERE[p1.peer_where()]) then return end
             local name = inst and inst.name or (l.peer and l.peer.name)
-            if name and p1.peer_where and HERE[p1.peer_where()] then on[name] = true end
+            local id = inst and inst.id or (l.peer and l.peer.id)
+            if name then on[name] = true end
+            if id then on[tostring(id)] = true end
         end)
     end
     local first, rest = {}, {}
     for _, p in ipairs(r.people) do
-        local st = (r.host and p.steam == r.host) and "hosting" or (on[p.name] and "here") or nil
+        local st = (r.host and p.steam == r.host) and "hosting"
+            or ((on[p.name] or (p.steam and on[tostring(p.steam)])) and "here") or nil
         -- (short: the handbook's one-label-each list, where green already says who's here)
         local e = { label = p.name .. (p.owner and " (owner)" or "") .. (st and (" - " .. st) or ""), on = st ~= nil,
                     short = p.name .. (st == "hosting" and " (host)" or "") }
@@ -187,8 +203,11 @@ function realmplay.model()
             -- (no "save <gen>": the upload count meant nothing to players)
             info = info .. " | " .. plural(r.members or 0, "member")
         end
+        -- the row's remove button: an owner deletes the Realm (an owner can't just leave it), a member leaves it, an
+        -- unreachable copy only goes off this list
+        local remove = r.offline and "REMOVE" or (r.role == "owner" and "DELETE" or "LEAVE")
         m.rows[#m.rows + 1] = { id = r.id, name = r.name, info = info, open = open, live = r.host ~= nil, here = here,
-                                owner = r.role == "owner" }
+                                owner = r.role == "owner", remove = remove }
     end
     if S then
         local r = S.id and realm.find(S.id)
@@ -233,6 +252,24 @@ end
 function realmplay.open(id, how)
     if how == "START" then realmplay.create_world(id) else realmplay.start(id) end
 end
+-- A row's DELETE / LEAVE / REMOVE (user 2026-10-30: no way to take a Realm off the list). Owner: the Realm goes for
+-- everyone (server and worlds); member: leaves it; an offline copy: only off this PC's list (its key is kept aside
+-- as .forgotten by the bridge). Never the Realm I'm in, never during a session.
+function realmplay.remove(id)
+    if S or in_coop() then say("Leave the Realm or co-op session first.", "info"); return end
+    local r = realm.find(id)
+    if not r then return end
+    local verb = r.offline and "forget" or (r.role == "owner" and "delete" or "leave")
+    local name = r.name or realm.code(id)
+    log.info("realmplay: " .. verb .. " " .. id)
+    realm.send(verb, id, function(ok, _, text)
+        if not ok then say("Couldn't " .. (verb == "delete" and "delete" or verb == "leave" and "leave" or "remove") .. " "
+            .. name .. " (" .. tostring(text) .. ").", "bad"); return end
+        say(verb == "delete" and (name .. " is deleted - for every member.") or verb == "leave" and ("You left " .. name .. ".")
+            or (name .. " is off your list."), "info")
+        realmplay.refresh_list(true)
+    end)
+end
 local listed_at = -100
 -- The bridge deletes its command file when it starts, so a list asked for before then was lost ("list failed:
 -- timeout" at every game start). Until its Realms file was written this run, the list waits (tick sends it).
@@ -255,6 +292,8 @@ end
 -- lease runs out) the claim answers "hosted" by that host: ask again every 5 s for a while.
 local takeover = nil
 local TAKEOVER_EVERY, TAKEOVER_TRIES = 5.0, 30
+-- OPEN on a brand-new game the game hasn't saved yet: { id, t } while its save runs (realmplay.start, tick)
+local save_then_open = nil
 
 -- who's connected and where I am in a Realm: when it changes (a player joins or leaves, a host ends or takes over)
 -- the list - LIVE, who hosts, who's in - is asked again at once instead of at the next 30 s refresh
@@ -268,10 +307,33 @@ local function realm_sig()
     end
     return table.concat(parts, "|")
 end
-function realmplay.takeover(id, old_host)
+-- follow: another guest takes it over in place (peers.first_guest) - join them once the Realm list shows them as its
+-- host; a claim before that could win it from under them. Nobody after FOLLOW_MAX s: open it myself as before.
+local FOLLOW_MAX, FOLLOW_EVERY = 60.0, 1.0
+-- old_lease: the old host's lease id as the list showed it when they left (else the list's holder now)
+function realmplay.takeover(id, old_host, follow, old_lease)
     local r = realm.find(id)
-    takeover = { id = id, old = old_host, old_lease = r and r.host, at = 0.0, tries = 0 }
-    say("You keep playing in the Realm - opening it as its host...", "info", "realm")
+    takeover = { id = id, old = old_host, old_lease = old_lease or (r and r.host), at = 0.0, tries = 0,
+                 follow = follow and 0.0 or nil }
+    if follow then say("Waiting for the Realm's next host - you'll join them in a moment...", "info", "realm")
+    else say("You keep playing in the Realm - opening it as its host...", "info", "realm") end
+end
+
+-- following: true while still waiting (the list asked again), false = go on (join the new host, or open it)
+local function follow_tick(t)
+    local r = realm.find(t.id)
+    local host = r and r.host
+    if host and host ~= t.old and host ~= t.old_lease then
+        log.info("realmplay: " .. t.id .. " is hosted by " .. host .. " now - joining them")
+        return false
+    end
+    if t.follow >= FOLLOW_MAX then
+        log.info("realmplay: nobody took " .. t.id .. " over in " .. FOLLOW_MAX .. " s - opening it myself")
+        t.follow = nil
+        return false
+    end
+    realmplay.refresh_list(true)
+    return true
 end
 
 function realmplay.start(id, retry)
@@ -284,7 +346,22 @@ function realmplay.start(id, retry)
     end
     if slotguard.log_exists() then say("A co-op session isn't finished yet. Restart the game, then try again.", "bad"); return end
     local cur = session.current_name()
-    if not cur or not slotguard.is_own(cur) then say("Load one of your own saves first, then open the Realm.", "bad"); return end
+    local why = slotguard.own_problem(cur)
+    -- a brand-new game hasn't written the player yet (no Player.sav): save it, then open (player report 2026-10-30:
+    -- "load one of your own saves" right after making a new save)
+    if why == "unsaved" and not (retry and retry.saved) then
+        log.info("realmplay: " .. tostring(cur) .. " has no Player.sav yet - saving first, then opening " .. tostring(id))
+        session.save_now()
+        save_then_open = { id = id, t = 0.0 }
+        say("Saving your game first...", "info", "realm")
+        return
+    end
+    if why then
+        log.warn("realmplay: can't open " .. tostring(id) .. " from save " .. tostring(cur) .. " (" .. why .. ")")
+        say("Load one of your own saves first, then open the Realm.", "bad")
+        return
+    end
+    util.safe(worldset.restore_now, "worldset.restore_now")   -- (still the host's values just after co-op)
     util.safe(difficulty.remember_mine, "realmplay.my_difficulty", cur)   -- (MY DIFFICULTY in the Realm uses it)
     local r = realm.find(id)
     S = { id = id, name = r and r.name or realm.code(id), t = 0.0 }
@@ -381,7 +458,19 @@ function realmplay.save_own()
     session.save_now()
 end
 
+-- The Realm's load never happened (the load call failed, or the world and player are still mine): the game still
+-- points at the Realm's save, so my own world's next save would land there. Back to my save, Realm released.
+local LOAD_GIVE_UP = 30.0
+local function load_failed()
+    log.error("realmplay: the Realm's load didn't start - staying in " .. tostring(S.own))
+    session.point_at(S.own)
+    session.anim_on_game_thread(false)
+    abort("The Realm didn't load, so you stayed in your own world. Save once to keep the autosave going, then try again.")
+end
+
 local function build()
+    -- (the claim and download take a while: a co-op join or hosting started meanwhile must not get the Realm loaded under it)
+    if in_coop() then abort("You're in co-op now, so the Realm didn't open. Stop co-op first, then open it again."); return end
     local own = session.current_slot()
     if not slotguard.is_own(own) then abort("Couldn't tell which save you're on, so the Realm didn't open."); return end
     local w = realm.world(S.id)
@@ -408,9 +497,11 @@ local function build()
     log.info(string.format("realmplay: %s generation %d in %s, %s character, home is %s", S.id, S.gen, S.coop,
         S.fresh and "a fresh" or "my Realm", own))
     step("loading")
+    -- (a load replaces the world and its player: both still the same LOAD_GIVE_UP s later = the load never ran)
+    S.from_player, S.from_world = util.addr(game.player()), util.addr(game.world())
     -- (EMS cached an empty PlayerInfo for this slot at game start: the load would ignore the Realm character's file)
     session.forget_cached_player(S.coop)
-    session.load_slot(S.coop)
+    if not session.load_slot(S.coop) then load_failed() end
 end
 
 -- ---- taking a Realm over in place: its host left while I was its guest ----
@@ -529,10 +620,42 @@ end
 
 -- ---- in the Realm ----
 
+-- An upload asked for during a save waits for it (realmplay.tick runs it, whatever the step): a world file read while
+-- the game writes it is cut short, still passes the header check, and would become every member's world. After
+-- UPLOAD_WAIT_MAX it goes anyway (a save system stuck "busy" mustn't keep the Realm from ever being stored).
+local UPLOAD_WAIT_MAX = 60.0
 local function upload(final, done)
+    if session.saving() and not (S.upload_wait and S.upload_wait.since >= UPLOAD_WAIT_MAX) then
+        local w = S.upload_wait
+        if not w then
+            w = { since = 0.0 }
+            S.upload_wait = w
+            log.info("realmplay: upload waits for the save in progress")
+        end
+        w.final = w.final or final
+        local first = w.done
+        w.done = (first and done) and function(ok) first(ok); done(ok) end or first or done
+        return
+    end
+    if S.upload_wait and S.upload_wait.since >= UPLOAD_WAIT_MAX then
+        log.warn("realmplay: the game still says it is saving after " .. UPLOAD_WAIT_MAX .. " s - uploading anyway")
+    end
+    S.upload_wait = nil
     local id = S.id
     local world, character = slotguard.read_realm(S.coop)
     if not world then log.error("realmplay: can't read the Realm save: " .. tostring(character)); if done then done(false) end; return end
+    -- (not the Realm's world: neither it nor this session's character may replace what is stored - DBG-20261031-003)
+    local shrunk = S.refused or realm.level_shrunk(id, world)
+    if shrunk then
+        if not S.refused then
+            S.refused = shrunk
+            log.error("realmplay: this session's world isn't the Realm (" .. shrunk .. ") - not uploaded, character not stored")
+            say("Your game isn't in " .. S.name .. "'s world, so nothing is saved to the Realm. Leave it, restart the game, "
+                .. "load your own world, then open the Realm again.", "bad", "realm")
+        end
+        if done then done(false) end
+        return
+    end
     if character then
         local ok, err = realm.store_character(id, character)
         if not ok then log.error("realmplay: Realm character not stored: " .. tostring(err)) end
@@ -553,7 +676,14 @@ local function upload(final, done)
             log.info("realmplay: uploaded generation " .. gen .. (final and " (final)" or ""))
         elseif w[1] == "lease_lost" or w[1] == "stale" then
             S.lost = true
-            say("Someone else is hosting this Realm now, so your game no longer saves to it.", "bad")
+            if final then
+                -- (leaving: a member already took it over in place - kit 2026-10-30 11:16, the leaving host read
+                -- "Someone else is hosting this Realm now", an alarm for what was the hand-over working)
+                log.info("realmplay: the final upload isn't needed - another member hosts " .. S.id .. " now (" .. text .. ")")
+                say(S.name .. " carries on with the member who hosts it now.", "info")
+            else
+                say("Someone else is hosting this Realm now, so your game no longer saves to it.", "bad")
+            end
         else
             log.warn("realmplay: upload failed (" .. text .. ") - kept for the next save")
         end
@@ -589,11 +719,26 @@ local function playing_tick(dt)
     end
 end
 
+local go_home
+
+-- the load opened the Shooting Range instead of the Realm's world (DBG-20261031-003): nothing from it may reach the
+-- Realm - no upload, no stored character, no kept session; the lease goes back at once and the player goes home
+local function wrong_map()
+    S.refused = "the Shooting Range"
+    log.error("realmplay: the load opened the Shooting Range, not " .. S.id .. " - lease released, nothing uploaded or stored")
+    if S.leased then realm.send("release", S.id) end
+    S.leased = false
+    say("The game opened the Shooting Range instead of " .. S.name .. ", so nothing was saved to the Realm. Restart the "
+        .. "game, load your own world, then open the Realm again.", "bad", "realm")
+    go_home()
+end
+
 local function arrived_tick(dt)
     local p = game.player()
     if session.current_name() ~= S.coop or session.loading() or not util.valid(p) then S.t = 0.0; return end
     S.t = S.t + dt
     if S.t < SETTLE then return end
+    if game.in_shooting_range() then wrong_map(); return end
     if S.fresh then
         -- a slot without a character puts the new one at the map origin, falling (experiment E7)
         local ok = pcall(function() game.controller():Svr_RequestRespawn_Random() end)
@@ -616,11 +761,16 @@ function realmplay.leave()
     if menu.role() == "host" then menu.realm_stop("You left " .. S.name .. ". The Realm is saved.") end
 end
 
-local function go_home()
+function go_home()
     local own, coop = S.own, S.coop
     close_live()
     step("going_home")
     S.home_at = S.clock
+    -- home is a NEW player in my own save: the save name is my own one a few frames before the load even starts
+    -- ("home in" logged 50 ms before Event_LoadLevel, kit 2026-10-30 11:17 - and a rejoin started then would run into
+    -- the load). Marked by name too: the load's garbage collection can give the new player the old one's address.
+    S.left_player = {}
+    util.mark(S.left_player, game.player())
     session.load_slot(own)
     slotguard.purge(coop)
     slotguard.log_clear()
@@ -646,7 +796,7 @@ local function ending_tick(dt)
         step("ending_upload")
         upload(true, function(ok)
             if not S then return end
-            if not ok and not S.lost then
+            if not ok and not S.lost and not S.refused then
                 -- the world stays on this PC and goes up the next time I host this Realm
                 local world = slotguard.read_realm(S.coop)
                 if world then realm.stash_pending(S.id, S.gen, world, realm.read_live(S.id)) end
@@ -656,13 +806,15 @@ local function ending_tick(dt)
             go_home()
         end)
     elseif S.step == "going_home" then
-        if session.current_name() == S.own and not session.loading() and util.valid(game.player()) then
+        local p = game.player()
+        if session.current_name() == S.own and not session.loading() and util.valid(p)
+                and not util.marked(S.left_player or {}, p) then
             log.info("realmplay: home in " .. S.own)
-            local again = S.rejoin and S.id
+            local again, refused = S.rejoin and S.id, S.refused
             S = nil
             -- (taken over in place, but another member won the Realm: join them from home)
             if again then realmplay.start(again)
-            else say("Back in your own world.", "good", "realm") end
+            elseif not refused then say("Back in your own world.", "good", "realm") end   -- (keeps the refusal's card)
         elseif S.clock - S.home_at > 120 then
             log.warn("realmplay: still not home after 120 s")
             S = nil
@@ -678,7 +830,7 @@ function left_by_menu()
     step("ending_upload")
     upload(true, function(ok)
         if not S then return end
-        if not ok and not S.lost then
+        if not ok and not S.lost and not S.refused then
             local world = slotguard.read_realm(S.coop)
             if world then realm.stash_pending(S.id, S.gen, world, realm.read_live(S.id)) end
         end
@@ -721,6 +873,7 @@ local function arm(id, name)
     S = { id = id, name = name or realm.code(id), own = S and S.own or session.current_slot(), t = 0.0 }
     if not slotguard.is_own(S.own) then S = nil; say("Load one of your own saves first, then create the Realm.", "bad"); return end
     -- the Realm plays at the difficulty of the save the creator is in now (not the New Game page's)
+    util.safe(worldset.restore_now, "worldset.restore_now")
     local ok, snap = util.safe(difficulty.snapshot, "realmplay.difficulty_snapshot")
     S.diff = ok and snap or nil
     util.safe(difficulty.remember_mine, "realmplay.my_difficulty", S.own)
@@ -756,12 +909,19 @@ local function to_main_menu()
         return
     end
     -- (outside the player's tick: the player and its UI go away with the world)
-    ExecuteInGameThread(function()
+    -- Animation goes to the game thread first and the world is left 2 frames later (animgate.lua): destroying the
+    -- players and the load wait for animation tasks that were already running (the join freeze, session.lua).
+    session.anim_on_game_thread(true)
+    require("mirror.animgate").later(function() ExecuteInGameThread(function()
         util.safe(function()
-            if not (S and S.step == "armed" and S.auto == "menu") then return end
+            if not (S and S.step == "armed" and S.auto == "menu") then session.anim_on_game_thread(false); return end
             local gi = FindFirstOf("SD_GameInstance_C")
-            if not util.valid(gi) then log.error("realmplay: no game instance - can't go to the main menu"); S.auto = nil; return end
-            session.anim_on_game_thread(true)   -- (the join freeze, session.lua: this load is called from Lua too)
+            if not util.valid(gi) then
+                log.error("realmplay: no game instance - can't go to the main menu")
+                S.auto = nil
+                session.anim_on_game_thread(false)
+                return
+            end
             -- exactly the pause screen's MAIN MENU (PauseScreen_C, decompiled): every player's UI cleared and the
             -- player removed, all actors removed, the autosave timer stopped, then the MainMenu level
             -- (ClearUI alone left world prompts like "[F] Clothing Cupboard" over the main menu)
@@ -782,7 +942,7 @@ local function to_main_menu()
             local ok, err = pcall(function() gi:Event_LoadLevel(FName("MainMenu")) end)
             log.info("realmplay: to the main menu for the New Game -> " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
         end, "realmplay.to_main_menu")
-    end)
+    end) end, "realmplay.to_main_menu")
 end
 
 -- at the main menu (no player ticks there): poll until the menu is up, then press its NEW GAME
@@ -943,8 +1103,36 @@ local function create_tick(dt)
     end
 end
 
+-- an upload that waited for a save goes once the save is over (or after UPLOAD_WAIT_MAX); false when S ended
+local function upload_wait_tick(dt)
+    local w = S.upload_wait
+    if not w then return true end
+    w.since = w.since + dt
+    if not session.saving() or w.since >= UPLOAD_WAIT_MAX then
+        upload(w.final, w.done)
+        if not S then return false end
+    end
+    return true
+end
+
+-- The bridge heartbeats a held lease only while this game confirms hosting it (report 2026-10-31: a host who left
+-- without a release, or a hung game, kept the Realm "hosted" for as long as the game stayed open). From the tick, and
+-- from a timer while no game tick runs (the pause menu) - a hung game thread sends nothing, so the server frees it.
+local HOSTING_EVERY = 30
+local hosting_sent = -100
+local function hosting_id() return S and S.leased and not S.lost and S.step ~= "going_home" and S.id or nil end
+local function confirm_hosting()
+    local id = hosting_id()
+    if not id or os.clock() - hosting_sent < HOSTING_EVERY then return false end
+    hosting_sent = os.clock()
+    realm.send("hosting", id)
+    return true
+end
+realmplay._confirm_hosting = confirm_hosting   -- (tests)
+
 local function tick(dt)
     realm.tick(dt)
+    confirm_hosting()
     members.tick(dt)
     sig_in = sig_in - dt
     if sig_in <= 0 then
@@ -956,7 +1144,10 @@ local function tick(dt)
     if list_wanted and bridge_up() then realmplay.refresh_list(true) end
     if takeover and not S and bridge_up() then
         takeover.at = takeover.at - dt
-        if takeover.at <= 0 then
+        if takeover.follow then takeover.follow = takeover.follow + dt end
+        if takeover.at <= 0 and takeover.follow and follow_tick(takeover) then
+            takeover.at = FOLLOW_EVERY   -- (still waiting for the next host)
+        elseif takeover.at <= 0 then
             local t = takeover
             takeover = nil
             t.tries = t.tries + 1
@@ -967,8 +1158,21 @@ local function tick(dt)
             end
         end
     end
+    if save_then_open and not S then
+        local w = save_then_open
+        w.t = w.t + dt
+        if w.t > 1.5 and not session.saving() then
+            save_then_open = nil
+            realmplay.start(w.id, { saved = true })
+        elseif w.t > 30 then
+            save_then_open = nil
+            log.warn("realmplay: the save before opening " .. tostring(w.id) .. " didn't finish in 30 s")
+            say("Couldn't save your game - save it once (or sleep), then open the Realm again.", "bad")
+        end
+    end
     if not S then return end
     S.t, S.clock = S.t + dt, (S.clock or 0) + dt
+    if not upload_wait_tick(dt) then return end
     if S.step == "armed" or S.step == "new_game" or S.step == "capturing" then
         create_tick(dt)
     elseif S.step == "saving_own" then
@@ -976,6 +1180,11 @@ local function tick(dt)
     elseif S.step == "loading" then
         S.wait = (S.wait or 0) + dt
         if S.wait > 180 and not S.slow_told then S.slow_told = true; log.error("realmplay: the Realm didn't load in 3 min") end
+        if S.wait > LOAD_GIVE_UP and not session.loading() and util.addr(game.player()) == S.from_player
+                and util.addr(game.world()) == S.from_world and S.from_world then
+            load_failed()
+            return
+        end
         arrived_tick(dt)
     elseif S.step == "playing" then
         if not S.pockets and S.t >= 5.0 and not session.saving() then
@@ -1004,6 +1213,31 @@ end
 
 -- ---- a Realm session the game didn't finish (crash, power cut) ----
 
+-- Kept for the next start when the rescue fails; after RESCUE_TRIES starts the save's character goes to Backups and
+-- the record is archived - a leftover record blocks every co-op join and Realm for good (session.lua does the same).
+local RESCUE_TRIES = 5
+local function rescue_later(t, why)
+    t.tries = tostring((tonumber(t.tries) or 0) + 1)
+    if tonumber(t.tries) < RESCUE_TRIES then
+        slotguard.log_write(t)
+        log.error("realmplay: " .. why .. " - tried again next start (" .. t.tries .. "/" .. RESCUE_TRIES .. ")")
+        return
+    end
+    if slotguard.has_character(t.coop) then
+        local key = slotguard.is_own(t.own) and t.own or t.coop
+        local f, e = require("mirror.backups").take{ slot = key, from = t.coop, kind = "character", reason = "Realm character rescued" }
+        if not f then
+            slotguard.log_write(t)
+            log.error("realmplay: " .. why .. ", and no backup of " .. tostring(t.coop) .. "'s character (" .. tostring(e) .. ") - kept")
+            return
+        end
+        log.warn("realmplay: the Realm character is kept in backup " .. key .. "\\" .. f)
+    end
+    if not slotguard.log_archive() then log.error("realmplay: can't archive the unfinished Realm session's record"); return end
+    log.warn("realmplay: closed the unfinished Realm session after " .. RESCUE_TRIES .. " tries (" .. why .. ")")
+    notify.show("Your last Realm session couldn't be finished. Its character is kept in Backups (handbook J, CO-OP tab).", "bad")
+end
+
 function realmplay.recover()
     local t = slotguard.log_read()
     if not (t and t.realm and realm.valid_id(t.realm)) then return end
@@ -1016,12 +1250,22 @@ function realmplay.recover()
     else
         local world, character = slotguard.read_realm(t.coop)
         if not world and character then
-            log.error("realmplay: can't read the unfinished Realm save " .. tostring(t.coop) .. ": " .. tostring(character))
+            return rescue_later(t, "can't read the unfinished Realm save " .. tostring(t.coop) .. ": " .. tostring(character))
+        end
+        -- (its map isn't the Realm's - a load that opened the Shooting Range: DBG-20261031-003)
+        local shrunk = world and realm.level_shrunk(id, world)
+        if shrunk then
+            log.error("realmplay: the unfinished Realm session of " .. id .. " isn't the Realm's world (" .. shrunk
+                .. ") - its character and world are not kept")
+            notify.show("Your last Realm session didn't finish in the Realm's world, so nothing from it was kept. "
+                .. "Your Realm character and the Realm are as they were.", "bad")
+            slotguard.purge(t.coop)
+            slotguard.log_clear()
             return
         end
         if character then
             local ok, err = realm.store_character(id, character)
-            if not ok then log.error("realmplay: Realm character not rescued yet: " .. tostring(err)); return end
+            if not ok then return rescue_later(t, "Realm character not rescued yet: " .. tostring(err)) end
             -- (a CREATE that crashed before its first upload: the New Game character is the starter too)
             if not guest and t.gen == "0" and not realm.starter(id) then realm.store_starter(id, character) end
         end
@@ -1033,6 +1277,34 @@ function realmplay.recover()
     end
     slotguard.purge(t.coop)
     slotguard.log_clear()
+end
+
+-- The game's MAIN MENU button destroys every player before the load, and realmplay's tick (with realm.tick, which
+-- hands out the bridge's answers) rides the player's: left_by_menu's upload answer never came at the menu, so the
+-- Realm save stayed, the session log stayed and Continue could load the Realm's world (same as session.lua's
+-- menu exit, kit 2026-10-30). Only what the exit waits on (the bridge's answers, an upload waiting for a save) is
+-- run from LoopAsync + the game thread while no game tick runs, until it's done.
+local last_tick = 0.0
+local function menu_ticks()
+    if type(LoopAsync) ~= "function" or type(ExecuteInGameThread) ~= "function" then return end
+    local done, polls = false, 0
+    LoopAsync(250, function()
+        if done then return true end
+        ExecuteInGameThread(function()
+            util.safe(function()
+                if done then return end
+                polls = polls + 1
+                -- (5 min: past every bridge timeout; the game's tick takes over once a world's player exists)
+                if not S or polls >= 1200 then done = true; return end
+                if os.clock() - last_tick > 0.5 then
+                    link.flush_cmds()
+                    realm.tick(0.25)
+                    if S then upload_wait_tick(0.25) end
+                end
+            end, "realmplay.menu_tick")
+        end)
+        return false
+    end)
 end
 
 function realmplay.init(c)
@@ -1051,7 +1323,9 @@ function realmplay.init(c)
         return inside and S.coop or nil, S.coop
     end)
     session.on_main_menu(function()
-        if S and (S.step == "playing" or S.step == "stopping" or S.step == "ending_save") then left_by_menu()
+        if S and (S.step == "playing" or S.step == "stopping" or S.step == "ending_save") then
+            left_by_menu()
+            menu_ticks()
         elseif S and S.step == "armed" then
             S.menu_seen, S.menu_at = true, os.time()
             S.menu_player = util.addr(game.player())
@@ -1068,7 +1342,20 @@ function realmplay.init(c)
             ExecuteInGameThread(function() util.safe(hook_play, "realmplay.hook_play") end)
         end)
     end)
-    game.on_tick(function(dt) util.safe(tick, "realmplay.tick", dt or 0) end)
+    game.on_tick(function(dt)
+        last_tick = os.clock()
+        util.safe(tick, "realmplay.tick", dt or 0)
+    end)
+    if type(LoopAsync) == "function" and type(ExecuteInGameThread) == "function" then
+        LoopAsync(5000, function()
+            ExecuteInGameThread(function()
+                util.safe(function()
+                    if os.clock() - last_tick > 2 and confirm_hosting() then link.flush_cmds() end
+                end, "realmplay.hosting_watch")
+            end)
+            return false
+        end)
+    end
     booted, list_wanted = os.time(), true   -- (the first list goes once the bridge is up)
     log.info("realmplay: Realms on")
 end

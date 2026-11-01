@@ -45,6 +45,10 @@ Copy-Item (Join-Path $Repo 'mod\LogicMods\SurrounSyncSounds.pak') (Join-Path $Co
 $Bp = Join-Path $Ue 'Mods\BPModLoaderMod\Scripts'
 New-Item -ItemType Directory -Force $Bp | Out-Null
 Copy-Item (Join-Path $Win64 'ue4ss\Mods\BPModLoaderMod\Scripts\main.lua') $Bp
+# what BPModLoaderMod requires first (a player's PC had none: 'module UEHelpers not found', no dog sounds)
+$Uh = Join-Path $Ue 'Mods\shared\UEHelpers'
+New-Item -ItemType Directory -Force $Uh | Out-Null
+Copy-Item (Join-Path $Win64 'ue4ss\Mods\shared\UEHelpers\UEHelpers.lua') $Uh
 # always a fresh bridge, built straight into the package (a running game locks the one in mod\SurrounSync\bridge)
 & (Join-Path $PSScriptRoot 'build-bridge.ps1') -Out (Join-Path $Ue 'Mods\SurrounSync\bridge')
 $Manifest = Join-Path (Split-Path (Split-Path $Game -Parent) -Parent) 'appmanifest_1645820.acf'

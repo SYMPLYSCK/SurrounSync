@@ -18,14 +18,14 @@ local SHARED = {
     version = true, notify = true, menu = true, menu_backups = true, journal_tab = true, fs = true, savefs = true,
     slotguard = true, backups = true, beds = true, bedtags = true, names = true, jig = true, instance = true,
     loader = true, hostrules = true, mysettings = true, modlist = true, localdir = true, uepath = true, status = true, itemclean = true, devtest = true, invdiag = true, probe = true, recorder = true,
-    phase0 = true, peers = true, xp = true,
+    phase0 = true, peers = true, xp = true, doorlock = true, difficulty = true, worldset = true,
     -- one Realm per game: a copy's own realmplay was never started and said it hosted nothing, so every join after
     -- the first friend's was refused "isn't hosting that Realm right now" (player report 2026-10-29)
     realmplay = true,
 }
 -- What a mate instance (another guest, seen from a guest) gets its own copy of; the rest is the host link's.
 local PRESENCE = {
-    link = true, link_file = true, events = true, phase1 = true, ghost = true, track = true, posepack = true,
+    link = true, link_file = true, events = true, phase1 = true, away = true, ghost = true, track = true, posepack = true,
     clockmap = true, anim = true, look = true, fire = true, lights = true, tactical = true, nametag = true,
     netq = true, pvp = true, save_guard = true, chat = true, voice = true, teleport = true, compat = true,
     throwables = true, vehicles = true, zombies = true, group = true, corpses = true, zfx = true,
@@ -126,6 +126,18 @@ function peers.is_ghost(obj)
     return false
 end
 
+-- a ghost of any player destroyed in the last few seconds (ghost.was)
+function peers.was_ghost(obj)
+    main_ghost = main_ghost or require("mirror.ghost")
+    if main_ghost.was(obj) then return true end
+    for i = 1, #order do
+        local inst = list[order[i]]
+        local g = inst.started and inst.loaded["mirror.ghost"]
+        if g and g ~= main_ghost and g.was and g.was(obj) then return true end
+    end
+    return false
+end
+
 function peers.ghost_list()
     local out = {}
     peers.each("mirror.ghost", function(g) local x = g.get(); if x then out[#out + 1] = x end end)
@@ -188,6 +200,20 @@ local main_out = { host = "host", guest = "guest" }
 -- player slots (host 0, guests 1-3) from the roster; without one, the two-player layout
 local my_slot, main_slot
 function peers.my_slot() return my_slot or (role == "guest" and 1 or 0) end
+-- When a Realm's host leaves, only the guest in the lowest slot takes it over: with two guests both did, the server
+-- gave it to one and the other left and loaded back in (player report 2026-10-29 22:28). True if that's me, else
+-- false and the name of the guest who does.
+function peers.first_guest()
+    local best, name
+    for _, tag in ipairs(order) do
+        local inst = list[tag]
+        if inst.started and inst.kind == "mate" and inst.slot and (not best or inst.slot < best) then
+            best, name = inst.slot, inst.name
+        end
+    end
+    if not best or peers.my_slot() < best then return true end
+    return false, name
+end
 -- slot of the player a copy shows: out tag of its link (nil = the main link)
 function peers.slot_of(out)
     if out and out ~= main_out[role] then

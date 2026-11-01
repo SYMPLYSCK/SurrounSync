@@ -15,6 +15,7 @@ end
 -- cfg.gc_mode = "incremental" puts Lua's default back.
 require("mirror.perf").set_gc(cfg.gc_mode)
 
+local start_clock = os.clock()
 local role, source = require("mirror.role").resolve(cfg)
 local V = require("mirror.version")
 log.info("SurrounSync " .. V.VERSION .. " (protocol " .. V.PROTOCOL .. ") starting (role=" .. role .. " from " .. source .. ")")
@@ -39,12 +40,17 @@ end
 
 require("mirror.ghost").configure(cfg)
 require("mirror.game").init()
+-- engine calls that wait for animation tasks (destroying characters, copies, cars) run only once animation is on the
+-- game thread: a worker in a hooked Blueprint function waiting for our Lua lock froze the game
+util.safe(function() require("mirror.animgate").init() end, "animgate.init")
 -- nests saved with the old 1,000,000-health pin get their real health back, in single player too
 require("mirror.infest").watch()
 -- zombies stop at arm's length instead of standing inside the player (the game's zombie capsule ignores pawns)
 util.safe(function() require("mirror.personalspace").init(cfg) end, "personalspace.init")
 -- dogs bark (the game has no bark sound; SurrounSyncSounds.pak brings them)
 util.safe(function() require("mirror.dogs").init(cfg) end, "dogs.init")
+-- an Xbox-style pad plays the game (MY SETTINGS -> CONTROLLER): pad keys added next to the keyboard's
+util.safe(function() require("mirror.gamepad").init(cfg) end, "gamepad.init")
 -- the message cards' world-reset hook and the history key (Ctrl+F9)
 util.safe(function() require("mirror.notify").init() end, "notify.init")
 
@@ -54,8 +60,11 @@ if role == "auto" then
     link.configure(cfg)
     link.start_lobby()
     require("mirror.session").preinit(cfg)
+    util.safe(function() require("mirror.worldset").init() end, "worldset.init")
     menu.init(cfg)
     util.safe(function() require("mirror.realmplay").init(cfg) end, "realmplay.init")
+    -- the message of the day (the bridge fetches it): a card in a world, a banner at the main menu
+    util.safe(function() require("mirror.motd").init() end, "motd.init")
 elseif role == "host" or role == "guest" then
     require("mirror.phase1").init(cfg, role)
     menu.init(cfg)
@@ -63,4 +72,4 @@ elseif cfg.phase0 and cfg.phase0.enabled then
     require("mirror.phase0").init(cfg)
 end
 
-log.info("SurrounSync ready.")
+log.info(string.format("SurrounSync ready (start-up %.0f ms).", (os.clock() - start_clock) * 1000))

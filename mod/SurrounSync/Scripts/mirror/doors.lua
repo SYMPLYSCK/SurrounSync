@@ -53,6 +53,9 @@ local dirty = false
 local active = false
 local now, poll_in, scan_in = 0.0, 0.0, 0.0
 local stats = { sent = 0, applied = 0, unlocked = 0, missing = 0 }
+local doorlock = require("mirror.doorlock")
+local lock_role, lock_session = nil, nil
+local lock_blob, lock_sent, lock_ops_sent, lock_ack, lock_seen = nil, nil, nil, 0, {}
 
 local function key(obj, cls)
     local l = obj:K2_GetActorLocation()
@@ -64,18 +67,30 @@ for cls in pairs(KINDS) do CLASSES[#CLASSES + 1] = cls end
 table.sort(CLASSES)
 -- Whose ReceiveBeginPlay tells util.instances about new ones (the Master/Lab doors have none).
 local function bp(dir, cls) local n = cls:gsub("_C$", ""); return dir .. n .. "." .. cls end
+-- (BP_WarehouseDoors has one but is in the master door group below, whose other doors have none: a group's walk
+-- fills only the members asked with the same hooks, so the hooked one and the unhooked ones each walked the master
+-- again - 7 walks of ~57 ms in 6.5 min in test-sync instead of 2. Unhooked, the group re-walks every 5 min.)
 local HOOKS = {
     BP_LockedDoor_C = bp("/Game/Blueprints/Other/Doors/", "BP_LockedDoor_C"),
-    BP_WarehouseDoors_C = bp("/Game/Blueprints/Other/Doors/", "BP_WarehouseDoors_C"),
 }
 for cls in pairs(KINDS) do
     if cls:find("^Buildable_") then HOOKS[cls] = bp("/Game/Blueprints/BuildingSystem/Actors/Doors/", cls) end
 end
+-- Children of one master (kit 2026-10-31, every class FindAllOf(BP_MasterDoor_C) returned in the world): one walk of
+-- the master finds them all. Each class was its own 30-60 ms walk, one a frame, right after a join ("perf: doors took
+-- 63 ms"). The hangar and police garage doors aren't synced but are listed: a child outside the list puts
+-- util.instances back to one walk per class. The others' masters (BP_MasterObject_C, Buildable_MASTER_C,
+-- BP_LaboratoryMaster_C with its cables) hold many other classes.
+local GROUP = {}
+local MASTER_DOOR = { "BP_WarehouseDoors_C", "BP_ContainerDoors_C", "BP_BarrierGate_C", "BP_KeycardDoor_C",
+    "BP_KeycardDoor_Child_C", "BP_KeypadDoor_C", "BP_HangarDoor_C", "BP_PoliceStationGarageDoor_C" }
+util.instance_group("BP_MasterDoor_C", MASTER_DOOR)
+for _, m in ipairs(MASTER_DOOR) do if KINDS[m] then GROUP[m] = "BP_MasterDoor_C" end end
 local scan_idx = 0
 local warm = 0
 
 local function rescan_class(cls)
-    local objs, walked = util.instances(cls, HOOKS[cls])
+    local objs, walked = util.instances(cls, HOOKS[cls], GROUP[cls])
     for id, d in pairs(list) do if d.cls == cls then list[id] = nil end end
     local kind = KINDS[cls]
     for _, o in ipairs(objs) do
@@ -193,8 +208,40 @@ local function set_active(on)
     end
 end
 
+-- Door code locks (doorlock.lua): the host sends its locks plus the last of this guest's changes it took ("locks"),
+-- a guest sends its changes ("lock_g"). Not tied to door_sync: a lock holds whichever way doors sync.
+local function sync_locks()
+    if not peer_live() then
+        -- (whoever joins next is a new guest game: nothing of theirs taken yet)
+        lock_blob, lock_sent, lock_ops_sent = nil, nil, nil
+        lock_ack, lock_seen = 0, {}
+        if lock_role ~= "host" then doorlock.take(nil); doorlock.left() end
+        return
+    end
+    if lock_role == "host" then
+        local g = link.get_blob("lock_g")
+        if g then lock_ack = doorlock.take_ops(g, lock_seen) end
+        local k = doorlock.gen() .. ":" .. lock_ack .. ":" .. tostring(lock_seen.run)
+        if k ~= lock_sent then lock_sent = k; link.put_blob("locks", doorlock.dump(lock_ack, lock_seen.run)) end
+        return
+    end
+    local b = link.get_blob("locks")
+    if b then lock_blob = b end
+    if not lock_session.in_world() then
+        -- home: my own world's locks again, but changes made in the host's world (the last frame there too) still go
+        -- to it until it took them (menu.lua keeps the link that long)
+        doorlock.take(nil)
+        doorlock.take_ack(lock_blob)
+    else
+        doorlock.take(lock_blob or "ack 0")   -- (before the host's first: nobody's doors yet, my changes still queue)
+    end
+    local og = doorlock.ops_gen()
+    if og ~= lock_ops_sent then lock_ops_sent = og; link.put_blob("lock_g", doorlock.ops_text()) end
+end
+
 function doors.tick(dt)
     now = now + dt
+    util.safe(sync_locks, "doors.locks")
     local b = peer_live() and link.get_blob("doors") or nil
     if b then peer_blob = b; if active then take_peer() end end
     set_active(role == "host" or session.in_world())
@@ -244,9 +291,19 @@ function doors.status()
         p > 0 and (", waiting " .. p) or "")
 end
 
+-- A world load: the old world's doors are gone (the host stays active through it, so set_active never clears them),
+-- and what this game opened or unlocked there belongs to that world - sent on, it would unlock a door of the next.
+function doors.forget()
+    list, last, expect, seen, pending = {}, {}, {}, {}, {}
+    if next(mine) then mine = {}; put() end   -- (at once: the rescan after a load takes several ticks)
+    if active then warm, scan_in = #CLASSES, RESCAN end
+end
+
 function doors.init(c, r, s, connected)
     cfg, role, session = c, r, s
+    lock_role, lock_session = r, s
     peer_live = connected or peer_live
+    require("mirror.game").on_world_reset(doors.forget)
     if cfg.door_sync == false then role = "off"; session = { in_world = function() return false end } end
     log.info("doors: " .. (role == "off" and "off" or "ready"))
 end

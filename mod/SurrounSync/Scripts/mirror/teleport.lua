@@ -95,6 +95,15 @@ local function ground_at(p, x, y, z)
     return hit
 end
 
+-- Just landed next to the other player: the host's zombies' hits on me are let off for ARRIVE_SAFE s (zombies.lua
+-- apply_dmg) - a guest teleported into a fight died 4 s after arriving (live 2026-10-30 02:28:59-02:29:03). Not the
+-- game's CanTakeDamage? flag: nothing to put back, so nothing can stay switched off.
+local ARRIVE_SAFE = 3.0
+local arrival = require("mirror.peers").shared_table("arrival")
+local function landed()
+    arrival.safe_until = os.clock() + ARRIVE_SAFE
+end
+
 local function move(p, to)
     local moved
     pcall(function() moved = p:K2_TeleportTo(to, p:K2_GetActorRotation()) end)  -- refuses spots that overlap something
@@ -124,6 +133,7 @@ local function go_to_peer()
             local g = ground_at(p, x, y, at.Z - 90)
             if g and move(p, { X = g.X, Y = g.Y, Z = g.Z + 100 }) then
                 log.info(string.format("teleport: moved to (%.0f, %.0f, %.0f), %d cm from the other player", g.X, g.Y, g.Z, r))
+                landed()
                 return nil
             end
         end
@@ -148,6 +158,7 @@ local function hold_tick(dt)
         hold = nil
         move(p, { X = g.X, Y = g.Y, Z = g.Z + 100 })
         set_mode(p, MOVE_WALKING)
+        landed()
         log.info("teleport: the ground loaded - landed")
     elseif hold.left <= 0 then
         local back = hold.back
@@ -297,6 +308,8 @@ function teleport.pending()
     local other = other_copy("accept", "")
     return other and other.pending() or nil
 end
+-- this link's player and I have a teleport open (asked, to answer, or one still landing)
+function teleport.busy() return asked ~= nil or pending ~= nil or hold ~= nil end
 function teleport.accept() local o = other_copy("accept", ""); if o then o.accept() else answer(true) end end
 function teleport.decline() local o = other_copy("deny", ""); if o then o.decline() else answer(false) end end
 

@@ -394,8 +394,14 @@ namespace SurrounSyncShared
         public const string WorldLoadFile = "mirror_world_load.txt";
         public const string DuringLoad = "during a world load";
         const int WorldLoadMaxS = 180;
+        // The mod starts the bridge while the game boots, so the watch's first look often finds the window not
+        // answering: UE4SS, the mods' start-up and the main menu's load hold the game thread (a guest's 4 s at 10 s in,
+        // report 2026-10-31 00:49, and 2 s in an earlier one). A stall that begins this early is the game starting.
+        public const string WhileStarting = "while the game starts";
+        public static int StartingS = 60;   // (tests set 0: their frozen process is seconds old)
         readonly Action<string> log;
         readonly string process, win64;
+        string startPart = "";
         DateTime hungSince = DateTime.MinValue, lastHealth = DateTime.MinValue, cpuAt = DateTime.MinValue;
         TimeSpan cpu;
         int dumps, sessionDumps;
@@ -417,6 +423,13 @@ namespace SurrounSyncShared
                 return f.Exists && (DateTime.Now - f.LastWriteTime).TotalSeconds < WorldLoadMaxS ? " " + DuringLoad : "";
             }
             catch (IOException) { return ""; }
+        }
+
+        static string StartPart(Process p, DateTime now)
+        {
+            try { return (now - p.StartTime).TotalSeconds < StartingS ? " " + WhileStarting : ""; }
+            catch (InvalidOperationException) { return ""; }
+            catch (System.ComponentModel.Win32Exception) { return ""; }
         }
 
         string StepPart()
@@ -444,13 +457,18 @@ namespace SurrounSyncShared
             DateTime now = DateTime.Now;
             if (!responding)
             {
-                if (hungSince == DateTime.MinValue) { hungSince = now; dumps = 0; log("watch: the game stopped responding" + LoadPart() + " - " + Dumps.Memory()); }
+                if (hungSince == DateTime.MinValue)
+                {
+                    // (Responding waited up to 5 s: the stall began before this look)
+                    hungSince = now; dumps = 0; startPart = StartPart(p, now.AddSeconds(-5));
+                    log("watch: the game stopped responding" + startPart + LoadPart() + " - " + Dumps.Memory());
+                }
                 double s = (now - hungSince).TotalSeconds;
                 if ((dumps == 0 && s >= 8) || (dumps == 1 && s >= 30)) Capture(p, s);
             }
             else if (hungSince != DateTime.MinValue)
             {
-                log(string.Format("watch: the game responds again after {0:0} s", (now - hungSince).TotalSeconds));
+                log(string.Format("watch: the game responds again after {0:0} s{1}", (now - hungSince).TotalSeconds, startPart));
                 hungSince = DateTime.MinValue;
             }
             if ((now - lastHealth).TotalSeconds >= 30) { lastHealth = now; log("watch: " + Health(p, now)); }
@@ -502,7 +520,7 @@ namespace SurrounSyncShared
             dumps++;
             string busy = "";
             try { busy = Busy(p); } catch (Exception e) { busy = "CPU sample failed: " + e.Message; }
-            string note = string.Format("frozen {0:0} s{1} | {2} | {3} | {4}{5}", secs, LoadPart(), busy, Dumps.Memory(),
+            string note = string.Format("frozen {0:0} s{1} | {2} | {3} | {4}{5}", secs, startPart + LoadPart(), busy, Dumps.Memory(),
                 DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), StepPart());
             if (sessionDumps >= MaxDumps) { log("watch: still frozen (" + note + ") - no more dumps this session"); return; }
             sessionDumps++;
@@ -556,8 +574,9 @@ namespace SurrounSyncShared
                         Add(z, "message.txt", Encoding.UTF8.GetBytes(message));
                     if (win64 != null)
                     {
-                        foreach (var n in new[] { "mirror_log.txt", "mirror_log.1.txt", "mirror_log.2.txt", "mirror_step.txt", "mirror_step.1.txt", "mirror_settings.txt", "mirror_role.txt" })
+                        foreach (var n in new[] { "mirror_log.txt", "mirror_log.1.txt", "mirror_log.2.txt", "mirror_settings.txt", "mirror_role.txt" })
                             if (!(lite && n == "mirror_log.2.txt")) AddFile(z, Path.Combine(win64, n), "game/" + n);
+                        foreach (var n in Diagnose.StepFiles) AddFile(z, Path.Combine(win64, n), "game/" + n);
                         AddFile(z, Path.Combine(win64, "ue4ss", "UE4SS.log"), "game/UE4SS.log");
                         AddFile(z, Path.Combine(win64, "ue4ss", "Mods", "mods.txt"), "game/mods.txt");
                         AddFile(z, Path.Combine(win64, "ue4ss", "UE4SS-settings.ini"), "game/UE4SS-settings.ini");
@@ -585,7 +604,7 @@ namespace SurrounSyncShared
                     AddWatchHangs(z, lite);
                     AddWindows(z);
                     if (win64 != null)
-                        foreach (var n in new[] { "mirror_steps.txt", "mirror_steps.1.txt" })
+                        foreach (var n in Diagnose.StepRings)
                         {
                             string steps = RecentSteps(Path.Combine(win64, n));
                             if (steps != null) Add(z, "game/recent_" + n, Encoding.UTF8.GetBytes(Diagnose.Scrub(steps)));
@@ -793,7 +812,7 @@ namespace SurrounSyncShared
                 {
                     // mirror_step*.txt = the mod step running when that run ended; use the run that ended at the crash
                     DateTime at = Directory.GetLastWriteTime(crash);
-                    foreach (var n in new[] { "mirror_step.txt", "mirror_step.1.txt" })
+                    foreach (var n in Diagnose.StepFiles)
                     {
                         string p = Path.Combine(win64, n);
                         if (!File.Exists(p)) continue;

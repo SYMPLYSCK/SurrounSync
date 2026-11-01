@@ -83,6 +83,9 @@ def link_blob_comes_back_after_reset():
         # audit N43: compat.reset forgets the friend's mod list - its unchanged "mods" blob must come back too
         check('link.reset_blob("mods")' in body and 'link.reset_blob("light")' in body,
               "phase1 reset_link_state resets the mods + light blobs")
+        # T10: a copy stopped for 20 s of silence restarts with peer_where nil; the unchanged "joined" must come back
+        check(all('link.reset_blob("%s")' % b in body for b in ("where", "life", "death")),
+              "phase1 reset_link_state resets the where + life + death blobs (state it clears)")
         # audit N42: a rejoin's unchanged host bed came back nil -> random start respawn
         ses = open(os.path.join(SCRIPTS, "mirror", "session.lua"), encoding="utf-8").read()
         j = ses.index('link.reset_blob("joincut")')
@@ -93,6 +96,110 @@ def link_blob_comes_back_after_reset():
               "an old goodbye only skips the 'stopped hosting' note - a joined guest still goes home first")
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def a_player_in_the_game_menu_is_not_a_frozen_game():
+    """Player review 2026-10-31: the host opened the pause/settings menu and 10 s later the guest read "Host's game
+    isn't responding (paused, loading or frozen)" (a file link went "gone" at 45 s: countdown home). The menu stops
+    the game's tick; away.lua puts "away menu <n>" from the LoopAsync watch and the other game reads paused/gone
+    as "menu" while it keeps coming."""
+    print("a_player_in_the_game_menu_is_not_a_frozen_game")
+    L = lua()
+    L.execute('''
+        CLOCK = 0; os.clock = function() return CLOCK end
+        PUT, IN, RESET, GAME_GONE = {}, nil, 0, false
+        package.loaded["mirror.link"] = {
+            put_blob = function(n, t) PUT[#PUT + 1] = n .. "=" .. t end,
+            get_blob = function(n) if n ~= "away" then return nil end local b = IN; IN = nil; return b end,
+            reset_blob = function(n) if n == "away" then RESET = RESET + 1 end end,
+            peer_game_gone = function() return GAME_GONE end,
+        }
+        away = require("mirror.away")
+        function at(t) CLOCK = t end
+        function puts() local s = table.concat(PUT, ","); PUT = {}; return s end
+    ''')
+    # sender: ticks run, then the menu opens at t=10 (no tick after it)
+    L.execute('at(0); away.tick(); at(1); away.idle(true); at(10); away.tick()')
+    check(L.eval('puts()') == "", "ticking: nothing is sent")
+    L.execute('at(11.5); away.idle(true)')
+    check(L.eval('puts()') == "", "1.5 s without a tick: nothing yet")
+    L.execute('at(12.5); away.idle(false)')
+    check(L.eval('puts()') == "", "no tick but no player (a load) or a load/leave under way: nothing")
+    L.execute('at(12.5); away.idle(true); at(13.5); away.idle(true); at(16); away.idle(true)')
+    check(L.eval('puts()') == "away=menu 1", "over 2 s without a tick: 'menu 1' once, not again within 5 s")
+    L.execute('at(17.6); away.idle(true)')
+    check(L.eval('puts()') == "away=menu 2", "bumped 5 s later, so the other game sees it change")
+    L.execute('at(30); away.tick(); away.tick()')
+    check(L.eval('puts()') == "away=-", "the next tick puts 'away -' once")
+    L.execute('at(30.5); away.idle(true)')
+    check(L.eval('puts()') == "", "ticking again: nothing")
+    # receiver
+    check(L.eval('away.wrap("paused")') == "paused", "no menu heard: paused stays paused")
+    L.execute('IN = "menu 3"; at(100); away.tick()')
+    check(L.eval('away.wrap("paused")') == "menu" and L.eval('away.wrap("gone")') == "menu",
+          "a menu bump: paused and gone read as menu")
+    check(L.eval('away.wrap("ok")') == "ok" and L.eval('away.wrap("unknown")') == "unknown", "ok/unknown are left alone")
+    L.execute('GAME_GONE = true')
+    check(L.eval('away.wrap("gone")') == "gone", "the bridge says their game closed: gone, whatever the blob said")
+    L.execute('GAME_GONE = false; at(118); away.tick()')
+    check(L.eval('away.wrap("paused")') == "menu", "18 s after the last bump: still menu")
+    L.execute('IN = "menu 4"; at(118.5); away.tick(); at(135); away.tick()')
+    check(L.eval('away.wrap("paused")') == "menu", "each bump keeps it fresh")
+    L.execute('at(139); away.tick()')
+    check(L.eval('away.wrap("paused")') == "paused", "no bump for 20 s (a game frozen in its menu): paused again")
+    # (kit 2026-10-31: "isn't responding" flashed as the host closed its menu - "away -" came before its poses)
+    L.execute('IN = "menu 5"; at(140); away.tick(); IN = "-"; at(141); away.tick()')
+    check(L.eval('away.wrap("paused")') == "menu", "'away -': still menu for a moment, until their poses come")
+    L.execute('at(143.9); away.tick()')
+    check(L.eval('away.wrap("paused")') == "menu", "...2.9 s after it")
+    L.execute('at(144.1); away.tick()')
+    check(L.eval('away.wrap("gone")') == "gone", "...and over 3 s after 'away -' it is over")
+    L.execute('IN = "-"; at(146); away.tick()')
+    check(L.eval('away.wrap("paused")') == "paused", "another 'away -' doesn't bring it back")
+    # reset: forgets the other game's state, and mine doesn't keep saying "menu" to a later link
+    L.execute('IN = "menu 6"; at(150); away.tick(); at(160); away.idle(true); puts(); away.reset()')
+    check(L.eval('away.wrap("paused")') == "paused" and L.eval('RESET') == 1, "reset forgets their menu and resets the blob")
+    check(L.eval('puts()') == "away=-", "reset while marked away puts 'away -'")
+    L.execute('at(170); away.idle(true)')
+    check(L.eval('puts()') == "", "after a reset nothing is sent before a tick was seen")
+    src = open(os.path.join(SCRIPTS, "mirror", "phase1.lua"), encoding="utf-8").read()
+    check('session.set_peer_state(function() return away.wrap(link.peer_state(now - last_rx)) end)' in src,
+          "phase1 gives the session the wrapped peer state")
+    check('local ps = away.wrap(link.peer_state(now - last_rx))' in src and 'ps == "ok" or ps == "menu"' in src,
+          "the host's guest-gone check reads it wrapped too (a guest in its menu isn't forgotten)")
+    reset = src[src.index("local function reset_link_state"):]
+    check("away.reset()" in reset[:reset.index("\nend\n")], "reset_link_state resets it")
+    tick = src[src.index("local function on_tick"):]
+    check("away.tick()" in tick[:tick.index("\nend\n")], "every phase1 tick calls away.tick")
+    peers_src = open(os.path.join(SCRIPTS, "mirror", "peers.lua"), encoding="utf-8").read()
+    pres = peers_src[peers_src.index("local PRESENCE"):]
+    check("away = true" in pres[:pres.index("}")], "every guest's copy has its own (peers PRESENCE)")
+    # kit 2026-10-31: 30 s into the host's menu the guest also said "Lost connection to Test-host." and its name tag
+    # read "no signal" - both went by the pose age alone. User: the tag says what is happening, no pop-up cards.
+    lost = src[src.index('elseif connected and now - last_rx > 30'):]
+    check("away.in_menu()" in lost[:lost.index("\n")], "no lost link while the other game says it's in its menu")
+    check('notify.show("Lost connection' not in src and 'notify.show("Reconnected' not in src,
+          "lost / reconnected: no pop-up card (the name tag says it)")
+    check('log.warn("phase1: Lost connection to " .. link.peer_name() .. ".")' in src,
+          "...still logged in the wording tools/sessionwatch.py reads")
+    why = src[src.index("netq.set_why(function()"):]
+    why = why[:why.index("\n    end)")]
+    check('if busy_where(peer_where) then return "loading" end' in why
+          and "return away.wrap(link.peer_state(now - last_rx))" in why, "phase1 tells the tag why: a load, else the wrapped state")
+    check(src.index("netq.set_why(") < src.index("    if mate then\n        anim.init"), "...in every copy (a mate's tag too)")
+    L.execute('''
+        package.loaded["mirror.events"] = { new = function() return { send = function() end, pump = function() end } end }
+        package.loaded["mirror.link"].status = function() return "" end
+        netq = require("mirror.netq")
+        netq.tick(0.1, 12)
+    ''')
+    check(L.eval('(netq.tag("Host"))') == "Host · No signal", "no poses, nothing known: 'No signal'")
+    for state, text in (("menu", "Paused"), ("loading", "Loading"), ("paused", "Not responding"),
+                        ("gone", "Disconnected"), ("ok", "No signal")):
+        L.execute('netq.set_why(function() return "%s" end)' % state)
+        check(L.eval('(netq.tag("Host"))') == "Host · " + text, "name tag for '%s': '%s'" % (state, text))
+    L.execute('netq.tick(0.1, 0.2)')
+    check(L.eval('(netq.tag("Host"))') == "Host", "poses coming: no state on the tag")
 
 
 def link_restart_puts_the_games_blobs_again():
@@ -257,6 +364,84 @@ def jig_stats_copy_the_asset_defaults():
           and 30 <= L.eval('G[1].MinValue_6_4B4822A7420F784740B6A58155973EE6') <= L.eval('G[1].MaxValue_8_04A5809A498E900862BCCA9A6E412BD7') <= 40,
           "firearm damage rolled inside the asset's range")
     check(L.eval('G[2].MinValue_6_4B4822A7420F784740B6A58155973EE6') == 600, "a forced stat keeps the asset's value")
+
+
+def weapon_slots_get_their_stats():
+    # 1 damage on 0.14.2: an item the mod adds was shown in an open window (HandleNewItemAdded) without its Stats, and
+    # the slot keeps its own copy (JSI_Slot.ItemStats) that a weapon's damage is read from (FindStat, 1 when missing)
+    print("weapon_slots_get_their_stats")
+    L = lua()
+    L.execute('''
+        FName = function(s) return { s = s, ToString = function() return s end } end
+        util = require("mirror.util")
+        jig = require("mirror.jig")
+        local F = require("mirror.fields")
+        local function nm(s) return { ToString = function() return s end } end
+        function tarr()   -- a TArray of structs: arr[i] = s writes, ForEach reads
+            local list = {}
+            return setmetatable({ list = list }, { __index = {
+                GetArrayNum = function() return #list end,
+                ForEach = function(_, fn) for i, s in ipairs(list) do fn(i, { get = function() return s end }) end end },
+                __newindex = function(_, k, v) list[k] = v end })
+        end
+        DMG = { STAT_NAME_13_8D9D8D5D48A145FB1BAD6E98C69D0A10 = { TagName = nm("Jig.Stat.FirearmDamage") },
+                Prefix_16_994B3BFF49FB68BE6A485DB9498EB954 = nm("None"), MinValue_6_4B4822A7420F784740B6A58155973EE6 = 34,
+                MaxValue_8_04A5809A498E900862BCCA9A6E412BD7 = 38, Txt_12_F1BE8023414240AC50F4B09BF1B79D58 = nm("Damage") }
+        GUN = { IsValid = function() return true end, GetAddress = function() return 77 end, SlotDimensions = { X = 3, Y = 1 },
+                Weight = 3, Price = 100, GetFullName = function() return "DataAsset /Game/I.DA_Gun" end,
+                ItemStats = { ForEach = function(_, fn) fn(1, { get = function() return DMG end }) end } }
+        StaticFindObject = function(p) if p == "/Game/I.DA_Gun" then return GUN end end
+        local items, n = {}, 0
+        local cont = { ReplicationUID_23_EB27D09649B6E02591DCA98708B06332 = { A = 9, B = 9, C = 9, D = 9 },
+                       Columns_4_1D84448048078D988999ABA138CE1809 = 5, Rows_6_78B4BC5B449017D63758E79844375AE9 = 4,
+                       ContainerIndex_22_9A211B86466A9D1C57E1FC839A5B0896 = 0,
+                       InContainerUID_24_D1504ED7438699C73EA046AD734E79BF = { A = 0, B = 0, C = 0, D = 0 } }
+        cont[F.ITEMS] = { ForEach = function(_, fn) for i, it in ipairs(items) do fn(i, { get = function() return it end }) end end }
+        COMP = { IsValid = function() return true end, MainJigContainers = { GetArrayNum = function() return 1 end, ForEach = function(_, fn) fn(1, { get = function() return cont end }) end } }
+        function COMP:AddNewItemToSlot(info, to, idx, a, b, out, c)
+            -- like the game: the stored info has an (empty) Stats array of its own
+            local stored = {}
+            for k, v in pairs(info[F.INFO]) do stored[k] = v end
+            stored[jig.STATS] = tarr()
+            n = n + 1
+            items[#items + 1] = { [F.INFO] = stored, [F.UID] = { A = n, B = 0, C = 0, D = 0 }, [F.SLOT_INDEX] = idx,
+                                  [F.ROTATED] = false, [F.MOTHER] = { A = 9, B = 9, C = 9, D = 9 } }
+            out.Added = true
+        end
+        SHOWN, UPDATED, REJECT_STATS, SLOT_THERE = {}, {}, false, true
+        function COMP:HandleNewItemAdded(info, uid, target, idx, rot, subs)
+            if REJECT_STATS and info[jig.STATS] then error("struct not taken") end
+            SHOWN[#SHOWN + 1] = info
+        end
+        SLOT = { IsValid = function() return true end, GetAddress = function() return 88 end }
+        function SLOT:UpdateStats(st) UPDATED[#UPDATED + 1] = st end
+        function COMP:FindItemByUID(g, out) if SLOT_THERE then out.Found = SLOT end end
+        function STAT(st, i, key) return st[i][key] end
+        function ITEMS() return items end
+    ''')
+    L.execute('U = jig.add_item(COMP, "/Game/I.DA_Gun", 1, 0, 0); jig.flush_ui()')
+    check(L.eval('#SHOWN') == 1 and L.eval('SHOWN[1][jig.STATS] ~= nil'), "the open window is told about the gun with its stats")
+    check(L.eval('#SHOWN[1][jig.STATS]') == 1
+          and L.eval('SHOWN[1][jig.STATS][1].STAT_NAME_13_8D9D8D5D48A145FB1BAD6E98C69D0A10.TagName.s') == "Jig.Stat.FirearmDamage"
+          and L.eval('SHOWN[1][jig.STATS][1].MinValue_6_4B4822A7420F784740B6A58155973EE6') == 34,
+          "the stats shown are the item's own (firearm damage 34)")
+    check(L.eval('SHOWN[1][jig.STATS][1] ~= DMG'), "fresh tables, not the game's struct")
+    check(L.eval('#UPDATED') == 1 and L.eval('#UPDATED[1]') == 1
+          and L.eval('UPDATED[1][1].MaxValue_8_04A5809A498E900862BCCA9A6E412BD7') == 38,
+          "and the slot in the window gets them through its UpdateStats")
+    # the game won't take the stats struct in HandleNewItemAdded: shown plain, the slot still gets them after
+    L.execute('SHOWN, UPDATED, REJECT_STATS = {}, {}, true; jig.add_item(COMP, "/Game/I.DA_Gun", 1, 0, 0); jig.flush_ui()')
+    check(L.eval('#SHOWN') == 1 and L.eval('SHOWN[1][jig.STATS]') is None and L.eval('#UPDATED') == 1
+          and L.eval('#UPDATED[1]') == 1, "stats refused by the add: shown without, then UpdateStats on the slot")
+    # an old stat-less gun in the player's inventory: the repair fills the data and the slot made without them
+    L.execute('''SHOWN, UPDATED, REJECT_STATS = {}, {}, false
+        local F = require("mirror.fields")
+        for _, it in ipairs(ITEMS()) do it[F.INFO][jig.STATS] = tarr() end
+        FIXED = jig.repair_stats(COMP)''')
+    check(L.eval('FIXED') == 2 and L.eval('#UPDATED') == 2 and L.eval('#UPDATED[1]') == 1,
+          "the repair of 2 stat-less guns updates both their slots")
+    L.execute('SLOT_THERE = false; UPDATED = {}; jig.add_item(COMP, "/Game/I.DA_Gun", 1, 0, 0); OK = pcall(jig.flush_ui)')
+    check(L.eval('OK') is True and L.eval('#UPDATED') == 0, "no slot for the item (no window): nothing to update, no error")
 
 
 FAKES = r"""
@@ -758,6 +943,65 @@ def vehicles_seat_four_players_by_slot():
     L.execute('vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 1.000"); for i = 1, 3 do vehicles.tick(0.1) end')
     check(L.eval('vehicles.status():find("driving Vehicle_Van_C_1") ~= nil'), "and the host keeps driving")
 
+    # the driver hops out and back in while the passenger stays (player review 2026-10-31: the car was sometimes thrown
+    # airborne). The passenger, whom its own game seats in the driver's seat, took the car over: the driver came back
+    # as a passenger of a car following the other game (kit 2026-10-31: "driving ... - the other game follows" on the
+    # guest, "riding along" on the host) while its own throttle fought the follow.
+    L = setup("guest", 1, 0)
+    L.execute(r'''
+        A.VehicleMovementComponent.SetHandbrakeInput = function(self, v) HB = v end
+        CAR_PARENT = A
+        vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 1.000"); for i = 1, 3 do vehicles.tick(0.1) end
+        RIDE0 = blobs_out.ride
+        blobs_out.drive = nil
+        blobs_in.drive = "P Vehicle_Van_C_1 0 0 0 0 0 0 0 50.0 100.0 2.000 0.00 0.00"
+        for i = 1, 20 do vehicles.tick(0.1) end
+    ''')
+    check((L.eval('RIDE0') or "").startswith("R Vehicle_Van_C_1"), "(setup) the guest rides along in the host's car")
+    check(L.eval('vehicles.status():find("driving %-") ~= nil') and L.eval('blobs_out.drive') is None,
+          "the driver got out: the passenger still in it doesn't take the car over (%s, %s)"
+          % (L.eval('vehicles.status()')[:60], L.eval('blobs_out.drive')))
+    check((L.eval('blobs_out.ride') or "").startswith("R Vehicle_Van_C_1") and L.eval('HB') is True,
+          "...it stays a passenger, the car standing with its handbrake on (ride %s, handbrake %s)"
+          % (L.eval('blobs_out.ride'), L.eval('HB')))
+    L.execute('vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 3.000"); for i = 1, 3 do vehicles.tick(0.1) end')
+    check(L.eval('vehicles.status():find("the other player\'s car Vehicle_Van_C_1") ~= nil') and L.eval('blobs_out.drive') is None,
+          "the driver gets back in: they drive again and the passenger rides on")
+    L.execute('CAR_PARENT = nil; for i = 1, 3 do vehicles.tick(0.1) end')
+    check(L.eval('blobs_out.ride') == "R -", "the passenger gets out: the other game hears it")
+
+    # the car's HitBox (runs zombies over) is off while the other player drives it here; the game turns it back on only
+    # when the car comes back into its optimization range, so it stayed off: user 2026-10-31 "after a while the zombies
+    # become brick walls to vehicles"
+    L = setup("guest", 1, 0)
+    L.execute(r'''
+        A.HitBoxCollision = { SetGenerateOverlapEvents = function(self, v) HITBOX = v end }
+        HITBOX = true
+        vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 1.000")
+        vehicles.drive_sample("D Vehicle_Van_C_1 50 0 0 0 0 0 500 0 0 1 0 1.100")
+        for i = 1, 5 do vehicles.tick(0.1) end
+        WHILE_THEY_DRIVE = HITBOX
+        blobs_in.drive = "P Vehicle_Van_C_1 0 0 0 0 0 0 0 50.0 100.0 2.000 0.00 0.00"
+        for i = 1, 3 do vehicles.tick(0.1) end
+        PARKED = HITBOX
+        vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 3.000")
+        vehicles.drive_sample("D Vehicle_Van_C_1 50 0 0 0 0 0 500 0 0 1 0 3.100")
+        for i = 1, 5 do vehicles.tick(0.1) end
+        AGAIN = HITBOX
+        blobs_in.ride = "R Vehicle_Van_C_1"; vehicles.tick(0.1)
+        RIDES = HITBOX
+        HITBOX = false
+        blobs_in.ride = "R -"; CAR_PARENT = A
+        for i = 1, 3 do vehicles.tick(0.1) end
+        I_DRIVE = HITBOX
+    ''')
+    check(L.eval('WHILE_THEY_DRIVE') is False and L.eval('AGAIN') is False,
+          "(setup) the HitBox is off while the other player drives the car here")
+    check(L.eval('PARKED') is True, "the other player parks it: the HitBox is back on (%s)" % L.eval('PARKED'))
+    check(L.eval('RIDES') is True, "the driver becomes a rider: the HitBox is back on (%s)" % L.eval('RIDES'))
+    check(L.eval('I_DRIVE') is True and L.eval('vehicles.status():find("driving Vehicle_Van_C_1") ~= nil'),
+          "I drive a car whose HitBox was left off: it is on (%s, %s)" % (L.eval('I_DRIVE'), L.eval('vehicles.status()')[:60]))
+
     # lights go the game's own way (TurnOnOffLights: intensity), never hidden - the driver's own switch lit hidden
     # lights (user 2026-10-29: the other player saw them, the driver didn't)
     L = setup("guest", 1, 0)
@@ -779,6 +1023,7 @@ def vehicles_seat_four_players_by_slot():
     L = setup("host", 0, 1)
     L.execute(r'''
         HERE = true
+        util.ensure_hook = function(p, fn) if p:find("ReceiveBeginPlay", 1, true) then BEGIN = fn end; return true end
         vehicles.init({ mirror_vehicles = true }, "host", { guest_in_world = function() return HERE end, in_world = function() return true end })
         for i = 1, 3 do vehicles.tick(0.1) end
         SKIPSAVE, MADE = nil, nil
@@ -790,16 +1035,53 @@ def vehicles_seat_four_players_by_slot():
                            Mesh = A.Mesh, VehicleMovementComponent = A.VehicleMovementComponent, IsA = function() return true end,
                            K2_DestroyActor = function(self) self.dead = true; DESTROYED = true end,
                            GetFName = function() return { ToString = function() return "Vehicle_Truck_C_77" end } end,
-                           GetFullName = function() return "Vehicle_Truck_C /Game/L.L:P.Vehicle_Truck_C_77" end })
+                           GetFullName = function() return "Vehicle_Truck_C /Game/L.L:P.Vehicle_Truck_C_77" end,
+                           -- (a class like a real car's: host_list leaves out a car whose class it can't name)
+                           GetClass = function() return obj({ GetFullName = function() return "BlueprintGeneratedClass /Game/Vehicles/Truck.Vehicle_Truck_C" end }) end })
         MADE = made
-        package.loaded["mirror.game"].world = function() return { SpawnActor = function() return made end } end
+        -- as in the game: the new car's BeginPlay (hooked) runs inside SpawnActor
+        package.loaded["mirror.game"].world = function() return { SpawnActor = function()
+            if BEGIN then BEGIN({ get = function() return made end }) end
+            return made end } end
+        for i = 1, 30 do vehicles.tick(0.1) end   -- (the car BeginPlay hook stands before the drive comes in)
+        BEGIN_BEFORE = BEGIN ~= nil
+        local lg = require("mirror.log")
+        local info = lg.info
+        ANNOUNCED = false
+        lg.info = function(m) if tostring(m):find("a new car here (Vehicle_Truck_C_77)", 1, true) then ANNOUNCED = true end; return info(m) end
         vehicles.drive_sample("D Vehicle_Truck_C_9 0 0 0 0 0 0 0 0 0 1 0 1.000 /Game/Vehicles/Truck.Vehicle_Truck_C")
         for i = 1, 3 do vehicles.tick(0.1) end
+        lg.info = info
+        -- a car of the host's own world turns up next (its BeginPlay outside any copy): the list goes to the guest
+        -- 2 s later - with the world's cars in it and not the copy (classes as a real car's: unnamed ones are left out)
+        local function cls(p) return function() return obj({ GetFullName = function() return "BlueprintGeneratedClass " .. p end }) end end
+        A.GetClass = cls("/Game/Vehicles/Van.Vehicle_Van_C")
+        local b = obj({ K2_GetActorLocation = function() return { X = 500, Y = 0, Z = 0 } end,
+                        K2_GetActorRotation = function() return { Pitch = 0, Yaw = 0, Roll = 0 } end,
+                        IsActorBeingDestroyed = function() return false end, IsA = function() return true end,
+                        GetClass = cls("/Game/Vehicles/Pickup.Vehicle_Pickup_C"),
+                        GetFName = function() return { ToString = function() return "Vehicle_Pickup_C_5" end } end,
+                        GetFullName = function() return "Vehicle_Pickup_C /Game/L.L:P.Vehicle_Pickup_C_5" end })
+        blobs_out.cars = nil
+        BEGIN({ get = function() return b end })
+        for i = 1, 25 do vehicles.tick(0.1) end
+        LISTED = blobs_out.cars or ""
     ''')
+    listed = L.eval('LISTED')
+    check("Vehicle_Pickup_C_5 " in listed and "Vehicle_Van_C_1 " in listed,
+          "(setup) a new car of the host's world sends the car list, with the world's cars in it: %r" % listed)
+    check("Vehicle_Truck_C_77" not in listed, "...and never the copy of the guest's car (live: the guest made a 2nd car of it)")
     check(L.eval('vehicles.status():find("added 1") ~= nil'), "the host made the guest's car (%s)" % L.eval('vehicles.status()'))
     check(L.eval('SKIPSAVE') is True, "...kept out of the host's saves")
-    L.execute('HERE = false; for i = 1, 3 do vehicles.tick(0.1) end')
-    check(L.eval('DESTROYED') is True, "...and removed when the guest leaves")
+    # report 2026-10-30 (Realm): the copy was announced as 'a new car here' and listed to the guest, who made a second
+    # car of it - players then sat in a car the other game had released
+    check(L.eval('BEGIN_BEFORE') is True, "(setup) the car BeginPlay hook stood before the copy was made")
+    check(L.eval('ANNOUNCED') is False, "...and never announced to the guest as 'a new car here' (live: the guest made a 2nd car of it)")
+    L.execute('HERE = false; for i = 1, 3 do vehicles.tick(0.1) end; NOW_GONE = DESTROYED == true')
+    # (a car has an anim graph: its K2_DestroyActor waits until animation runs on the game thread - animgate.lua)
+    L.execute('for i = 1, 3 do util.new_frame(); require("mirror.animgate").tick() end')
+    check(L.eval('NOW_GONE') is False and L.eval('DESTROYED') is True,
+          "...and removed when the guest leaves, 2 frames after animation went to the game thread")
 
     # wheels: the driver's steering / throttle / brake travel with the car, the follower's wheels use them
     L = setup("host", 0, 1)
@@ -819,6 +1101,36 @@ def vehicles_seat_four_players_by_slot():
     check(L.eval("STEER") == -0.6 and L.eval("THROTTLE") == 0.8, "the other player's car steers and drives its wheels (%s, %s)"
           % (L.eval("STEER"), L.eval("THROTTLE")))
     check(L.eval("A.VehicleMovementComponent.IdleBrakeInput") == 0.0, "and its idle brake is off while it follows")
+
+    # Vehicle_Humvee2_C (game update 26303910) is a car too: left out of the types it was never in the host's car list
+    # (a guest driving one made the host spawn a second one), and it split the one car walk into one per type after
+    # every join (kit 2026-10-31: "BP_VehicleMaster_C has a child class outside its group (Vehicle_Humvee2_C)")
+    L = setup("host", 0, 1)
+    L.execute(r'''
+        local function cls(p) return function() return obj({ GetFullName = function() return "BlueprintGeneratedClass " .. p end }) end end
+        A.GetClass = cls("/Game/Vehicles/Van.Vehicle_Van_C")
+        local h = obj({ K2_GetActorLocation = function() return { X = 900, Y = 0, Z = 0 } end,
+                        K2_GetActorRotation = function() return { Pitch = 0, Yaw = 0, Roll = 0 } end,
+                        IsActorBeingDestroyed = function() return false end, IsA = function() return true end,
+                        GetClass = cls("/Game/Blueprints/Vehicles/Types/Humvee2/Vehicle_Humvee2.Vehicle_Humvee2_C"),
+                        GetFName = function() return { ToString = function() return "Vehicle_Humvee2_C_3" end } end,
+                        GetFullName = function() return "Vehicle_Humvee2_C /Game/L.L:P.Vehicle_Humvee2_C_3" end })
+        util.instances = function(c)
+            if c == "Vehicle_Van_C" then return { A }, true end
+            if c == "Vehicle_Humvee2_C" then return { h }, true end
+            return {}, true
+        end
+        -- (the guest leaves and comes back: the host sends its list anew)
+        HERE = false
+        vehicles.init({ mirror_vehicles = true }, "host", { guest_in_world = function() return HERE end, in_world = function() return true end })
+        for i = 1, 3 do vehicles.tick(0.1) end
+        blobs_out.cars, HERE = nil, true
+        for i = 1, 30 do vehicles.tick(0.1) end
+        LISTED = blobs_out.cars or ""
+    ''')
+    listed = L.eval('LISTED')
+    check("Vehicle_Van_C_1 " in listed and "Vehicle_Humvee2_C_3 " in listed,
+          "the host's car list has its Humvee2 (game update 26303910) as well: %r" % listed)
 
 
 def vehicles_keep_this_worlds_fuel():
@@ -879,6 +1191,26 @@ def vehicles_keep_this_worlds_fuel():
     check(L.eval('blobs_out.carstate') is None, "applied state is not echoed back")
     L.execute('A.FuelComponent.CurrentFuel = 97.5; for i = 1, 30 do vehicles.tick(0.1) end')
     check("Vehicle_Van_C_1 0 97.5" in (L.eval('blobs_out.carstate') or ""), "a refuel here is told to the other game")
+    # T10 audit 2026-10-31: the other player's refuel came while the car was driven (they refuelled, the driver got in
+    # first): it was marked applied and dropped, and the driver's state after the drive undid it on both screens
+    L.execute(r"""
+        DRIVEN = false
+        local pd = vehicles.peer_drives
+        vehicles.peer_drives = function(c) return (DRIVEN and c == A) or pd(c) end
+        DRIVEN = true
+        blobs_in.carstate = "Vehicle_Van_C_1 0 100.0 80.0"; vehicles.tick(0.1)
+        DURING = A.FuelComponent.CurrentFuel
+        A.FuelComponent.CurrentFuel = 90.0   -- the drive used 7.5
+        for i = 1, 5 do vehicles.tick(0.1) end
+        DRIVEN = false
+        blobs_out.carstate = nil
+        for i = 1, 30 do vehicles.tick(0.1) end
+    """)
+    check(L.eval('DURING') == 97.5, "a change from the other game waits while the car is driven (%s)" % L.eval('DURING'))
+    check(abs(L.eval('A.FuelComponent.CurrentFuel') - 92.5) < 1e-6,
+          "after the drive their refuel of 2.5 is added to what the drive left (%s)" % L.eval('A.FuelComponent.CurrentFuel'))
+    check("Vehicle_Van_C_1 0 92.5" in (L.eval('blobs_out.carstate') or ""),
+          "and the result goes back to them (%r)" % L.eval('blobs_out.carstate'))
 
 
 def car_horn_reaches_the_other_game():
@@ -923,7 +1255,9 @@ def car_horn_reaches_the_other_game():
             vehicles = require("mirror.vehicles")
             vehicles.init({ mirror_vehicles = true }, ROLE, { guest_in_world = function() return true end, in_world = function() return true end })
             local tick = vehicles.tick
-            vehicles.tick = function(dt) util.new_frame(); tick(dt) end
+            -- (each tick is 0.1 s of game time: an event channel writes at most every 0.05 s)
+            local real = os.clock; SKEW = 0; os.clock = function() return real() + SKEW end
+            vehicles.tick = function(dt) util.new_frame(); SKEW = SKEW + dt; tick(dt) end
             for i = 1, 30 do vehicles.tick(0.1) end
             function P(v) return { get = function() return v end } end
         """.replace("ROLE", '"%s"' % role))
@@ -1266,12 +1600,25 @@ def hounds_bark_when_they_come_for_you():
     L.execute('N1 = #PLAYS; run(5)')
     check(L.eval('#PLAYS') == L.eval('N1'), "...and it never barks again")
     check("1 near bark(s)" in L.eval('dg.status()'), "counted in the status (%s)" % L.eval('dg.status()'))
+    check("1 seen" in L.eval('dg.status()'), "the hound itself is counted as seen (%s)" % L.eval('dg.status()'))
     # a short near bark (0.5-0.8 s) has ended and freed its component; the hound dies 0.3 s later
     L.execute('H = hound(1500); IN = { H }; N4 = #PLAYS; for i = 1, 200 do if #PLAYS > N4 then break end run(0.1, -5) end; '
               'B = PLAYS[#PLAYS]; for i = 1, 30 do if not B.on then break end run(0.1) end; run(0.3); '
               'H.dead = true; IN = {}; run(0.3)')
     check(L.eval('#PLAYS > N4') and L.eval('B.on') is False and L.eval('LATE') == 0,
           "a hound dying after its short bark ended: no call on the freed component (%s calls)" % L.eval('LATE'))
+    # user 2026-10-30: other players cannot hear dog barks - a hound chasing the friend 20 m from me barks on my
+    # game too (judged by my own player alone it was "not closing in" and quiet)
+    L.execute('GHOST_AT = { X = 2000, Y = 0, Z = 0 }; '
+              'package.loaded["mirror.peers"] = { each = function(name, fn) if name == "mirror.ghost" then '
+              'fn({ location = function() return GHOST_AT end }) end end }; '
+              'H = hound(1200); IN = { H }; run(1.5); N5 = #PLAYS; '
+              # (running from 12 m off me towards the other player: away from me, so only they can be its target)
+              'for i = 1, 30 do T = T + 0.1; H.x = math.min(1900, H.x + 30); for _, f in ipairs(TICKS) do f(0.1) end '
+              'for _, c in ipairs(PLAYS) do if c.on and T >= c.t_end then c.on = false end end end')
+    n = L.eval('#PLAYS - N5')
+    # (one at least: a random 2.9 s "fit" can fill the whole run; judged by my player alone it is 0)
+    check(n >= 1, "a hound chasing the other player near me barks on my game (%d)" % n)
     L.execute('LOADED = false; util.find = function(p) return StaticFindObject(p) end; H = hound(500); IN = { H }; N2 = #PLAYS; run(5, -20)')
     check(L.eval('#PLAYS') == L.eval('N2'), "no pak: quiet, nothing loaded from Lua")
 
@@ -1381,6 +1728,170 @@ def zombie_copies_take_the_hosts_look():
     L.execute('zombies._look.sync(3, MCOPY, E, { arch = 0, bones = 0, eyes = 1 }); '
               'P = zombie(); P.Event_BloodMoon = M.Event_BloodMoon; zombies._look.sync(4, { z = P, fam = "zombie" }, E, { arch = 0, bones = 0, eyes = 1 })')
     check(L.eval('#MOONS') == 2, "no blood moon call on copies that never had one")
+
+
+def copy_deaths_and_removals_wait_for_the_animation_gate():
+    # Guest froze inside a copy's Death() called from our Lua (report 2026-10-30 15:36) and 3 s after dying, while
+    # the copies the host stopped sending were removed (16:11): both wait for the mesh's animation task, whose worker
+    # waited for our Lua lock. They now run 2 frames after animation went to the game thread, never in the call.
+    print("copy_deaths_and_removals_wait_for_the_animation_gate")
+    L = lua()
+    L.execute(FAKES + r"""
+        WORLD = obj({})
+        package.loaded["mirror.game"] = { player = function() return nil end, world = function() return WORLD end,
+                                          controller = function() return nil end,
+                                          on_world_reset = function() end, keybind = function() end }
+        package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
+        package.loaded["mirror.loader"] = { want = function() end }
+        package.loaded["mirror.invdiag"] = { summary = function() return "-" end }
+        CV = { ["a.ParallelAnimUpdate"] = 1, ["a.ParallelAnimEvaluation"] = 1 }
+        KSL = obj({ GetConsoleVariableIntValue = function(self, n) return CV[n] end,
+                    ExecuteConsoleCommand = function(self, w, cmd)
+                        local n, v = cmd:match("^(%S+) (%S+)$"); CV[n] = tonumber(v) end })
+        StaticFindObject = function() return nil end
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        util.cdo = function(p) if p:find("KismetSystemLibrary", 1, true) then return KSL end
+                               return { GetConsoleVariableBoolValue = function() return false end } end
+        zombies = require("mirror.zombies")
+        animgate = require("mirror.animgate")
+        zombies._test.setup({ zombies = { enabled = true, send_hz = 15, despawn_after = 3.0 } }, "guest")
+        function zombie()
+            local z = obj({ DEATHS = 0, DESTROYED = 0, Mesh = {}, BP_JigMultiplayer = {} })
+            z.Death = function(self) self.DEATHS = self.DEATHS + 1 end
+            z.K2_DestroyActor = function(self) self.DESTROYED = self.DESTROYED + 1 end
+            z.SetActorHiddenInGame = function(self, h) self.HIDDEN = h end
+            z.SetActorEnableCollision = function() end
+            return z
+        end
+        T = 0; os.clock = function() return T end
+        function frame(n) for i = 1, n or 1 do T = T + 0.016; util.new_frame(); zombies._test.gate_tick(0.016) end end
+        A = zombie(); zombies._test.copy(7, A)
+        blobs_in.zombies = "H\nT 1.0\nZ 7 0 0 0 100 0 0 0 0 0 0 0 0 1\n"
+        zombies._test.read()
+        R1 = { A.DEATHS, CV["a.ParallelAnimUpdate"], CV["a.ParallelAnimEvaluation"] }
+        frame(1); R2 = A.DEATHS
+        frame(1); R3 = A.DEATHS
+        frame(1); R4 = A.DEATHS
+        frame(80); R5 = { CV["a.ParallelAnimUpdate"], CV["a.ParallelAnimEvaluation"], animgate.held("load") }
+    """)
+    r1 = L.eval('R1')
+    check(r1[1] == 0 and r1[2] == 0 and r1[3] == 0,
+          "a copy the host says died isn't killed inside the snapshot call; animation goes to the game thread (%s)" % list(r1.values()))
+    check(L.eval('R2') == 0, "not yet the next frame (a task started before the switch may still run)")
+    check(L.eval('R3') == 1 and L.eval('R4') == 1, "its Death() runs 2 frames later, once")
+    r5 = L.eval('R5')
+    check(r5[1] == 1 and r5[2] == 1, "the engine's own values come back a second after the last need (%s)" % list(r5.values()))
+    # removing a copy (gone from the host's snapshots): hidden at once, destroyed once the gate is ready
+    L.execute('''
+        B = zombie(); zombies._test.copy(8, B)
+        zombies._test.remove(8)
+        R6 = { B.DESTROYED, B.HIDDEN == true, zombies._test.copies()[8] == nil, zombies.is_copy(B) }
+        frame(1); R7 = B.DESTROYED
+        frame(2); R8 = B.DESTROYED
+        frame(80); R9 = CV["a.ParallelAnimUpdate"]
+    ''')
+    r6 = L.eval('R6')
+    check(r6[1] == 0 and r6[2] and r6[3], "a removed copy is hidden and dropped at once, not destroyed in the call")
+    check(r6[4], "and still counts as a copy until it's destroyed (not swept as my own zombie)")
+    check(L.eval('R7') == 0 and L.eval('R8') == 1, "it's destroyed once animation has run on the game thread for 2 frames")
+    check(L.eval('R9') == 1, "the cvars come back afterwards")
+    # a load holding the gate keeps animation on the game thread when the zombies let go
+    L.execute('''
+        animgate.hold("load")
+        C = zombie(); zombies._test.copy(9, C); zombies._test.remove(9); frame(3); frame(80)
+        R10 = { C.DESTROYED, CV["a.ParallelAnimUpdate"] }
+        animgate.release("load"); R11 = CV["a.ParallelAnimUpdate"]
+    ''')
+    r10 = L.eval('R10')
+    check(r10[1] == 1 and r10[2] == 0, "while a load holds the gate the zombies letting go doesn't switch animation back")
+    check(L.eval('R11') == 1, "the load's release does")
+    # a host hit that kills a copy runs its Death inside ApplyDamage: it waits for the gate; one that doesn't kill doesn't
+    # (kit 2026-10-29: the host's kills killed 15 copies through these replays)
+    L.execute('''
+        frame(80)
+        HITS = {}
+        GS = { ApplyDamage = function(self, z, amt) HITS[#HITS + 1] = amt end }
+        local cdo = util.cdo
+        util.cdo = function(p) if p:find("GameplayStatics", 1, true) then return GS end return cdo(p) end
+        H = zombie(); H.DamageComponent = { CurrentHealth = 30 }; zombies._test.copy(11, H)
+        zombies._test.zhit("11 10 -"); R13 = #HITS
+        zombies._test.zhit("11 40 -"); R14 = #HITS
+        frame(1); R15 = #HITS
+        frame(2); R16 = #HITS
+    ''')
+    check(L.eval('R13') == 1, "a host hit that doesn't kill is replayed at once")
+    check(L.eval('R14') == 1 and L.eval('R15') == 1 and L.eval('R16') == 2,
+          "one that kills waits until animation has run on the game thread for 2 frames")
+    # no world: the gate can't close - calls run at once as before (and nothing waits forever)
+    L.execute('WORLD = nil; D = zombie(); zombies._test.copy(10, D); zombies._test.remove(10); R12 = D.DESTROYED')
+    check(L.eval('R12') == 1, "without a world the removal runs at once, as before the gate")
+
+
+def animgate_runs_waiting_calls_once_animation_is_on_the_game_thread():
+    # the shared gate for the ghost, stray bodies, cars and the Realm's main-menu exit (animgate.lua)
+    print("animgate_runs_waiting_calls_once_animation_is_on_the_game_thread")
+    L = lua()
+    L.execute(FAKES + r"""
+        WORLD = obj({}); TICK, RESET = nil, nil
+        package.loaded["mirror.game"] = { world = function() return WORLD end,
+                                          on_tick = function(f) TICK = f end, on_world_reset = function(f) RESET = f end }
+        CV = { ["a.ParallelAnimUpdate"] = 1, ["a.ParallelAnimEvaluation"] = 1 }
+        KSL = obj({ GetConsoleVariableIntValue = function(self, n) return CV[n] end,
+                    ExecuteConsoleCommand = function(self, w, cmd) local n, v = cmd:match("^(%S+) (%S+)$"); CV[n] = tonumber(v) end })
+        util = require("mirror.util")
+        util.cdo = function() return KSL end
+        T = 0; os.clock = function() return T end
+        gate = require("mirror.animgate")
+        gate.init()
+        function frame(n) for i = 1, n or 1 do T = T + 0.016; util.new_frame(); TICK(0.016) end end
+        function actor() local a = obj({ gone = 0 }); a.K2_DestroyActor = function(self) self.gone = self.gone + 1 end
+                         a.SetActorHiddenInGame = function(self, h) self.hidden = h end
+                         a.SetActorEnableCollision = function(self, on) self.collides = on end; return a end
+        RAN = 0
+        R1 = gate.later(function() RAN = RAN + 1 end, "test")
+        A = actor(); gate.destroy(A, "test")
+        R2 = { RAN, A.gone, A.hidden == true, A.collides == false, gate.pending(A), CV["a.ParallelAnimUpdate"] }
+        frame(1); R3 = { RAN, A.gone }
+        frame(1); R4 = { RAN, A.gone, gate.pending(A) }
+        R5 = gate.safe_now()
+        B = actor(); gate.destroy(B); R6 = B.gone
+        frame(70); R7 = { CV["a.ParallelAnimUpdate"], CV["a.ParallelAnimEvaluation"] }
+        R8 = gate.safe_now(); frame(1); R9 = gate.safe_now(); frame(1); R10 = gate.safe_now()
+        C = actor(); gate.destroy(C); frame(70)
+        D = actor(); frame(70); gate.destroy(D); RESET(); frame(3)
+        R11 = { C.gone, D.gone, gate.pending(D), CV["a.ParallelAnimUpdate"] }
+    """)
+    check(L.eval('R1') is False, "a call that waits for animation isn't run while animation tasks may be running")
+    r2 = L.eval('R2')
+    check(r2[1] == 0 and r2[2] == 0 and r2[3] and r2[4] and r2[5] and r2[6] == 0,
+          "an actor to destroy is hidden, without collision, pending; animation goes to the game thread")
+    check(list(L.eval('R3').values()) == [0, 0], "not yet the next frame")
+    r4 = L.eval('R4')
+    check(r4[1] == 1 and r4[2] == 1 and not r4[3], "2 frames later both ran once and nothing is pending")
+    check(L.eval('R5') is True and L.eval('R6') == 1, "while the gate is open such calls run at once")
+    check(list(L.eval('R7').values()) == [1, 1], "a second after the last need the engine's values come back")
+    check(L.eval('R8') is False and L.eval('R9') is False and L.eval('R10') is True,
+          "a caller that asks every frame gets its go 2 frames after the first ask")
+    r11 = L.eval('R11')
+    check(r11[1] == 1, "a destroy started earlier finishes")
+    check(r11[2] == 0 and not r11[3] and r11[4] == 1,
+          "a world reset drops the old world's waiting calls (never touched again) and gives animation back")
+    # hardening: a hold nobody renews lapses; a restore without a world comes later; a save flushes waiting destroys
+    L.execute('''
+        gate.hold("someone"); frame(2); R12 = { CV["a.ParallelAnimUpdate"], gate.held("someone") }
+        frame(400); R13 = { CV["a.ParallelAnimUpdate"], gate.held("someone") }
+        gate.hold("load"); frame(400); R14 = { CV["a.ParallelAnimUpdate"], gate.held("load") }
+        local W = WORLD; WORLD = nil; gate.release("load"); R15 = CV["a.ParallelAnimUpdate"]
+        WORLD = W; frame(1); R16 = CV["a.ParallelAnimUpdate"]
+        E = actor(); gate.destroy(E); R17 = gate.flush(); R18 = { E.gone, gate.pending(E) }; frame(80); R19 = E.gone
+    ''')
+    check(list(L.eval('R12').values()) == [0, True], "a hold closes the gate")
+    check(list(L.eval('R13').values()) == [1, False], "one not renewed for 5 s lapses: animation back on its threads")
+    check(list(L.eval('R14').values()) == [0, True], "a load's hold lasts a whole load (6 s here)")
+    check(L.eval('R15') == 0 and L.eval('R16') == 1, "released without a world: the engine's values come back once there is one")
+    check(L.eval('R17') == 1 and list(L.eval('R18').values()) == [1, False] and L.eval('R19') == 1,
+          "a save flushes a waiting destroy at once, and it isn't destroyed twice")
 
 
 def zombie_archetype_effects_reach_copies():
@@ -2251,6 +2762,7 @@ def loot_take_for_a_container_the_host_lacks_is_kept():
     check(L.eval("ONCE") == 1, "and only once (%d)" % L.eval("ONCE"))
     check(L.eval("R0") == 0 and (L.eval("R1") or "").startswith("R " + "Container_FuelLoot_GasPump_C@10,0,0 G7"),
           "a put-in for a container that never comes is handed back after 10 min (%r)" % L.eval("R1"))
+    check((L.eval("R1") or "").endswith(" 6"), "the refusal names the put-in's action number (%r)" % L.eval("R1"))
 
 
 def same_moment_container_takes_keep_one_copy():
@@ -2295,6 +2807,136 @@ def same_moment_container_takes_keep_one_copy():
     """)
     check(any(m == "L Container_FuelLoot_GasPump_C@10,0,0 G1" for m in H.eval("SENT").values()),
           "host: a take of an item it has none of is answered with L")
+
+
+def same_moment_partial_takes_keep_the_total():
+    # T10 audit 2026-10-31: a stack of 10, the host takes 3 and the guest 4 within one round trip. Takes said only
+    # how many were left: the guest's "left 6" made the host remove 1, the host's "left 7" nothing on the guest -
+    # 13 items from 10. A take now carries how many it moved; the host gives back only what it didn't have.
+    print("same_moment_partial_takes_keep_the_total")
+    L = loot_guest()
+    L.execute(r"""
+        PUMP.BP_JigMultiplayer = COMP
+        package.loaded["mirror.jig"].contents_of = function(c) if c == COMP then return CONT end return {} end
+        CONT = { { uid = "G1", da = "/Game/X.DA_Bandage", count = 10 } }
+        open(); loot.tick(0.1)
+        ID = SENT[1] and SENT[1]:match("^Q (%S+)$")
+        INBOX.lootc = { "C " .. tostring(ID) .. " 0 one" }
+        loot.tick(0.1)
+        COUNT = 6
+        COMP.MainJigContainers = { GetArrayNum = function() return 1 end, ForEach = function(self, f)
+            f(1, { get = function() return { ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B = { ForEach = function(_, g)
+                if COUNT > 0 then g(1, { get = function() return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = "G1",
+                    ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { Count_8_DD79AF2A46126A338C8DCCB4616D91CD = COUNT } } end }) end
+            end } } end }) end }
+        SENT = {}
+        HOOKS["/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C:JigMP_OnItemRemoved"]({ get = function() return PUMP end }, { get = function() return "G1" end })
+        loot.tick(0.01)
+        TAKE = nil
+        for _, p in ipairs(SENT) do if p:find("^" .. ID:gsub("%p", "%%%0") .. " G1 6") then TAKE = p end end
+        -- the host's own take of 3 (sent "left 7, moved 3") reaches the guest, which has 6 left
+        TOOK = {}
+        package.loaded["mirror.jig"].take = function(c, uid, n, total) TOOK[#TOOK + 1] = uid .. ":" .. n; COUNT = COUNT - n; return true end
+        INBOX.loot = { ID .. " G1 7 9 /Game/X.DA_Bandage 3" }
+        loot.tick(0.1)
+        GUEST_LEFT = COUNT
+    """)
+    check((L.eval("TAKE") or "").endswith("/Game/X.DA_Bandage 4"), "the guest's take says it moved 4 (%r)" % L.eval("TAKE"))
+    check(L.eval("TOOK[1]") == "G1:3" and L.eval("GUEST_LEFT") == 3,
+          "guest: the host's take of 3 removes 3 of its 6 (%s, %d left)" % (L.eval("TOOK[1]"), L.eval("GUEST_LEFT")))
+    H = loot_guest()
+    H.execute(r"""
+        package.loaded["mirror.loot"] = nil
+        loot = require("mirror.loot")
+        loot.init({}, "host", { in_world = function() return true end })
+        PUMP.BP_JigMultiplayer = COMP
+        package.loaded["mirror.jig"].contents_of = function() return {} end
+        COUNT = 7
+        COMP.MainJigContainers = { GetArrayNum = function() return 1 end, ForEach = function(self, f)
+            f(1, { get = function() return { ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B = { ForEach = function(_, g)
+                if COUNT > 0 then g(1, { get = function() return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = "G1",
+                    ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { Count_8_DD79AF2A46126A338C8DCCB4616D91CD = COUNT } } end }) end
+            end } } end }) end }
+        TOOK = {}
+        package.loaded["mirror.jig"].take = function(c, uid, n, total) TOOK[#TOOK + 1] = uid .. ":" .. n; COUNT = COUNT - n; return true end
+        SENT = {}
+        ID = "Container_FuelLoot_GasPump_C@10,0,0"
+        INBOX.loot = { ID .. " G1 6 5 /Game/X.DA_Bandage 4" }
+        loot.tick(0.1)
+        HOST_LEFT, L1 = COUNT, #SENT
+        -- the guest took 4 more but only 2 are still here: the host takes 2, the guest gives 2 back
+        COUNT = 2
+        INBOX.loot = { ID .. " G1 2 6 /Game/X.DA_Bandage 4" }
+        loot.tick(0.1)
+        TOOK2, GIVE = TOOK[2], SENT[#SENT]
+        -- an older message without the moved count: down to "left" as before
+        COUNT = 7
+        INBOX.loot = { ID .. " G1 6 7 /Game/X.DA_Bandage" }
+        loot.tick(0.1)
+        TOOK3 = TOOK[3]
+    """)
+    check(H.eval("TOOK[1]") == "G1:4" and H.eval("HOST_LEFT") == 3 and H.eval("L1") == 0,
+          "host: the guest's take of 4 removes 4 of its 7, nothing given back (%s, %d left, %d sent)"
+          % (H.eval("TOOK[1]"), H.eval("HOST_LEFT"), H.eval("L1")))
+    check(H.eval("TOOK2") == "G1:2" and H.eval("GIVE") == "L Container_FuelLoot_GasPump_C@10,0,0 G1 2",
+          "host: 4 taken, 2 here: removes 2 and asks 2 back (%s, %r)" % (H.eval("TOOK2"), H.eval("GIVE")))
+    check(H.eval("TOOK3") == "G1:1", "host: a take without the count still goes down to left (%s)" % H.eval("TOOK3"))
+    L.execute(r"""
+        GAVE = {}
+        package.loaded["mirror.jig"].take = function(c, uid, n, total) GAVE[#GAVE + 1] = uid .. ":" .. n; return true end
+        ME.BP_JigMultiplayer = obj({})
+        package.loaded["mirror.jig"].contents_of = function(c) if c == COMP then return {} end return { { uid = "P5", da = "/Game/X.DA_Bandage", count = 4 } } end
+        INBOX.loot = { "L " .. ID .. " G1 2" }
+        loot.tick(0.1)
+    """)
+    check(L.eval("GAVE[1]") == "P5:2", "guest: an L for 2 gives back 2 of the 4 it took (%s)" % L.eval("GAVE[1]"))
+
+
+def refused_put_in_taken_back_tells_the_host_nothing():
+    # T10 audit 2026-10-31: the host had no room for a guest's put-in (R) - it is only in the guest's copy. Taking it
+    # back out was sent as a take: the host matched it by kind and removed its OWN same item, or found none and had
+    # the guest give it back (lost). And R never acked the put-in, so the host's lists stayed un-taken-over.
+    print("refused_put_in_taken_back_tells_the_host_nothing")
+    L = loot_guest()
+    L.execute(r"""
+        PUMP.BP_JigMultiplayer = COMP
+        package.loaded["mirror.jig"].contents_of = function(c) if c == COMP then return CONT end return {} end
+        CONT = { { uid = "G1", da = "/Game/X.DA_Bandage", count = 2 }, { uid = "G7", da = "/Game/X.DA_Pills", count = 1 } }
+        open(); loot.tick(0.1)
+        ID = SENT[1] and SENT[1]:match("^Q (%S+)$")
+        INBOX.lootc = { "C " .. tostring(ID) .. " 0 one" }
+        loot.tick(0.1)
+        COUNT = 1
+        COMP.MainJigContainers = { GetArrayNum = function() return 1 end, ForEach = function(self, f)
+            f(1, { get = function() return { ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B = { ForEach = function(_, g)
+                if COUNT > 0 then g(1, { get = function() return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = "G1",
+                    ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { Count_8_DD79AF2A46126A338C8DCCB4616D91CD = COUNT } } end }) end
+            end } } end }) end }
+        -- my last action there (a take of 1 bandage) waits for the host's ack
+        SENT = {}
+        HOOKS["/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C:JigMP_OnItemRemoved"]({ get = function() return PUMP end }, { get = function() return "G1" end })
+        loot.tick(0.01)
+        S = nil
+        for _, p in ipairs(SENT) do S = S or p:match("^" .. ID:gsub("%p", "%%%0") .. " G1 1 (%d+)") end
+        -- the host had no room for my pills, refused as that last action
+        INBOX.loot = { "R " .. ID .. " G7 /Game/X.DA_Pills " .. tostring(S) }
+        loot.tick(0.1)
+        -- I take the pills back out: only in my copy
+        SENT = {}
+        NOW = (NOW or 0) + 1
+        HOOKS["/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C:JigMP_OnItemRemoved"]({ get = function() return PUMP end }, { get = function() return "G7" end })
+        loot.tick(0.01)
+        TOLD = 0
+        for _, p in ipairs(SENT) do if p:find(" G7 ", 1, true) then TOLD = TOLD + 1 end end
+        -- the host's next list (its ack is older than the refused action) is taken over: nothing of mine waits
+        APPLIED = 0
+        INBOX.lootc = { "C " .. ID .. " 0 two" }
+        loot.tick(0.1)
+        TAKEN_OVER = APPLIED
+    """)
+    check(L.eval("S") is not None, "the guest's take went out with its action number (%r)" % L.eval("S"))
+    check(L.eval("TOLD") == 0, "taking a refused item back out sends nothing to the host (%d sent)" % L.eval("TOLD"))
+    check(L.eval("TAKEN_OVER") == 1, "a refused last action no longer blocks the host's lists (%d taken over)" % L.eval("TAKEN_OVER"))
 
 
 def stacking_moves_reach_the_other_game():
@@ -2502,6 +3144,53 @@ def player_rip_in_a_container_is_a_take():
     check(L.eval("BOTH") == 1, "the container's own event and the component hook for one consume send one take (%d)" % L.eval("BOTH"))
 
 
+def bench_output_made_on_a_guest_reaches_the_host():
+    # user 2026-10-31: a guest's decrafted items appear in the bench's lower grid, then despawn. The bench UI adds them
+    # with JigTryAddItemSomewhere (AddNewItemToSlot / CLIENT_UpdateCount: no added event), so the host never got them
+    # and its list after the input's consume took them away
+    print("bench_output_made_on_a_guest_reaches_the_host")
+    L = loot_guest()
+    L.execute(r"""
+        PUMP.BP_JigMultiplayer = COMP
+        local J = package.loaded["mirror.jig"]
+        J.contents_of = function(c) return CONT end
+        J.subtree = function(c, uid) return { { uid = uid } } end
+        J.worth_sending = function() return false end
+        CONT = { { uid = "G1", da = "/Game/X.DA_Rifle", count = 1 }, { uid = "G5", da = "/Game/X.DA_Screws", count = 4 } }
+        open(); loot.tick(0.1)
+        ID = SENT[1]:match("^Q (%S+)$")
+        INBOX.lootc = { "C " .. ID .. " 0 one" }
+        loot.tick(0.1)
+        SENT = {}
+        local H = HOOKS["/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C:JigTryAddItemSomewhere"]
+        HOOKED = H ~= nil
+        local function made(da) if H then H({ get = function() return COMP end }, { get = function() return COMP end }, { get = function() return da end }) end end
+        -- the bench makes 3 scrap (a new item) and 2 screws (onto the stack there), then consumes the rifle
+        CONT = { { uid = "G1", da = "/Game/X.DA_Rifle", count = 1 }, { uid = "G5", da = "/Game/X.DA_Screws", count = 6 },
+                 { uid = "G9", da = "/Game/X.DA_Scrap", count = 3 } }
+        made("/Game/X.DA_Scrap"); made("/Game/X.DA_Screws")
+        SAME_FRAME = #SENT
+        loot.tick(0.1)
+        function sent(pat) local n = 0; for _, p in ipairs(SENT) do if p:find(pat) then n = n + 1 end end; return n end
+        PUTS = sent("^A %S+ G9 /Game/X%.DA_Scrap 3 ")
+        STACKED = sent("^N %S+ G5 2 ")
+        RIFLE = sent("G1")
+        -- the same kind made again later: only the new one goes, the scrap already sent doesn't go twice
+        CONT[#CONT + 1] = { uid = "G10", da = "/Game/X.DA_Scrap", count = 1 }
+        made("/Game/X.DA_Scrap")
+        loot.tick(0.1)
+        AGAIN = sent("^A %S+ G9 ")
+        NEW = sent("^A %S+ G10 ")
+    """)
+    check(L.eval("HOOKED") is True, "JigTryAddItemSomewhere is hooked")
+    check(L.eval("SAME_FRAME") == 0, "an item a bench makes is looked at the next frame (%d sent at once)" % L.eval("SAME_FRAME"))
+    check(L.eval("PUTS") == 1, "a guest's bench output is sent to the host as a put-in (%d)" % L.eval("PUTS"))
+    check(L.eval("STACKED") == 1, "bench output added onto a stack there is sent as N 2 (%d)" % L.eval("STACKED"))
+    check(L.eval("RIFLE") == 0, "items the bench didn't make aren't sent (%d)" % L.eval("RIFLE"))
+    check(L.eval("AGAIN") == 1 and L.eval("NEW") == 1,
+          "made again: only the new item is sent (old %d, new %d)" % (L.eval("AGAIN"), L.eval("NEW")))
+
+
 def lights_come_back_on_a_respawned_ghost():
     # audit N37: get_blob hands out the light blob only when it changes - every save respawns the ghost, which stayed dark
     print("lights_come_back_on_a_respawned_ghost")
@@ -2555,6 +3244,71 @@ def perf_run_puts_the_outer_step_back():
     """)
     check(L.eval("IN") == "fire", "after a nested run the outer step is back (%s)" % L.eval("IN"))
     check(L.eval("TOP") == "pose", "a top-level run leaves its own step (%s)" % L.eval("TOP"))
+    # spikes of the same size in unrelated parts (live 2026-10-30): a slow part says when a Lua GC ran inside it
+    L.execute(r"""
+        LINES = {}
+        package.loaded["mirror.log"] = setmetatable({ info = function(s) LINES[#LINES + 1] = s end },
+            { __index = function() return function() end end })
+        package.loaded["mirror.perf"] = nil
+        perf = require("mirror.perf")
+        local function busy() local t = os.clock(); while os.clock() - t < 0.035 do end end
+        JUNK = {}; for i = 1, 40000 do JUNK[i] = { i, tostring(i) } end
+        perf.frame_begin()
+        perf.run("plain", busy)
+        perf.run("fire", function() JUNK = nil; collectgarbage("collect"); busy() end)
+        perf.frame_end(31)
+    """)
+    lines = list(L.eval("LINES").values())
+    plain = [s for s in lines if s.startswith("perf: plain took")]
+    fire = [s for s in lines if s.startswith("perf: fire took")]
+    check(plain and "GC" not in plain[0], "a slow part without a collection says only its time (%s)" % plain)
+    check(fire and "a Lua GC ran inside it" in fire[0], "a slow part with a collection inside says so (%s)" % fire)
+    check(any("inside 1 slow part(s)" in s for s in lines), "the 30 s report counts them")
+    # live 2026-10-31: the 8 listed parts were about half of "mod 2.09 ms/frame" - the rest and the time outside
+    # any part are given, sub-parts not counted twice
+    L.execute(r"""
+        LINES = {}
+        package.loaded["mirror.perf"] = nil
+        perf = require("mirror.perf")
+        local function busy(ms) local t = os.clock(); while os.clock() - t < ms / 1000 do end end
+        perf.frame_begin()
+        for i = 1, 9 do perf.run("p" .. i, function() busy(12 - i); if i == 1 then perf.run("sub", busy, 6.5) elseif i == 2 then perf.run("sub2", busy, 1) end end) end
+        local s = perf.start(); busy(4.5); perf.stop("span", s)
+        busy(20)
+        perf.frame_end(31)
+    """)
+    import re
+    rep = [s for s in L.eval("LINES").values() if s.startswith("perf: mod")]
+    m = re.search(r"(\d+) more parts ([\d.]+), outside any part (-?[\d.]+)", rep[0]) if rep else None
+    # (no marks: the 20 ms outside the parts is "glue start". Listed: glue start, p1-p5, sub, p6; left out: p7 5 ms,
+    # a caller-timed span 4.5 ms, p8 4 ms, p9 3 ms - and sub2 inside p2)
+    check(m is not None and m.group(1) == "4", "the report counts the top-level parts it left out, not sub-parts (%s)" % (m and m.group(0)))
+    check(m is not None and 15.0 <= float(m.group(2)) <= 18.5, "with their time (%s)" % (m and m.group(2)))
+    g = re.search(r"glue start ([\d.]+) \(max", rep[0]) if rep else None
+    check(g is not None and 17.0 <= float(g.group(1)) <= 23.0, "the time outside the parts is glue (%s)" % (g and g.group(1)))
+    check(m is not None and abs(float(m.group(3))) <= 0.6, "and nothing is left outside, nor counted twice (%s)" % (m and m.group(3)))
+    # kit 2026-10-31: still 0.66 ms/frame outside every part on both games - phase1's step marks time the code
+    # between them, without the parts run inside
+    L.execute(r"""
+        LINES = {}
+        package.loaded["mirror.perf"] = nil
+        perf = require("mirror.perf")
+        local function busy(ms) local t = os.clock(); while os.clock() - t < ms / 1000 do end end
+        perf.frame_begin()
+        busy(2); perf.glue("a")
+        perf.run("x", busy, 5); busy(3); perf.glue("b")
+        busy(4)
+        perf.frame_end(31)
+    """)
+    rep = [s for s in L.eval("LINES").values() if s.startswith("perf: mod")]
+    def part(n):
+        g = re.search(re.escape(n) + r" ([\d.]+) \(max", rep[0]) if rep else None
+        return float(g.group(1)) if g else None
+    o = re.search(r"outside any part (-?[\d.]+)", rep[0]) if rep else None
+    check(part("glue start") is not None and 1.5 <= part("glue start") <= 3.0, "the code before the first mark is its own glue (%s)" % part("glue start"))
+    check(part("glue a") is not None and 2.5 <= part("glue a") <= 4.0, "glue leaves out the parts run inside it (%s)" % part("glue a"))
+    check(part("glue b") is not None and 3.5 <= part("glue b") <= 5.0, "the last mark runs to the frame's end (%s)" % part("glue b"))
+    check(o is not None and abs(float(o.group(1))) <= 0.6, "and nothing is left outside (%s)" % (o and o.group(1)))
 
 
 def fs_write_is_whole_or_old():
@@ -2571,6 +3325,53 @@ def fs_write_is_whole_or_old():
         os.remove(p)
         with open(p + ".new", "wb") as f: f.write(b"three\n")
         check(L.eval("fs.read(P)") == "three\n" and os.path.exists(p), "a crash after remove (only .new left) is recovered on read")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def host_rules_and_mod_list_survive_a_full_disk():
+    """Save audit 2026-10-30: hostrules (a Realm's rules travel with its world) and modlist (UE4SS starts SurrounSync
+    from mods.txt) wrote their files in place - a write that failed half-way (a full disk) left them empty."""
+    print("host_rules_and_mod_list_survive_a_full_disk")
+    d = tempfile.mkdtemp()
+    try:
+        L = lua()
+        rules = os.path.join(d, "rules.txt").replace("\\", "/")
+        with open(rules, "wb") as f: f.write(b"pvp on\n")
+        L.execute(r'''
+            package.loaded["mirror.notify"] = { show = function() end }
+            hr = require("mirror.hostrules")
+            hr.init(function() return "host" end)
+            hr.use_file(...)
+            REAL_OPEN = io.open
+            -- a full disk: files open for writing, nothing written reaches them
+            function FULL_DISK()
+                io.open = function(p, m)
+                    local f, e = REAL_OPEN(p, m)
+                    if not f or not tostring(m):find("w") then return f, e end
+                    return { write = function() return nil, "No space left on device" end, close = function() f:close(); return true end }
+                end
+            end
+        ''', rules)
+        before = L.eval('hr.my_value("pvp")')
+        L.execute('FULL_DISK(); hr.toggle("pvp"); io.open = REAL_OPEN')
+        with open(rules, "rb") as f: kept = f.read()
+        check(before == "on" and b"pvp on" in kept, "host rules: a failed save keeps the old file (%r)" % kept)
+        w64 = os.path.join(d, "SurrounDead", "Binaries", "Win64")
+        mods = os.path.join(w64, "ue4ss", "Mods")
+        for m in ("SurrounSync", "AimRun"):
+            os.makedirs(os.path.join(mods, m))
+        os.makedirs(os.path.join(d, "SurrounDead", "Content", "Paks"))
+        with open(os.path.join(mods, "mods.txt"), "wb") as f: f.write(b"SurrounSync : 1\r\nAimRun : 1\r\n")
+        g = L.globals()
+        g.pydirs = lambda p: L.table_from(sorted(x for x in os.listdir(p) if os.path.isdir(os.path.join(p, x)))) if os.path.isdir(p) else None
+        g.pyfiles = lambda p: L.table_from(sorted(x for x in os.listdir(p) if not os.path.isdir(os.path.join(p, x)))) if os.path.isdir(p) else None
+        g.W64, g.PAKS = w64, os.path.join(d, "SurrounDead", "Content", "Paks")
+        L.execute('ml = require("mirror.modlist"); ml.configure{ io_root = W64 .. "\\\\", list_win64 = W64, list_paks = PAKS, reset = true,'
+                  ' lister = { dirs = function(p) return pydirs(p) end, files = function(p) return pyfiles(p) end } }; ml.init()')
+        L.execute('FULL_DISK(); SET = ml.set("AimRun", false); io.open = REAL_OPEN')
+        with open(os.path.join(mods, "mods.txt"), "rb") as f: kept = f.read()
+        check(b"SurrounSync : 1" in kept, "mods.txt: a failed write keeps SurrounSync in it (%r)" % kept)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -2666,6 +3467,21 @@ def crumb_keeps_the_last_64_steps():
         check(os.path.exists("mirror_steps.1.txt") and len(open("mirror_steps.1.txt", "rb").read()) == 64 * 100,
               "the last run's steps are kept as mirror_steps.1.txt")
         check(str(L.eval("PREV")).rstrip().endswith("step 70"), "the last run's final step is still reported at start")
+        # player report 2026-10-31: crash 23:14, three more runs, report 01:05 - the crash run's steps were gone
+        for i in range(3):
+            L.execute(r"""
+                package.loaded["mirror.crumb"] = nil
+                collectgarbage(); collectgarbage()
+                local crumb = require("mirror.crumb")
+                crumb.start()
+                crumb.at("run %d")
+            """ % (i + 3))
+        kept = {n: open(n).read().strip() for n in ("mirror_step.1.txt", "mirror_step.2.txt", "mirror_step.3.txt")}
+        check(kept["mirror_step.1.txt"].endswith("run 4") and kept["mirror_step.2.txt"].endswith("run 3")
+              and kept["mirror_step.3.txt"].endswith("next run"),
+              "the last three runs' steps are kept, newest first (%r)" % kept)
+        check(not os.path.exists("mirror_step.4.txt") and os.path.exists("mirror_steps.3.txt"),
+              "...no more than three, for the step ring too")
     finally:
         os.chdir(old)
         shutil.rmtree(d, ignore_errors=True)
@@ -2806,6 +3622,8 @@ def unanswered_join_keeps_the_friends_list():
         package.loaded["mirror.session"] = stub({ state = function() return STATE end,
             home_since = function() return STATE == "idle" and HOME or nil end, forget_home = function() HOME = nil end })
         package.loaded["mirror.events"] = stub({ unconfirmed = function() return UNCONF end })
+        LOCKS = 0
+        package.loaded["mirror.doorlock"] = stub({ unconfirmed = function() return LOCKS end })
         package.loaded["mirror.phase1"] = stub({ started = function() return ROLE end, connected = function() return CONNECTED end,
             init = function(c, r) ROLE = r end, stop = function() STOPPED = STOPPED + 1; ROLE = nil end })
         package.loaded["mirror.journal_tab"] = stub({ configure = function(t) TAB = t end })
@@ -2820,7 +3638,9 @@ def unanswered_join_keeps_the_friends_list():
     check(L.eval("STOPPED") == 0, "just home: the link stays a moment")
     L.execute("CLOCK = 1010; TICK(0.1)")
     check(L.eval("STOPPED") == 0, "two messages the host hasn't confirmed yet: the link stays")
-    L.execute("UNCONF = 0; CLOCK = 1011; TICK(0.1)")
+    L.execute("UNCONF = 0; LOCKS = 1; CLOCK = 1011; TICK(0.1)")
+    check(L.eval("STOPPED") == 0, "a door code change the host hasn't taken yet: the link stays")
+    L.execute("LOCKS = 0; CLOCK = 1012; TICK(0.1)")
     check(L.eval("STOPPED") == 1 and L.eval("HOME") is None, "all confirmed: disconnected (NOT IN CO-OP), once")
     L.execute("ROLE = 'guest'; HOME = 2000; UNCONF = 5; CLOCK = 2059; TICK(0.1)")
     check(L.eval("STOPPED") == 1, "a host that never confirms: still waiting at 59 s")
@@ -2828,6 +3648,46 @@ def unanswered_join_keeps_the_friends_list():
     check(L.eval("STOPPED") == 2, "...and disconnected after 60 s anyway")
     L.execute("ROLE = 'guest'; HOME = 3000; UNCONF = 0; STATE = 'joining'; CLOCK = 3010; TICK(0.1)")
     check(L.eval("STOPPED") == 2, "joining again before it ended: the link stays")
+    check(L.eval("#ERRS") == 0, "no errors (%s)" % list(L.eval("ERRS").values()))
+
+
+def refused_realm_join_disarms_the_realm():
+    # hardening 2026-10-30: a declined Realm join kept the Realm armed, so the next Ctrl+F10 join of the same host
+    # went out as a Realm join with the Realm character (and was refused as the wrong kind)
+    print("refused_realm_join_disarms_the_realm")
+    L = lua()
+    L.execute(r"""
+        local any = { __index = function() return function() end end }
+        local function stub(t) return setmetatable(t or {}, any) end
+        for _, n in ipairs({ "notify", "menu_backups", "instance", "hostrules", "mysettings",
+                             "modlist", "itemclean", "names", "voice", "chat", "teleport", "compat", "version" }) do
+            package.loaded["mirror." .. n] = stub()
+        end
+        ERRS, LOBBY, ARMED = {}, { hosts = {} }, "unset"
+        package.loaded["mirror.hostrules"] = stub({ my_value = function() return "4" end })
+        package.loaded["mirror.util"] = stub({ error_count = function() return 0 end,
+            safe = function(f, n, ...) local ok, e = pcall(f, ...); if not ok then ERRS[#ERRS + 1] = tostring(n) .. ": " .. tostring(e) end; return ok, e end })
+        package.loaded["mirror.game"] = stub({ on_tick = function(f) TICK = f end })
+        ROLE = nil
+        package.loaded["mirror.link"] = stub({ kind = function() return "steam" end, peer_name = function() return "Bob" end,
+            lobby = function() return LOBBY end, bridge_cmd = function() return true end })
+        package.loaded["mirror.session"] = stub({ state = function() return "idle" end, realm_guest = function(id) ARMED = id end })
+        package.loaded["mirror.phase1"] = stub({ started = function() return ROLE end, connected = function() return false end,
+            init = function(c, r) ROLE = r end, stop = function() ROLE = nil end })
+        package.loaded["mirror.journal_tab"] = stub({ configure = function(t) TAB = t end })
+        ModifierKey = { CONTROL = 1 }
+        os.clock = function() return 1000 end
+        menu = require("mirror.menu")
+        menu.init({})
+        menu.realm_join("7656", "Bob", "Camp")
+        package.loaded["mirror.session"].realm_guest("R1")   -- (realmplay.start arms it right after)
+        TICK(0.1)
+        A1 = ARMED
+        LOBBY = { hosts = {}, joinerror = "declined" }
+        TICK(1.0)   -- (the lobby is read once a second)
+    """)
+    check(L.eval("A1") == "R1", "asking to join the Realm keeps it armed")
+    check(L.eval("ARMED") is None, "the host declined: the Realm is no longer armed")
     check(L.eval("#ERRS") == 0, "no errors (%s)" % list(L.eval("ERRS").values()))
 
 
@@ -3155,8 +4015,685 @@ def ghost_swims_without_its_own_water_detection():
     check(L.eval('G.SwimmingComponent["IsSwimming?"]') is False, "leaving the water ends the ghost's swimming")
 
 
-def ghost_never_blocks_cars():
-    print("ghost_never_blocks_cars")
+def a_player_sitting_down_sits_on_the_other_screen():
+    # User 2026-10-30: "also sitting down isnt synced". The game's sit (BP_PlayerCharacter IA_SitDown) plays
+    # Chr_SittingFloor_Montage straight on the character and sets Sitting? - not through MC_Montage, which is all
+    # anim.lua mirrors - so the other player saw them stand. The montage's one section loops on itself.
+    print("a_player_sitting_down_sits_on_the_other_screen")
+    L = lua()
+    L.execute(FAKES + r"""
+        util = require("mirror.util")
+        SIT = obj({})
+        StaticFindObject = function(p) if p:find("Chr_SittingFloor_Montage", 1, true) then return SIT end end
+        p1 = require("mirror.poseline")
+        ghost = require("mirror.ghost")
+        ghost.configure({ ghost = { snap_distance = 500 } })
+        PLAYS, STOPS = {}, {}
+        NOW = 100; os.clock = function() return NOW end
+        PLAYLEN, CURM, TP_OK = 1.5, nil, true
+        G = obj({ CharacterMovement = { MovementMode = 1 }, SwimmingComponent = {}, StaminaComponent = {},
+                  K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end,
+                  K2_TeleportTo = function() return TP_OK end,
+                  K2_SetActorLocationAndRotation = function(_, l) SET = l end,
+                  GetCurrentMontage = function() return CURM end,
+                  PlayAnimMontage = function(_, m) PLAYS[#PLAYS + 1] = m; return PLAYLEN end,
+                  StopAnimMontage = function(_, m) STOPS[#STOPS + 1] = m end })
+        ghost._set_for_test(G)
+        ME = obj({ ["Sitting?"] = true, bIsCrouched = false, CharacterMovement = { IsFalling = function() return false end } })
+        tr = require("mirror.track").new(2.0)
+    """)
+    check(L.eval('p1.flags(ME)') == 32, "a sitting player sends the sit flag (%s)" % L.eval('p1.flags(ME)'))
+    L.execute('P = p1.parse("1 2 3 90 0 0 0 32"); tr:push(1.0, P); tr:push(1.1, p1.parse("1 2 3 90 0 0 0 32"))')
+    check(L.eval('P.sit') is True and L.eval('P.crouch') is False, "the other side reads it as sitting, not crouching")
+    L.execute('ghost.apply(tr:at(1.05, util), false); ghost.apply(tr:at(1.2, util), false)')
+    check(L.eval('#PLAYS') == 1 and L.eval('PLAYS[1] == SIT'), "the ghost sits once through the track (%s plays)" % L.eval('#PLAYS'))
+    L.execute('ghost.apply(p1.parse("1 2 3 90 0 0 0 0"), false)')
+    check(L.eval('#STOPS') == 1 and L.eval('STOPS[1] == SIT'), "standing up stops only the sit montage on the ghost")
+    L.execute('ghost.apply(p1.parse("1 2 3 90 0 0 0 1"), false)')
+    check(L.eval('#STOPS') == 1 and L.eval('#PLAYS') == 1, "crouching is not sitting")
+    check(L.eval('p1.parse("1 2 3 90 0 0 0 16").sit') is False, "an old build's flags never read as sitting")
+    check(L.eval('p1.parse("1 2 3 90 0 0 0 31").crouch and p1.parse("1 2 3 90 0 0 0 31").underwater') is True,
+          "the other flags read as before")
+    # audit 2026-10-31: a stop-all (anim.lua "-", vehicles.lua seat exit) cut the sit and nothing sat the ghost again
+    L.execute('PLAYS = {}; SITP = p1.parse("1 2 3 90 0 0 0 32"); ghost.apply(SITP, false); CURM = SIT'
+              '; NOW = NOW + 2; ghost.apply(SITP, false)')
+    check(L.eval('#PLAYS') == 1, "a sit that still plays isn't started again (%s plays)" % L.eval('#PLAYS'))
+    L.execute('CURM = nil; NOW = NOW + 0.5; ghost.apply(SITP, false)')
+    check(L.eval('#PLAYS') == 1, "a cut sit isn't replayed every pose")
+    L.execute('NOW = NOW + 0.6; ghost.apply(SITP, false)')
+    check(L.eval('#PLAYS') == 2, "a sit cut by a stop-all is sat again within a second (%s plays)" % L.eval('#PLAYS'))
+    L.execute('CURM = obj({}); NOW = NOW + 2; ghost.apply(SITP, false)')
+    check(L.eval('#PLAYS') == 2, "nor over another montage that plays (a use, a reload)")
+    L.execute('ghost.apply(p1.parse("1 2 3 90 0 0 0 0"), false); PLAYLEN = 0; CURM = nil; ghost.apply(SITP, false)'
+              '; NOW = NOW + 0.5; ghost.apply(SITP, false)')
+    check(L.eval('#PLAYS') == 3, "a sit that didn't play (0) waits a second before trying again (%s)" % L.eval('#PLAYS'))
+    L.execute('PLAYLEN = 1.5; NOW = NOW + 0.6; ghost.apply(SITP, false); CURM = SIT; NOW = NOW + 0.6; ghost.apply(SITP, false)')
+    check(L.eval('#PLAYS') == 4, "and then sits (%s plays)" % L.eval('#PLAYS'))
+    # audit 2026-10-31: K2_TeleportTo refuses spots that overlap a car (the capsule blocks cars since 4e98473)
+    L.execute('SET = nil; TP_OK = false; ghost.apply(p1.parse("40 0 3 90 0 0 0 0"), false)')
+    check(L.eval('SET ~= nil and SET.X == 40'), "a move refused beside a car still puts the ghost where its player is")
+    L.execute('SET = nil; TP_OK = true; ghost.apply(p1.parse("60 0 3 90 0 0 0 0"), false)')
+    check(L.eval('SET == nil'), "a move that works isn't set twice")
+
+
+def door_code_locks_keep_other_players_out_until_they_type_it():
+    # User 2026-10-30: "it ads a selection in the door menu for lock and then a keypad UI pops up where u set a
+    # password and then it saves for all doors you have placed, no other players can use the door unless they enter
+    # the password correctly and they have access too the players doors". Host + guest, each its own Lua, with the
+    # real doors.lua carrying the locks between them (door_sync off: locks don't depend on it).
+    print("door_code_locks_keep_other_players_out_until_they_type_it")
+    import tempfile
+    def side(role, sid, name):
+        d = tempfile.mkdtemp().replace("\\", "/")
+        L = lua()
+        L.execute(FAKES + r"""
+            DIR, ROLE = "D", "R"
+            package.loaded["mirror.link"].lobby = function() return { id = "SID", name = "NAME" } end
+            CARDS = {}
+            package.loaded["mirror.notify"] = { show = function(t) CARDS[#CARDS + 1] = t end, clear = function() end }
+            function opt(n) return obj({ sel = false, SetSelected = function(self, v) self.sel = v end, OptionName = n,
+                                        UpdateText = function(self, v) self.OptionName = v end,
+                                        RemoveFromParent = function(self) for i, k in ipairs(VB.kids) do if k == self then table.remove(VB.kids, i) end end end }) end
+            function arr(items) return { items = items, GetArrayNum = function(self) return #self.items end,
+                ForEach = function(self, fn) for i, e in ipairs(self.items) do fn(i, { get = function() return e end }) end end } end
+            OPTS = { opt("Open"), opt("Pick up"), opt("Move") }
+            VB = obj({ kids = {} })
+            for _, o in ipairs(OPTS) do VB.kids[#VB.kids + 1] = o end
+            VB.GetChildrenCount = function(self) return #self.kids end
+            VB.GetChildAt = function(self, i) return self.kids[i + 1] end
+            VB.AddChildToVerticalBox = function(self, w) self.kids[#self.kids + 1] = w; return { SetPadding = function() end } end
+            W = obj({ InteractOptions = VB, Options = arr(OPTS), ObjectName = { t = "Wooden Door", SetText = function(self, v) self.t = v end,
+                                                                          GetText = function(self) local t = self.t; return { ToString = function() return t end } end } })
+            function door(x, y) return obj({ GetClass = function() return cls("Buildable_WoodenDoor_C") end,
+                                             K2_GetActorLocation = function() return { X = x, Y = y, Z = 50 } end }) end
+            DOOR1, DOOR2, DOOR3 = door(1000, 2000), door(1400, 2000), door(5000, 5000)
+            -- (TraceToWorld: the game's camera trace; TRACE = what it hits now, nil = leave it as it is)
+            HELPER = obj({ CurrentTracActor = nil, CurrentInteractOptionIndex = 0,
+                           TraceToWorld = function(self) if TRACE ~= nil then self.CurrentTracActor = TRACE end end })
+            -- the helper's own option map (tag -> text, in key order), as TryInteract picks from it
+            function opts(list) return { ForEach = function(self, fn) for _, s in ipairs(list) do
+                fn({}, { get = function() return { ToString = function() return s end } end }) end end } end
+            HELPER.CurrentInteractOptions = opts({ "Open", "Pick up", "Move" })
+            -- the game's TryInteract in its real order: its camera trace (TRACE, else what the hover has), the option
+            -- at the index on a hit that is CurrentTracActor, Option1 on anything else - and only then the hook
+            -- (UE4SS runs it after the function). Returns the text of the option that ran, nil for none.
+            function real_press()
+                local hit, labels = TRACE or HELPER.CurrentTracActor, {}
+                HELPER.CurrentInteractOptions:ForEach(function(_, v) labels[#labels + 1] = v:get():ToString() end)
+                if hit == HELPER.CurrentTracActor then RAN = labels[HELPER.CurrentInteractOptionIndex + 1] else RAN = labels[1] end
+                HOOKS.TryInteract({ get = function() return HELPER end })
+                return RAN
+            end
+            PAD = nil
+            PC = obj({ MyHUD = { InteractWidget = W }, bShowMouseCursor = false,
+                       Pawn = { DisableInput = function() end, EnableInput = function() end } })
+            -- (ME_AT: where this player stands; nil = no spot to read)
+            package.loaded["mirror.game"] = { player = function() return { BP_JigHelperComp = HELPER,
+                                                  K2_GetActorLocation = ME_AT and function() return ME_AT end } end,
+                                              controller = function() return PC end, on_world_reset = function() end }
+            util = require("mirror.util")
+            HOOKS = {}
+            util.ensure_hook = function(p, fn) HOOKS[p:match(":(%w+)$")] = fn; return true end
+            util.cdo = function() return {
+                Create = function(_, pc, c)
+                    if c.path:find("KeypadUI", 1, true) then
+                        local code = ""
+                        PAD = obj({ AcceptedCode = 0, shown = false, CurrentCode = { ToString = function() return code end },
+                                    AddToViewport = function(self) self.shown = true end,
+                                    IsInViewport = function(self) return self.shown end,
+                                    RemoveFromParent = function(self) self.shown = false end })
+                        PAD.type = function(s) code = s end
+                        return PAD
+                    end
+                    return opt(nil)
+                end,
+                SetInputMode_GameAndUIEx = function() end, SetInputMode_GameOnly = function() end } end
+            StaticFindObject = function(p) return obj({ path = p }) end
+            FText = function(s) return s end
+            lock = require("mirror.doorlock")
+            SESSION = { in_world = function() return true end, data_file = function(n) return DIR .. "/" .. n end }
+            lock.init(SESSION, function() return DIR .. "/id.txt" end)
+            doors = require("mirror.doors")
+            LIVE = true
+            doors.init({ door_sync = false }, ROLE, SESSION, function() return LIVE end)
+            function tick(n) for i = 1, (n or 1) do util.new_frame(); doors.tick(0.05); lock.tick(0.2) end end
+            function look(d) HELPER.CurrentTracActor = d; tick(2) end
+            function press() HOOKS.TryInteract({ get = function() return HELPER end }); tick(2) end
+            -- scroll from the door's last option down onto ours (the menu wraps to 0 and our row takes that step)
+            function pick() HELPER.CurrentInteractOptionIndex = 2; tick(); HELPER.CurrentInteractOptionIndex = 0
+                            HOOKS.CycleOptions(nil, { get = function() return false end }); tick() end
+            function at(d) local l = d:K2_GetActorLocation(); return (lock.state_at(l)) end
+            function row() return VB.kids[4] and VB.kids[4].OptionName end
+        """.replace('"D"', '"%s"' % d).replace('"R"', '"%s"' % role).replace("SID", sid).replace("NAME", name))
+        return L, d
+    H, hd = side("host", "7656001", "Hosty")
+    G, gd = side("guest", "7656002", "Guesty")
+    last = {}
+    def pump():
+        for src, dst, name in ((H, G, "locks"), (G, H, "lock_g")):
+            b = src.eval('blobs_out["%s"]' % name)
+            if b is not None and last.get(name) != b:
+                last[name] = b
+                dst.execute('blobs_in["%s"] = ...' % name, b)
+        H.execute("tick(2)"); G.execute("tick(2)")
+
+    # the host builds a door while joined: it is the host's, open to all until the host sets a code
+    H.execute('lock.placed("Buildable_WoodenDoor_C", { X = 1003, Y = 1998, Z = 50 })')
+    pump(); pump()
+    check(H.eval('at(DOOR1)') == "unset" and G.eval('at(DOOR1)') == "open", "a placed door is its builder's, open while no code is set")
+    G.execute('look(DOOR1)')
+    check(G.eval('#VB.kids') == 3, "an open door of someone else gets no lock row")
+    # the host sets a code: Lock row -> keypad -> 4 digits
+    H.execute('look(DOOR1)')
+    check(H.eval('row()') == "Set door code", "the builder's door menu gets a code row (%s)" % H.eval('row()'))
+    H.execute('pick()')
+    check(H.eval('HELPER.CurrentInteractOptionIndex') == 3 and H.eval('VB.kids[4].sel') is True, "scrolling down past the last option selects it")
+    H.execute('press()')
+    check(H.eval('PAD ~= nil and PAD.shown') is True and H.eval('PAD.AcceptedCode') == 2147483647,
+          "picking it opens the game's keypad, its own code check parked out of reach")
+    H.execute('PAD.type("0472"); tick()')
+    check(H.eval('PAD.shown') is False and H.eval('at(DOOR1)') == "mine", "4 digits close the keypad and set the code")
+    saved = open(hd + "/mirror_coop_door_locks.txt").read()
+    check("0472" not in saved and ("C 7656001 " + H.eval('lock.hash("7656001", "0472")')) in saved
+          and "D 1003 1998 50 7656001" in saved, "the world's lock file keeps the door and a hash, never the code")
+    pump(); pump()
+    # the guest is locked out
+    G.execute('look(DOOR1)')
+    check(G.eval('at(DOOR1)') == "locked" and G.eval('row()') == "Enter code" and G.eval('HELPER.CurrentInteractOptionIndex') == 3,
+          "the guest sees the door locked: only an Enter code row, picked")
+    check(G.eval('W.ObjectName.t') == "Hosty's door - locked", "the hover title names the owner (%s)" % G.eval('W.ObjectName.t'))
+    G.execute('HELPER.CurrentInteractOptionIndex = 0; HOOKS.TryInteract({ get = function() return HELPER end })')
+    check(G.eval('HELPER.CurrentInteractOptionIndex') == 64, "pressing interact on the door's own option runs nothing (index far past the end)")
+    G.execute('tick(2)')
+    check(G.eval('PAD ~= nil and PAD.shown') is True, "...and opens the keypad to enter the code")
+    G.execute('PAD.type("1111"); tick()')
+    check(G.eval('at(DOOR1)') == "locked" and G.eval('CARDS[#CARDS]') == "Wrong code.", "a wrong code keeps it locked")
+    # E pressed just after turning to the door: the game's own trace hits it before its 0.4 s hover caught up
+    # (TryInteract runs Option1 = open on a hit that isn't CurrentTracActor)
+    G.execute('HELPER.CurrentTracActor = nil; HELPER.CurrentInteractOptionIndex = 0; TRACE = DOOR1; '
+              'HOOKS.TryInteract({ get = function() return HELPER end }); TRACE = nil')
+    check(G.eval('HELPER.CurrentTracActor == DOOR1') is True and G.eval('HELPER.CurrentInteractOptionIndex') == 64,
+          "a locked door the hover hasn't caught up with yet still runs nothing")
+    G.execute('HELPER.CurrentTracActor = DOOR3; HELPER.CurrentInteractOptionIndex = 0; TRACE = DOOR1; '
+              'HOOKS.TryInteract({ get = function() return HELPER end }); TRACE = nil')
+    check(G.eval('HELPER.CurrentTracActor == DOOR1') is True and G.eval('HELPER.CurrentInteractOptionIndex') == 64,
+          "...nor when the hover still has another thing")
+    G.execute('tick(2); if PAD and PAD.shown then PAD.shown = false end; tick(2)')
+    # the same in the game's real order, where the hook comes after the option ran (Sentinel R5 2026-10-31)
+    G.execute('look(DOOR1); HELPER.CurrentInteractOptionIndex = 0; tick()')
+    check(G.eval('real_press()') is None, "pressing interact on a locked door runs none of its options, the hook after it")
+    G.execute('tick(2); if PAD and PAD.shown then PAD.shown = false end; tick(2)')
+    G.execute('HELPER.CurrentTracActor = DOOR3; HELPER.CurrentInteractOptionIndex = 0; TRACE = DOOR1; tick()')
+    check(G.eval('real_press()') is None, "turned to a locked door a frame before pressing: nothing runs (%s)" % G.eval('RAN'))
+    G.execute('TRACE = nil; tick(2); if PAD and PAD.shown then PAD.shown = false end; tick(2)')
+    G.execute('PC.MyHUD.InteractWidget = nil; HELPER.CurrentTracActor = DOOR1; HELPER.CurrentInteractOptionIndex = 0; tick()')
+    check(G.eval('real_press()') is None, "before the game's hover menu is up a locked door still runs nothing (%s)" % G.eval('RAN'))
+    G.execute('PC.MyHUD.InteractWidget = W; W.ObjectName.t = "Wooden Door"; tick(2); if PAD and PAD.shown then PAD.shown = false end; tick(2)')
+    G.execute('press(); PAD.type("0472"); tick()')
+    check(G.eval('at(DOOR1)') == "access", "the right code opens it on the guest at once")
+    G.execute('tick(2)')
+    check(G.eval('W.ObjectName.t') == "Wooden Door", "the hover title loses its lock mark once the guest may open it (%s)"
+          % G.eval('W.ObjectName.t'))
+    check(" grant 7656001 7656002 " in G.eval('lock.ops_text()'), "the guest tells the host (%r)" % G.eval('lock.ops_text()'))
+    pump(); pump()
+    saved = open(hd + "/mirror_coop_door_locks.txt").read()
+    check("A 7656001 7656002" in saved, "the host keeps the guest's access in the world's file")
+    pump()   # (the guest sends on the tick after the keypad, so the host's answer is one round later)
+    check(G.eval('lock.ops_text()').count("\n") == 0, "once the host took it the guest stops sending it (%r, host sends %r)"
+          % (G.eval('lock.ops_text()'), (H.eval('blobs_out["locks"]') or "")[:12]))
+    G.execute('tick(2)')
+    check(G.eval('#VB.kids') == 3 and G.eval('at(DOOR1)') == "access", "the lock row goes; the door's own options are back")
+    # all of the owner's doors
+    H.execute('lock.placed("Buildable_WoodenDoor_C", { X = 1400, Y = 2000, Z = 50 })')
+    pump(); pump()
+    check(G.eval('at(DOOR2)') == "access", "the code covers the owner's other doors, built later too")
+    # replays and forged changes do nothing
+    gen0 = H.eval('lock.gen()')
+    blob = G.eval('blobs_out["lock_g"]')
+    H.execute('blobs_in["lock_g"] = ...', blob); H.execute('tick(2)')
+    check(H.eval('lock.gen()') == gen0, "the guest's changes sent again change nothing")
+    H.execute('seen2 = {}; lock.take_ops("run x\\n1 grant 7656001 9999 00000000\\n2 code 7656001 ffffffff\\n'
+              '3 grant 7656001 7656002 ffffffff", seen2)')
+    saved = open(hd + "/mirror_coop_door_locks.txt").read()
+    check(H.eval('lock.gen()') == gen0 and "A 7656001 9999" not in saved and H.eval('lock.hash("7656001", "0472")') in saved,
+          "a grant with the wrong hash and a code change in the host's name are refused")
+    # one connection is one player, whatever run it names; the next connection (seen starts over) is its own player
+    H.execute('seen3 = {}; lock.take_ops("run a\\n1 code 111 aaaaaaaa", seen3); lock.take_ops("run b\\n1 code 222 bbbbbbbb", seen3)')
+    saved = open(hd + "/mirror_coop_door_locks.txt").read()
+    check("C 111 aaaaaaaa" in saved and "C 222" not in saved, "a guest can't become another player by naming a new run")
+    H.execute('seen4 = {}; lock.take_ops("run b\\n1 code 222 bbbbbbbb\\n2 code 333 cccccccc", seen4)')
+    saved = open(hd + "/mirror_coop_door_locks.txt").read()
+    check("C 222 bbbbbbbb" in saved and "C 333" not in saved, "the next connection is its own player, and stays one")
+    # a guest can't build its way into someone else's door, nor fill the list until real owners' doors drop off
+    H.execute('seen5 = {}; lock.take_ops("run q\\n1 place 7656002 1400 2000 50\\n2 claim 7656002 1003 1998 50", seen5)')
+    check(H.eval('at(DOOR2)') == "mine" and H.eval('at(DOOR1)') == "mine", "a guest's build over the host's door leaves it the host's")
+    H.execute('local t = { "run z" }; for i = 1, 600 do t[#t + 1] = i .. " place 999 " .. (20000 + i * 100) .. " 0 0" end; '
+              'seen6 = {}; lock.take_ops(table.concat(t, "\\n"), seen6)')
+    saved = open(hd + "/mirror_coop_door_locks.txt").read()
+    check(saved.count(" 999\n") + saved.endswith(" 999") <= 500 and H.eval('at(DOOR1)') == "mine",
+          "one guest owns at most a quarter of the list (%d)" % saved.count(" 999\n"))
+    H.execute('S = { codes = {}, doors = {}, access = {}, names = {} }; '
+              'for i = 1, 2001 do lock._apply_op(S, "place", "o" .. i, tostring(i * 100), "0", "0") end')
+    check(H.eval('#S.doors') == 2000 and H.eval('S.doors[1].owner') == "o1", "a full list takes no new door rather than drop the oldest")
+    # an ack the host meant for another guest game doesn't drop this game's unsent changes
+    G.execute('lock.placed("Buildable_WoodenDoor_C", { X = 9000, Y = 9000, Z = 50 })')
+    q = G.eval('lock.ops_text()')
+    run = q.split("\n")[0].split(" ")[1]
+    body = H.eval('blobs_out["locks"]').split("\n", 1)[1]
+    G.execute('lock.take(...)', "ack 999 other\n" + body)
+    check(G.eval('lock.ops_text()') == q, "an ack for another guest game drops nothing (%r)" % G.eval('lock.ops_text()'))
+    G.execute('lock.take(...)', "ack 999 %s\n" % run + body)
+    check(G.eval('lock.ops_text()').count("\n") == 0, "an ack for this game drops what it covers (%r)" % G.eval('lock.ops_text()'))
+    G.execute('lock.take(nil)')
+    # the host's ack names the guest game and starts over when the guest goes
+    pump()
+    check((H.eval('blobs_out["locks"]') or "").startswith("ack ") and run in H.eval('blobs_out["locks"]').split("\n")[0],
+          "the host's locks name the guest game their ack is for (%r)" % H.eval('blobs_out["locks"]').split("\n")[0])
+    H.execute('LIVE = false; tick(); LIVE = true; tick()')
+    check(H.eval('blobs_out["locks"]').split("\n")[0] == "ack 0", "after the guest left the host's ack starts over (%r)"
+          % H.eval('blobs_out["locks"]').split("\n")[0])
+    pump(); pump()
+    # the guest's own door
+    G.execute('lock.placed("Buildable_WoodenGate_C", { X = 5000, Y = 5000, Z = 50 })')
+    check(G.eval('at(DOOR3)') == "unset", "the guest's own build is the guest's straight away")
+    pump(); pump()
+    check(H.eval('at(DOOR3)') == "open", "and the host sees it as the guest's")
+    G.execute('look(DOOR3); pick(); press(); PAD.type("8080"); tick()')
+    pump(); pump()
+    H.execute('look(DOOR3)')
+    check(H.eval('at(DOOR3)') == "locked" and H.eval('row()') == "Enter code", "the guest's code locks the host out of the guest's doors")
+    H.execute('look(DOOR1)')
+    check(H.eval('at(DOOR1)') == "mine" and H.eval('row()') == "Change door code", "the host's own doors stay the host's")
+    # a restart: the file brings it all back
+    H.execute('lock.forget()')
+    check(H.eval('at(DOOR1)') == "mine" and H.eval('at(DOOR3)') == "locked", "after a world reload the locks come back from the file")
+    # the guest goes home in the frame it built a door: the door is still the guest's in the host's world, and the
+    # guest counts it unconfirmed (the leave keeps the link for it) until the host took it
+    G.execute('lock.placed("Buildable_WoodenDoor_C", { X = 6000, Y = 6000, Z = 50 }); SESSION.in_world = function() return false end')
+    check(G.eval('lock.unconfirmed()') > 0, "a change the host hasn't taken counts as unconfirmed (%r)" % G.eval('lock.ops_text()'))
+    pump(); pump(); pump()
+    saved = open(hd + "/mirror_coop_door_locks.txt").read()
+    check("D 6000 6000 50 7656002" in saved, "a door built just before going home still lands in the host's file as the guest's")
+    check(G.eval('lock.unconfirmed()') == 0 and G.eval('at(DOOR1)') == "free",
+          "...the host's ack read at home clears it, the guest going by its own locks (%s)" % G.eval('lock.unconfirmed()'))
+    G.execute('SESSION.in_world = function() return true end'); pump(); pump()
+    # the guest leaves: back to its own world's locks
+    G.execute('lock.placed("Buildable_WoodenDoor_C", { X = 7000, Y = 7000, Z = 50 })')
+    check(G.eval('lock.ops_text()').count("\n") > 0, "(a change the host hasn't taken yet)")
+    G.execute('LIVE = false; tick()')
+    check(G.eval('at(DOOR1)') == "free", "a guest back alone goes by its own world's locks")
+    check(G.eval('lock.ops_text()').count("\n") == 0, "what the host never took isn't sent to the next host")
+    # moved and removed doors
+    H.execute('lock.moved({ X = 1003, Y = 1998, Z = 50 }, { X = 1200, Y = 2600, Z = 50 })')
+    check(H.eval('(lock.state_at({ X = 1200, Y = 2600, Z = 50 }))') == "mine" and H.eval('at(DOOR1)') == "free",
+          "a moved door keeps its lock")
+    H.execute('lock.gone({ X = 1200, Y = 2600, Z = 50 })')
+    check(H.eval('lock.state_at({ X = 1200, Y = 2600, Z = 50 })') == "free", "a removed door leaves the file")
+    check(G.eval('lock.loc_of_id("Buildable_WoodenDoor_C@100,200,5").X') == 1000, "a builds id reads back as its place")
+    # an id kept from a start without Steam stays: the doors and code filed under it are still this player's
+    K, kd = side("host", "7656009", "Kay")
+    with open(kd + "/id.txt", "w") as f:
+        f.write("p12345678\n")
+    check(K.eval('lock.me()') == "p12345678" and open(kd + "/id.txt").read().strip() == "p12345678",
+          "a kept id beats a Steam id read later (%s)" % K.eval('lock.me()'))
+
+    # User 2026-10-31: "add a remove permissions button that removes peoples access too the door so for when changing
+    # the code etc you can remove there access then change the code"; "other players cannot move or pickup others
+    # buildables unless they have key door access and removing access removes building/ pickup perms near there
+    # buildables"; "add the same lock feature too containers". A fresh host + guest pair.
+    print("door_locks_remove_access_guard_the_base_and_cover_containers")
+    H, hd = side("host", "7656001", "Hosty")
+    G, gd = side("guest", "7656002", "Guesty")
+    last.clear()
+    for L in (H, G):
+        L.execute(r"""
+            function thing(cname, x, y, extra)
+                local t = { GetClass = function() return cls(cname) end,
+                            K2_GetActorLocation = function() return { X = x, Y = y, Z = 50 } end }
+                for k, v in pairs(extra or {}) do t[k] = v end
+                return obj(t)
+            end
+            BC_CLS = { ["Buildable_MASTER_C"] = true }
+            CRATE = thing("Buildable_StorageCrate_C", 1600, 2000)
+            WALL = thing("Base_wood_wall_C", 1800, 2300, { IsA = function(self, c) return c.path:find("Buildable_MASTER", 1, true) ~= nil end })
+            FAR_WALL = thing("Base_wood_wall_C", 90000, 90000, { IsA = function(self, c) return c.path:find("Buildable_MASTER", 1, true) ~= nil end })
+            -- looking at a with these options, idx picked, a frame, then E: the text of the option that ran, or nil
+            function try_on(a, list, idx)
+                HELPER.CurrentTracActor = a; HELPER.CurrentInteractOptions = opts(list); HELPER.CurrentInteractOptionIndex = idx
+                TRACE = nil; tick(); return real_press()
+            end
+            -- the building component after the game's BuildCycle made the ghost green
+            COMP = obj({ ["BuildModeOn?"] = true, CanBuild = true, BuildTransform = { Translation = { X = 0, Y = 0, Z = 50 } },
+                         GiveBuildColour = function(self, g) self.CanBuild = g end })
+            function ghost_at(x, y)
+                COMP.CanBuild = true; COMP.BuildTransform.Translation = { X = x, Y = y, Z = 50 }
+                HOOKS.BuildCycle({ get = function() return COMP end }); return COMP.CanBuild
+            end
+        """)
+    H.execute('lock.placed("Buildable_WoodenDoor_C", { X = 1003, Y = 1998, Z = 50 })')
+    H.execute('look(DOOR1); pick(); press(); PAD.type("0472"); tick()')
+    pump(); pump()
+    # containers lock like doors
+    H.execute('lock.placed("Buildable_StorageCrate_C", { X = 1600, Y = 2000, Z = 50 })')
+    pump(); pump()
+    check(H.eval('at(CRATE)') == "mine" and G.eval('at(CRATE)') == "locked", "a container its builder placed is locked by the same code")
+    G.execute('look(CRATE)')
+    check(G.eval('row()') == "Enter code" and G.eval('W.ObjectName.t') == "Hosty's container - locked",
+          "the guest's container menu has only Enter code, titled as a container (%s)" % G.eval('W.ObjectName.t'))
+    check(G.eval('try_on(CRATE, {"Open", "Pick up", "Move"}, 0)') is None, "opening a locked container runs nothing")
+    G.execute('tick(2); if PAD and PAD.shown then PAD.shown = false end; look(nil); tick(2)')
+    # the base is guarded: no pick-up, move or building near the owner's locks
+    check(G.eval('try_on(WALL, {"Pickup", "Move"}, 0)') is None and G.eval('try_on(WALL, {"Pickup", "Move"}, 1)') is None,
+          "the owner's base pieces don't pick up or move for a player without the code (%s)" % G.eval('RAN'))
+    check(G.eval('try_on(WALL, {"Open", "Pickup"}, 0)') == "Open", "other options of a base piece still run")
+    check(G.eval('try_on(WALL, {"Pick up", "Move", "Rotate"}, 0)') == "Rotate",
+          "a guarded option is stepped over to the next one the player may use (%s)" % G.eval('RAN'))
+    G.execute('HOOKS.CycleOptions(nil, { get = function() return true end })')
+    check(G.eval('try_on(WALL, {"Rotate", "Pick up", "Move", "Open"}, 2)') == "Rotate",
+          "...upwards when the player scrolls up (%s)" % G.eval('RAN'))
+    G.execute('HOOKS.CycleOptions(nil, { get = function() return false end })')
+    check(G.eval('try_on(FAR_WALL, {"Pickup", "Move"}, 0)') == "Pickup", "far from any lock pieces pick up as before")
+    # away from the host's base the guard doesn't run at all: no camera trace every frame (perf, user 2026-10-31)
+    G.execute('TRACES = 0; HELPER.TraceToWorld = function(self) TRACES = TRACES + 1; if TRACE ~= nil then self.CurrentTracActor = TRACE end end')
+    G.execute('ME_AT = { X = 90000, Y = 90000, Z = 50 }; HELPER.CurrentTracActor = FAR_WALL; tick(3); TRACES = 0; tick(10)')
+    check(G.eval('TRACES') == 0, "away from other players' bases the guard runs no trace (%s)" % G.eval('TRACES'))
+    G.execute('ME_AT = { X = 1700, Y = 2100, Z = 50 }; tick(2); TRACES = 0; tick(10)')
+    check(G.eval('TRACES') == 10, "walking into reach of the base the guard runs every frame again (%s)" % G.eval('TRACES'))
+    check(G.eval('try_on(WALL, {"Pickup", "Move"}, 0)') is None, "...and still stops Pick up there")
+    G.execute('ME_AT = nil; HELPER.TraceToWorld = function(self) if TRACE ~= nil then self.CurrentTracActor = TRACE end end; tick(2)')
+    check(G.eval('ghost_at(1500, 2500)') is False and G.eval('ghost_at(90000, 90000)') is True,
+          "the build ghost turns red in the owner's base, and only there")
+    G.execute('COMP["ReplacingObject?"] = true; COMP.ReplacingActor = WALL')
+    check(G.eval('ghost_at(90000, 90000)') is False, "a piece moved out of the owner's base stays red outside it too")
+    G.execute('COMP["ReplacingObject?"] = false; COMP.ReplacingActor = nil')
+    check(H.eval('ghost_at(1500, 2500)') is True and H.eval('try_on(WALL, {"Pickup", "Move"}, 0)') == "Pickup",
+          "the owner builds and picks up in their own base")
+    check(G.eval('lock._build_op("Pick Up")') and G.eval('lock._build_op("Move")') and not G.eval('lock._build_op("Open")'),
+          "pick up and move are the guarded options, open isn't")
+    # a base of the guest's own next to the host's stays the guest's to build in
+    G.execute('lock.placed("Buildable_WoodenDoor_C", { X = 4700, Y = 2000, Z = 50 })')
+    check(G.eval('ghost_at(4300, 2000)') is True, "next to its own lock the guest builds even inside the owner's zone")
+    # ...but a lock set down inside the owner's base doesn't carry the next build further in
+    G.execute('lock.placed("Buildable_WoodenDoor_C", { X = 3800, Y = 2000, Z = 50 })')
+    check(G.eval('ghost_at(3000, 2000)') is False, "a lock placed inside someone's base doesn't make the spots past it the guest's")
+    # the class of a just-placed door or container comes from the actor standing there
+    G.execute('FindAllOf = function(c) if c == "Buildable_StorageCrate_C" then return { CRATE } end return {} end')
+    check(G.eval('lock.class_at({ X = 1610, Y = 2000, Z = 50 }, "/Game/Inventory/Items/DataAssets/Buildable/Storage/DA_StorageCrate1.DA_StorageCrate1")')
+          == "Buildable_StorageCrate_C" and G.eval('lock.class_at({ X = 1610, Y = 2000, Z = 50 }, "/Game/X/DoorsAndGates/DA_WoodenDoor1.DA_WoodenDoor1")') is None
+          and G.eval('lock.class_at({ X = 1610, Y = 2000, Z = 50 }, "/Game/X/Walls/DA_Wall.DA_Wall")') is None,
+          "a placed container's class is read off the actor at its spot")
+    # the guest types the code: all of it opens up
+    G.execute('look(DOOR1); press(); PAD.type("0472"); tick(); look(nil); tick(2)')
+    pump(); pump(); pump()
+    check(G.eval('at(CRATE)') == "access" and G.eval('try_on(WALL, {"Pickup", "Move"}, 0)') == "Pickup" and G.eval('ghost_at(1500, 2500)') is True,
+          "with the code the guest opens the container, picks up and builds in the base")
+    # the owner's door now shows Remove access
+    H.execute('look(DOOR1)')
+    check(H.eval('VB.kids[4] and VB.kids[4].OptionName') == "Change door code" and H.eval('VB.kids[5] and VB.kids[5].OptionName') == "Remove access (1)",
+          "the owner's door shows Remove access with the count (%s / %s)" % (H.eval('VB.kids[4] and VB.kids[4].OptionName'),
+                                                                                H.eval('VB.kids[5] and VB.kids[5].OptionName')))
+    # scrolling: last game option -> our first row -> our second row; and back up
+    H.execute('HELPER.CurrentInteractOptionIndex = 2; tick(); HELPER.CurrentInteractOptionIndex = 0; '
+              'HOOKS.CycleOptions(nil, { get = function() return false end }); tick()')
+    check(H.eval('HELPER.CurrentInteractOptionIndex') == 3, "scrolling down past the game's options lands on the first row")
+    H.execute('HELPER.CurrentInteractOptionIndex = 0; HOOKS.CycleOptions(nil, { get = function() return false end }); tick()')
+    check(H.eval('HELPER.CurrentInteractOptionIndex') == 4 and H.eval('VB.kids[5].sel') is True and H.eval('VB.kids[4].sel') is False,
+          "one more step lands on Remove access, the only row selected")
+    H.execute('HELPER.CurrentInteractOptionIndex = 0; HOOKS.CycleOptions(nil, { get = function() return true end }); tick()')
+    check(H.eval('HELPER.CurrentInteractOptionIndex') == 3, "scrolling up from Remove access goes back to the code row")
+    H.execute('HOOKS.CycleOptions(nil, { get = function() return false end }); HELPER.CurrentInteractOptionIndex = 0; tick()')
+    H.execute('HELPER.CurrentInteractOptionIndex = 4; tick(); press(); tick(2)')
+    check(H.eval('at(DOOR1)') == "mine" and H.eval('PAD == nil or not PAD.shown') is True
+          and "A 7656001 7656002" not in open(hd + "/mirror_coop_door_locks.txt").read(),
+          "picking Remove access takes the guest's access off the world's file, no keypad")
+    check(H.eval('#VB.kids') == 4, "with nobody left to remove the row goes (%d rows)" % H.eval('#VB.kids'))
+    pump(); pump()
+    check(G.eval('at(DOOR1)') == "locked" and G.eval('at(CRATE)') == "locked" and G.eval('try_on(WALL, {"Pickup"}, 0)') is None
+          and G.eval('ghost_at(1500, 2500)') is False, "the guest is locked out of the doors, the container and the base again")
+    # a guest owner removes access too: its revoke goes through the host
+    H.execute('seen9 = {}; lock.take_ops("run g\\n1 code 7656002 " .. lock.hash("7656002", "1234") .. "\\n2 place 7656002 9000 9000 50", seen9)')
+    H.execute('seen10 = {}; lock.take_ops("run h\\n1 grant 7656002 777 " .. lock.hash("7656002", "1234"), seen10)')
+    check("A 7656002 777" in open(hd + "/mirror_coop_door_locks.txt").read(), "(a third player has the guest's code)")
+    H.execute('lock.take_ops("run g\\n3 revoke 7656002", seen9)')
+    check("A 7656002 777" not in open(hd + "/mirror_coop_door_locks.txt").read(), "a guest's Remove access reaches the host's file")
+    H.execute('S2 ={ codes = {}, doors = {}, access = { o = { p = true } }, names = {} }')
+    check(H.eval('lock._apply_op(S2, "revoke", "o")') is True and H.eval('lock._apply_op(S2, "revoke", "o")') is False,
+          "a revoke applied twice changes nothing the second time")
+    H.execute('lock.take_ops("run x\\n1 grant 7656001 7656003 " .. lock.hash("7656001", "0472"), {})')
+    before = open(hd + "/mirror_coop_door_locks.txt").read()
+    H.execute('lock.take_ops("run y\\n1 revoke 7656001", {})')
+    check("A 7656001 7656003" in open(hd + "/mirror_coop_door_locks.txt").read() and "A 7656001 7656003" in before,
+          "a guest can't remove access in the host's name")
+
+
+def all_players_must_sleep_before_the_night_is_skipped():
+    # User 2026-10-30: "sleeping bags sync for everyone when 1 person sleeps" -> "Feature: all must sleep".
+    # The game's sleep (SleepingUI_C) runs the sky's Transition Time of Day(650, 2.0, 7, 2.0, false); joined, one
+    # sleeping host skipped the night for all. Blueprint hooks run before the function: the hook changes its target.
+    print("all_players_must_sleep_before_the_night_is_skipped")
+    def side(role):
+        L = lua()
+        L.execute(FAKES + r"""
+            NOW = 0; os.clock = function() return NOW end
+            util = require("mirror.util")
+            HOOK = nil
+            util.ensure_hook = function(p, fn) if p:find(":Transition Time of Day", 1, true) then HOOK = fn end; return true end
+            CARDS = {}
+            package.loaded["mirror.notify"] = { show = function(t) CARDS[#CARDS + 1] = t end, clear = function() end }
+            AT = { X = 0, Y = 0, Z = 0 }
+            PLAYER = obj({ K2_GetActorLocation = function() return AT end })
+            package.loaded["mirror.game"] = { player = function() return PLAYER end }
+            function P(v) local box = { v = v }; return { get = function() return box.v end, set = function(_, x) box.v = x end } end
+            MOVES = {}
+            SKY = obj({ ["Time of Day"] = 2300.0, GetFullName = function() return "Ultra_Dynamic_Sky_C /Game/M.M:P.Ultra_Dynamic_Sky_2" end })
+            -- kit 2026-10-31: the hook runs AFTER the function, which has already stored its target in Transition Time B
+            -- (the clock went 54 -> 655 with only the argument changed): what the sky eases to is that stored target
+            local function run(self, t, d)
+                local np = P(t)
+                self["Transition Time B"], self["Transitioning Time"] = t, true
+                if HOOK then HOOK({ get = function() return self end }, np, P(d)) end
+                return self["Transition Time B"]
+            end
+            SKY["Transition Time of Day"] = function(self, t, d) MOVES[#MOVES + 1] = run(self, t, d) end
+            FindAllOf = function(c) if c == "Ultra_Dynamic_Sky_C" then return { SKY } end return {} end
+            -- the game's sleep button: where the sky is told to go
+            function GAME_SLEEP() return run(SKY, 650.0, 2.0) end
+            function OTHER_TRANSITION() return run(SKY, 1200.0, 5.0) end
+            -- (like the real link: a blob stays, and is handed out only when its text changed - until reset_blob)
+            SEEN = {}
+            package.loaded["mirror.link"].get_blob = function(n)
+                local b = blobs_in[n]
+                if b == nil or b == SEEN[n] then return nil end
+                SEEN[n] = b
+                return b
+            end
+            package.loaded["mirror.link"].reset_blob = function(n) SEEN[n] = nil end
+            LIVE = true
+            sleep = require("mirror.sleep")
+            sleep.init("ROLE", function() return LIVE end)
+            function tick(s) NOW = NOW + (s or 0.6); sleep.tick(s or 0.6) end
+            tick()
+        """.replace("ROLE", role))
+        return L
+    H, G = side("host"), side("guest")
+    def pump():
+        for n in ("slp_h",):
+            v = H.eval('blobs_out["%s"]' % n)
+            if v is not None: G.execute('blobs_in["%s"] = %r' % (n, v)); H.execute('blobs_out["%s"] = nil' % n)
+        v = G.eval('blobs_out["slp_g"]')
+        if v is not None: H.execute('blobs_in["slp_g"] = %r' % v); G.execute('blobs_out["slp_g"] = nil')
+    def turn():
+        pump(); H.execute("tick()"); G.execute("tick()"); pump(); H.execute("tick()"); G.execute("tick()")
+    turn()
+    H.execute("LIVE = false; tick()")
+    check(H.eval("GAME_SLEEP()") == 650.0, "alone, the game's sleep skips the night as before")
+    H.execute("LIVE = true; tick()")
+    check(abs(H.eval("GAME_SLEEP()") - 2300.01) < 0.001, "joined, the host's sleep is held: the sky stays at its time")
+    check(H.eval("OTHER_TRANSITION()") == 1200.0, "a time change that isn't the sleep is left alone")
+    turn()
+    check(H.eval("#MOVES") == 0, "one of two asleep: no morning on the host")
+    check(any("1 of 2 players asleep" in (G.eval("CARDS[%d]" % i) or "") for i in range(1, G.eval("#CARDS") + 1)),
+          "the guest is told 1 of 2 players are asleep")
+    H.execute("AT = { X = 500, Y = 0, Z = 0 }"); turn()
+    check(H.eval("sleep._shared.me") is None, "walking away from the bed wakes the host")
+    H.execute("AT = { X = 0, Y = 0, Z = 0 }"); H.execute("GAME_SLEEP()")
+    check(abs(G.eval("GAME_SLEEP()") - 2300.01) < 0.001, "the guest's sleep is held too")
+    turn(); turn()
+    check(H.eval("#MOVES") == 1 and H.eval("MOVES[1]") == 650.0, "both asleep: the host's sky goes to morning once (%s)" % H.eval("#MOVES"))
+    check(G.eval("#MOVES") == 1 and G.eval("MOVES[1]") == 650.0, "and the guest's sky goes the same way (%s)" % G.eval("#MOVES"))
+    check(H.eval("sleep._shared.me") is None and G.eval("sleep._shared.me") is None, "everyone is awake after the night")
+    turn(); turn(); turn()
+    check(H.eval("#MOVES") == 1 and G.eval("#MOVES") == 1, "the night is skipped only once")
+    G.execute("GAME_SLEEP()"); turn(); turn()
+    check(H.eval("#MOVES") == 1, "the next night the guest's \"asleep\" alone skips nothing")
+    # the host's link stalls (15 s without a word) and comes back; the guest never noticed and sends nothing new
+    H.execute("LIVE = false; tick(); LIVE = true"); turn()
+    H.execute("GAME_SLEEP()"); turn(); turn()
+    check(H.eval("#MOVES") == 2, "after a stall the guest still counts as asleep: the host's sleep brings morning (%s)" % H.eval("#MOVES"))
+    # the other player leaves while I sleep: woken, told so
+    turn(); H.execute("GAME_SLEEP()"); turn()
+    check(H.eval("sleep._shared.me") is not None, "(the host asleep, the guest awake)")
+    H.execute("LIVE = false; tick()")
+    check(H.eval("sleep._shared.me") is None and "left - you're awake" in H.eval("CARDS[#CARDS]"),
+          "the other player leaves while I sleep: I'm awake and told so (%s)" % H.eval("CARDS[#CARDS]"))
+    # a guest that never says (an older build): after 10 s it doesn't hold the night
+    H.execute("blobs_in.slp_g = nil; LIVE = true; tick(); GAME_SLEEP(); tick(); M0 = #MOVES")
+    check(H.eval("#MOVES") == H.eval("M0"), "a guest that hasn't said yet counts as awake at first")
+    H.execute("for i = 1, 20 do tick() end")
+    check(H.eval("#MOVES") == H.eval("M0") + 1, "a guest silent for 10 s doesn't hold the night (%s)" % (H.eval("#MOVES") - H.eval("M0")))
+    H.execute("tick(); GAME_SLEEP(); for i = 1, 3 do tick() end")
+    check(H.eval("#MOVES") == H.eval("M0") + 2, "...nor the next night (%s)" % (H.eval("#MOVES") - H.eval("M0")))
+    # the hook's change didn't take: not marked asleep (the later morning would be a whole day on)
+    H.execute("tick(); BAD = setmetatable({}, { __index = { ['Time of Day'] = 2300.0, ['Transitioning Time'] = true, ['Transition Time B'] = 650.0 },"
+              " __newindex = function() error('read only') end })"
+              "; HOOK({ get = function() return BAD end }, { get = function() return 650.0 end, set = function() end }, P(2.0))")
+    check(H.eval("sleep._shared.me") is None, "a hold that didn't take marks nobody asleep")
+
+    # three players: the host has a copy of sleep.lua per guest link; they count together through peers.shared
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        util = require("mirror.util")
+        util.ensure_hook = function(p, fn) HOOK = HOOK or fn; return true end
+        package.loaded["mirror.game"] = { player = function() return obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end }) end }
+        function P(v) local box = { v = v }; return { get = function() return box.v end, set = function(_, x) box.v = x end } end
+        MOVES = {}
+        SKY = obj({ ["Time of Day"] = 100.0, GetFullName = function() return "Ultra_Dynamic_Sky_C /Game/M.M:P.S" end })
+        local function run(self, t, d)
+            local np = P(t)
+            self["Transition Time B"], self["Transitioning Time"] = t, true   -- (the hook runs after the function: kit 2026-10-31)
+            if HOOK then HOOK({ get = function() return self end }, np, P(d)) end
+            return self["Transition Time B"]
+        end
+        SKY["Transition Time of Day"] = function(self, t, d) MOVES[#MOVES + 1] = run(self, t, d) end
+        FindAllOf = function(c) if c == "Ultra_Dynamic_Sky_C" then return { SKY } end return {} end
+        function GAME_SLEEP() return run(SKY, 650.0, 2.0) end
+        LINKS, COPIES = {}, {}
+        for i = 1, 2 do
+            local l = { out = {}, inn = {} }
+            l.put_blob = function(n, b) l.out[n] = b end
+            l.get_blob = function(n) local b = l.inn[n]; l.inn[n] = nil; return b end
+            LINKS[i] = l
+            package.loaded["mirror.link"] = l
+            package.loaded["mirror.sleep"] = nil
+            COPIES[i] = require("mirror.sleep")
+            COPIES[i].init("host", function() return true end)
+        end
+        function tick() NOW = NOW + 0.6; for i = 1, 2 do COPIES[i].tick(0.6) end end
+        tick()
+    """)
+    L.execute('GAME_SLEEP(); LINKS[1].inn.slp_g = "1"; tick(); tick()')
+    check(L.eval("#MOVES") == 0 and L.eval('LINKS[2].out.slp_h') == "2 3 0",
+          "three players, two asleep: no morning, and the third is told 2 of 3 (%s)" % L.eval('LINKS[2].out.slp_h'))
+    L.execute('LINKS[2].inn.slp_g = "1"; tick(); tick()')
+    check(L.eval("#MOVES") == 1 and L.eval("MOVES[1]") == 650.0, "the third goes to sleep: one morning (%s)" % L.eval("#MOVES"))
+    check(str(L.eval('LINKS[1].out.slp_h')).endswith(" 1") and str(L.eval('LINKS[2].out.slp_h')).endswith(" 1"),
+          "both guests are told the night is over (%s, %s)" % (L.eval('LINKS[1].out.slp_h'), L.eval('LINKS[2].out.slp_h')))
+
+
+def sleeping_screen_stays_until_everyone_sleeps():
+    # User 2026-10-31: "when player sleeps make it so the sleeping screen stays on untill the other players sleep too,
+    # add some text that says Move too cancel sleep". SleepingUI_C's sleep button shows SleepingText and calls Exit
+    # (screen off, input back) 2.5 s later: while the night is held the screen is put back up.
+    print("sleeping_screen_stays_until_everyone_sleeps")
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        util = require("mirror.util")
+        util.ensure_hook = function(p, fn) HOOK = fn; return true end
+        package.loaded["mirror.notify"] = { show = function() end, clear = function() end }
+        AT = { X = 0, Y = 0, Z = 0 }
+        package.loaded["mirror.game"] = { player = function() return obj({ K2_GetActorLocation = function() return AT end }) end }
+        function P(v) local box = { v = v }; return { get = function() return box.v end, set = function(_, x) box.v = x end } end
+        MOVES = {}
+        SKY = obj({ ["Time of Day"] = 2300.0, GetFullName = function() return "Ultra_Dynamic_Sky_C /Game/M.M:P.S" end })
+        local function run(self, t, d)
+            self["Transition Time B"], self["Transitioning Time"] = t, true
+            if HOOK then HOOK({ get = function() return self end }, P(t), P(d)) end
+            return self["Transition Time B"]
+        end
+        SKY["Transition Time of Day"] = function(self, t, d) MOVES[#MOVES + 1] = run(self, t, d) end
+        FText = function(s) return { s = s } end
+        ADDS = 0
+        TEXT = obj({ SetText = function(_, t) SHOWN_TEXT = t.s end, SetVisibility = function(_, v) TEXT_VIS = v end })
+        CHOICES = obj({ SetVisibility = function(_, v) CHOICES_VIS = v end })
+        UI = obj({ inview = true, SleepingText = TEXT, Choices = CHOICES, BlurAnim = {},
+                   IsInViewport = function(self) return self.inview end,
+                   AddToViewport = function(self) self.inview = true; ADDS = ADDS + 1 end,
+                   RemoveFromParent = function(self) self.inview = false end,
+                   PlayAnimationForward = function() BLUR = true end })
+        FindAllOf = function(c)
+            if c == "Ultra_Dynamic_Sky_C" then return { SKY } end
+            if c == "SleepingUI_C" then return { UI } end
+            return {}
+        end
+        function GAME_SLEEP() UI.inview = true; return run(SKY, 650.0, 2.0) end
+        sleep = require("mirror.sleep")
+        sleep.init("host", function() return true end)
+        blobs_in.slp_g = "0"
+        function tick(s) NOW = NOW + (s or 0.6); sleep.tick(s or 0.6) end
+        tick()
+    """)
+    L.execute("GAME_SLEEP(); tick()")
+    check(L.eval("MOVES[1]") != 650.0 and "Move to cancel sleep" in (L.eval("SHOWN_TEXT") or ""),
+          "held: the game's sleeping screen says Move to cancel sleep (%r)" % L.eval("SHOWN_TEXT"))
+    check("Waiting for 1 more player to sleep" in L.eval("SHOWN_TEXT"), "and how many are still awake")
+    # the game's own Exit 2.5 s after the button
+    L.execute("tick(1.0); tick(1.0); UI.inview = false; tick(0.016)")
+    check(L.eval("UI.inview") is True and L.eval("ADDS") == 1 and L.eval("CHOICES_VIS") == 2 and L.eval("TEXT_VIS") == 4,
+          "the game takes its screen down: put straight back up, choices hidden, the text shown")
+    check("Move to cancel sleep" in L.eval("SHOWN_TEXT"), "with the text again")
+    L.execute("for i = 1, 10 do tick() end")
+    check(L.eval("UI.inview") is True and L.eval("sleep._shared.me") is not None, "it stays while the other player is awake")
+    # a step cancels: awake, screen off at once
+    L.execute("AT = { X = 80, Y = 0, Z = 0 }; tick()")
+    check(L.eval("sleep._shared.me") is None and L.eval("UI.inview") is False, "a step (80 cm): awake and the screen goes")
+    L.execute("for i = 1, 3 do tick() end")
+    check(L.eval("ADDS") == 1, "and it isn't put back")
+    # asleep again, then everyone is: morning, the screen stays while the sky moves, then goes
+    L.execute("AT = { X = 0, Y = 0, Z = 0 }; GAME_SLEEP(); tick(); tick(1.0); tick(1.0); UI.inview = false; tick(0.016)")
+    check(L.eval("ADDS") == 2, "asleep again: put back after the game's Exit again")
+    L.execute('blobs_in.slp_g = "1"; tick(0.6)')
+    check(L.eval("#MOVES") >= 1 and L.eval("MOVES[#MOVES]") == 650.0 and L.eval("UI.inview") is True,
+          "everyone asleep: morning, and the screen is still up as the sky moves")
+    L.execute("tick(1.0); tick(1.0); tick(1.0)")
+    check(L.eval("UI.inview") is False and L.eval("sleep._shared.scr") is None, "2.5 s later the screen goes")
+    # taken down again later (the pause key: its Tick calls Exit): stays down, still asleep
+    L.execute('blobs_in.slp_g = "0"; tick(); GAME_SLEEP(); tick(); tick(1.0); tick(1.0); UI.inview = false; tick(0.016); ADDS0 = ADDS')
+    L.execute("tick(3.0); UI.inview = false; tick(0.016); tick()")
+    check(L.eval("UI.inview") is False and L.eval("ADDS") == L.eval("ADDS0") and L.eval("sleep._shared.me") is not None,
+          "taken down again later (Escape): it stays down and the player stays asleep")
+    # no sleeping screen found: the hold works as before
+    L.execute("AT = { X = 200, Y = 0, Z = 0 }; tick(); AT = { X = 0, Y = 0, Z = 0 }; UI.dead = true"
+              "; UI.IsValid = function() return false end; GAME_SLEEP(); tick()")
+    check(L.eval("sleep._shared.me") is not None and L.eval("sleep._shared.scr") is None, "no screen: still held, nothing to keep up")
+
+
+def ghost_stands_on_cars_but_never_pushes_them():
+    # 2026-10-24: a ghost capsule with a physics body, teleported into a car's body, flung parked cars - so it ignored
+    # cars. User 2026-10-30: "when player is ontop of car they are floating for the other": with cars ignored the
+    # ghost had no floor on a roof. Now: cars blocked for queries (floor sweeps), no physics body, no physics push.
+    print("ghost_stands_on_cars_but_never_pushes_them")
     L = lua()
     L.execute(FAKES + r"""
         util = require("mirror.util")
@@ -3167,20 +4704,322 @@ def ghost_never_blocks_cars():
         ghost.configure({ ghost = { class = "/Game/X.Ghost_C", target_tag = "t", view_controller = false } })
         BLOCKS = {}
         local function body()
-            local cap = { SetCollisionEnabled = function() end, SetCollisionResponseToAllChannels = function() end,
+            local cap = { SetCollisionEnabled = function(_, m) CAP_MODE = m end, SetCollisionResponseToAllChannels = function() end,
                           SetCollisionResponseToChannel = function(_, ch, r) if r == 2 then BLOCKS[ch] = true end end }
-            return obj({ CapsuleComponent = cap, Mesh = { SetCollisionEnabled = function() end,
+            LAST = obj({ CapsuleComponent = cap, Mesh = { SetCollisionEnabled = function() end,
                          SetCollisionResponseToAllChannels = function() end, SetCollisionResponseToChannel = function() end },
                          MedicalComponent = {}, CharacterMovement = {}, Tags = { Empty = function() end },
                          AIOInvoker = {}, ActorHasTag = function() return false end,
                          GetFullName = function() return "BP_Ghost /Game/X.Ghost" end })
+            return LAST
         end
         WORLD = { SpawnActor = function() return body() end }
     """)
     for kind in ("guest", "host"):
-        L.execute('BLOCKS = {}; ghost.forget(); ghost.spawn(WORLD, { X = 0, Y = 0, Z = 0 }, 0, "%s")' % kind)
-        check(L.eval('BLOCKS[6]') is None, "the %s ghost's capsule doesn't block cars (a teleported capsule flings them)" % kind)
+        L.execute('BLOCKS = {}; CAP_MODE = nil; ghost.forget(); ghost.spawn(WORLD, { X = 0, Y = 0, Z = 0 }, 0, "%s")' % kind)
+        check(L.eval('BLOCKS[6]') is True, "the %s ghost's capsule blocks cars, so it stands on a car roof" % kind)
+        check(L.eval('CAP_MODE') == 1, "the %s ghost's capsule is queries only: no physics body to shove a car (%s)" % (kind, L.eval('CAP_MODE')))
+        check(L.eval('LAST.CharacterMovement.bEnablePhysicsInteraction') is False,
+              "the %s ghost's steps don't push cars or other simulated things" % kind)
         check(L.eval('BLOCKS[0] and BLOCKS[1] and BLOCKS[2]') is True, "the %s ghost still blocks the world and players" % kind)
+
+
+def a_host_zombie_hit_reaches_a_guest_with_three_players():
+    # live 2026-10-30, 3 players: every hit the host sent ("took 20.0 damage from zombie 38") was set to 0 inside
+    # ApplyDamage by the other player's copy of zombies.lua ("[to2] blocked damage from a zombie copy", 85 times)
+    print("a_host_zombie_hit_reaches_a_guest_with_three_players")
+    L = lua()
+    L.execute(FAKES + r"""
+        PLAYER = obj({ MedicalComponent = { Health = 100 } })
+        PLAYER.K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end
+        HURT = {}
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return obj({}) end,
+            controller = function() return nil end, on_world_reset = function() end, keybind = function() end,
+            on_ready = function() end, on_tick = function() end,
+            player_hook = function(name, fn) if name == "ReceiveAnyDamage" then HURT[#HURT + 1] = fn end end }
+        package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
+        package.loaded["mirror.loader"] = { want = function() end }
+        package.loaded["mirror.invdiag"] = { summary = function() return "-" end }
+        StaticFindObject = function() return nil end
+        ModifierKey = ModifierKey or { CONTROL = 1 }
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        GOT = {}
+        util.cdo = function(p)
+            if p:find("GameplayStatics", 1, true) then
+                return { ApplyDamage = function(self, who, amt, inst, causer)
+                    local d = { v = amt }
+                    local Damage = { get = function() return d.v end, set = function(_, v) d.v = v end }
+                    for _, fn in ipairs(HURT) do fn({ get = function() return who end }, Damage, nil, nil, { get = function() return causer end }) end
+                    GOT[#GOT + 1] = d.v
+                end }
+            end
+            return { GetConsoleVariableBoolValue = function() return false end, GetConsoleVariableIntValue = function() return 0 end }
+        end
+        CFG = { zombies = { enabled = true, send_hz = 15, despawn_after = 3.0, dmg_reach = 400 } }
+        local function instance()
+            package.loaded["mirror.zombies"] = nil
+            local z = require("mirror.zombies")
+            local ok, e = pcall(z.init, CFG, "guest", { in_world = function() return true end })
+            if not ok then INIT_ERR = tostring(e) end
+            z._test.setup(CFG, "guest")
+            return z
+        end
+        MAIN, MATE = instance(), instance()
+        Z = obj({ Mesh = {} }); Z.K2_GetActorLocation = function() return { X = 100, Y = 0, Z = 0 } end
+        MAIN._test.copy(7, Z)
+        MAIN._test.dmg("7 20.0 - 100 0 0 0")
+    """)
+    check(L.eval('#HURT') == 2, "both copies of the module watch my damage (%s hooks, %s)" % (L.eval('#HURT'), L.eval('INIT_ERR')))
+    check(L.eval('GOT[1]') == 20.0, "the host's hit is applied in full, not set to 0 by the other copy (%s)" % L.eval('GOT[1]'))
+    L.execute('local d = { v = 15 }; for _, fn in ipairs(HURT) do fn({ get = function() return PLAYER end }, '
+              '{ get = function() return d.v end, set = function(_, v) d.v = v end }, nil, nil, { get = function() return Z end }) end; OWN = d.v')
+    check(L.eval('OWN') == 0, "a copy's own hit (not the host's) is still blocked")
+    # live 2026-10-30 02:28:59: teleported into a fight, dead 4 s later
+    L.execute('ARR = require("mirror.peers").shared_table("arrival"); ARR.safe_until = os.clock() + 3; N0 = #GOT; '
+              'MAIN._test.dmg("7 20.0 - 100 0 0 0"); SPARED = #GOT - N0; '
+              'ARR.safe_until = os.clock() - 0.01; MAIN._test.dmg("7 20.0 - 100 0 0 0"); AFTER = #GOT - N0')
+    check(L.eval('SPARED') == 0, "a host zombie's hit just after a teleport landed is let off")
+    check(L.eval('AFTER') == 1 and L.eval('GOT[#GOT]') == 20.0, "...and hits land again once the 3 s are over")
+
+
+def zombie_loot_tables_are_all_looked_up_and_misses_stay_few():
+    # live 2026-10-30 02:34 as a guest: only Bandit and BanditBoss were ever asked (every 2 s, 32-59 ms of misses),
+    # "16/16 missing" for 3.5 min - and the host's zombies wait for those tables
+    print("zombie_loot_tables_are_all_looked_up_and_misses_stay_few")
+    L = lua()
+    L.execute(FAKES + r"""
+        package.loaded["mirror.game"] = { player = function() return nil end, world = function() return obj({}) end,
+            controller = function() return nil end, on_world_reset = function() end, keybind = function() end }
+        package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
+        package.loaded["mirror.loader"] = { want = function() end }
+        package.loaded["mirror.invdiag"] = { summary = function() return "-" end }
+        LOADED, MISSES, WALKS = {}, 0, 0
+        StaticFindObject = function(p)
+            if p:find("DA_LootTable_", 1, true) then MISSES = MISSES + 1 end
+            return nil
+        end
+        -- the tables' class: every loaded table (and other container data) in one walk
+        FindAllOf = function(c)
+            if c ~= "ContainerItems_DataAsset_C" then return nil end
+            WALKS = WALKS + 1
+            local out = { cls("DA_Container_Fridge"), cls("DA_LootTable_Bandit") }   -- (a container table: not the AI one)
+            for p in pairs(LOADED) do
+                local o = cls(p:match("%.(DA_LootTable_.+)$"))
+                o.GetFullName = function() return "ContainerItems_DataAsset_C " .. p end
+                out[#out + 1] = o
+            end
+            return out
+        end
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        zombies = require("mirror.zombies")
+        zombies._test.setup({ zombies = { enabled = true } }, "guest")
+        T = 0; os.clock = function() return T end
+        function table_path(n) return "/Game/AI/AILootTables/DA_LootTable_" .. n .. ".DA_LootTable_" .. n end
+        -- every table but the first two is in memory
+        for _, n in ipairs({ "BanditSniper", "Bear", "Deer", "MilitaryBoss", "MilitaryRifleman", "Rabbit", "Scavenger", "Wolf",
+                             "Zombie", "ZombieBoss", "ZombieBossSmall", "ZombieHound", "ZombieInfected", "ZombieRadiated" }) do
+            LOADED[table_path(n)] = true
+        end
+        for i = 1, 40 do T = T + 2; R_OK, R_MISSING = zombies._test.loot_ready() end
+        M40, W40 = MISSES, WALKS
+        LOADED[table_path("Bandit")], LOADED[table_path("BanditBoss")] = true, true
+        for i = 1, 10 do T = T + 2; R2_OK = zombies._test.loot_ready() end
+        W50 = WALKS
+        for i = 1, 10 do T = T + 2; zombies._test.loot_ready() end
+    """)
+    check(L.eval('R_MISSING') == 2, "every table is looked up, not only the first two missing ones (%s missing)" % L.eval('R_MISSING'))
+    # (kit 2026-10-31: a StaticFindObject per table was ~15 ms, found or not - 224-269 ms for the 16 in one frame)
+    check(L.eval('M40') == 0, "no table is looked up by name: %s lookups (was 16 in the first probe)" % L.eval('M40'))
+    check(L.eval('W40') <= 14, "one class walk a probe, probes backing off: %s walks in 80 s" % L.eval('W40'))
+    check(L.eval('R2_OK') is True, "once they're there it is seen within a few probes")
+    check(L.eval('WALKS') == L.eval('W50'), "all there: no more walks (%s after)" % (L.eval('WALKS') - L.eval('W50')))
+
+
+def zombies_go_after_the_ghost_again_after_a_save():
+    # live 2026-10-30: every save let the zombies chasing the ghost go ("8 zombie(s) stopped chasing it")
+    print("zombies_go_after_the_ghost_again_after_a_save")
+    L = lua()
+    L.execute(FAKES + r"""
+        util = require("mirror.util")
+        util.cdo = function() return obj({ SetActorSaveProperties = function() end }) end
+        StaticFindObject = function() return obj({}) end
+        FindFirstOf = function() return nil end
+        ME = obj({ GetFullName = function() return "BP_PlayerCharacter_C /Game/L.L:P.Me" end, Controller = obj({}) })
+        package.loaded["mirror.game"] = { player = function() return ME end, on_world_reset = function() end }
+        package.loaded["mirror.animgate"] = { destroy = function() end, flush = function() return 0 end }
+        function zombie()
+            local bb = { v = {} }
+            bb.GetValueAsObject = function(self, k) return self.v[tostring(k)] end
+            bb.SetValueAsObject = function(self, k, o) self.v[tostring(k)] = o end
+            bb.SetValueAsBool = function(self, k, b) self.v[tostring(k)] = b end
+            bb.SetValueAsVector = function(self, k, x) self.v[tostring(k)] = x end
+            bb.ClearValue = function(self, k) self.v[tostring(k)] = nil end
+            return obj({ Controller = obj({ Blackboard = bb, Combat = true }) })
+        end
+        CHASER, OTHER = zombie(), zombie()
+        PAWNS = { CHASER, OTHER }
+        package.loaded["mirror.zombies"] = { all_cached = function() return PAWNS end }
+        ghost = require("mirror.ghost")
+        ghost.configure({ ghost = { class = "/Game/X.Ghost_C", target_tag = "t", view_controller = false } })
+        local function body()
+            local cap = { SetCollisionEnabled = function() end, SetCollisionResponseToAllChannels = function() end,
+                          SetCollisionResponseToChannel = function() end }
+            local b = obj({ CapsuleComponent = cap, Mesh = { SetCollisionEnabled = function() end,
+                         SetCollisionResponseToAllChannels = function() end, SetCollisionResponseToChannel = function() end },
+                         MedicalComponent = {}, CharacterMovement = {}, Tags = { Empty = function() end, Add = function() end },
+                         AIOInvoker = {}, ActorHasTag = function() return false end })
+            b.GetFullName = function() return "BP_PlayerCharacter_C /Game/L.L:P.Ghost" end
+            b.K2_GetActorLocation = function() return { X = 1, Y = 2, Z = 3 } end
+            b.K2_DestroyActor = function() end
+            return b
+        end
+        WORLD = { SpawnActor = function() return body() end }
+        CLOCK = 100; os.clock = function() return CLOCK end
+        G1 = ghost.spawn(WORLD, { X = 0, Y = 0, Z = 0 }, 0, "host")
+        CHASER.Controller.Blackboard.v.AttackTarget = G1
+        ghost.destroy("save", true)
+        RELEASED = CHASER.Controller.Blackboard.v.AttackTarget == nil and CHASER.Controller.Combat == false
+        CLOCK = CLOCK + 1.5
+        G2 = ghost.spawn(WORLD, { X = 0, Y = 0, Z = 0 }, 0, "host")
+        BACK = CHASER.Controller.Blackboard.v.AttackTarget == G2 and CHASER.Controller.Combat == true
+            and CHASER.Controller.Blackboard.v["CanSeePlayer?"] == true
+        LEFT = OTHER.Controller.Blackboard.v.AttackTarget == nil
+        -- the other player died: their ghost goes for good, nothing comes back for the next one
+        CHASER.Controller.Blackboard.v.AttackTarget = G2
+        ghost.destroy("peer dead", true)
+        CLOCK = CLOCK + 1
+        G3 = ghost.spawn(WORLD, { X = 0, Y = 0, Z = 0 }, 0, "host")
+        DEAD_LEFT = CHASER.Controller.Blackboard.v.AttackTarget == nil
+    """)
+    check(L.eval('RELEASED') is True, "a save lets the zombies after the ghost go, as before")
+    check(L.eval('BACK') is True, "the ghost back after the save: the zombies that were after it go after it again")
+    check(L.eval('LEFT') is True, "...not the ones that weren't")
+    check(L.eval('DEAD_LEFT') is True, "a ghost gone for another reason (death): nobody is sent after the next one")
+
+
+def a_ghost_the_game_removed_is_let_go_and_made_again():
+    # report 2026-10-30 (Realm): after the guest's bed respawn the host stayed invisible to them and /goto went to 0,0,0
+    print("a_ghost_the_game_removed_is_let_go_and_made_again")
+    L = lua()
+    L.execute(FAKES + r"""
+        util = require("mirror.util")
+        util.cdo = function() return obj({ SetActorSaveProperties = function() end }) end
+        StaticFindObject = function() return obj({}) end
+        FindFirstOf = function() return nil end
+        ME = obj({ GetFullName = function() return "BP_PlayerCharacter_C /Game/L.L:P.Me" end, Controller = obj({}) })
+        package.loaded["mirror.game"] = { player = function() return ME end, on_world_reset = function() end }
+        GATED = 0
+        package.loaded["mirror.animgate"] = { destroy = function() GATED = GATED + 1 end, flush = function() return 0 end }
+        local bb = { v = {} }
+        bb.GetValueAsObject = function(self, k) return self.v[tostring(k)] end
+        bb.SetValueAsObject = function(self, k, o) self.v[tostring(k)] = o end
+        bb.SetValueAsBool = function(self, k, b) self.v[tostring(k)] = b end
+        bb.SetValueAsVector = function(self, k, x) self.v[tostring(k)] = x end
+        bb.ClearValue = function(self, k) self.v[tostring(k)] = nil end
+        CHASER = obj({ Controller = obj({ Blackboard = bb, Combat = true }) })
+        package.loaded["mirror.zombies"] = { all_cached = function() return { CHASER } end }
+        ghost = require("mirror.ghost")
+        ghost.configure({ ghost = { class = "/Game/X.Ghost_C", target_tag = "t", view_controller = false } })
+        KILLS = 0
+        local function body()
+            local cap = { SetCollisionEnabled = function() end, SetCollisionResponseToAllChannels = function() end,
+                          SetCollisionResponseToChannel = function() end }
+            local b = obj({ CapsuleComponent = cap, Mesh = { SetCollisionEnabled = function() end,
+                         SetCollisionResponseToAllChannels = function() end, SetCollisionResponseToChannel = function() end },
+                         MedicalComponent = {}, CharacterMovement = {}, Tags = { Empty = function() end, Add = function() end },
+                         AIOInvoker = {}, ActorHasTag = function() return false end })
+            b.at, b.root = { X = 5000, Y = 6000, Z = 300 }, obj({})
+            b.GetFullName = function() return "BP_PlayerCharacter_C /Game/L.L:P.Ghost" end
+            b.K2_GetActorLocation = function(self) return self.at end
+            b.K2_GetRootComponent = function(self) return self.root end
+            b.K2_DestroyActor = function() KILLS = KILLS + 1 end
+            return b
+        end
+        WORLD = { SpawnActor = function() return body() end }
+        CLOCK = 100; os.clock = function() return CLOCK end
+        G1 = ghost.spawn(WORLD, { X = 5000, Y = 6000, Z = 300 }, 0, "host")
+        KEPT = ghost.check and (ghost.check(1) == false) and ghost.exists()
+        LOC = ghost.location()
+        LIVE_AT = LOC and LOC.X == 5000
+        CHASER.Controller.Blackboard.v.AttackTarget = G1
+        -- the game destroys it (the guest's respawn): still IsValid, root gone, reads 0,0,0
+        G1.at, G1.root = { X = 0, Y = 0, Z = 0 }, obj({ IsValid = function() return false end })
+        TO = ghost.location()
+        GONE = TO == nil and not ghost.exists() and ghost.was(G1)
+        UNTOUCHED = KILLS == 0 and GATED == 0
+        NO_ORIGIN = CHASER.Controller.Blackboard.v.LastHeardLocation == nil
+        CLOCK = CLOCK + 1
+        G2 = ghost.spawn(WORLD, { X = 5000, Y = 6000, Z = 300 }, 0, "host")
+        BACK = CHASER.Controller.Blackboard.v.AttackTarget == G2
+        -- the tick's own check: root gone while the location still reads right
+        G2.root = obj({ IsValid = function() return false end })
+        EARLY = ghost.check and ghost.check(0.1)
+        LATE = ghost.check and ghost.check(0.5)
+        TICK_GONE = not ghost.exists()
+    """)
+    check(L.eval('KEPT') is True and L.eval('LIVE_AT') is True, "a live ghost is kept and read where it stands")
+    check(L.eval('GONE') is True, "one the game destroyed (0,0,0, no root) is let go: no teleport to the world's origin")
+    check(L.eval('UNTOUCHED') is True, "...without destroying it again (%d K2_DestroyActor, %d gated)" % (L.eval('KILLS'), L.eval('GATED')))
+    check(L.eval('NO_ORIGIN') is True, "its zombies aren't sent to 0,0,0")
+    check(L.eval('BACK') is True, "the zombies after it go after the new ghost")
+    check(L.eval('EARLY') is False and L.eval('LATE') is True and L.eval('TICK_GONE') is True,
+          "the tick checks every 0.5 s and lets go of a ghost without a root")
+
+
+def a_ghost_destroyed_for_a_save_is_never_touched_again():
+    print("a_ghost_destroyed_for_a_save_is_never_touched_again")
+    L = lua()
+    L.execute(FAKES + r"""
+        util = require("mirror.util")
+        util.cdo = function() return obj({ SetActorSaveProperties = function() end }) end
+        StaticFindObject = function() return obj({}) end
+        FindFirstOf = function() return nil end
+        ME = obj({ GetFullName = function() return "BP_PlayerCharacter_C /Game/L.L:P.Me" end, Controller = obj({}) })
+        package.loaded["mirror.game"] = { player = function() return ME end, on_world_reset = function() end }
+        ghost = require("mirror.ghost")
+        ghost.configure({ ghost = { class = "/Game/X.Ghost_C", target_tag = "t", view_controller = false } })
+        TOUCHED, DESTROYS = 0, 0
+        local function body()
+            local cap = { SetCollisionEnabled = function() end, SetCollisionResponseToAllChannels = function() end,
+                          SetCollisionResponseToChannel = function() end }
+            local b = obj({ CapsuleComponent = cap, Mesh = { SetCollisionEnabled = function() end,
+                         SetCollisionResponseToAllChannels = function() end, SetCollisionResponseToChannel = function() end },
+                         MedicalComponent = {}, CharacterMovement = {}, Tags = { Empty = function() end },
+                         AIOInvoker = {}, ActorHasTag = function() return false end })
+            -- (like the game: still valid once destroyed, and IsActorBeingDestroyed is false again)
+            b.GetFullName = function() TOUCHED = TOUCHED + 1; return "BP_PlayerCharacter_C /Game/L.L:P.Ghost" end
+            b.IsActorBeingDestroyed = function() return false end
+            b.K2_DestroyActor = function() DESTROYS = DESTROYS + 1 end
+            return b
+        end
+        WORLD = { SpawnActor = function() GHOST = body(); return GHOST end }
+        ghost.spawn(WORLD, { X = 0, Y = 0, Z = 0 }, 0, "guest")
+        HOOKED = {}
+        util.hook = function(path, fn) HOOKED[path] = fn end
+        package.loaded["mirror.animgate"] = { flush = function() return 0 end }
+        save_guard = require("mirror.save_guard")
+        save_guard.configure({ save = { destroy_ghost_on_save = true } }, function() end)
+        save_guard.install()
+        CLOCK = 100; os.clock = function() return CLOCK end
+        ghost.destroy("save", true)
+        -- (my own autosave came 5 s after the other player died, live 2026-10-30 02:28:37: well inside the window)
+        CLOCK = CLOCK + 30
+        TOUCHED, DESTROYS = 0, 0
+        STRAY = obj({ GetFullName = function() return "BP_PlayerCharacter_C /Game/L.L:P.Left" end,
+                      IsActorBeingDestroyed = function() return false end })
+        STRAY.K2_DestroyActor = function() STRAY_GONE = true end
+        FindAllOf = function() return { ME, GHOST, STRAY } end
+        -- another player's copy runs its save check right after mine destroyed my ghost
+        HOOKED["/Script/EasyMultiSave.EMSAsyncSaveGame:AsyncSaveActors"]()
+    """)
+    check(L.eval('DESTROYS') == 0 and L.eval('TOUCHED') == 0,
+          "a ghost just destroyed for a save isn't taken for a stray body and touched again (%s destroys, %s reads)"
+          % (L.eval('DESTROYS'), L.eval('TOUCHED')))
+    check(L.eval('STRAY_GONE') is True, "a real stray body is still removed")
+    L.execute('CLOCK = CLOCK + 100; R_LATE = ghost.was(GHOST)')
+    check(L.eval('R_LATE') is False, "a ghost destroyed long ago (garbage-collected since) is forgotten")
 
 
 def audio_spatializes_and_shares_without_echo():
@@ -3214,6 +5053,9 @@ def audio_spatializes_and_shares_without_echo():
                                       host_id_of = function() return nil end, copy = function() return nil end }, { last_shot = -100 })
         audio.tick(0.1)
         function P(v) return { get = function() return v end } end
+        -- a shared sound as the other game sends it, stamped `ago_ms` before now on the sender's clock (shifted by `off`)
+        function MSG(x, ago_ms, off) return string.format("/Game/Audio/Shotgun_Insert_Cue.Shotgun_Insert_Cue %d 0 0 1.00 1.00 %d",
+            x, math.floor(os.clock() * 1000) + (off or 0) - ago_ms) end
     """)
     check(L.eval('audio.attenuation_for(CUES["/Game/Audio/Shotgun_Insert_Cue.Shotgun_Insert_Cue"], "/Game/Audio/Shotgun_Insert_Cue.Shotgun_Insert_Cue") == DOOR'),
           "a 2D reload cue gets a short-range attenuation")
@@ -3221,12 +5063,33 @@ def audio_spatializes_and_shares_without_echo():
           "a cue with its own attenuation keeps it")
     check(L.eval('audio.attenuation_for(cue("explosion_large_06_Cue")) == RIFLE'),
           "a cue passed without its path is still named (an explosion gets the long range)")
-    L.execute('INBOX = { "/Game/Audio/Shotgun_Insert_Cue.Shotgun_Insert_Cue 5000 0 0 1.00 1.00" }; audio.tick(0.1)')
+    L.execute('INBOX = { MSG(5000, 0) }; audio.tick(0.1)')
     check(L.eval('#PLAYED == 1 and PLAYED[1].att == DOOR'), "a replayed 2D cue plays with the attenuation")
     # This game played the same cue at the same spot itself: the replay is a duplicate.
     L.execute('HOOKS.PlaySoundAtLocation(nil, P(obj({})), P(CUES["/Game/Audio/Shotgun_Insert_Cue.Shotgun_Insert_Cue"]), P({ X = 9000, Y = 0, Z = 0 }), nil, P(1), P(1)); '
-              'INBOX = { "/Game/Audio/Shotgun_Insert_Cue.Shotgun_Insert_Cue 9100 0 0 1.00 1.00" }; audio.tick(0.1)')
+              'INBOX = { MSG(9100, 0) }; audio.tick(0.1)')
     check(L.eval('#PLAYED') == 1, "a sound both games played is not doubled")
+    # Late sounds (user 2026-10-31: the other player's game sounds were glitchy over Steam at 229 ms). The sender's
+    # clock is 7 minutes off from this one: only the delay relative to the smallest one seen counts.
+    OFF = 420000
+    L.execute('audio.late_reset(); PLAYED = {}; INBOX = { MSG(20000, 229, %d) }; audio.tick(0.1); '
+              'INBOX = { MSG(21000, 229, %d), MSG(22000, 260, %d) }; audio.tick(0.1)' % (OFF, OFF, OFF))
+    check(L.eval('#PLAYED') == 3, "a steady 229 ms link with a different clock: every sound plays (%s)" % L.eval('#PLAYED'))
+    # a 2 s stall: the backlog arrives at once - only what is still within half a second of now plays
+    L.execute('PLAYED = {}; INBOX = { MSG(30000, 2229, %d), MSG(31000, 1729, %d), MSG(32000, 1229, %d), MSG(33000, 600, %d), '
+              'MSG(34000, 229, %d) }; audio.tick(0.1)' % (OFF, OFF, OFF, OFF, OFF))
+    check(L.eval('#PLAYED') == 2, "after a 2 s stall only the sounds under 0.5 s late play, not the backlog (%s)" % L.eval('#PLAYED'))
+    # the first batch after joining is a backlog too: judged against its own newest sound
+    L.execute('audio.late_reset(); PLAYED = {}; INBOX = { MSG(40000, 3000, %d), MSG(41000, 1500, %d), MSG(42000, 0, %d) }; '
+              'audio.tick(0.1)' % (OFF, OFF, OFF))
+    check(L.eval('#PLAYED') == 1, "the first batch: only its newest sound plays (%s)" % L.eval('#PLAYED'))
+    # the other game restarted (its clock began again, far behind): sounds play again at once, not dropped as late
+    L.execute('PLAYED = {}; INBOX = { MSG(50000, 0, %d) }; audio.tick(0.1); INBOX = { MSG(51000, 0, %d) }; audio.tick(0.1)'
+              % (OFF - 400000, OFF - 400000))
+    check(L.eval('#PLAYED') == 2, "the other game restarted: its sounds play (%s)" % L.eval('#PLAYED'))
+    # an old-version message (no clock): dropped, not an error
+    L.execute('PLAYED = {}; INBOX = { "/Game/Audio/Shotgun_Insert_Cue.Shotgun_Insert_Cue 60000 0 0 1.00 1.00" }; audio.tick(0.1)')
+    check(L.eval('#PLAYED') == 0 and "format=1" in L.eval('audio.status()'), "an old-format sound is dropped and counted")
     # A crate the player opens, 2 m away: its one-shot sound is shared.
     L.execute('CRATE = obj({ GetOwner = function() return nil end }); '
               'HOOKS.PlaySoundAtLocation(nil, P(CRATE), P(CUES["/Game/Audio/Shotgun_Insert_Cue.Shotgun_Insert_Cue"]), P({ X = 200, Y = 0, Z = 0 }), nil, P(1), P(1)); '
@@ -3243,7 +5106,7 @@ def keycard_doors_open_on_both_games():
         GHOST = obj({})
         package.loaded["mirror.ghost"] = { get = function() return GHOST end }
         BLOB = nil
-        package.loaded["mirror.link"].get_blob = function(n) local b = n == "doors" and BLOB or nil; BLOB = nil; return b end
+        package.loaded["mirror.link"].get_blob = function(n) if n ~= "doors" then return nil end local b = BLOB; BLOB = nil; return b end
         PUT = nil
         package.loaded["mirror.link"].put_blob = function(n, s) if n == "doors" then PUT = s end end
         util = require("mirror.util")
@@ -3286,6 +5149,108 @@ def keycard_doors_open_on_both_games():
     echo = L.eval("ECHO")
     check(not echo or "BP_KeycardDoor_C" not in echo, "opening it here is not sent back as my own (%r)" % echo)
     check(L.eval("CALLED_AGAIN") is None, "their door closing doesn't shut (or reopen) this one")
+
+
+def doors_of_one_master_are_found_in_one_walk():
+    # kit 2026-10-31: each door class was its own 30-60 ms walk, one a frame, right after a join ("perf: doors took 63 ms");
+    # the keycard/keypad/container/barrier doors are all children of BP_MasterDoor_C (live class chains)
+    print("doors_of_one_master_are_found_in_one_walk")
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        package.loaded["mirror.ghost"] = { get = function() return nil end }
+        package.loaded["mirror.link"].get_blob = function() return nil end
+        package.loaded["mirror.link"].put_blob = function() end
+        util = require("mirror.util")
+        StaticFindObject = function() return nil end
+        local function door(c, x)
+            local d = obj({ ["Open?"] = false })
+            d.GetClass = function() return cls(c) end
+            d.K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end
+            d.GetFullName = function() return c .. " /Game/L.L:P." .. c .. "_" .. x end
+            return d
+        end
+        WORLD = { door("BP_ContainerDoors_C", 100), door("BP_KeycardDoor_C", 200), door("BP_KeycardDoor_Child_C", 300),
+                  door("BP_BarrierGate_C", 400), door("BP_KeypadDoor_C", 500),
+                  door("BP_HangarDoor_C", 600),    -- (a child of the master the mod doesn't sync, live 2026-10-31)
+                  door("BP_WarehouseDoors_C", 700) }
+        -- (the game has the warehouse door's class and its BeginPlay loaded)
+        StaticFindObject = function(p) if p:find("BP_WarehouseDoors", 1, true) then return obj({ GetFName = function()
+            return { ToString = function() return p:match("ReceiveBeginPlay$") and "ReceiveBeginPlay" or "BP_WarehouseDoors_C" end } end }) end end
+        local PARENT = { BP_KeycardDoor_Child_C = "BP_KeycardDoor_C" }
+        CALLS = {}
+        -- like the engine: a class's FindAllOf returns its children's objects too
+        FindAllOf = function(c)
+            CALLS[c] = (CALLS[c] or 0) + 1
+            local out = {}
+            for _, o in ipairs(WORLD) do
+                local k = util.class_name(o)
+                if c == "BP_MasterDoor_C" or k == c or PARENT[k] == c then out[#out + 1] = o end
+            end
+            return out
+        end
+        doors = require("mirror.doors")
+        doors.init({}, "guest", { in_world = function() return true end })
+        for i = 1, 200 do NOW = NOW + 0.3; util.new_frame(); doors.tick(0.3) end
+        STATUS, M1 = doors.status(), CALLS.BP_MasterDoor_C
+        OWN1 = {}
+        for _, o in ipairs(WORLD) do local c = util.class_name(o); if CALLS[c] then OWN1[#OWN1 + 1] = c end end
+        -- a door that comes later (an event site's): the group's 5 min re-walk finds it, for every member alike
+        WORLD[#WORLD + 1] = door("BP_KeypadDoor_C", 800)
+        for i = 1, 1100 do NOW = NOW + 0.3; util.new_frame(); doors.tick(0.3) end
+        STATUS2 = doors.status()
+    """)
+    own = L.eval("table.concat(OWN1, ',')")
+    check(L.eval("M1") == 1 and own == "",
+          "one walk of BP_MasterDoor_C finds its door classes in the first minute (master %s, own walks %r)" % (L.eval("M1"), own))
+    check(L.eval("STATUS").startswith("doors: 6 here"), "...and all 6 doors are synced, the keycard child under its own class (%s)"
+          % L.eval("STATUS"))
+    check(L.eval("STATUS2").startswith("doors: 7 here") and L.eval("CALLS.BP_MasterDoor_C") == 2,
+          "a keypad door that comes later is found by the group's re-walk within 5 min (%s, %s master walks)"
+          % (L.eval("STATUS2"), L.eval("CALLS.BP_MasterDoor_C")))
+
+
+def doors_forget_the_old_world_at_a_load():
+    # hardening 2026-10-30: the host stays active through its own loads, so set_active never cleared the doors - the
+    # old world's door objects were read after the load and its unlocks were sent on to the next world's guest
+    print("doors_forget_the_old_world_at_a_load")
+    L = lua()
+    L.execute(FAKES + r"""
+        PUT = nil
+        package.loaded["mirror.link"].put_blob = function(n, s) if n == "doors" then PUT = s end end
+        util = require("mirror.util")
+        function door(name)
+            local d = obj({ Unlocked = false })
+            d.GetClass = function() return cls("BP_LaboratorySecureDoors_C") end
+            d.K2_GetActorLocation = function() return { X = 100, Y = 200, Z = 0 } end
+            d.GetFullName = function() return "BP_LaboratorySecureDoors_C /Game/L.L:P." .. name end
+            return d
+        end
+        OLD = door("Old")
+        HERE = { OLD }
+        util.instances = function(c)
+            if c == "BP_LaboratorySecureDoors_C" then return HERE, true end
+            return {}, true
+        end
+        doors = require("mirror.doors")
+        doors.init({}, "host", { in_world = function() return true end })
+        for i = 1, 40 do doors.tick(0.3) end
+        OLD.Unlocked = true
+        for i = 1, 3 do doors.tick(0.3) end
+        SENT_A = PUT
+        -- the host loads another save: the old door is freed, the new world's one is locked
+        READ_OLD = false
+        OLD.IsValid = function() READ_OLD = true; return true end
+        HERE = {}
+        require("mirror.game").reset_world()
+        doors.tick(0.3)
+        SENT_B = PUT
+        HERE = { door("New") }
+        for i = 1, 40 do doors.tick(0.3) end
+    """)
+    check("BP_LaboratorySecureDoors_C" in (L.eval("SENT_A") or ""), "the unlock is sent in the first world (%r)" % L.eval("SENT_A"))
+    check("BP_LaboratorySecureDoors_C" not in (L.eval("SENT_B") or ""), "after the load it isn't sent any more (%r)" % L.eval("SENT_B"))
+    check(L.eval("READ_OLD") is False, "the old world's door is never read after the load")
 
 
 def throws_and_mines_reach_the_other_game():
@@ -3399,6 +5364,24 @@ def throws_and_mines_reach_the_other_game():
     sent = list(L.eval('SENT').values())
     check(any(m == "builds:R Buildable_Turret_C@500,0,0" for m in sent),
           "a picked-up turret is sent with its place even when the hook only runs after it is gone (%s)" % sent)
+    # A place sent again (a join's save already holds the piece) a few mm across a 10 cm grid line: the exact id
+    # missed it and built it twice. A fence's neighbour 2 m on is a new piece (rejoin live 2026-10-30).
+    L.execute(r"""
+        FENCE, BUILT = actor("Buildable_MetalFence_C", 1004.9), {}
+        local fcls = cls("Buildable_MetalFence_C")
+        StaticFindObject = function() return obj({ BuildActorClass = fcls }) end
+        util.all_of = function() local l = { FENCE }; for _, b in ipairs(BUILT) do l[#l + 1] = b end; return l, 0 end
+        WORLD = { SpawnActor = function(self, c, loc) local a = actor("Buildable_MetalFence_C", loc.X); BUILT[#BUILT + 1] = a; return a end }
+        package.loaded["mirror.game"].world = function() return WORLD end
+        INBOX.builds = { "P /Game/B/DA_MetalFence.DA_MetalFence 1005.10 0 0 0 0 0 1 1 1" }
+        builds.tick(0.1)
+        N1 = #BUILT
+        INBOX.builds = { "P /Game/B/DA_MetalFence.DA_MetalFence 1215.00 0 0 0 0 0 1 1 1" }
+        builds.tick(0.1)
+        N2 = #BUILT
+    """)
+    check(L.eval('N1') == 0, "a fence sent again 2 mm off, across a grid line: not built twice (%s)" % L.eval('N1'))
+    check(L.eval('N2') == 1, "its neighbour 2.1 m on is built")
 
 
 def map_pings_reach_the_other_game():
@@ -3414,11 +5397,21 @@ def map_pings_reach_the_other_game():
         function data(t, r) return { [TEX] = t, [COL] = { R = r, G = 0, B = 0, A = 1 }, [SIZE] = { X = 32, Y = 32 }, [CMP] = true } end
         HOOKS = {}
         function P(v) return { get = function() return v end } end
-        MARKERS = {}
+        MARKERS, COMPASSES, QMARKS = {}, {}, {}
+        -- BP_CompassMarker: one compass icon each (the ping spawns it at its own place when CompassMarker? is set)
+        function compass(x)
+            local c = obj({ gone = false })
+            c.IsValid = function() return not c.gone end
+            c.K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end
+            c.K2_DestroyActor = function() c.gone = true end
+            COMPASSES[#COMPASSES + 1] = c
+            return c
+        end
         function marker(x, d)
             local m = obj({ ["Marker Data"] = d, gone = false })
             m.IsValid = function() return not m.gone end
             m.K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end
+            if d and d[CMP] then m.CompassMarker = compass(x) end
             MARKERS[#MARKERS + 1] = m
             return m
         end
@@ -3431,6 +5424,7 @@ def map_pings_reach_the_other_game():
             HOOKS[ADD](P(SPAWNED))
         end
         COMP["Remove Player Marker"] = function(self, m)
+            if m.CompassMarker then m.CompassMarker.gone = true end   -- (its ReceiveDestroyed: only the one it holds)
             HOOKS[DESTROYED](P(m)); m.gone = true; HOOKS[REMOVE](P(self), P(m))
         end
         -- laptop scans: quest marker class + defaults, the crate class, a world that spawns
@@ -3470,7 +5464,12 @@ def map_pings_reach_the_other_game():
             send = function(self, m) SENT[#SENT + 1] = m end,
             pump = function(self, fn) local q = INBOX[name] or {}; INBOX[name] = {}; for _, m in ipairs(q) do fn(m) end end } end }
         StaticFindObject = function(p) return OBJS[p] or obj({}) end
-        FindAllOf = function(c) if c == "BP_GuaranteedSpawner_Classified_C" then return CRATES end return MARKERS end
+        FindAllOf = function(c)
+            if c == "BP_GuaranteedSpawner_Classified_C" then return CRATES end
+            if c == "BP_CompassMarker_C" then return COMPASSES end
+            if c == "BP_QuestMarker_C" then return QMARKS end
+            return MARKERS
+        end
         util = require("mirror.util")
         util.ensure_hook = function(path, fn) HOOKS[path:match("([%w_]+:[^:]+)$")] = fn; return true end
         IN_WORLD = true
@@ -3507,6 +5506,34 @@ def map_pings_reach_the_other_game():
     check(L.eval('#MARKERS == N') and "waiting 1" in L.eval('pings.status()'), "no map yet (respawning): the ping waits")
     L.execute('HAS_COMP = true; pings.tick(2.1)')
     check(L.eval('#MARKERS == N + 1') and "waiting" not in L.eval('pings.status()'), "...and is placed once the map is back")
+    # a respawn (SD_GameInstance Survival_Respawn) runs RespawnMarker on every ping: it spawns a new compass marker over
+    # the one the ping holds and never destroys the old one, so a removed ping left a compass icon behind
+    L.execute(r"""
+        function respawn()
+            for _, m in ipairs(MARKERS) do
+                if not m.gone and m["Marker Data"][CMP] then m.CompassMarker = compass(m.K2_GetActorLocation().X) end
+            end
+        end
+        function icons_at(x)
+            local n = 0
+            for _, c in ipairs(COMPASSES) do if not c.gone and math.abs(c.K2_GetActorLocation().X - x) < 100 then n = n + 1 end end
+            return n
+        end
+        INBOX.pings = { "A 3000 0 0 - 1 1 1 1 0 0 1" }; pings.tick(0.1)
+        THEIRS2 = SPAWNED
+        MINE2 = place(3500, data(SKULL, 1))
+        KEEP = place(6000, data(SKULL, 1))
+        QUEST = obj({ CompassMarker = compass(3000) }); QMARKS[1] = QUEST
+        respawn()
+        A0, B0 = icons_at(3000), icons_at(3500)
+        INBOX.pings = { "R 3000 0 0" }; pings.tick(0.1); pings.tick(0.1)
+        COMP["Remove Player Marker"](COMP, MINE2); pings.tick(0.1)
+    """)
+    check(L.eval('A0 == 3 and B0 == 2'), "a respawn leaves a second compass marker per ping (%s at 3000, %s at 3500)" % (L.eval('A0'), L.eval('B0')))
+    check(L.eval('THEIRS2.gone') and L.eval('icons_at(3000)') == 1 and not L.eval('QUEST.CompassMarker.gone'),
+          "the other player's removal after a respawn takes all its compass icons here, a quest marker's on the spot stays (%s left)" % L.eval('icons_at(3000)'))
+    check(L.eval('icons_at(3500)') == 0, "removing my own ping after a respawn takes all its compass icons (%s left)" % L.eval('icons_at(3500)'))
+    check(not L.eval('KEEP.CompassMarker.gone'), "a ping still there keeps its compass icon")
     # military laptop scans: the bounty quest's map icon and its crate reach the other game
     L.execute(r"""
         SENT = {}
@@ -3547,6 +5574,20 @@ def map_pings_reach_the_other_game():
     L.execute('INBOX.pings = { "C /Game/Inv/BP_GuaranteedSpawner_Classified.BP_GuaranteedSpawner_Classified_C 5000.0 0.0 10.0 0.00 90.00 0.00" }; pings.tick(0.1)')
     check(L.eval('#CRATES') == 1 and L.eval('#SENT') == 0, "...once, and nothing goes back")
     check(L.eval('CRATES[1].Opened') is True, "...already searched here: the item and the quest stay the scanner's")
+    # a crate class not loaded here is never loaded from our Lua (a LoadAsset there can deadlock, L-014): it waits
+    L.execute(r"""
+        LOADS = 0; LoadAsset = function() LOADS = LOADS + 1 end
+        local fa = FindAllOf; FindAllOf = function(c) if c == "BP_Other_C" then return {} end return fa(c) end
+        P2 = "/Game/Inv/BP_Other.BP_Other_C"
+        OBJS[P2] = { IsValid = function() return false end }
+        N0 = #WORLD_SPAWNED
+        INBOX.pings = { "C " .. P2 .. " 7000.0 0.0 10.0 0.00 0.00 0.00" }; pings.tick(0.1)
+        N1 = #WORLD_SPAWNED
+        OBJS[P2] = obj({}); pings.tick(2.1)
+        N2 = #WORLD_SPAWNED
+    """)
+    check(L.eval('LOADS') == 0 and L.eval('N1 == N0'), "a crate whose class isn't loaded here isn't loaded from Lua - it waits")
+    check(L.eval('N2 == N0 + 1'), "...and is placed once the game has the class")
     L.execute('HOOKS["BP_GuaranteedSpawner_C:Svr_CrateOpen"](P(CRATES[1]))')
     check(L.eval('#SENT') == 0, "searching the copy sends nothing")
     L.execute(r"""
@@ -3556,6 +5597,173 @@ def map_pings_reach_the_other_game():
     check(list(L.eval('SENT').values()) == ["O BP_GuaranteedSpawner_Classified_C 9000.0 0.0 0.0"], "searching my own scan's crate is sent (%s)" % list(L.eval('SENT').values()))
     L.execute('SENT = {}; INBOX.pings = { "O BP_GuaranteedSpawner_Classified_C 5000.0 0.0 10.0" }; pings.tick(0.1)')
     check(L.eval('CRATES[1].lid') is True and L.eval('#SENT') == 0, "the scanner searching theirs opens the copy's lid here, no echo")
+
+
+def drops_pickup_reaches_every_guest():
+    # T10 audit 2026-10-31: drops.lua set channel.send twice; the later one (checkpoint on D/T) replaced the relay
+    # send, so with 3-4 players a pickup on the host reached only the guest who dropped the item.
+    print("drops_pickup_reaches_every_guest")
+    L = lua()
+    L.execute(FAKES + r"""
+        package.loaded["mirror.game"] = { player = function() return nil end, world = function() return nil end,
+                                          on_world_reset = function() end }
+        package.loaded["mirror.bedtags"] = { gone = function() end, tick = function() end, init = function() end }
+        SENT, RELAYED, CHECKPOINTS = {}, {}, 0
+        package.loaded["mirror.events"] = evmock { new = function(name) return {
+            send = function(self, m) SENT[#SENT + 1] = name .. ":" .. m end, pump = function() end } end,
+            send = function(self, m) SENT[#SENT + 1] = "drops:" .. m end }
+        package.loaded["mirror.peers"] = { relaying = function() return false end, my_slot = function() return 0 end,
+            each = function() end, relay = function(name, self, fn) RELAYED[#RELAYED + 1] = name end }
+        StaticFindObject = function() return obj({}) end
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        util.cdo = function() return nil end
+        drops = require("mirror.drops")
+        drops.init({ mirror_drops = true }, "host", { in_world = function() return true end,
+            checkpoint = function() CHECKPOINTS = CHECKPOINTS + 1 end })
+        drops.relay_take("T U1 0")
+    """)
+    check(L.eval("#SENT") == 1 and L.eval("SENT[1]") == "drops:T U1 0", "the pickup goes out (%r)" % L.eval("SENT[1]"))
+    check(L.eval("RELAYED[1]") == "mirror.drops", "and is offered to the other guests' copies (%r)" % L.eval("RELAYED[1]"))
+    check(L.eval("CHECKPOINTS") == 1, "and still checkpoints the trade (%d)" % L.eval("CHECKPOINTS"))
+
+
+DROPS_PAIR_FAKES = FAKES + r"""
+    package.loaded["mirror.game"] = { player = function() return nil end, world = function() return nil end,
+                                      on_world_reset = function() end }
+    package.loaded["mirror.bedtags"] = { gone = function() end, tick = function() end, init = function() end }
+    SENT, INBOX = {}, {}
+    package.loaded["mirror.events"] = evmock { new = function(name) return {
+        send = function(self, m) SENT[#SENT + 1] = name .. ":" .. m end,
+        pump = function(self, fn) local q = INBOX[name] or {}; INBOX[name] = {}; for _, p in ipairs(q) do fn(p) end end } end,
+        send = function(self, m) SENT[#SENT + 1] = "drops:" .. m end }
+    package.loaded["mirror.peers"] = { relaying = function() return false end, my_slot = function() return 0 end,
+        relay = function() end, each = function(name, fn) fn(require(name)) end }
+    StaticFindObject = function() return obj({}) end
+    util = require("mirror.util")
+    util.ensure_hook = function() return true end
+    util.cdo = function() return nil end
+    util.class_name = function(a) return a.cls end
+    WORLD = {}
+    FindAllOf = function() return WORLD end
+    function pickup(x, name)
+        local asset = obj({ GetFullName = function() return "DA /Game/Items/" .. name .. "." .. name end })
+        local a
+        a = obj({ cls = "BP_Pickup_C", K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end,
+                  IsActorBeingDestroyed = function() return a.gone == true end, GetAttachParentActor = function() return a.parent end,
+                  K2_DestroyActor = function() a.gone = true end })
+        local comp = obj({ ItemDataAsset = asset, GetOwner = function() return a end, MainJigContainers = { ForEach = function() end } })
+        a.GetComponentByClass = function() return comp end
+        WORLD[#WORLD + 1] = a
+        return a
+    end
+    drops = require("mirror.drops")
+"""
+
+
+def drops_rejoin_pairs_the_saved_pickups():
+    # T10 audit 2026-10-31: after a join or rejoin the guest's dropped items are plain saved pickups and a guest at
+    # home forgets which were drops; the host still tracked them. The guest's pickup went out as a world item (W) the
+    # host skipped, the host's as a uid the guest didn't know: both kept the item. The host now tells the joining
+    # guest its drops (P) and the guest pairs them with the saved pickups.
+    print("drops_rejoin_pairs_the_saved_pickups")
+    H = lua()
+    H.execute(DROPS_PAIR_FAKES + r"""
+        drops.init({ mirror_drops = true }, "host", { in_world = function() return true end, checkpoint = function() end })
+        RIFLE, AMMO = pickup(100, "DA_Rifle"), pickup(140, "DA_Ammo")
+        -- (tracked the way a guest's pairing does it: the host's own tracking of these is not what is tested)
+        INBOX.drops = { "P U1 BP_Pickup_C 100.0 0.0 0.0 " .. "/Game/Items/DA_Rifle.DA_Rifle",
+                        "P U2 BP_Pickup_C 140.0 0.0 0.0 " .. "/Game/Items/DA_Ammo.DA_Ammo" }
+        drops.tick(0.6)
+        SENT = {}
+        if drops.join_started then drops.join_started() end
+    """)
+    lines = sorted(m[len("drops:"):] for m in H.eval("SENT").values())
+    want = ["P U1 BP_Pickup_C 100.0 0.0 0.0 /Game/Items/DA_Rifle.DA_Rifle", "P U2 BP_Pickup_C 140.0 0.0 0.0 /Game/Items/DA_Ammo.DA_Ammo"]
+    check(lines == want, "host: a join's save start sends its 2 tracked drops (%r)" % lines)
+    lines = want
+    G = lua()
+    G.execute(DROPS_PAIR_FAKES + r"""
+        drops.init({ mirror_drops = true }, "guest", { in_world = function() return true end, checkpoint = function() end })
+        -- the join save's pickups: the two drops, and a level-placed rifle 2 m off
+        R, A, OTHER = pickup(101, "DA_Rifle"), pickup(139, "DA_Ammo"), pickup(300, "DA_Rifle")
+        INBOX.drops = LINES
+    """.replace("LINES", "{ " + ", ".join('"%s"' % l for l in lines) + " }"))
+    G.execute("drops.tick(0.6)")
+    G.execute('SENT = {}; INBOX.drops = { "T U1 0" }; drops.tick(0.1)')
+    check(G.eval("R.gone") is True and not G.eval("OTHER.gone"),
+          "guest: the host's pickup of its drop removes the saved rifle here, not the other one")
+    G.execute("A.parent = obj({}); drops.tick(0.6)")   # picked up: in the player's hands
+    sent = [m for m in G.eval("SENT").values()]
+    check(any(m.startswith("drops:T U2 ") for m in sent) and not any(m.startswith("drops:W ") for m in sent),
+          "guest: its pickup of the saved ammo goes out as the host's drop U2 (%r)" % sent)
+
+
+def drops_pile_pickups_take_only_their_own_item():
+    # T10 audit 2026-10-31: three cans lying in a pile. The guest picks up one, the host the one next to it within
+    # 15 s: the host's W matched the guest's own pickup as a same-moment race, so the guest took its can back out AND
+    # removed the host's here - two cans became one. A real race (both took the same can) removed the neighbour too.
+    print("drops_pile_pickups_take_only_their_own_item")
+    def side(role, slot, xs, pick_x, w_x, w_slot):
+        G = lua()
+        G.execute(DROPS_PAIR_FAKES.replace('drops = require("mirror.drops")', "") + r"""
+            PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end })
+            PLAYER.BP_JigMultiplayer = obj({})
+            package.loaded["mirror.game"].player = function() return PLAYER end
+            package.loaded["mirror.peers"].my_slot = function() return @MYSLOT end
+            TAKEN = {}
+            require("mirror.jig")
+            package.loaded["mirror.jig"].contents_of = function(c)
+                if c == PLAYER.BP_JigMultiplayer then return { { uid = "I1", da = "/Game/Items/DA_Can.DA_Can", count = 1 } } end
+                return {}
+            end
+            package.loaded["mirror.jig"].take = function(c, uid, n) TAKEN[#TAKEN + 1] = uid; return true end
+            HOOKS = {}
+            util.ensure_hook = function(path, fn) HOOKS[path:match(":(.+)$")] = fn; return true end
+            drops = require("mirror.drops")
+            drops.init({ mirror_drops = true }, @ROLE, { in_world = function() return true end, checkpoint = function() end })
+            drops.tick(0.6)
+            CANS = {}
+            for i, x in ipairs(@XS) do CANS[i] = pickup(x, "DA_Can") end
+            C1, C2, C3 = CANS[1], CANS[2], CANS[3]
+            for _, c in ipairs(CANS) do if c.K2_GetActorLocation().X == @PICK_X then MINE = c end end
+            HOOKS["JigMP_OnPickupEquipped"]({ get = function() return PLAYER end }, { get = function() return MINE end }, nil, { get = function() return "I1" end })
+            MINE.parent = obj({})
+            W = nil
+            for _, m in ipairs(SENT) do W = W or m:match("^drops:(W .*)$") end
+            INBOX.drops = { "W BP_Pickup_C " .. @W_X .. ".0 0.0 0.0 /Game/Items/DA_Can.DA_Can " .. @W_SLOT }
+            drops.tick(0.1)
+            HELD = 1 - #TAKEN
+            LYING = 0
+            for _, c in ipairs(CANS) do if c ~= MINE and not c.gone then LYING = LYING + 1 end end
+        """.replace("@ROLE", '"%s"' % role).replace("@MYSLOT", str(slot)).replace("@XS", "{ %s }" % ", ".join(map(str, xs)))
+           .replace("@PICK_X", str(pick_x)).replace("@W_X", str(w_x)).replace("@W_SLOT", str(w_slot)))
+        return G
+    def guest(pick_x):   # the host (slot 0) picked up the can at 130
+        return side("guest", 1, (100, 130, 160), pick_x, 130, 0)
+    G = guest(100)
+    check((G.eval("W") or "").startswith("W BP_Pickup_C 100.0"), "guest: its pickup goes out as a world item (%r)" % G.eval("W"))
+    check(G.eval("#TAKEN") == 0, "neighbour picked up by the host: the guest keeps its own can (%d taken back)" % G.eval("#TAKEN"))
+    check(G.eval("C2.gone") is True and not G.eval("C3.gone"), "and the host's can is removed here, not the third one")
+    G = guest(130)
+    check(G.eval("#TAKEN") == 1, "both took the same can: the guest (higher slot) gives it back (%d)" % G.eval("#TAKEN"))
+    check(not G.eval("C1.gone") and not G.eval("C3.gone"), "and no neighbouring can is removed")
+    # Sentinel R4: cans 5 cm apart, the host's world has them 20 cm off. Both take the same can; each game decided
+    # from its own lying cans and the two came out different (host: race, guest: neighbour) - a can more than there was.
+    # In each world the cans held by both players plus those lying there must still be 3.
+    H = side("host", 0, (120, 125, 130), 120, 100, 1)
+    G = side("guest", 1, (100, 105, 110), 100, 120, 0)
+    held = H.eval("HELD") + G.eval("HELD")
+    check(held + H.eval("LYING") == 3 and held + G.eval("LYING") == 3,
+          "worlds 20 cm apart, both took the same can: still 3 cans in each world (held %d, lying host %d, guest %d)"
+          % (held, H.eval("LYING"), G.eval("LYING")))
+    # the other way: neighbours 10 cm apart in the same spots, the guest took one, the host the next (a race to both)
+    H = side("host", 0, (100, 110, 120), 110, 100, 1)
+    G = side("guest", 1, (100, 110, 120), 100, 110, 0)
+    held = H.eval("HELD") + G.eval("HELD")
+    check(held + H.eval("LYING") == 3 and held + G.eval("LYING") == 3,
+          "neighbours 10 cm apart taken at once: still 3 cans in each world (held %d, lying host %d, guest %d)"
+          % (held, H.eval("LYING"), G.eval("LYING")))
 
 
 def horde_rewards_reach_the_other_game():
@@ -3688,6 +5896,55 @@ def loose_magazine_rounds_reach_the_picker():
     check(L.eval('#TAKEN') == 0, "...only once")
 
 
+def a_picked_up_items_address_can_come_back_as_a_new_drop():
+    """Audit 2026-10-30: a pickup destroyed here is marked ended (it stays valid until garbage collection), and the mark
+    was its address, kept for the whole world. After the collection a new pickup can get that address: the other
+    player's pickup of it no longer removed it here, so the item was in both games."""
+    print("a_picked_up_items_address_can_come_back_as_a_new_drop")
+    L = lua()
+    L.execute(FAKES + r"""
+        PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end, BP_JigMultiplayer = obj({}) })
+        local k = 0
+        function pickup(x)
+            k = k + 1
+            local comp = obj({ PickupInfo = { ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = {} } })
+            local a = obj({ name = "BP_Pickup_C /Game/Map.Map:PersistentLevel.BP_Pickup_C_" .. k,
+                            K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end,
+                            IsActorBeingDestroyed = function() return false end, GetAttachParentActor = function() return nil end,
+                            GetComponentByClass = function() return comp end })
+            a.GetFullName = function(self) return self.name end
+            a.K2_DestroyActor = function(self) self.destroyed = (self.destroyed or 0) + 1 end
+            if REUSE then local r = REUSE; a.GetAddress = function() return r end end
+            return a
+        end
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+            world = function() return { SpawnActor = function(_, c, l) COPY = pickup(l.X); return COPY end } end }
+        IN = {}
+        package.loaded["mirror.events"] = evmock { new = function(name) return {
+            send = function() end, pump = function(self, fn) local q = IN; IN = {}; for _, p in ipairs(q) do fn(p) end end } end,
+            send = function() end }
+        KNIFE = "/Game/Items/DA_Knife.DA_Knife"
+        StaticFindObject = function(p) return obj({ PickupClass = obj({}) }) end
+        package.loaded["mirror.jig"] = { full_path = function() return KNIFE end, guid = function() return {} end,
+            uid_str = function(g) return "0_0_0_0" end, contents_of = function() return {} end, write_stats = function() return 0 end }
+        package.loaded["mirror.names"] = { set = function() end, decode = function(s) return s end, moved = function() end }
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        util.cdo = function() return nil end
+        drops = require("mirror.drops")
+        drops.init({ mirror_drops = true }, "host", nil)
+    """)
+    # an item lying here is cleaned up: destroyed and marked, still listed until garbage collection
+    L.execute('OLD = pickup(500); CLEANED = drops.cleanup_remove(OLD)')
+    check(L.eval('CLEANED') is True and L.eval('drops.cleanup_remove(OLD)') is False,
+          "a cleaned-up item counts as gone while it is still listed")
+    # collected; the other player drops a knife here and its copy gets the old item's address
+    L.execute('REUSE = OLD:GetAddress(); IN = { "D 5_5_5_5 " .. KNIFE .. " 1 0 0 100 0 0 0 0 0 1 1 0.5 10" }; drops.tick(0.1)')
+    check(L.eval('COPY ~= nil and COPY:GetAddress() == REUSE'), "the copy has the old item's address")
+    L.execute('IN = { "T 5_5_5_5 1" }; drops.tick(0.1)')
+    check(L.eval('COPY.destroyed') == 1, "the other player picks it up: the copy here is removed (%s)" % L.eval('COPY.destroyed'))
+
+
 def loose_magazine_picked_up_without_hooks_still_gets_its_rounds():
     # in-game 2026-10-24: the game's pickup of a mag copy ran none of the pickup hooks - it was only seen as "gone"
     print("loose_magazine_picked_up_without_hooks_still_gets_its_rounds")
@@ -3742,6 +5999,69 @@ def loose_magazine_picked_up_without_hooks_still_gets_its_rounds():
     check(L.eval('FILLED and FILLED.list[2].count') == 25, "all 25 rounds")
     L.execute('FILLED = nil; drops.tick(1.0); drops.tick(1.0)')
     check(L.eval('FILLED') is None, "the rounds are put in once")
+
+
+def loose_magazine_picked_up_by_both_at_once_is_kept_once():
+    # T10 audit 2026-10-31: a mag copy's pickup here is only seen at the next ground check (0.5 s). The host's "T" for
+    # the same mag in between forgot the copy and the check never told mine: both kept the mag.
+    print("loose_magazine_picked_up_by_both_at_once_is_kept_once")
+    L = lua()
+    L.execute(FAKES + r"""
+        PC = obj({})
+        PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end, BP_JigMultiplayer = PC })
+        COMP = obj({ PickupInfo = { ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = {},
+                                    UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = { A = 7, B = 7, C = 7, D = 7 } } })
+        GONE = false
+        COPY = obj({ K2_GetActorLocation = function() return { X = 100, Y = 0, Z = 0 } end,
+                     IsActorBeingDestroyed = function() return GONE end, GetAttachParentActor = function() return nil end,
+                     GetComponentByClass = function() return COMP end, K2_DestroyActor = function() end })
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+            world = function() return { SpawnActor = function() return COPY end } end }
+        package.loaded["mirror.notify"] = { show = function() end }
+        SENT, IN = {}, {}
+        package.loaded["mirror.events"] = evmock { new = function(name) return {
+            send = function(self, m) SENT[#SENT + 1] = m end,
+            pump = function(self, fn) local q = IN; IN = {}; for _, p in ipairs(q) do fn(p) end end } end,
+            send = function(self, m) SENT[#SENT + 1] = m end }
+        CLIP = "/Game/Items/DA_AR45Clip.DA_AR45Clip"
+        StaticFindObject = function(p)
+            if p == CLIP then return obj({ PickupClass = obj({}), ["IsContainer?"] = true }) end
+            return obj({})
+        end
+        INV, TAKEN = { { uid = "5_5_5_5", da = CLIP } }, {}
+        package.loaded["mirror.jig"] = {
+            full_path = function() return CLIP end, guid = function() return {} end,
+            uid_str = function(g) return string.format("%d_%d_%d_%d", g.A, g.B, g.C, g.D) end,
+            contents_of = function(c) if c == PC then return INV end return {} end,
+            apply_contents = function(c, want) return 0, 0, 0, #want end,
+            fill = function(c, uid, list) return #list - 1, 0 end,
+            take = function(c, uid, n) TAKEN[#TAKEN + 1] = uid; return true end }
+        package.loaded["mirror.names"] = { set = function() end, decode = function(s) return s end, moved = function() end }
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        util.cdo = function() return { IsValid = function() return not GONE end } end
+        drops = require("mirror.drops")
+        drops.init({ mirror_drops = true }, "guest", { in_world = function() return true end, checkpoint = function() end })
+        package.loaded["mirror.peers"].my_slot = function() return 1 end
+        IN = { "D 1_2_3_4 " .. CLIP .. " 1 0 0 0 0 0 0 0 0 1 2 0.2 10",
+               "I 1_2_3_4 /Game/Items/DA_45ACPAmmo.DA_45ACPAmmo 25 0.000 0.000 0 0" }
+        drops.tick(0.1)
+        drops.tick(0.6)
+        drops.tick(0.6)
+        -- I pick it up; the host (slot 0) picked it up too, its T lands before my next ground check
+        GONE = true
+        INV[2] = { uid = "9_9_9_9", da = CLIP }
+        SENT = {}
+        IN = { "T 1_2_3_4 0" }
+        drops.tick(0.05)
+    """)
+    sent = list(L.eval('SENT').values())
+    check("T 1_2_3_4 1" in sent, "my pickup is told after all, so the host settles it too (%r)" % sent)
+    check(L.eval('TAKEN[1]') == "9_9_9_9", "the higher slot gives back the mag it just picked up, not the one it carried (%s)"
+          % L.eval('TAKEN[1]'))
+    L.execute('SENT = {}; TAKEN = {}; for i = 1, 4 do drops.tick(0.6) end')
+    check(L.eval('#TAKEN') == 0 and not any(m.startswith("T 1_2_3_4") for m in L.eval('SENT').values()),
+          "...once: the forgotten copy isn't told again")
 
 
 def ground_weapon_attachments_reach_the_other_game():
@@ -3809,7 +6129,7 @@ def ground_weapon_attachments_reach_the_other_game():
         MOVE(PC, obj({ GetOwner = function() return obj({}) end }))
         drops.tick(0.4)
         OTHER = #SENT
-        IN = { "C 1_2_3_4 /Game/Items/DA_Scope.DA_Scope;/Game/Items/DA_Grip.DA_Grip" }
+        IN = { "C 1_2_3_4 - /Game/Items/DA_Scope.DA_Scope;/Game/Items/DA_Grip.DA_Grip" }
         drops.tick(0.1)
         drops.tick(0.4)
         drops.tick(0.6)
@@ -3855,20 +6175,154 @@ def ground_weapon_attachments_reach_the_other_game():
     """)
     first = list(L.eval('FIRST').values())
     check(L.eval('EARLY') == 0, "the change is sent once the move has settled")
-    check(first == ["C 1_2_3_4 /Game/Items/DA_Scope.DA_Scope"], "an attachment put on a dropped weapon is sent with its uid")
+    check(first == ["C 1_2_3_4 * /Game/Items/DA_Scope.DA_Scope"],
+          "an attachment put on a dropped weapon is sent with its uid; no list known before: '*', taken whole (%r)" % first)
     check(L.eval('SAME') == 0, "an unchanged weapon isn't sent again")
-    check(list(L.eval('TAKEN').values()) == ["C 1_2_3_4 "], "taking the attachment off is sent too")
+    check(list(L.eval('TAKEN').values()) == ["C 1_2_3_4 /Game/Items/DA_Scope.DA_Scope -"], "taking the attachment off is sent too")
     check(L.eval('OTHER') == 0, "moves between untracked containers send nothing")
     check(L.eval('APPLIED and APPLIED.comp == COMP') and L.eval('#APPLIED.want') == 2,
           "the other game's change goes onto this game's copy")
     check(L.eval('ECHO') == 0, "applying the other game's change isn't echoed back")
-    check(list(L.eval('POLLED').values()) == ["C 1_2_3_4 /Game/Items/DA_Laser.DA_Laser"],
+    check(list(L.eval('POLLED').values()) == ["C 1_2_3_4 - /Game/Items/DA_Laser.DA_Laser"],
           "a part put on without any hook is found by looking and sent")
     check(L.eval('POLLED_AGAIN') == 0, "and sent once")
     check(L.eval('FAR') == 0, "an item 10 m away isn't looked at")
     check(L.eval('LOOKED_EARLY') == True, "(the check saw the copy's default parts first)")
     check(L.eval('LANDED_HAVE') == 1, "the copy got the other game's parts")
     check(L.eval('LANDED_N') == 0, "the other game's parts landing on a fresh copy aren't sent back")
+
+
+def ground_weapon_parts_changed_by_both_at_once_keep_both_changes():
+    # T10 item-sync audit 2026-10-31: a parts change on a dropped weapon went over as its whole parts list. The host
+    # takes the scope off while the guest takes the mag off: each list put back the part the other had just taken
+    # (the host kept a scope in its bag and one on the weapon). Each game must end with both changes and stay quiet.
+    print("ground_weapon_parts_changed_by_both_at_once_keep_both_changes")
+    def side(role):
+        S = lua()
+        S.execute(FAKES + r"""
+            PC = obj({})
+            PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end, BP_JigMultiplayer = PC })
+            COMP = obj({ PickupInfo = { ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = {},
+                                        UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = { A = 7, B = 7, C = 7, D = 7 } } })
+            COPY = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end,
+                         IsActorBeingDestroyed = function() return false end, GetAttachParentActor = function() return nil end,
+                         GetComponentByClass = function() return COMP end, K2_DestroyActor = function() end })
+            COMP.GetOwner = function() return COPY end
+            PC.GetOwner = function() return PLAYER end
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+                world = function() return { SpawnActor = function() return COPY end } end }
+            SENT, IN = {}, {}
+            package.loaded["mirror.events"] = evmock { new = function(name) return {
+                send = function(self, m) SENT[#SENT + 1] = m end,
+                pump = function(self, fn) local q = IN; IN = {}; for _, p in ipairs(q) do fn(p) end end } end,
+                send = function(self, m) SENT[#SENT + 1] = m end }
+            RIFLE = "/Game/Items/DA_Rifle.DA_Rifle"
+            StaticFindObject = function(p)
+                if p == RIFLE then return obj({ PickupClass = obj({}), ["IsContainer?"] = false }) end
+                return obj({})
+            end
+            package.loaded["mirror.names"] = { set = function() end, get = function() end, decode = function(s) return s end,
+                                               encode = function(s) return s end, moved = function() end }
+            local real = require("mirror.jig")
+            package.loaded["mirror.jig"] = {
+                full_path = function() return RIFLE end, guid = function() return {} end,
+                uid_str = function(g) return string.format("%d_%d_%d_%d", g.A, g.B, g.C, g.D) end,
+                write_stats = function() return 0 end,
+                contents_of = function(c) if c == COMP then return HAVE end return {} end,
+                encode = real.encode, decode = real.decode,
+                apply_contents = function(c, want)
+                    HAVE = {}
+                    for i, w in ipairs(want) do
+                        HAVE[i] = { da = w.da, count = w.count, dx = w.dx, dy = w.dy, parent = w.parent, slot = w.slot }
+                    end
+                    return #want, 0, 0, 0
+                end }
+            util = require("mirror.util")
+            util.ensure_hook = function() return true end
+            util.cdo = function() return nil end
+            drops = require("mirror.drops")
+            drops.init({ mirror_drops = true }, "@ROLE", { in_world = function() return true end, checkpoint = function() end })
+            function PART(name, slot, count) return { da = "/Game/Items/DA_" .. name .. ".DA_" .. name, count = count, parent = 1, slot = slot } end
+            HAVE = { { da = RIFLE }, PART("Scope", 1), PART("Mag", 2, 30) }
+            IN = { "D 1_2_3_4 " .. RIFLE .. " 1 0 0 0 0 0 0 0 0 4 2 3 100" }
+            drops.tick(0.6)
+            drops.tick(0.6)
+            SENT = {}
+            function OFF(name) for i = #HAVE, 1, -1 do if HAVE[i].da:find("DA_" .. name, 1, true) then table.remove(HAVE, i) end end end
+            function KINDS()
+                local t = {}
+                for _, h in ipairs(HAVE) do t[#t + 1] = h.da:match("DA_(%w+)$") .. ((h.count or 1) ~= 1 and ("x" .. h.count) or "") end
+                table.sort(t)
+                return table.concat(t, ",")
+            end
+        """.replace("@ROLE", role))
+        return S
+    def settle(H, G):
+        for S in (H, G):
+            S.execute("drops.tick(0.6); drops.tick(0.6)")
+        rounds = 0
+        while rounds < 6:
+            h, g = list(H.eval("SENT").values()), list(G.eval("SENT").values())
+            if not h and not g:
+                return rounds
+            rounds += 1
+            for S, inbox in ((H, g), (G, h)):
+                S.execute("SENT = {}; IN = { %s }; drops.tick(0.6); drops.tick(0.6)"
+                          % ", ".join("[==[%s]==]" % m for m in inbox))
+        return rounds
+    H, G = side("host"), side("guest")
+    check(H.eval("KINDS()") == "Magx30,Rifle,Scope" and H.eval("#SENT") == 0, "(both games start with a rifle, scope and mag)")
+    H.execute('OFF("Scope")')
+    G.execute('OFF("Mag")')
+    rounds = settle(H, G)
+    check(H.eval("KINDS()") == "Rifle" and G.eval("KINDS()") == "Rifle",
+          "scope off on the host, mag off on the guest at once: both are off in both games (host %s, guest %s)"
+          % (H.eval("KINDS()"), G.eval("KINDS()")))
+    check(rounds < 6, "and the games go quiet (%d exchanges)" % rounds)
+    H, G = side("host"), side("guest")
+    H.execute('OFF("Scope")')
+    G.execute('OFF("Scope")')
+    rounds = settle(H, G)
+    check(H.eval("KINDS()") == "Magx30,Rifle" and G.eval("KINDS()") == "Magx30,Rifle" and rounds < 6,
+          "both take the scope off at once: it stays off, nothing else changes (host %s, guest %s, %d exchanges)"
+          % (H.eval("KINDS()"), G.eval("KINDS()"), rounds))
+    H, G = side("host"), side("guest")
+    H.execute('HAVE[#HAVE + 1] = PART("Grip", 3)')
+    G.execute('OFF("Mag")')
+    rounds = settle(H, G)
+    check(H.eval("KINDS()") == "Grip,Rifle,Scope" and G.eval("KINDS()") == "Grip,Rifle,Scope" and rounds < 6,
+          "a grip put on here while the mag comes off there: both kept (host %s, guest %s, %d exchanges)"
+          % (H.eval("KINDS()"), G.eval("KINDS()"), rounds))
+    H, G = side("host"), side("guest")
+    G.execute("HAVE[3].count = 12")
+    rounds = settle(H, G)
+    check(H.eval("KINDS()") == "Magx12,Rifle,Scope" and rounds < 6,
+          "a lone change still goes over whole (host %s, %d exchanges)" % (H.eval("KINDS()"), rounds))
+    # Sentinel R5: both games answered a same-moment change with their merge; the answers crossed and each applied
+    # the other's count change a second time (30 -> 12 beside a scope taken off: the mag went on both sides)
+    def both(host_do, guest_do, want, what):
+        H, G = side("host"), side("guest")
+        H.execute(host_do)
+        G.execute(guest_do)
+        rounds = settle(H, G)
+        check(H.eval("KINDS()") == want and G.eval("KINDS()") == want and rounds < 6,
+              "%s: %s on both (host %s, guest %s, %d exchanges)" % (what, want, H.eval("KINDS()"), G.eval("KINDS()"), rounds))
+    both("HAVE[3].count = 12", 'OFF("Scope")', "Magx12,Rifle", "rounds taken out of the mag here, the scope off there")
+    both("HAVE[3].count = 20", 'HAVE[#HAVE + 1] = PART("Grip", 3)', "Grip,Magx20,Rifle,Scope",
+         "rounds taken out here, a grip put on there")
+    both("HAVE[3].count = 20", "HAVE[3].count = 25", "Magx15,Rifle,Scope", "10 rounds taken here, 5 there")
+    # a change here the 0.5 s check hasn't seen yet when theirs lands: it goes over on top of theirs
+    def unsent(host_do, guest_do, want, what):
+        H, G = side("host"), side("guest")
+        G.execute(guest_do + "; drops.tick(0.6); drops.tick(0.6)")
+        g = list(G.eval("SENT").values())
+        G.execute("SENT = {}")
+        H.execute("%s; IN = { %s }; drops.tick(0.1)" % (host_do, ", ".join("[==[%s]==]" % m for m in g)))
+        rounds = settle(H, G)
+        check(H.eval("KINDS()") == want and G.eval("KINDS()") == want and rounds < 6,
+              "%s: %s on both (host %s, guest %s, %d exchanges)" % (what, want, H.eval("KINDS()"), G.eval("KINDS()"), rounds))
+    unsent('OFF("Scope")', 'OFF("Mag")', "Rifle", "scope off here not sent yet when the mag-off lands")
+    unsent("HAVE[3].count = 12", 'OFF("Scope")', "Magx12,Rifle", "rounds taken out here not sent yet when the scope-off lands")
 
 
 def ghost_gun_in_hand_is_known():
@@ -3887,6 +6341,101 @@ def ghost_gun_in_hand_is_known():
     r = list(L.eval('R').values())
     check(r == [False, False, True, True], "pieces under a hand socket are the held gun, the holstered one isn't")
     check(L.eval('GONE') is False, "forgetting the gear forgets the hand pieces")
+
+
+def ghost_wears_its_players_face_beard_and_tattoos():
+    # User 2026-10-31: "character beards and facial stuff tattoos etc sync those if not already". The character
+    # creator (CharacterCreatorMenu / BP_PlayerCharacter SetSexMesh, build 26303910) keeps every choice as an asset on
+    # a named part: BeardMesh/HairMesh/EyebrowsMesh/Mouth static meshes, tattoos, scars, freckles and war paint as
+    # Accessory1-3 static meshes, skin and hair colour as material instances. The ghost starts with OUR save's look
+    # (its construction script runs SetSexMesh from this PC's save): the other player's parts must replace all of it.
+    print("ghost_wears_its_players_face_beard_and_tattoos")
+    L = lua()
+    L.execute(FAKES + r"""
+        ASSETS = {}
+        function asset(p, c) local o = obj({ GetFullName = function() return (c or "StaticMesh") .. " " .. p end }); ASSETS[p] = o; return o end
+        StaticFindObject = function(p) return ASSETS[p] end
+        local P = "/Game/PlayerModel/"
+        for _, p in ipairs({ "Hair/Beard/Chr_Beard2.Chr_Beard2", "Hair/Beard/Chr_Moustache1.Chr_Moustache1",
+                             "Hair/HairMesh/Chr_MaleHair3.Chr_MaleHair3", "Hair/Eyebrows/Chr_Eyebrows2.Chr_Eyebrows2",
+                             "BodyParts/Head/Features/Male/Male_Tattoo2.Male_Tattoo2", "BodyParts/Head/Features/Male/Male_Scar1.Male_Scar1",
+                             "BodyParts/Head/Features/Male/Male_Freckles.Male_Freckles", "BodyParts/Head/Features/Male/Male_Mouth2.Male_Mouth2" }) do
+            asset(P .. p)
+        end
+        asset(P .. "BodyParts/Male/SK_Chr_Male_Head.SK_Chr_Male_Head", "SkeletalMesh")
+        for _, p in ipairs({ "Hair/Material/Other/MI_CharacterHair_Ginger.MI_CharacterHair_Ginger",
+                             "Hair/Material/Brown/MI_CharacterHair_Brown.MI_CharacterHair_Brown" }) do asset(P .. p, "MaterialInstanceConstant") end
+        for _, n in ipairs({ "1A", "1C" }) do asset("/Game/Character/M_Chr_Texture_" .. n .. ".M_Chr_Texture_" .. n, "MaterialInstanceConstant") end
+        function A(p) return ASSETS[p:find("^/Game/Character") and p or (P .. p)] end
+        function sm(mesh, mat) return obj({ StaticMesh = mesh, mats = { mat }, vis = true,
+            GetNumMaterials = function(self) return self.StaticMesh and #self.mats or 0 end,
+            GetMaterial = function(self, i) return self.mats[i + 1] end, IsVisible = function(self) return self.vis end,
+            SetStaticMesh = function(self, m) self.StaticMesh = m end, SetMaterial = function(self, i, m) self.mats[i + 1] = m end,
+            SetVisibility = function(self, v) self.vis = v end, SetCastShadow = function() end }) end
+        function sk(mesh, mat) local c = sm(nil, mat); c.SK = mesh
+            c.GetSkinnedAsset = function(self) return self.SK end
+            c.SetSkinnedAssetAndUpdate = function(self, m) self.SK = m end
+            c.GetNumMaterials = function(self) return #self.mats end
+            return c end
+        local skin = function(n) return A("/Game/Character/M_Chr_Texture_" .. n .. ".M_Chr_Texture_" .. n) end
+        local ginger, brown = A("Hair/Material/Other/MI_CharacterHair_Ginger.MI_CharacterHair_Ginger"), A("Hair/Material/Brown/MI_CharacterHair_Brown.MI_CharacterHair_Brown")
+        local head = A("BodyParts/Male/SK_Chr_Male_Head.SK_Chr_Male_Head")
+        PEER = obj({ Head = sk(head, skin("1C")), Torso = sk(nil, skin("1C")),
+                     BeardMesh = sm(A("Hair/Beard/Chr_Beard2.Chr_Beard2"), ginger), HairMesh = sm(nil, ginger),
+                     EyebrowsMesh = sm(A("Hair/Eyebrows/Chr_Eyebrows2.Chr_Eyebrows2"), ginger),
+                     Mouth = sm(A("BodyParts/Head/Features/Male/Male_Mouth2.Male_Mouth2")),
+                     Accessory1 = sm(A("BodyParts/Head/Features/Male/Male_Tattoo2.Male_Tattoo2")),
+                     Accessory2 = sm(nil), Accessory3 = sm(A("BodyParts/Head/Features/Male/Male_Scar1.Male_Scar1")) })
+        G = obj({ Head = sk(head, skin("1A")), Torso = sk(nil, skin("1A")),
+                  BeardMesh = sm(A("Hair/Beard/Chr_Moustache1.Chr_Moustache1"), brown),
+                  HairMesh = sm(A("Hair/HairMesh/Chr_MaleHair3.Chr_MaleHair3"), brown), EyebrowsMesh = sm(nil, brown),
+                  Mouth = sm(nil), Accessory1 = sm(nil), Accessory2 = sm(A("BodyParts/Head/Features/Male/Male_Freckles.Male_Freckles")),
+                  Accessory3 = sm(nil), Mesh = obj({ SetCastShadow = function() end }) })
+        look = require("mirror.look")
+        BLOB = look.capture(PEER)
+        look.apply(G, BLOB)
+        function name(o) return o and o:GetFullName():match("[^%.]+$") or "none" end
+    """)
+    got = lambda e: L.eval('name(%s)' % e)
+    check(got('G.BeardMesh.StaticMesh') == "Chr_Beard2" and got('G.BeardMesh.mats[1]') == "MI_CharacterHair_Ginger",
+          "the ghost's beard is its player's, in their colour (%s, %s)" % (got('G.BeardMesh.StaticMesh'), got('G.BeardMesh.mats[1]')))
+    check(got('G.HairMesh.StaticMesh') == "none", "a bald player's ghost loses our save's hair (%s)" % got('G.HairMesh.StaticMesh'))
+    check(got('G.EyebrowsMesh.StaticMesh') == "Chr_Eyebrows2" and got('G.Mouth.StaticMesh') == "Male_Mouth2", "eyebrows and mouth")
+    check(got('G.Accessory1.StaticMesh') == "Male_Tattoo2", "the face tattoo (%s)" % got('G.Accessory1.StaticMesh'))
+    check(got('G.Accessory2.StaticMesh') == "none", "our save's freckles come off (%s)" % got('G.Accessory2.StaticMesh'))
+    check(got('G.Accessory3.StaticMesh') == "Male_Scar1", "the scar (%s)" % got('G.Accessory3.StaticMesh'))
+    check(got('G.Head.mats[1]') == "M_Chr_Texture_1C" and got('G.Torso.mats[1]') == "M_Chr_Texture_1C",
+          "the skin colour on head and body (%s)" % got('G.Head.mats[1]'))
+
+
+def ghost_look_is_applied_over_frames():
+    # a 46-line look took 153 ms in one frame at a join (live 2026-10-30 02:34:29)
+    print("ghost_look_is_applied_over_frames")
+    L = lua()
+    L.execute(FAKES + r"""
+        StaticFindObject = function() return obj({}) end
+        G = obj({ Mesh = obj({}), AddComponentByClass = function() return obj({}) end })
+        look = require("mirror.look")
+        local A = function(id, parent, sock) return table.concat({ "A", id, parent, "S", sock, "-", "", "0,0,0", "0,0,0", "1,1,1", 0 }, "\t") end
+        BLOB = table.concat({ A(1, 0, "PrimaryWeaponBackpack"), A(2, 1, "None"), A(3, 0, "Rifle_Hand"), A(4, 3, "None") }, "\n")
+        local T = 0
+        os.clock = function() T = T + 0.004; return T end
+        R1 = look.apply(G, BLOB, 0.006); N1 = #look.components(); BUSY1 = look.applying()
+        R2 = look.apply(G, BLOB, 0.006); N2 = #look.components(); BUSY2 = look.applying()
+        HAND = { look.in_hand(1), look.in_hand(2), look.in_hand(3), look.in_hand(4) }
+        -- a new look while one is half on starts over
+        look.apply(G, BLOB, 0.006)
+        R3 = look.apply(G, A(1, 0, "Rifle_Hand"), 0.006); N3 = #look.components()
+        -- without a budget: all at once, as before
+        look.forget()
+        R4 = look.apply(G, BLOB); N4 = #look.components()
+    """)
+    check(L.eval('R1') is None and L.eval('N1') == 2 and L.eval('BUSY1') is True,
+          "a look over budget stops part way (%s parts, %s)" % (L.eval('N1'), L.eval('R1')))
+    check(L.eval('R2') == 0 and L.eval('N2') == 4 and L.eval('BUSY2') is False, "...and is finished at the next call")
+    check(list(L.eval('HAND').values()) == [False, False, True, True], "...with the same pieces as in one go")
+    check(L.eval('R3') == 0 and L.eval('N3') == 1, "a changed look starts over (%s parts)" % L.eval('N3'))
+    check(L.eval('R4') == 0 and L.eval('N4') == 4, "no budget: the whole look in one call")
 
 
 def missing_zombie_looks_get_loaded():
@@ -4002,7 +6551,13 @@ def random_and_debug_weather_is_shared():
     H2.execute('GWS.Rain = 6; GWS.Snow = 3; world.tick(2.1)')
     pass_blobs(H2, G2)
     G2.execute('world.tick(2.1)')
+    check(G2.eval('GWS.Rain') == 0, "a sudden jump of the host's weather waits for a second look")
+    G2.execute('world.tick(2.1)')
     check(G2.eval('GWS.Rain') == 6 and G2.eval('GWS.Snow') == 3, "the host's live weather changing reaches the guest")
+    # the host read zeros for a moment (it stalled, live 2026-10-30): back the next look - the guest's never moves
+    H2.execute('GWS.Rain = 0; GWS.Snow = 0; world.tick(2.1)'); pass_blobs(H2, G2); G2.execute('world.tick(2.1)')
+    H2.execute('GWS.Rain = 6; GWS.Snow = 3; world.tick(2.1)'); pass_blobs(H2, G2); G2.execute('world.tick(2.1); world.tick(2.1)')
+    check(G2.eval('GWS.Rain') == 6 and G2.eval('CHANGES') == 2, "a one-look glitch of the host's weather never reaches the guest (%s sets)" % G2.eval('CHANGES'))
     # Blood moon: each game rolled its own at sunset; the host's is shared and the guest doesn't roll while joined.
     H3, G3 = side("host"), side("guest")
     for L in (H3, G3):
@@ -4022,6 +6577,478 @@ def random_and_debug_weather_is_shared():
     check(G3.eval('#SETS') == 2 and G3.eval('SETS[2]') is False, "and ends there when the host's ends")
     G3.execute('world.init({}, "off", { in_world = function() return true end }, function() return true end)')
     check(G3.eval('EM.BloodMoonChance') == 25, "leaving gives the guest its own blood moon chance back")
+
+
+def an_ended_zombie_is_never_read_from_the_zombie_list():
+    """DBG-20261030-010: the host crashed in UE4SS on leaving the settings menu, mod step keepalive (it reads the
+    zombie list before zombies.tick). An ended zombie stayed listed until a prune at a later time, and a pause lets
+    the garbage collector free it first; the next read touched freed memory."""
+    print("an_ended_zombie_is_never_read_from_the_zombie_list")
+    L = lua()
+    L.execute(FAKES + r"""
+        package.loaded["mirror.game"] = { player = function() return nil end, world = function() return nil end,
+                                          on_world_reset = function() end, keybind = function() end }
+        package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
+        package.loaded["mirror.loader"] = { want = function() end }
+        StaticFindObject = function() return nil end
+        FindAllOf = function() return {} end
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        HOOKS = {}
+        util.hook = function(p, fn) HOOKS[p] = fn; return true end
+        util.instances("Door_C")   -- puts the EndPlay hook in
+        zombies = require("mirror.zombies")
+        TOUCH = 0
+        function zombie(n) return obj({ name = n, GetFullName = function() return "BP_Z_C /Game/L.L:P.Z_" .. n end }) end
+        -- the engine frees it: any use of the old handle is a touch
+        function free(z)
+            for k in pairs(z) do z[k] = nil end
+            setmetatable(z, { __index = function() TOUCH = TOUCH + 1; error("freed") end })
+        end
+        function ended(z) HOOKS["/Script/Engine.Actor:ReceiveEndPlay"]({ get = function() return z end }) end
+        function has(z) for _, x in ipairs(zombies.all_cached()) do if rawequal(x, z) then return true end end return false end
+        zombies.all_cached()       -- the full walk (none), then new ones arrive through BeginPlay
+        A, B, C = zombie(1), zombie(2), zombie(3)
+        zombies._test.zlist_begin({ get = function() return A end })
+        zombies._test.zlist_begin({ get = function() return B end })
+    """)
+    check(L.eval('has(A) and has(B)'), "zombies that began play are listed")
+    # A ends; the settings menu pauses our ticks (same module time) and the collector frees it
+    L.execute('ended(A); free(A); R1 = has(A); R2 = has(B)')
+    check(not L.eval('R1'), "a zombie that ended is gone from the very next read, at the same time")
+    check(L.eval('R2'), "the others stay listed")
+    check(L.eval('TOUCH') == 0, "the ended, freed zombie is never touched")
+    # C begins and ends before any read; freed before the list takes the queued ones in
+    L.execute('TOUCH = 0; zombies._test.zlist_begin({ get = function() return C end }); ended(C); free(C); R3 = has(C)')
+    check(not L.eval('R3') and L.eval('TOUCH') == 0, "a queued zombie that ended is dropped untouched")
+    L.execute('D = zombie(4); zombies._test.zlist_begin({ get = function() return D end }); R4 = has(D)')
+    check(L.eval('R4') and L.eval('has(B)'), "a new zombie after that is listed as before")
+
+
+def a_copy_the_game_keeps_removing_is_held_back():
+    """DBG-20261030-008 (live 2026-10-30, guest of K3YBOARD32): 'copy 42 was removed by the game - making a new one'
+    1829 times in 4 min: every new copy was gone (0,0,0) at its first check and the next snapshot made another."""
+    print("a_copy_the_game_keeps_removing_is_held_back")
+    L = lua()
+    L.execute(FAKES + r"""
+        package.loaded["mirror.game"] = { player = function() return nil end, world = function() return obj({}) end,
+                                          controller = function() return nil end,
+                                          on_world_reset = function() end, keybind = function() end }
+        package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
+        package.loaded["mirror.loader"] = { want = function() end }
+        package.loaded["mirror.invdiag"] = { summary = function() return "-" end }
+        StaticFindObject = function() return nil end
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        util.cdo = function() return { GetConsoleVariableBoolValue = function() return false end,
+                                       GetConsoleVariableIntValue = function() return 1 end,
+                                       ExecuteConsoleCommand = function() end } end
+        zombies = require("mirror.zombies")
+        zombies._test.setup({ zombies = { enabled = true, send_hz = 15, despawn_after = 3.0 } }, "guest")
+        ASKED = 0
+        zombies.set_copy_hooks(function(id) ASKED = ASKED + 1; return false end, nil)
+        -- a copy the game removed: no root component, reads 0,0,0
+        function gone_copy() zombies._test.copy(42, obj({ K2_GetRootComponent = function() return nil end })) end
+        function snapshot() blobs_in.zombies = "H\nT 1.0\nZ 42 0 0 0 100 0 0 0 0 0 0 0 0 0\n"; zombies._test.read() end
+        function removed() return zombies._test.copies()[42] == nil end
+    """)
+    L.execute('gone_copy(); zombies._test.drive(0.3); R1 = removed(); snapshot(); R2 = ASKED')
+    check(L.eval('R1') and L.eval('R2') == 1, "a copy the game removed once is made again at the next snapshot")
+    L.execute('ASKED = 0; for i = 1, 2 do gone_copy(); zombies._test.drive(0.3) end; R3 = removed(); snapshot(); R4 = ASKED')
+    check(L.eval('R3') and L.eval('R4') == 0, "removed 3 times in 10 s: not made again (asked %s)" % L.eval('R4'))
+    L.execute('for i = 1, 40 do zombies._test.drive(0.3); snapshot() end; R5 = ASKED')
+    check(L.eval('R5') == 0, "still held 12 s later")
+    L.execute('zombies._test.drive(3.5); snapshot(); R6 = ASKED')
+    check(L.eval('R6') == 1, "after 15 s it is made again")
+    # it keeps going: the next hold is longer
+    L.execute('ASKED = 0; for i = 1, 3 do gone_copy(); zombies._test.drive(0.3) end; '
+              'zombies._test.drive(20); snapshot(); R7 = ASKED; zombies._test.drive(11); snapshot(); R8 = ASKED')
+    check(L.eval('R7') == 0 and L.eval('R8') == 1, "the second hold is 30 s (%s %s)" % (L.eval('R7'), L.eval('R8')))
+    # another copy removed once in a while is never held
+    L.execute('ASKED = 0; for i = 1, 4 do zombies._test.copy(43, obj({ K2_GetRootComponent = function() return nil end })); '
+              'zombies._test.drive(11) end; '
+              'blobs_in.zombies = "H\\nT 1.0\\nZ 43 0 0 0 100 0 0 0 0 0 0 0 0 0\\n"; zombies._test.read(); R9 = ASKED')
+    check(L.eval('R9') == 1, "a copy removed once every 11 s is made again each time")
+    # a long session: a copy the game removed once doesn't leave its record behind forever
+    L.execute('zombies._test.drive(400); for i = 1, 300 do zombies._test.copy(1000 + i, obj({ K2_GetRootComponent = function() return nil end })); '
+              'zombies._test.drive(0.01) end; zombies._test.drive(400); '
+              'for i = 1, 300 do zombies._test.copy(2000 + i, obj({ K2_GetRootComponent = function() return nil end })); zombies._test.drive(0.01) end; '
+              'R10 = zombies._test.remade_count()')
+    # (600 removed in two batches 400 s apart: about the second batch is kept, not both)
+    check(L.eval('R10') <= 320, "copies removed long ago are forgotten (%s kept)" % L.eval('R10'))
+
+
+def a_new_ghost_leaves_no_name_tag_behind():
+    """user 2026-10-30 (live, guest of K3YBOARD32): 'my name is stuck somewhere else as well as above me on his screen'.
+    A ghost waiting for its destroy is only hidden, and its screen-space tag still drew where it was left."""
+    print("a_new_ghost_leaves_no_name_tag_behind")
+    L = lua()
+    L.execute('''
+        CALLS = {}; ONDESTROY = {}; G, GEN = nil, 0; TAGS = {}
+        local function comp(n)
+            return setmetatable({ valid = true, n = n, visible = true }, { __index = function(o, k)
+                return function(_, ...)
+                    CALLS[#CALLS + 1] = "tag" .. o.n .. ":" .. k
+                    if k == "SetVisibility" then o.visible = (...) end
+                end
+            end })
+        end
+        package.loaded["mirror.util"] = { valid = function(o) return o ~= nil and o.valid ~= false end,
+            dist = function() return 100 end, vec = function(v) return v end }
+        package.loaded["mirror.game"] = { on_world_reset = function() end,
+            player = function() return { K2_GetActorLocation = function() return {} end } end }
+        package.loaded["mirror.ghost"] = { get = function() return G end, generation = function() return G and GEN or nil end,
+            on_destroy = function(fn) ONDESTROY[#ONDESTROY + 1] = fn end }
+        package.loaded["mirror.link"] = { peer_name = function() return "Bob" end }
+        package.loaded["mirror.netq"] = { tag = function(n) return n, "white" end }
+        package.loaded["mirror.voice"] = { talking = function() return 0, false end }
+        package.loaded["mirror.mysettings"] = { on = function() return true end }
+        FText = function(s) return s end
+        nametag = require("mirror.nametag")
+        nametag.attach = function(actor, text)
+            local c = comp(#TAGS + 1); TAGS[#TAGS + 1] = c
+            return { comp = c, text = { SetText = function() end, SetColorAndOpacity = function() end }, name = text, shown = true }
+        end
+        nametag.init({}); nametag.init({})   -- (phase1 calls it from two places)
+        function spawn() G = { valid = true }; GEN = GEN + 1 end
+        function destroy(by_game) for _, fn in ipairs(ONDESTROY) do fn() end; if not by_game then G.valid = false end; G = nil end
+        function shown() local n = 0; for _, c in ipairs(TAGS) do if c.visible then n = n + 1 end end; return n end
+    ''')
+    L.execute('spawn(); nametag.tick(1.0)')
+    check(L.eval('#TAGS') == 1 and L.eval('shown()') == 1, "a ghost gets one tag")
+    check(L.eval('#ONDESTROY') == 1, "the tag follows the ghost's destroy, registered once for two inits")
+    # a destroy that only hides the ghost (animgate waits): the old actor and its tag stay in the world
+    L.execute('local old = G; for _, fn in ipairs(ONDESTROY) do fn() end; G = nil; spawn(); nametag.tick(1.0)')
+    check(L.eval('#TAGS') == 2 and L.eval('TAGS[1].visible') is False,
+          "a ghost waiting for its destroy: its tag is hidden (was: stayed on screen where the ghost was left)")
+    check(L.eval('shown()') == 1 and L.eval('TAGS[2].visible') is True, "...and only the new ghost's tag shows")
+    L.execute('destroy(true); spawn(); nametag.tick(1.0)')
+    check(L.eval('shown()') == 1 and L.eval('#TAGS') == 3, "the game removed it: one tag, on the new ghost")
+    L.execute('CALLS = {}; G = nil; for _, fn in ipairs(ONDESTROY) do fn() end')
+    check(L.eval('#CALLS') == 0, "no ghost left (a world reset freed it): the old tag isn't touched")
+
+
+def the_message_of_the_day_shows_once_in_a_world_and_on_the_main_menu():
+    """user 2026-10-30 'a message of the day that I can send whenever': the bridge's mirror_motd.txt shows once per
+    message as a card in a world (not again after a restart) and as a banner at the main menu while the menu is up."""
+    print("the_message_of_the_day_shows_once_in_a_world_and_on_the_main_menu")
+    d = tempfile.mkdtemp()
+    try:
+        def new_lua():
+            L = lua()
+            L.execute('''
+                local d = ...
+                NOTES = {}; CALLS = {}; MENUS = {}; HOOKS = 0
+                function called(s) for _, c in ipairs(CALLS) do if c == s then return true end end return false end
+                function mock(name)
+                    local o = { valid = true, name = name }
+                    return setmetatable(o, { __index = function(_, k)
+                        if k == "WidgetTree" then local t = mock("tree"); rawset(o, k, t); return t end
+                        if k == "Font" then return {} end
+                        return function(_, ...)
+                            CALLS[#CALLS + 1] = name .. ":" .. k
+                            if k == "IsInViewport" then return o.on end
+                            if k:find("^AddChild") then return mock("slot") end
+                            if k == "GetOwningPlayer" then return mock("pc") end
+                            if k == "Create" then return mock("banner") end
+                        end
+                    end })
+                end
+                StaticFindObject = function(p) return mock("found") end
+                StaticConstructObject = function(cls) return mock("w") end
+                FindAllOf = function() return MENUS end
+                FText = function(s) return s end
+                FName = function(s) return s end
+                LOOPS = {}
+                LoopAsync = function(ms, fn) LOOPS[#LOOPS + 1] = fn end
+                ExecuteInGameThread = function(fn) fn() end
+                package.loaded["mirror.notify"] = { show = function(text, kind, key, always, opts)
+                    NOTES[#NOTES + 1] = { text = text, key = key, always = always, title = opts and opts.title, sticky = opts and opts.sticky, secs = opts and opts.secs } end }
+                package.loaded["mirror.link"] = { dir = function() return d end }
+                package.loaded["mirror.util"] = { valid = function(o) return o ~= nil and o.valid ~= false end,
+                    safe = function(fn, _, ...) return pcall(fn, ...) end, cdo = function() return mock("wbl") end,
+                    ensure_hook = function() HOOKS = HOOKS + 1; return true end }
+                TICK, RESET = nil, nil
+                LOGS = {}
+                function logged(s) for _, l in ipairs(LOGS) do if l:find(s, 1, true) then return true end end return false end
+                function nlogged(s) local n = 0; for _, l in ipairs(LOGS) do if l:find(s, 1, true) then n = n + 1 end end return n end
+                package.loaded["mirror.log"] = setmetatable({}, { __index = function(_, k)
+                    return function(s) LOGS[#LOGS + 1] = k .. " " .. tostring(s) end end })
+                package.loaded["mirror.game"] = { on_tick = function(fn) TICK = fn end, on_world_reset = function(fn) RESET = fn end }
+                motd = require("mirror.motd")
+                function put(s) local f = io.open(d .. "/mirror_motd.txt", "wb"); f:write(s); f:close() end
+                function seenfile() local f = io.open(d .. "/mirror_motd_seen.txt", "rb"); local s = f and f:read("*a"); if f then f:close() end; return s end
+            ''', d.replace("\\", "/"))
+            return L
+
+        L = new_lua()
+        # the file's shape
+        check(L.eval('motd.parse("motd ABCDEFGH 0 Hello there\\nEND\\n").text') == "Hello there"
+              and L.eval('motd.parse("motd ABCDEFGH 0 Hello there\\nEND\\n").id') == "ABCDEFGH", "a message line is read")
+        check(L.eval('motd.parse("motd none\\nEND\\n")') is None and L.eval('motd.parse("motd ABCDEFGH 0 Half")') is None
+              and L.eval('motd.parse("motd ABC 0 short id\\nEND\\n")') is None and L.eval('motd.parse(nil)') is None,
+              "'motd none', a half written file, a bad id and no file are no message")
+        check(L.eval('motd.parse("motd ABCDEFGH 100 Old\\nEND\\n", 100)') is None
+              and L.eval('motd.parse("motd ABCDEFGH 200 Soon\\nEND\\n", 100).text') == "Soon", "an expired one is no message, one expiring later is")
+
+        # in a world: once per message, as a 25 s card shown whatever the messages setting says
+        L.execute('motd.init(); put("motd ABCDEFGH 0 Servers down tonight\\nEND\\n")')
+        L.execute('TICK(1.0)')
+        check(L.eval('#NOTES') == 0, "nothing in the first seconds of a world (the load settles first)")
+        L.execute('for _ = 1, 10 do TICK(1.0) end')
+        check(L.eval('#NOTES') == 1 and L.eval('NOTES[1].text') == "Servers down tonight" and L.eval('NOTES[1].always') is True
+              and L.eval('NOTES[1].title') == "MESSAGE FROM SYMPLYSCK" and L.eval('NOTES[1].secs') == 25 and not L.eval('NOTES[1].sticky'),
+              "a new message shows once as a card: %s" % L.eval('NOTES[1] and NOTES[1].text'))
+        check((L.eval('seenfile()') or "").startswith("ABCDEFGH"), "...and is noted as seen on this PC")
+        L.execute('for _ = 1, 20 do TICK(1.0) end; RESET(); for _ = 1, 20 do TICK(1.0) end')
+        check(L.eval('#NOTES') == 1, "the same message isn't shown again (next reads, a new world)")
+        L2 = new_lua()
+        L2.execute('motd.init(); for _ = 1, 20 do TICK(1.0) end')
+        check(L2.eval('#NOTES') == 0, "...nor after the game restarts")
+        L2.execute('put("motd JKMNPQRS 0 Weekend event\\nEND\\n"); for _ = 1, 6 do TICK(1.0) end')
+        check(L2.eval('#NOTES') == 1 and L2.eval('NOTES[1].text') == "Weekend event", "a newer message shows")
+        L2.execute('put("motd none\\nEND\\n"); for _ = 1, 6 do TICK(1.0) end')
+        check(L2.eval('#NOTES') == 1, "'motd none' shows nothing")
+
+        # at the main menu: a banner while the menu is up, polled from LoopAsync, gone once a world ticks
+        L3 = new_lua()
+        L3.execute('put("motd ABCDEFGH 0 Servers down tonight\\nEND\\n"); motd.init()')
+        check(L3.eval('#LOOPS') == 1, "the main menu poll starts with the game")
+        L3.execute('LOOPS[1](); LOOPS[1]()')
+        check(L3.eval('motd._test.banner()') is None, "no banner while the main menu isn't on screen")
+        L3.execute('MENUS = { mock("menu") }; MENUS[1].on = true; for _ = 1, 3 do LOOPS[1]() end')
+        check(L3.eval('motd._test.banner() ~= nil') and L3.eval('motd._test.banner().id') == "ABCDEFGH"
+              and L3.eval('called("banner:AddToViewport")'), "the menu up 2 s: the banner shows the message")
+        check(L3.eval('#NOTES') == 0, "...and the world's once-only card isn't used up by it")
+        L3.execute('MENUS[1].on = false; LOOPS[1]()')
+        check(L3.eval('called("banner:SetVisibility")') and L3.eval('motd._test.banner().shown') is False,
+              "the menu off the screen (New Game, Load): the banner hides")
+        L3.execute('MENUS[1].on = true; LOOPS[1](); put("motd none\\nEND\\n"); LOOPS[1]()')
+        check(L3.eval('motd._test.banner()') is None and L3.eval('called("banner:RemoveFromParent")'), "the message cleared: the banner goes")
+        L3.execute('put("motd JKMNPQRS 0 Weekend event\\nEND\\n"); LOOPS[1]()')
+        check(L3.eval('motd._test.banner() and motd._test.banner().id') == "JKMNPQRS", "a new message at the menu: its banner shows")
+        L3.execute('CALLS = {}; TICK(0.1)')
+        check(L3.eval('motd._test.banner()') is None and L3.eval('called("banner:RemoveFromParent")'), "a world's first tick takes the banner away")
+        L3.execute('TICK(0.1)')
+        check(L3.eval('LOOPS[1]()') is True, "...and the main menu poll stops once the world ticks")
+        L3.execute('CALLS = {}; HOOKS = 0; for _ = 1, 10 do TICK(1.0) end')
+        check(L3.eval('HOOKS') > 0, "in a world the main menu hook is kept in place")
+
+        # user 2026-10-31 'make it stay while the main menu is up' (was 15 s, then gone)
+        L4 = new_lua()
+        L4.execute('put("motd ABCDEFGH 0 Servers down tonight\\nEND\\n"); motd.init(); LOOPS[1]()')
+        check(L4.eval('logged("motd: main menu off screen")'), "the menu not up yet: logged as off the screen")
+        L4.execute('MENUS = { mock("menu") }; MENUS[1].on = true; for _ = 1, 3 do LOOPS[1]() end')
+        check(L4.eval('motd._test.banner() and motd._test.banner().id') == "ABCDEFGH" and L4.eval('logged("motd: main menu on screen")'),
+              "the menu up: logged, and the banner shows")
+        L4.execute('CALLS = {}; for _ = 1, 2000 do LOOPS[1]() end')
+        check(L4.eval('motd._test.banner() and motd._test.banner().shown') is True and not L4.eval('called("banner:RemoveFromParent")'),
+              "...still there after 2000 s of the menu up (no time limit, no giving up)")
+        check(L4.eval('LOOPS[1]()') is False, "...and the main menu poll keeps going")
+        check(L4.eval('nlogged("motd: main menu on screen")') == 1, "...the menu logged once while it stays up")
+        L4.execute('MENUS[1].on = false; for _ = 1, 30 do LOOPS[1]() end')
+        check(L4.eval('motd._test.banner().shown') is False and L4.eval('nlogged("motd: main menu off screen")') == 2,
+              "the menu off the screen (New Game, Load): hidden, logged once")
+        L4.execute('CALLS = {}; MENUS[1].on = true; LOOPS[1]()')
+        check(L4.eval('motd._test.banner().shown') is True and L4.eval('called("banner:SetVisibility")')
+              and not L4.eval('called("banner:AddToViewport")'), "back at the menu: the same banner shows again")
+        L4.execute('put("motd JKMNPQRS 0 Weekend event\\nEND\\n"); LOOPS[1](); LOOPS[1]()')
+        check(L4.eval('motd._test.banner() and motd._test.banner().id') == "JKMNPQRS", "a new message: its banner replaces the old one")
+        # a banner that can't be built isn't retried every second, and the poll keeps going for the next message
+        L4.execute('motd._test.reset(); LOOPS = {}; put("motd ABCDEFGH 0 Servers down tonight\\nEND\\n"); motd.init()')
+        L4.execute('local c = package.loaded["mirror.util"].cdo; package.loaded["mirror.util"].cdo = function() return nil end; '
+                   'for _ = 1, 10 do LOOPS[1]() end; package.loaded["mirror.util"].cdo = c')
+        check(L4.eval('motd._test.banner()') is None and L4.eval('nlogged("main menu banner for message ABCDEFGH -> false")') == 1,
+              "a failed build: logged once, not retried for that message")
+        L4.execute('put("motd JKMNPQRS 0 Weekend event\\nEND\\n"); LOOPS[1]()')
+        check(L4.eval('motd._test.banner() and motd._test.banner().id') == "JKMNPQRS", "...the next message still gets its banner")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def the_host_can_switch_the_debug_menu_off_for_everyone():
+    """user 2026-10-30: host rule DEBUG MENU - off, an opened menu closes at once (the game's CloseDebugMenu); on, the
+    others hear who opened it; everyone hears the rule change."""
+    print("the_host_can_switch_the_debug_menu_off_for_everyone")
+
+    def side(role):
+        L = lua()
+        L.execute(FAKES + r"""
+            ROLE = ...
+            package.loaded["mirror.link"].peer_age = function() return 0 end
+            package.loaded["mirror.link"].peer_name = function() return ROLE == "host" and "Gus" or "Hal" end
+            package.loaded["mirror.link"].dir = nil   -- (no settings file in the test)
+            package.loaded["mirror.peers"] = { each = function(m, fn) fn(package.loaded["mirror.link"], nil) end }
+            NOTES = {}
+            package.loaded["mirror.notify"] = { show = function(m) NOTES[#NOTES + 1] = m end, clear = function() end }
+            util = require("mirror.util")
+            HOOKS = {}
+            util.ensure_hook = function(path, fn) HOOKS[path] = fn; return true end
+            CLOSED = 0
+            PLAYER = obj({ CloseDebugMenu = function() CLOSED = CLOSED + 1 end })
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end }
+            hostrules = require("mirror.hostrules")
+            hostrules.init(function() return ROLE end)
+            dm = require("mirror.debugmenu")
+            dm.init()
+            function OPEN() HOOKS["/Game/UI/Widgets/Debug/DebugMenu.DebugMenu_C:Construct"]() end
+            function note_has(s) for _, m in ipairs(NOTES) do if m:find(s, 1, true) then return true end end return false end
+            dm.tick(2.1)
+        """, role)
+        return L
+    H, G = side("host"), side("guest")
+
+    def carry(a, b):
+        out, inn = a.eval("blobs_out"), b.eval("blobs_in")
+        for k in list(out.keys()):
+            inn[k] = out[k]
+
+    H.execute("hostrules.tick()"); carry(H, G); G.execute("dm.tick(0.1)")
+    G.execute("OPEN(); dm.tick(0.1)"); carry(G, H); H.execute("dm.tick(0.1)")
+    check(H.eval('note_has("Gus opened the debug menu.")') and G.eval("CLOSED") == 0, "rule on: the host hears the guest opened it")
+    H.execute('hostrules.toggle("debugmenu"); hostrules.tick(); dm.tick(0.1)'); carry(H, G); G.execute("dm.tick(0.1)")
+    check(H.eval('note_has("debug menu OFF for everyone")') and G.eval('note_has("debug menu OFF for everyone")'),
+          "the switch to off is announced on both screens")
+    G.execute("OPEN(); dm.tick(0.1)")
+    check(G.eval("CLOSED") == 1 and G.eval('note_has("switched the debug menu off")'), "rule off: the guest's menu closes at once")
+    H.execute("OPEN(); dm.tick(0.1)")
+    check(H.eval("CLOSED") == 1, "...and the host's own too")
+    # audit 2026-10-30: a guest joining a host whose rule is already off ran on the defaults (on) until the rules
+    # arrived, and their arrival read as a switch - "turned OFF for everyone" on a join where nobody switched anything
+    G2 = side("guest")
+    G2.execute("dm.tick(0.1)")
+    H.execute("hostrules.tick()"); carry(H, G2); G2.execute("dm.tick(0.1); dm.tick(0.1)")
+    check(not G2.eval('note_has("for everyone")'), "joining a host with the rule off: no switch notice")
+    G2.execute("OPEN(); dm.tick(0.1)")
+    check(G2.eval("CLOSED") == 1, "...and the host's off rule still holds for the joiner")
+    H.execute('hostrules.toggle("debugmenu"); hostrules.tick(); dm.tick(0.1)'); carry(H, G2); G2.execute("dm.tick(0.1)")
+    check(G2.eval('note_has("debug menu ON for everyone")'), "...while a real switch afterwards is still announced")
+    # ...and leaving forgets that host's rules: the next host (rule off) is read fresh, not through the old one's
+    G2.execute('RESETS = 0; package.loaded["mirror.link"].reset_blob = function(n) if n == "rules" then RESETS = RESETS + 1 end end')
+    G2.execute('ROLE = "solo"; dm.tick(0.1); NOTES = {}')
+    check(G2.eval("RESETS") == 1, "leaving: the rules blob is reset so the next host's arrive again")
+    H2 = side("host")
+    H2.execute('hostrules.toggle("debugmenu"); hostrules.tick()')
+    G2.execute('ROLE = "guest"; dm.tick(0.1)')
+    check(G2.eval('hostrules.source()') is None, "joining the next host: no rules in hand yet (the old host's are gone)")
+    carry(H2, G2); G2.execute("dm.tick(0.1)")
+    check(G2.eval('hostrules.get("debugmenu")') is False and not G2.eval('note_has("for everyone")'),
+          "...its off rule arrives and applies without a switch notice")
+
+
+def the_nuke_goes_off_on_both_screens():
+    """user 2026-10-30 'sync nuke': the easter-egg bomb's MC_Explode in one game sets off the other game's bomb at the
+    same spot, once, without echoing back."""
+    print("the_nuke_goes_off_on_both_screens")
+    sides = {}
+    for role in ("host", "guest"):
+        L = lua()
+        L.execute(FAKES + r"""
+            package.loaded["mirror.link"].peer_age = function() return 0 end
+            util = require("mirror.util")
+            HOOKS = {}
+            util.ensure_hook = function(path, fn) HOOKS[path] = fn; return true end
+            FN = "/Game/Blueprints/Other/EasterEggs/BP_EasterEgg_Nuke.BP_EasterEgg_Nuke_C:MC_Explode"
+            CALLS = 0
+            -- the game runs the hook around its own MC_Explode: as UE4SS calls a pre hook, with the actor wrapped
+            BOMB = obj({ K2_GetActorLocation = function() return { X = 1000, Y = 2000, Z = 300 } end })
+            BOMB.MC_Explode = function(self) CALLS = CALLS + 1; if HOOKS[FN] then HOOKS[FN]({ get = function() return BOMB end }) end end
+            FAR = obj({ K2_GetActorLocation = function() return { X = 90000, Y = 0, Z = 0 } end, MC_Explode = function() FAR_CALLS = (FAR_CALLS or 0) + 1 end })
+            FindAllOf = function(c) if c == "BP_EasterEgg_Nuke_C" then return { FAR, BOMB } end return {} end
+            nuke = require("mirror.nuke")
+            nuke.init()
+            nuke.tick(2.1)
+        """)
+        sides[role] = L
+    H, G = sides["host"], sides["guest"]
+
+    def carry(a, b):
+        out, inn = a.eval("blobs_out"), b.eval("blobs_in")
+        for k in list(out.keys()):
+            inn[k] = out[k]
+
+    check(H.eval("HOOKS[FN] ~= nil"), "(setup) MC_Explode is hooked")
+    H.execute("BOMB:MC_Explode(); nuke.tick(0.1)")          # shot on the host's screen
+    carry(H, G)
+    G.execute("nuke.tick(0.1)")
+    check(G.eval("CALLS") == 1 and G.eval("FAR_CALLS") is None, "the guest's bomb at that spot goes off (not one far away)")
+    G.execute("nuke.tick(0.1)")
+    sent_back = G.eval("blobs_out.nuke")
+    check(sent_back is None or "E " not in sent_back, "...without sending it back")
+    carry(H, G)
+    G.execute("nuke.tick(0.1)")
+    check(G.eval("CALLS") == 1, "the same news again doesn't set it off twice")
+
+
+def human_corpses_get_their_inventory_made_first():
+    """live 2026-10-30: every item failed on all 8 human corpses ('0 matched, 0 added' - no containers), 0 failures on
+    153 zombies. The guest makes a human copy's inventory once before putting the host's loot in; zombies untouched."""
+    print("human_corpses_get_their_inventory_made_first")
+    out = {}
+    for fam in ("human", "zombie"):
+        L = lua()
+        L.execute(FAKES + r"""
+            FAM = ...
+            package.loaded["mirror.link"].peer_age = function() return 0 end
+            util = require("mirror.util")
+            util.job = function(name, fn, ...) fn(...); return true end
+            HOOKS = {}
+            util.ensure_hook = function(p, fn) HOOKS[p] = fn; return true end
+            package.loaded["mirror.ghost"] = { exists = function() return true end }
+            T = 0
+            Z = obj({ BP_JigMultiplayer = obj({}) })
+            BOXES = FAM == "human" and 0 or 1
+            GEN, ADDED, MISSING, PUTS = 0, 0, 0, 0
+            ROLLED = {}
+            local info = package.loaded["mirror.log"].info
+            package.loaded["mirror.log"].info = function(m, ...)
+                if m:find("telling the other game", 1, true) then PUTS = PUTS + 1 end
+                return info(m, ...)
+            end
+            package.loaded["mirror.jig"] = {
+                -- the roll puts the body's own items in: if the game fires its item-added event for them, it must
+                -- not reach the host as items the guest put in (they'd join the host's loot)
+                generate = function()
+                    GEN = GEN + 1; BOXES = 1
+                    ROLLED = { { uid = "r1", da = "/Game/Items/Bandage.DA_Bandage", count = 1, dx = 0, dy = 0 } }
+                    for p, f in pairs(HOOKS) do
+                        if p:find("JigMP_OnItemAdded", 1, true) then f({ get = function() return Z end }, { get = function() return "r1" end }) end
+                    end
+                end,
+                container_count = function() return BOXES end,
+                contents_of = function() return ROLLED end,
+                subtree = function() return {} end, worth_sending = function() return false end,
+                count_of_item = function() return 1 end,
+                encode = function(l) return "" end,
+                decode = function(s) return { { da = "/Game/Items/Rags.DA_Rags", count = 1 }, { da = "/Game/Items/Knife.DA_Knife", count = 1 } } end,
+                apply_contents = function(comp, items)
+                    if BOXES == 0 then MISSING = MISSING + #items; return 0, 0, 0, #items end
+                    ADDED = ADDED + #items; return 0, #items, 0, 0
+                end,
+                set_starting = function() return 0, 0 end,
+                full_path = function(x) return x end, uid_str = function(x) return x end,
+            }
+            COPY = { z = Z, born = 0, fam = FAM, dead_at = 0.1 }
+            package.loaded["mirror.zombies"] = {
+                now = function() return T end, host_zombies = function() return {} end,
+                copies = function() return { [9] = COPY } end, copy = function(id) return id == 9 and COPY or nil end,
+                is_trader = function() return false end, dead_of = function() return true end,
+                host_id_of = function() return nil end, copy_id_of = function(z) return z == Z and 9 or nil end,
+                set_copy_hooks = function() end,
+            }
+            corpses = require("mirror.corpses")
+            corpses.init({}, "guest", package.loaded["mirror.zombies"], { in_world = function() return true end, guest_in_world = function() return true end })
+        """, fam)
+        # the host's list for body 9 arrives (as its blob would), then the guest's checks at 1 s and 4 s after death
+        ep = "1"
+        L.execute('blobs_in.zloot = %r' % ("%s 1 1 L 9 x" % ep))
+        for _ in range(20):
+            L.execute("T = T + 0.3; corpses.tick(0.3)")
+        out[fam] = (L.eval("GEN"), L.eval("ADDED"), L.eval("MISSING"), L.eval("PUTS"))
+    check(out["human"][0] == 1 and out["human"][1] > 0 and out["human"][2] == 0,
+          "a human corpse's inventory is made once, then the host's loot goes in: %s" % (out["human"],))
+    check(out["human"][3] == 0, "the body's own roll is not sent to the host as items put in (%d sent)" % out["human"][3])
+    check(out["zombie"][0] == 0 and out["zombie"][1] > 0, "a zombie corpse (containers already there) is not re-made: %s" % (out["zombie"],))
 
 
 def trader_stock_is_the_hosts():
@@ -4093,6 +7120,20 @@ def trader_stock_is_the_hosts():
     for _ in range(5):
         G.execute("tick()")
     check(G.eval("#APPLIED") == 2 and G.eval("APPLIED[2]") == 1, "the dead trader's body holds the host's loot")
+    for _ in range(15):
+        G.execute("tick()")
+    n_applied = G.eval("#APPLIED")
+    # the host sends that same list once more (live 2026-10-30: each corpse was set 3-4 times): not set again
+    last = H.eval("blobs_out.zloot").split("\n")[-1]
+    ep, _, stamp, payload = last.split(" ", 3)
+    G.execute('blobs_in.zloot = %r' % ("%s 99 %s %s" % (ep, stamp, payload)))
+    for _ in range(20):
+        G.execute("tick()")
+    check(G.eval("#APPLIED") == n_applied, "the same list again doesn't set the corpse again (%s -> %s)" % (n_applied, G.eval("#APPLIED")))
+    G.execute('blobs_in.zloot = %r' % ("%s 100 %s L 7 -" % (ep, stamp)))
+    for _ in range(20):
+        G.execute("tick()")
+    check(G.eval("#APPLIED") > n_applied, "a changed list does")
 
 
 CORPSE_FAKES = FAKES + r"""
@@ -4295,6 +7336,55 @@ def corpse_looted_at_the_same_moment_keeps_one_copy():
     check(G.eval("#GAVE") == 1, "...once")
 
 
+def corpse_partial_takes_at_the_same_moment_keep_the_total():
+    # T10 audit 2026-10-31: body of 5, the host takes 1 and the guest 2 before hearing of the other. The host went
+    # down to the guest's "left 3", keeping its own take on the body too: 3 left of 5 - 1 - 2, one copied.
+    print("corpse_partial_takes_at_the_same_moment_keep_the_total")
+    H = lua()
+    H.execute(CORPSE_FAKES + r"""
+        STOCK = { { uid = "h1", da = AMMO, count = 5 } }
+        main = require("mirror.corpses")
+        main.init({}, ROLE, zfake(7), SESSION)
+        ALL = { main }
+        function tick() T = T + 0.3; main.tick(0.3) end
+    """, "host")
+    G = lua()
+    G.execute(CORPSE_FAKES + r"""
+        STOCK = {}
+        ZF = zfake(7)
+        PCI = obj({})
+        INV = {}
+        package.loaded["mirror.game"] = { player = function() return obj({ BP_JigMultiplayer = PCI }) end, on_world_reset = function() end }
+        corpses = require("mirror.corpses")
+        corpses.init({}, "guest", ZF, SESSION)
+        local jg = package.loaded["mirror.jig"]
+        local inner = jg.contents_of
+        jg.contents_of = function(c) if c == PCI then return INV end return inner(c) end
+        GAVE = {}
+        jg.take = function(c, uid, n, total) GAVE[#GAVE + 1] = uid .. ":" .. n; return c == PCI end
+        function tick() T = T + 0.3; if DEAD then ZF._copy.dead_at = ZF._copy.dead_at or T end; corpses.tick(0.3) end
+    """, "guest", 7)
+
+    def step(n=1):
+        for _ in range(n):
+            H.execute("tick()")
+            for k in list(H.eval("blobs_out").keys()):
+                G.eval("blobs_in")[k] = H.eval("blobs_out")[k]
+            G.execute("tick()")
+            for k in list(G.eval("blobs_out").keys()):
+                H.eval("blobs_in")[k] = G.eval("blobs_out")[k]
+
+    step(4)
+    H.execute("DEAD = true"); G.execute("DEAD = true")
+    step(6)
+    check(G.eval("count(AMMO)") == 5, "the guest's corpse holds the host's 5 ammo (%d)" % G.eval("count(AMMO)"))
+    H.execute("STOCK[1].count = 4; fire_removed(TR, AMMO, 1)")
+    G.execute('STOCK[1].count = 3; INV = { { uid = "p9", da = AMMO, count = 2 } }; fire_removed(TR, AMMO, 2)')
+    step(4)
+    check(H.eval("count(AMMO)") == 2, "host: 5 - 1 - 2 leaves 2 on the body (%d)" % H.eval("count(AMMO)"))
+    check(G.eval("#GAVE") == 0, "the host had enough: the guest gives nothing back (%d)" % G.eval("#GAVE"))
+
+
 def link_reads_only_blobs_the_index_says_changed():
     print("link_reads_only_blobs_the_index_says_changed")
     import tempfile
@@ -4455,9 +7545,11 @@ SPLIT_FAKES = r"""
     package.loaded["mirror.horde"] = { active_near = function() return HORDE end }
     util = require("mirror.util")
     split = require("mirror.split")
-    CFG = { zombies = { split = { split_radius = 40000, split_after = 10.0, merge_radius = 30000, force_radius = 20000,
+    CFG = { zombies = { split = { split_radius = 40000, split_after = 10.0, merge_radius = 30000, merge_after = 3.0, force_radius = 20000,
         quiet_radius = 6000, ack_timeout = 10.0, retry_after = 30.0, horde_radius = 25000, nest_hit_s = 90.0 } } }
-    split.init(CFG, role, { guest_in_world = function() return GUEST end, in_world = function() return INWORLD end })
+    REVIVED, TP_OPEN = math.huge, false
+    split.init(CFG, role, { guest_in_world = function() return GUEST end, in_world = function() return INWORLD end },
+        function() return REVIVED end, function() return TP_OPEN end)
     function run(secs) for i = 1, math.floor(secs * 10 + 0.5) do split.tick(0.1) end end
 """
 
@@ -4496,11 +7588,140 @@ def group_split_host_decides_follow_and_ignores_followers():
     check(A.eval('split.host_state()') == "split", "leader split on its own")
     A.execute('OTHERS = { other(3, { "following" }, { X = 50500, Y = 0, Z = 0 }, 2) }; run(3)')
     check(A.eval('split.host_state()') == "split", "its follower 5 m away: still split")
-    A.execute('OTHERS = { other(3, { "merged" }, { X = 50500, Y = 0, Z = 0 }, nil) }; run(1.1)')
+    A.execute('OTHERS = { other(3, { "merged" }, { X = 50500, Y = 0, Z = 0 }, nil) }; run(3)')
+    check(A.eval('split.host_state()') == "split", "a higher slot next to it, far from the host, not following yet: still split (it follows next)")
+    A.execute('OTHERS = { other(1, { "merged" }, { X = 50500, Y = 0, Z = 0 }, nil) }; run(1.1)')
     ep = (A.eval('blobs_out.p8') or "").split(" ")[-1]
-    check(A.eval('split.host_state()') == "merging", "a guest next to it that isn't following: merge (hand-back asked first)")
+    check(A.eval('split.host_state()') == "merging", "a lower slot next to it that isn't following: merge (hand-back asked first)")
     A.execute('blobs_in.p8h = "%s\\nA 1 x"; run(0.3)' % ep)
     check(A.eval('split.host_state()') == "merged", "... merged once the zombies are handed back")
+    # two guests together far from the host (live 2026-10-30: slots 1 and 2 at 6-70 m, host 700+ m: never split)
+    B = lua()
+    B.execute(FAKES + PEERS + SPLIT_FAKES, "host", 1)
+    B.execute('OTHERS = { other(2, { "merged" }, { X = 50500, Y = 0, Z = 0 }, nil) }; GL = { X = 50000, Y = 0, Z = 0 }; run(12)')
+    check(B.eval('split.host_state()') == "splitting", "the lower slot of two guests together far from the host splits (the other follows it)")
+    B.execute('OTHERS = { other(2, { "merged" }, { X = 20000, Y = 0, Z = 0 }, nil) }; blobs_in.p8g = "s 1 0"; run(0.5)')
+    check(B.eval('split.host_state()') == "merged", "... but not for one near the host: that one counts (merge)")
+    # the other guest never follows (blocked, no answer): after a while it counts again - both share the host's AI
+    C = lua()
+    C.execute(FAKES + PEERS + SPLIT_FAKES, "host", 1)
+    C.execute('OTHERS = { other(2, { "merged" }, { X = 50500, Y = 0, Z = 0 }, nil) }; GL = { X = 50000, Y = 0, Z = 0 }; run(12); '
+              'blobs_in.p8g = "s 1 0"; run(0.5)')
+    check(C.eval('split.host_state()') == "split", "split, the other guest asked to follow it")
+    C.execute('run(45)')
+    ep = (C.eval('blobs_out.p8') or "").split(" ")[-1]
+    check(C.eval('split.host_state()') == "merging", "it never followed: merge after a while, not each with its own zombies (%s)" % C.eval('split.host_state()'))
+
+
+POWER_FAKES = r"""
+    OUT, INBOX = {}, {}
+    package.loaded["mirror.events"] = { reliable = function() return {
+        send = function(self, m) OUT[#OUT + 1] = m end,
+        pump = function(self, fn) local q = INBOX; INBOX = {}; for _, m in ipairs(q) do fn(m) end end } end }
+    PLAYER = obj({}); PLAYER.K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end
+    package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end }
+    function turret(x)
+        local t = obj({ ["PoweredOn?"] = true, cls = "Buildable_Turret_C", calls = 0 })
+        t.K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end
+        t["Power On"] = function(self, who) self["PoweredOn?"] = true; self.calls = self.calls + 1 end
+        t["Power Off"] = function(self, who) self["PoweredOn?"] = false; self.calls = self.calls + 1 end
+        return t
+    end
+    util = require("mirror.util")
+    LIST = {}
+    util.instances = function(cls, hooks, group) HOOKS_SEEN = HOOKS_SEEN or {}; HOOKS_SEEN[cls] = { hooks = hooks, group = group }
+        return LIST[cls] or {}, true end
+    util.class_name = function(o) return o.cls end
+    power = require("mirror.power")
+    -- (the echo window is real time: os.clock goes with the ticks here)
+    CLOCK = 0; os.clock = function() return CLOCK end
+    function run(s) for i = 1, math.floor(s * 10) do CLOCK = CLOCK + 0.1; power.tick(0.1) end end
+"""
+
+
+def a_turret_switched_off_is_off_for_everyone():
+    # player report 2026-10-31: "Turret needs to be disabled by all players, dosent sync"
+    print("a_turret_switched_off_is_off_for_everyone")
+    H, G = lua(), lua()
+    for L, role in ((H, "host"), (G, "guest")):
+        L.execute(FAKES + POWER_FAKES)
+        L.execute('T = turret(1000); LIST["Buildable_Turret_C"] = { T }; '
+                  'power.init({}, %r, { in_world = function() return true end }); run(14)' % role)
+    check(H.eval('HOOKS_SEEN["Buildable_Turret_C"].group') == "Buildable_TurretMASTER_C"
+          and H.eval('HOOKS_SEEN["Buildable_SmallTurret_C"].group') == "Buildable_TurretMASTER_C",
+          "both turret classes are found in one walk of their master")
+    check(H.eval('#OUT') == 0, "a turret left as it is sends nothing")
+    H.execute('T["PoweredOn?"] = false; run(1)')
+    sent = list(H.eval('OUT').values())
+    check(len(sent) == 1 and sent[0].startswith("S Buildable_Turret_C@100,0,0 t 0"), "switched off on one game: sent (%r)" % sent)
+    G.execute('INBOX = { %r }; run(0.2)' % sent[0])
+    check(G.eval('T["PoweredOn?"]') is False and G.eval('T.calls') == 1, "...and switched off on the other's copy")
+    G.execute('run(3)')
+    check(G.eval('#OUT') == 0, "...without being sent back")
+    G.execute('T["PoweredOn?"] = true; run(1)')
+    back = list(G.eval('OUT').values())
+    check(len(back) == 1 and " t 1 " in back[0], "the guest switching it on again is sent to the host (%r)" % back)
+    H.execute('INBOX = { %r }; run(0.2)' % back[0])
+    check(H.eval('T["PoweredOn?"]') is True, "...and the host's turret is on again")
+
+
+def a_teleport_landing_lets_off_the_first_hits():
+    # live 2026-10-30 02:28:59: teleported into a fight, dead 4 s later (zombies.lua lets the hits off, see
+    # a_host_zombie_hit_reaches_a_guest_with_three_players)
+    print("a_teleport_landing_lets_off_the_first_hits")
+    L = lua()
+    L.execute(FAKES + r"""
+        INBOX, SENT = {}, {}
+        package.loaded["mirror.events"] = { new = function() return {
+            send = function(self, m) SENT[#SENT + 1] = m end,
+            pump = function(self, fn) local q = INBOX; INBOX = {}; for _, m in ipairs(q) do fn(m) end end } end }
+        package.loaded["mirror.notify"] = { show = function() end }
+        package.loaded["mirror.hostrules"] = { get = function() return true end }
+        package.loaded["mirror.vehicles"] = { busy = function() return nil end }
+        package.loaded["mirror.link"].peer_name = function() return "Friend" end
+        PLAYER = obj({ at = { X = 0, Y = 0, Z = 0 } })
+        PLAYER.K2_GetActorLocation = function() return PLAYER.at end
+        PLAYER.K2_GetActorRotation = function() return { Pitch = 0, Yaw = 0, Roll = 0 } end
+        PLAYER.K2_TeleportTo = function(self, to) PLAYER.at = to; return true end
+        GHOST = obj({}); GHOST.K2_GetActorLocation = function() return { X = 50000, Y = 0, Z = 0 } end
+        package.loaded["mirror.ghost"] = { get = function() return GHOST end,
+            location = function() return { X = 50000, Y = 0, Z = 0 } end }
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end }
+        util = require("mirror.util")
+        util.cdo = function() return { LineTraceSingle = function(self, p, a, b, _, _, _, _, out)
+            out.OutHit = { ImpactPoint = { X = a.X, Y = a.Y, Z = 0 } }; return true end } end
+        tp = require("mirror.teleport")
+        ARR = require("mirror.peers").shared_table("arrival")
+        BEFORE = ARR.safe_until
+        tp.command("/goto")
+        INBOX = { "A" }; tp.tick(0.1)
+        LEFT = (ARR.safe_until or 0) - os.clock()
+    """)
+    check(L.eval('PLAYER.at.X') > 49000, "the player landed next to the other one (%s)" % L.eval('PLAYER.at.X'))
+    # (a clock difference: 3.0000000000000004 failed it once)
+    check(L.eval('BEFORE') is None and 2.5 < L.eval('LEFT') <= 3.0 + 1e-9,
+          "...and the host's zombies' hits are let off for the next 3 s (%s)" % L.eval('LEFT'))
+
+
+def load_split_waits_after_a_respawn_and_for_a_teleport():
+    # live 2026-10-30: respawn 02:28:40, split 02:28:51, teleport asked 02:28:53, merged 02:29:00
+    print("load_split_waits_after_a_respawn_and_for_a_teleport")
+    H = lua()
+    H.execute(FAKES + SPLIT_FAKES, "host")
+    H.execute('SETTING = true; GL = { X = 50000, Y = 0, Z = 0 }; REVIVED = 0; run(12)')
+    check(H.eval('split.state()') == "merged", "a guest that just respawned far away isn't split")
+    H.execute('REVIVED = 15; run(4)')
+    check(H.eval('split.state()') == "merged", "...still within 20 s of the respawn")
+    H.execute('REVIVED = math.huge; TP_OPEN = true; run(15)')
+    check(H.eval('split.state()') == "merged", "a teleport open between them: no split")
+    H.execute('TP_OPEN = false; run(9)')
+    check(H.eval('split.state()') == "merged", "after it: split_after counts from there")
+    H.execute('run(3)')
+    check(H.eval('split.state()') == "splitting", "...then the split is asked as usual")
+    H.execute('blobs_in.p8g = "s 1 0"; run(0.3)')
+    check(H.eval('split.state()') == "split", "split")
+    H.execute('REVIVED = 0; TP_OPEN = true; run(5)')
+    check(H.eval('split.state()') == "split", "a split already on isn't ended by either")
 
 
 def load_split_switches_only_when_both_agree():
@@ -4548,7 +7769,9 @@ def load_split_switches_only_when_both_agree():
     check(H.eval('split.state()') == "split", "a save (ghost gone for a moment) doesn't merge")
     H.execute('GHOST = true; GL = { X = 35000, Y = 0, Z = 0 }; blobs_in.p8g = "s 3 1"; run(2)')
     check(H.eval('split.state()') == "split", "between merge_radius and split_radius: still split")
-    H.execute('GL = { X = 25000, Y = 0, Z = 0 }; run(1.1)')
+    H.execute('GL = { X = 25000, Y = 0, Z = 0 }; run(1.1); GL = { X = 35000, Y = 0, Z = 0 }; run(2); GL = { X = 25000, Y = 0, Z = 0 }; run(2.2)')
+    check(H.eval('split.state()') == "split", "within merge_radius only briefly (a player driving by): still split")
+    H.execute('run(2.2)')
     check(H.eval('split.state()') == "merging" and H.eval('INV') == -1 and H.eval('SPLIT') is True and H.eval('blobs_out.p8') == "M 4",
           "within merge_radius, even mid-fight: the host first asks for the guest's zombies (ghost still out)")
     to_guest(); G.execute('run(0.6)')
@@ -4563,7 +7786,7 @@ def load_split_switches_only_when_both_agree():
     check(G.eval('SPLIT') is False and G.eval('blobs_out.p8g') == "m 5 0" and G.eval('FINISHED') == "m 5\nH 1 77",
           "guest: follows the merge and gets the ids for its zombies")
     H.execute('GL = { X = 50000, Y = 0, Z = 0 }; run(12)'); handshake()
-    H.execute('GL = { X = 25000, Y = 0, Z = 0 }; blobs_in.p8g = "s 6 0"; run(1.1)')
+    H.execute('GL = { X = 25000, Y = 0, Z = 0 }; blobs_in.p8g = "s 6 0"; run(4.4)')
     check(H.eval('split.state()') == "merging", "closer again: hand-back asked")
     H.execute('GL = { X = 50000, Y = 0, Z = 0 }; run(0.3)')
     check(H.eval('split.state()') == "split" and H.eval('TAKE_CANCELLED') == 1 and H.eval('INV') == -1,
@@ -4742,6 +7965,115 @@ def load_split_hands_the_ai_to_the_guest():
           "takeover: the spawner runs again and the spawn volume restarted once")
     check(L.eval('KEEP') is True and L.eval('zombies.taking_over()') is False and L.eval('zombies.is_split()') is False,
           "takeover ends with no split state left for the host's code")
+    # K3YBOARD32 2026-10-31: a takeover turned every stopped spawner on and the area the host had cleared filled
+    # again. The ones whose SpawnRadius I stand in stay off until I'm out of their range.
+    L.execute(r"""
+        ME = { X = 0, Y = 0, Z = 0 }
+        function HELD() return zombies._test.held and zombies._test.held() or -1 end   -- (Lua before the hold: no hook)
+        zombies._test.setup(CFG, "guest"); zombies.set_split(false); zombies._test.sweep(10)
+        function placed(s, x, r) s.SpawnRadius = r; s.K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end; return s end
+        SN, SF = placed(spawner(), 1000, 10000), placed(spawner(), 50000, 5000)   -- (held within radius + 2000)
+        RESTARTED = 0
+        VN = placed(obj({ ["Stop Spawning"] = function(self) self.stopped = true end,
+                         ["Restart Spawning"] = function(self) self.stopped = false; RESTARTED = RESTARTED + 1 end }), 3000, 4000)
+        SPAWNERS = { SN, SF }
+        util.instances = function(c) if c == "BP_AISpawner_Master_C" then return SPAWNERS end
+                                     if c == "BP_AISpawningVolume_Prefab_C" then return { VN } end return {} end
+        LIST = {}
+        for i = 1, 6 do zombies._test.sweep(10) end
+        T_STOPPED = SN.IsSpawningStopped and SF.IsSpawningStopped and VN.stopped
+        zombies.begin_takeover(); zombies._test.handover(); zombies.takeover_ready(); zombies._test.reenable(100)
+        T_READY = zombies.takeover_ready()
+        T_NEAR_OFF, T_FAR_ON, T_VOL_OFF = SN.IsSpawningStopped, not SF.IsSpawningStopped, VN.stopped == true
+        zombies._test.setup(CFG, "host"); zombies.end_takeover()
+        T_HELD_STILL = HELD()          -- host, still in range
+        ME = { X = 10000, Y = 0, Z = 0 }              -- 7000 from the volume (out of 4000 + 2000), 9000 from the spawner (in)
+        T_HELD_MID = HELD()
+        T_VOL_ON = VN.stopped == false and RESTARTED == 1
+        ME = { X = 20000, Y = 0, Z = 0 }
+        T_HELD_END = HELD()
+        T_NEAR_ON = SN.IsSpawningStopped == false
+        -- a guest split, then merged again before leaving the range: the held spawner is the mod's to hand back again
+        ME = { X = 0, Y = 0, Z = 0 }
+        zombies._test.setup(CFG, "guest"); SPAWNERS = { SN }; util.instances = function(c) return c == "BP_AISpawner_Master_C" and SPAWNERS or {} end
+        zombies.set_split(false); for i = 1, 6 do zombies._test.sweep(10) end
+        S_SWEPT = SN.IsSpawningStopped
+        zombies.set_split(true); zombies._test.reenable(100)
+        S_SPLIT_OFF = SN.IsSpawningStopped
+        zombies.set_split(false)
+        S_HELD = HELD()
+        for i = 1, 6 do zombies._test.sweep(10) end   -- (it's off already: the sweep doesn't list it)
+        zombies.set_split(true); zombies._test.reenable(100)
+        ME = { X = 20000, Y = 0, Z = 0 }
+        HELD()
+        S_ON_AGAIN = SN.IsSpawningStopped == false
+        zombies.set_split(false)
+    """)
+    check(L.eval('T_STOPPED') is True and L.eval('T_READY') is True, "hold: the sweep stopped them and the takeover is ready")
+    check(L.eval('T_NEAR_OFF') is True and L.eval('T_VOL_OFF') is True and L.eval('T_FAR_ON') is True,
+          "takeover: the spawner and spawn volume around me stay off, the far spawner goes on")
+    check(L.eval('T_HELD_STILL') == 2, "takeover: as host, still in range, both stay held (%s)" % L.eval('T_HELD_STILL'))
+    check(L.eval('T_HELD_MID') == 1 and L.eval('T_VOL_ON') is True,
+          "takeover: out of the volume's range it restarts once, the spawner (still in range) stays held")
+    check(L.eval('T_HELD_END') == 0 and L.eval('T_NEAR_ON') is True, "takeover: out of range the spawner goes on")
+    check(L.eval('S_SWEPT') is True and L.eval('S_SPLIT_OFF') is True and L.eval('S_HELD') == 0 and L.eval('S_ON_AGAIN') is True,
+          "split: a held spawner goes back to the mod's list on a merge and on again at the next split, out of range")
+
+def a_looping_reload_stops_on_the_other_game():
+    # user 2026-10-31: "the other players when reloading have a never ending reload animation". The shotgun's and
+    # revolver's ReloadB montage loops (its section's next is itself) and the game ends it without MC_StopMontage.
+    print("a_looping_reload_stops_on_the_other_game")
+    L = lua()
+    L.execute(FAKES + r"""
+        CLOCK = 0; os.clock = function() return CLOCK end
+        HOOKS, PLAYING, GSTOP = {}, {}, {}
+        ME = obj({ Mesh = { GetAnimInstance = function() return { Montage_IsPlaying = function(self, m) return PLAYING[m] == true end } end } })
+        G = obj({ StopAnimMontage = function(self, m) GSTOP[#GSTOP + 1] = m end })
+        package.loaded["mirror.game"] = { player = function() return ME end, player_hook = function(n, fn) HOOKS[n] = fn end }
+        package.loaded["mirror.ghost"] = { is = function() return false end, get = function() return G end }
+        package.loaded["mirror.link"].peer_age = function() return 0 end
+        util = require("mirror.util")
+        function sections(list)
+            return { ForEach = function(self, fn) for i, s in ipairs(list) do
+                fn(i, { get = function() return { SectionName = { ToString = function() return s[1] end },
+                                                   NextSectionName = { ToString = function() return s[2] end } } end }) end end }
+        end
+        function montage(name, len, secs)
+            return obj({ GetFullName = function() return "AnimMontage /Game/Character/Anims/" .. name .. "." .. name end,
+                         GetPlayLength = function() return len end, CompositeSections = sections(secs) })
+        end
+        LOOP = montage("Chr_AN_Shotgun_ReloadB_Anim_Montage", 1.0, { { "Default", "Default" } })
+        ONCE = montage("Chr_Rifle_Reload_Hip_Montage", 2.0, { { "Default", "None" } })
+        util.find = function(p) if p:find("ReloadB", 1, true) then return LOOP end return ONCE end
+        anim = require("mirror.anim")
+        anim.init({ ghost = { mirror_montages = true } })
+        SELF = { get = function() return ME end }
+        function play(m) HOOKS.MC_Montage(SELF, { get = function() return m end }, { get = function() return 1.0 end }) end
+        function run(secs) local t = 0; while t < secs do CLOCK = CLOCK + 0.05; t = t + 0.05; anim.tick() end end
+        function stops() local n = 0; for l in (blobs_out.anim or ""):gmatch("[^\n]+") do if l:find(" stop ", 1, true) then n = n + 1 end end; return n end
+        play(LOOP); PLAYING[LOOP] = true; run(3.0)               -- three times round the loop
+        LOOPING = stops()
+        PLAYING[LOOP] = nil; run(0.2)                            -- the game ends it (no MC_StopMontage)
+        LOOP_ENDED = stops()
+        play(ONCE); PLAYING[ONCE] = true; run(1.95); PLAYING[ONCE] = nil; run(0.2)
+        ONCE_ENDED = stops()                                     -- ran to its end: the other game's ends there too
+        play(ONCE); PLAYING[ONCE] = true; run(0.5); PLAYING[ONCE] = nil; run(0.2)
+        ONCE_CUT = stops()                                       -- cut short here
+        play(LOOP); PLAYING[LOOP] = true; run(0.5)
+        HOOKS.MC_StopMontage(SELF, { get = function() return LOOP end }); PLAYING[LOOP] = nil; run(0.5)
+        EXPLICIT = stops()                                       -- the game's own stop: one line, not two
+        play(ONCE); run(1.5)
+        NEVER = stops()                                          -- never played here: nothing to stop
+        blobs_in.anim = "9 1 " .. os.time() .. " stop /Game/Character/Anims/Chr_AN_Shotgun_ReloadB_Anim_Montage.Chr_AN_Shotgun_ReloadB_Anim_Montage 1.000"
+        anim.tick()
+    """)
+    check(L.eval('LOOPING') == 0, "a looping reload still playing here sends no stop (%d)" % L.eval('LOOPING'))
+    check(L.eval('LOOP_ENDED') == 1, "the looping reload ended by the game: a stop goes out (%d)" % L.eval('LOOP_ENDED'))
+    check(L.eval('ONCE_ENDED') == 1, "a reload that ran to its end sends no stop (%d)" % L.eval('ONCE_ENDED'))
+    check(L.eval('ONCE_CUT') == 2, "a reload cut short here sends a stop (%d)" % L.eval('ONCE_CUT'))
+    check(L.eval('EXPLICIT') == 3, "the game's own stop is sent once (%d)" % L.eval('EXPLICIT'))
+    check(L.eval('NEVER') == 3, "a montage that never played here sends no stop (%d)" % L.eval('NEVER'))
+    check(L.eval('#GSTOP') == 1 and L.eval('GSTOP[1] == LOOP'), "the other game stops the looping montage on the player's character")
 
 def reliable_events_survive_pauses_and_restarts():
     print("reliable_events_survive_pauses_and_restarts")
@@ -4811,6 +8143,100 @@ def reliable_events_survive_pauses_and_restarts():
     check(A2.eval('#ch.recent') > 200, "7 min unread (a guest waiting for its host): every take is still kept (%d)" % A2.eval('#ch.recent'))
     A2.execute('CLOCK = CLOCK + 1500; ch:send("M z")')
     check(A2.eval('#ch.recent') == 64, "an unread history shrinks to the small keep after 30 min")
+    # T10 audit 2026-10-31 (R2 #2): over Steam (whole seconds, 2 s clock slack) the guest's cut let host messages from
+    # ~3 s before it through, and messages sent between the cut and the save's start are in the save too: both were
+    # applied twice. The host's ids at the save's start decide instead.
+    A3, B3 = side(7000), side(7000)
+    for s in (A3, B3):
+        s.execute('package.loaded["mirror.link"].peer_age = function(s) return os.time() - s - 2 end')
+    B3.execute('JOINING = true; events.set_hold(function() return JOINING end)')
+    A3.execute('ch:send("D old"); T = T + 1.5; events.set_cut(os.time()); CUT = os.time(); ch:send("D in save"); '
+               'MARKS = events.marks(); T = T + 0.5; ch:send("D after"); tick(0.25)')
+    ship(A3, B3)
+    B3.execute('tick(0.25)')
+    cut = 'os.time() - package.loaded["mirror.link"].peer_age(%d) - 2' % A3.eval('CUT')
+    B3.execute('events.set_cut(%s, %s); JOINING = false; tick(0.25)' % (cut, repr(A3.eval('MARKS'))))
+    check(B3.eval('#GOT') == 1 and B3.eval('GOT[1]') == "D after",
+          "Steam join: only the host's messages after its save's start are applied (%s)"
+          % [B3.eval('GOT[%d]' % (i + 1)) for i in range(B3.eval('#GOT'))])
+    A3.execute('ch:send("D next"); tick(0.25)'); ship(A3, B3); B3.execute('tick(0.25)')
+    check(B3.eval('#GOT') == 2 and B3.eval('GOT[2]') == "D next", "...and later ones still arrive")
+    # an older host sends no marks: the time cut alone decides (and clears marks of an earlier join)
+    B4 = side(7000)
+    B4.execute('package.loaded["mirror.link"].peer_age = function(s) return os.time() - s - 2 end; '
+               'events.set_cut(1, "drops 1 99"); events.set_cut(%d)' % A3.eval('CUT'))
+    A3.execute('ch.dirty = true; tick(0.25)'); ship(A3, B4); B4.execute('tick(0.25)')
+    check(B4.eval('#GOT') == 4 and B4.eval('GOT[1]') == "D old" and B4.eval('GOT[2]') == "D in save",
+          "no marks (an older host): the time cut alone decides, an earlier join's marks are gone - and it lets the "
+          "two messages already in the save through, the double apply the marks stop (%d)" % B4.eval('#GOT'))
+    # T10 audit 2026-10-31: a give-back to the guest's bag ("G"/"L") is in no join save; sent between the join request
+    # and the save start it was skipped with the rest, and the guest kept the duplicate. Fresh ones pass the cut.
+    A5, B5 = side(9000), side(9000)
+    B5.execute('JOINING = true; events.set_hold(function() return JOINING end); '
+               'ch.past_cut = function(p) return p:sub(1, 2) == "G " end')
+    A5.execute('ch:send("G stale"); T = T + 180; ch:send("G give back"); ch:send("D in save"); '
+               'CUT = os.time(); MARKS = events.marks(); T = T + 0.5; ch:send("D after"); tick(0.25)')
+    ship(A5, B5)
+    B5.execute('T = T + 180.5; tick(0.25); events.set_cut(%d, %s); JOINING = false; tick(0.25)' % (A5.eval('CUT'), repr(A5.eval('MARKS'))))
+    got = [B5.eval('GOT[%d]' % (i + 1)) for i in range(B5.eval('#GOT'))]
+    check(got == ["G give back", "D after"],
+          "join: a fresh give-back sent before the save start still reaches the guest, a 3 min old one and the "
+          "save's own messages don't (%s)" % got)
+
+
+def plain_events_skip_late_lines_and_bound_the_window():
+    print("plain_events_skip_late_lines_and_bound_the_window")
+    def side():
+        L = lua()
+        L.execute(FAKES + r"""
+            T = 1000; os.time = function() return math.floor(T) end
+            CLOCK = 0; os.clock = function() return CLOCK end
+            local lk = package.loaded["mirror.link"]
+            lk.peer_age = function(s) return os.time() - s - 2 end     -- Steam: whole seconds, 2 s clock slack
+            local put = lk.put_blob
+            PUTS, MAXL = 0, 0
+            lk.put_blob = function(n, b)
+                if n == "imp" then PUTS = PUTS + 1; MAXL = math.max(MAXL, select(2, b:gsub("\n", "")) + 1) end
+                return put(n, b)
+            end
+            events = require("mirror.events")
+            hits = events.new("hits", 32, 3)
+            imp = events.new("imp", 200, 1)
+            GOT, GOTI = {}, {}
+            function tick(dt)
+                T = T + dt; CLOCK = CLOCK + dt
+                hits:pump(function(p) GOT[#GOT + 1] = p end)
+                imp:pump(function(p) GOTI[#GOTI + 1] = p end)
+            end
+        """)
+        return L
+    def ship(a, b):
+        out = a.eval('blobs_out')
+        inn = b.eval('blobs_in')
+        for k in list(out.keys()):
+            inn[k] = out[k]
+        a.execute('blobs_out = {}')
+    A, B = side(), side()
+    A.execute('hits:send("on time"); tick(0.1)'); ship(A, B); B.execute('tick(0.1)')
+    check(B.eval('#GOT') == 1, "a hit read at once is applied")
+    # a 4 s link stall: the line reaches B 4 s after it was sent (the whole-second check alone let it through)
+    A.execute('hits:send("stalled"); tick(0.1)'); ship(A, B)
+    B.execute('T = T + 4; CLOCK = CLOCK + 4'); A.execute('T = T + 4; CLOCK = CLOCK + 4')
+    B.execute('tick(0.1)')
+    check(B.eval('#GOT') == 1, "a hit read 4 s late is skipped (max_age 3) (%d applied)" % B.eval('#GOT'))
+    A.execute('hits:send("after"); tick(0.1)'); ship(A, B); B.execute('tick(0.1)')
+    check(B.eval('#GOT') == 2 and B.eval('GOT[2]') == "after", "the next hit after the stall is applied")
+    # 25 messages a second for 10 s at 50 frames a second: the window holds ~1 s, at most 20 writes a second, none lost
+    for i in range(500):
+        if i % 2 == 0:
+            A.execute('imp:send("i%d")' % (i // 2))
+        A.execute('tick(0.02)'); ship(A, B); B.execute('tick(0.02)')
+    A.execute('tick(0.1)'); ship(A, B); B.execute('tick(0.02)')
+    got = B.eval('#GOTI')
+    check(got == 250 and B.eval('GOTI[250]') == "i249" and B.eval('GOTI[1]') == "i0",
+          "every one of 250 impacts arrives once, in order (%d)" % got)
+    check(A.eval('MAXL') <= 28, "the window holds only the last second (max %d lines, was up to 200)" % A.eval('MAXL'))
+    check(A.eval('PUTS') <= 205, "at most 20 writes a second (%d in 10 s, was one per message)" % A.eval('PUTS'))
 
 
 def jig_price_follows_the_traders_table():
@@ -4949,7 +8375,8 @@ def settlement_camps_follow_the_host():
                                   table.insert(WORLD.BP_SettlementCampSpawner_C, s) end
             for i = 1, 4 do spawner("Prefab_Settlement" .. i .. "_C") end
             JOINED = true
-            package.loaded["mirror.game"] = { on_world_reset = function() end }
+            -- (no world: the animation gate lets a camp's destroy run at once)
+            package.loaded["mirror.game"] = { on_world_reset = function() end, world = function() return nil end }
             camps = require("mirror.camps")
             camps.init({}, "%s", { in_world = function() return JOINED end }, function() return true end)
             function n(cls) return #util.instances(cls) end
@@ -5069,6 +8496,15 @@ def airdrops_follow_the_host():
             end
             StaticFindObject = function(p) return obj({ path = p }) end
             FindFirstOf = function() return obj({ ReferencedObjects = { GetArrayNum = function() return 0 end } }) end
+            -- the container loot tables: all in memory (one walk of their class finds them)
+            FindAllOf = function(c)
+                if c ~= "ContainerItems_DataAsset_C" then return nil end
+                local out = {}
+                for _, p in ipairs(require("mirror.loottables")._paths) do
+                    out[#out + 1] = obj({ GetFullName = function() return "ContainerItems_DataAsset_C " .. p end })
+                end
+                return out
+            end
             package.loaded["mirror.game"] = { on_world_reset = function() end,
                 world = function() return { SpawnActor = function(_, cls, l) return actor(cls.path:match("%%.(.+)$"), l) end } end }
             JOINED = true
@@ -5136,11 +8572,26 @@ def event_sites_follow_the_host():
             MARKER_CDO = obj({})
             FText = function(s) return "FText:" .. s end
             NOT_LOADED = {}   -- paths the game hasn't loaded (StaticFindObject finds nothing)
+            FINDS = {}
             StaticFindObject = function(p)
+                FINDS[p] = (FINDS[p] or 0) + 1
                 if NOT_LOADED[p] then return nil end
                 if p:find("Default__BP_Marker_C", 1, true) then return MARKER_CDO end
                 if p:find("Default__GameFunctionLibrary_C", 1, true) then return obj({ XpMultiplierCalc = function() return 50 end }) end
                 return obj({ cls = p:match("%%.(.+)$") })
+            end
+            -- the container loot tables in memory: one walk of their class finds them (not one lookup each)
+            WALKS = 0
+            FindAllOf = function(c)
+                if c ~= "ContainerItems_DataAsset_C" then return nil end
+                WALKS = WALKS + 1
+                local out = {}
+                for _, p in ipairs(require("mirror.loottables")._paths) do
+                    if not NOT_LOADED[p] then
+                        out[#out + 1] = obj({ GetFullName = function() return "ContainerItems_DataAsset_C " .. p end })
+                    end
+                end
+                return out
             end
             MARKERS, XP = {}, 0
             ME = obj({ K2_GetActorLocation = function() return ME_AT end }); ME_AT = { X = 0, Y = 0, Z = 0 }
@@ -5182,13 +8633,26 @@ def event_sites_follow_the_host():
     check(G.eval('n("Prefab_CrashedHelicopter01_C")') == 1 and G.eval('n("Prefab_CrashedMilitaryPlane_C")') == 0,
           "nothing changes in the first seconds after arriving")
     G.execute('for i = 1, 6 do prefabs.tick(5) end')
+    # (a site can hold animated child actors: destroyed once animation runs on the game thread - animgate.lua)
+    check(G.eval('n("Prefab_CrashedHelicopter01_C")') == 1, "the guest's own crash site waits for the animation gate")
+    G.execute('for i = 1, 3 do util.new_frame(); require("mirror.animgate").tick() end')
     check(G.eval('n("Prefab_CrashedHelicopter01_C")') == 0, "the guest's own crash site is removed")
     check(G.eval('n("Prefab_CrashedMilitaryPlane_C")') == 0, "the host's site's class isn't loaded here: not spawned")
-    G.execute('NOT_LOADED[PLANE] = nil; for i = 1, 6 do prefabs.tick(5) end')
+    # (a miss costs ~15 ms in the game: 42-49 ms every 5 s live 2026-10-30 with ~12 such sites)
+    check(G.eval('FINDS[PLANE]') == 1, "...and not looked up again at every check (%s lookups)" % G.eval('FINDS[PLANE]'))
+    # (util.find asks a missing path again 2 s later, real time: the ticks here take no time)
+    G.execute('NOT_LOADED[PLANE] = nil; util.find_reset(); for i = 1, 6 do prefabs.tick(5) end')
     check(G.eval('n("Prefab_CrashedMilitaryPlane_C")') == 0,
           "class loaded, one container loot table not: still not spawned (no load inside SpawnActor)")
-    G.execute('NOT_LOADED[TABLE] = nil; for i = 1, 16 do prefabs.tick(5) end')
+    G.execute('NOT_LOADED[TABLE] = nil; for i = 1, 16 do prefabs.tick(5); '
+              'if GI.ReferencedObjects.n == 30 and PIN_N == nil then PIN_N = n("Prefab_CrashedMilitaryPlane_C") end end')
     check(G.eval('GI.ReferencedObjects.n') == 30, "every loot table in memory: all 30 pinned (%s)" % G.eval('GI.ReferencedObjects.n'))
+    # (kit 2026-10-31: ~15 ms a lookup, found or not - "perf: prefabs took 139 ms" after a join)
+    G.execute('BYNAME = 0; for p, k in pairs(FINDS) do if p:find("/LootTables/", 1, true) then BYNAME = BYNAME + k end end')
+    check(G.eval('BYNAME') == 0 and G.eval('WALKS') >= 1,
+          "...found by walking their class, none looked up by name (%s lookups, %s walks)" % (G.eval('BYNAME'), G.eval('WALKS')))
+    # (pin + spawn in one frame: 468 ms live 2026-10-30 02:34:53)
+    check(G.eval('PIN_N') == 0, "...and the site isn't spawned in the check that pinned them (%s)" % G.eval('PIN_N'))
     check(G.eval('OWN_SP.gone') is True and G.eval('OWN_MARK.gone') is True,
           "...with its spawner and map marker (no marker for a site that isn't there)")
     check(G.eval('n("Prefab_CrashedMilitaryPlane_C")') == 1, "the host's crashed plane is spawned at its spot")
@@ -5200,6 +8664,47 @@ def event_sites_follow_the_host():
           "settlements and quest prefabs are left alone")
     G.execute('for i = 1, 6 do prefabs.tick(5) end')
     check(G.eval('n("Prefab_CrashedMilitaryPlane_C")') == 1, "and only once")
+
+
+def a_destroyed_sites_address_can_come_back_as_a_new_site():
+    """Audit 2026-10-30: an event site or camp destroyed here stays listed until garbage collection, so it is marked;
+    the mark was its address, kept for the whole world. After the collection the address can come back as a new actor:
+    a host that took over the Realm in place left that site out of its list and every guest removed it."""
+    print("a_destroyed_sites_address_can_come_back_as_a_new_site")
+    L = lua()
+    L.execute(FAKES + r"""
+        util = require("mirror.util")
+        ALL = {}
+        util.instances = function() local l = {} for _, a in ipairs(ALL) do if not a.gone then l[#l + 1] = a end end return l end
+        util.class_name = function(a) return a.cls end
+        util.class_path = function(a) return "/Game/Prefabs/X/" .. a.cls:gsub("_C$", "") .. "." .. a.cls end
+        local k = 0
+        function prefab(cls, x, y)
+            k = k + 1
+            local a = obj({ cls = cls, at = { X = x, Y = y, Z = 100 }, name = cls .. " /Game/Map.Map:Persistent." .. cls .. "_" .. k })
+            a.GetFullName = function(self) return self.name end
+            a.K2_GetActorLocation = function(self) return self.at end
+            a.K2_GetActorRotation = function() return { Pitch = 0, Yaw = 0, Roll = 0 } end
+            a.K2_DestroyActor = function(self) self.destroyed = true end   -- still listed until "garbage collection"
+            ALL[#ALL + 1] = a; return a
+        end
+        package.loaded["mirror.game"] = { on_world_reset = function() end, player = function() end,
+            world = function() return { SpawnActor = function() end } end }
+        JOINED = true
+        prefabs = require("mirror.prefabs")
+        prefabs.init({}, "guest", { in_world = function() return JOINED end }, function() return true end)
+    """)
+    L.execute('OLD = prefab("Prefab_CrashedHelicopter01_C", 9000, 9000); blobs_in.prefabs = "-"; '
+              'for i = 1, 8 do prefabs.tick(5) end; '
+              'for i = 1, 3 do util.new_frame(); require("mirror.animgate").tick() end')
+    check(L.eval('OLD.destroyed') is True, "the guest destroys its own site the host doesn't have")
+    # in place, no world load: the guest becomes the host (Realm takeover)
+    L.execute('prefabs.init({}, "host", { in_world = function() return true end }, function() return true end); prefabs.tick(5)')
+    check(L.eval('blobs_out.prefabs') == "-", "the new host leaves out the site it destroyed while still listed (%r)" % L.eval('blobs_out.prefabs'))
+    L.execute('OLD.gone = true; NEW = prefab("Prefab_CrashedMilitaryPlane_C", 5000, 6000); '
+              'local a = OLD:GetAddress(); NEW.GetAddress = function() return a end; prefabs.tick(5)')
+    sent = L.eval('blobs_out.prefabs') or ""
+    check(sent.startswith("Prefab_CrashedMilitaryPlane_C "), "a new site at the old one's address is sent (%r)" % sent)
 
 
 def new_realm_character_gets_the_starting_kit():
@@ -5279,6 +8784,179 @@ def realm_takes_the_creators_difficulty():
         check(L.eval('dif.remember_mine("QuickSave1")') is True, "the player's own difficulty is remembered")
         mine, name = L.eval('(dif.mine())'), L.eval('select(2, dif.mine())')
         check(mine is not None and mine["Loot.General"] == "1.5" and name == "QuickSave1", "...with the save it came from")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+WORLDSET_LUA = r"""
+    package.loaded["mirror.game"] = { world = function() return WORLD end, player = function() return PLAYER end,
+        on_tick = function(f) TICKS[#TICKS + 1] = f end }
+    WORLD, PLAYER, TICKS = {}, obj({}), {}
+    CMDS, NOTES = {}, {}
+    local BOOL = { ["Difficulty.Permadeath"] = true }
+    local k = obj({})
+    k.GetConsoleVariableBoolValue = function(self, n) return LIVE[n] end
+    k.GetConsoleVariableFloatValue = function(self, n) return LIVE[n] end
+    k.ExecuteConsoleCommand = function(self, w, c)
+        TRIES = (TRIES or 0) + 1
+        if FAIL and c:find(FAIL, 1, true) then error("console refused") end
+        CMDS[#CMDS + 1] = c
+        local n, v = c:match("^(%S+) (%S+)$")
+        if BOOL[n] then LIVE[n] = v == "1" else LIVE[n] = tonumber(v) end
+    end
+    util = require("mirror.util")
+    util.cdo = function() return k end
+    require("mirror.localdir").configure({ getenv = function() return DIR end })
+    STATE, SLOT, INW = "idle", nil, false
+    OWN = { A = true, B = true }
+    package.loaded["mirror.session"] = { state = function() return STATE end, world_save = function() return SLOT end,
+        in_world = function() return STATE == "joined" and INW end }
+    package.loaded["mirror.slotguard"] = { is_own = function(n) return OWN[n] == true end }
+    package.loaded["mirror.notify"] = { show = function(t) NOTES[#NOTES + 1] = t end }
+    dif = require("mirror.difficulty")
+    ws = require("mirror.worldset")
+    function look() ws.tick(5.0) end
+    function own(a, b) LIVE = { ["Difficulty.Permadeath"] = false, ["Difficulty.TraderCurrencyAmount"] = a,
+        ["Difficulty.XPMultiplier"] = b, ["Loot.General"] = 1.5 } end
+    HOST = "Difficulty.Permadeath=1\nDifficulty.TraderCurrencyAmount=5000\nDifficulty.XPMultiplier=2\nLoot.General=1.5\n"
+    function cmds() table.sort(CMDS); local s = table.concat(CMDS, ","); CMDS = {}; return s end
+    function pend() local p = dif.pending(); return p and (p.slot .. " " .. p.loads) or "none" end
+"""
+
+
+def coop_guest_runs_the_hosts_world_settings():
+    """Player review 2026-10-31: 'if the host changes a world setting e.g. trader currency cap, player 2 has to do it
+    too'. The guest's game runs the host's Difficulty/Loot values while joined, and gets its own back in its own save
+    (Sentinel R1: also after a crash, and never remembering the host's as its own)."""
+    print("coop_guest_runs_the_hosts_world_settings")
+    d = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(d, "SurrounDead", "Saved", "Config", "Windows"))
+        with open(os.path.join(d, "SurrounDead", "Saved", "Config", "Windows", "UserSettings.ini"), "w") as f:
+            f.write("[Settings]\nDifficulty.Permadeath=false\nDifficulty.TraderCurrencyAmount=1000\n"
+                    "Difficulty.XPMultiplier=1.5\nLoot.General=1.5\n")
+        setup = FAKES + WORLDSET_LUA.replace("DIR", repr(d))
+        L = lua()
+        L.execute(setup.replace(repr(d), repr(os.path.join(d, "missing"))))
+        check(L.eval('dif.set_pending("A", "?")') is False and L.eval('pend()') == "A ?",
+              "a restore file that can't be written: still owed while the game runs")
+        L = lua()
+        L.execute(setup)
+        check(L.eval('dif.same({ a = "2" }, { a = "2.0" })') is True and L.eval('dif.same({ a = "1.5121" }, { a = "1.51210004" })') is True
+              and L.eval('dif.same({ a = "2" }, { a = "2.1" })') is False and L.eval('dif.same({}, { a = "1" })') is False,
+              "values compare as numbers (the game keeps floats), a missing one differs")
+        L.execute('own(1000, 1.5); SLOT = "A"; look()')
+        mine, name = L.eval('(dif.mine())'), L.eval('select(2, dif.mine())')
+        check(name == "A" and mine is not None and mine["Difficulty.TraderCurrencyAmount"] == "1000",
+              "solo in my own save: my world settings are kept (%s)" % name)
+        L.execute('own(1200, 1.5); look()')
+        check(L.eval('(dif.mine())')["Difficulty.TraderCurrencyAmount"] == "1200", "...and a change there is kept too")
+        L.execute('STATE = "requested"; ws.tick(0.1)')
+        check(L.eval('pend()') == "A ?", "asking to join: a restore is owed to save A (%s)" % L.eval('pend()'))
+        check(os.path.exists(os.path.join(d, "SurrounDead", "mirror_difficulty_restore.txt")),
+              "...written to a file (a crash keeps it)")
+        # the join's load didn't change the values (the case the guest reported): the host's are set
+        L.execute('STATE, SLOT, INW = "joined", "Coop1", false; ws.follow(HOST, "Hosty")')
+        check(L.eval('cmds()') == "", "still loading into the host's world: nothing set yet")
+        L.execute('INW = true; ws.follow(HOST, "Hosty")')
+        c = L.eval('cmds()')
+        check(c == "Difficulty.Permadeath 1,Difficulty.TraderCurrencyAmount 5000,Difficulty.XPMultiplier 2",
+              "in the host's world: the host's values are set, only the ones that differ (%s)" % c)
+        check(L.eval('pend()') == "A no", "...and the join showed a world load doesn't set them (%s)" % L.eval('pend()'))
+        L.execute('ws.follow(HOST, "Hosty")')
+        check(L.eval('cmds()') == "" and L.eval('#NOTES') == 0, "matching: nothing more is set, no message")
+        L.execute('LIVE["Difficulty.TraderCurrencyAmount"] = 99; ws.follow(HOST, "Hosty")')
+        check(L.eval('cmds()') == "Difficulty.TraderCurrencyAmount 5000", "the guest changed one: the host's comes back")
+        check(L.eval('#NOTES') == 1 and "Hosty" in L.eval('NOTES[1]'), "...with one message saying why")
+        L.execute('LIVE["Difficulty.TraderCurrencyAmount"] = 98; ws.follow(HOST, "Hosty")')
+        check(L.eval('cmds()') == "Difficulty.TraderCurrencyAmount 5000" and L.eval('#NOTES') == 1, "...only one message")
+        L.execute('HOST = HOST:gsub("XPMultiplier=2", "XPMultiplier=3"); ws.follow(HOST, "Hosty")')
+        check(L.eval('cmds()') == "Difficulty.XPMultiplier 3" and L.eval('#NOTES') == 1,
+              "the host changes a setting: it reaches the guest (no message, the guest changed nothing)")
+        check(L.eval('dif.remember_mine("A")') is False, "the host's values are never remembered as mine meanwhile")
+        # home again, the save path asks first
+        L.execute('STATE, SLOT = "idle", nil')
+        check(L.eval('ws.restore_now()') is False and L.eval('cmds()') == "", "home world still loading: nothing set yet")
+        L.execute('SLOT = "A"')
+        check(L.eval('ws.restore_now()') is True, "back in save A: the restore runs before the save")
+        c = L.eval('cmds()')
+        check(c == "Difficulty.Permadeath 0,Difficulty.TraderCurrencyAmount 1200,Difficulty.XPMultiplier 1.5",
+              "...my own values are set again (%s)" % c)
+        check(L.eval('pend()') == "none" and not os.path.exists(os.path.join(d, "SurrounDead", "mirror_difficulty_restore.txt")),
+              "...and nothing is owed any more")
+        L.execute('look()')
+        check(L.eval('(dif.mine())')["Difficulty.TraderCurrencyAmount"] == "1200", "my own values stay mine")
+
+        # a crash while joined, then another own save: a load that doesn't set them leaves the host's -> set mine
+        L.execute('STATE, SLOT = "requested", "A"; ws.tick(0.1); STATE, SLOT, INW = "joined", "Coop1", true; ws.follow(HOST, "Hosty"); cmds()')
+        check(L.eval('pend()') == "A no", "joined again (%s)" % L.eval('pend()'))
+        L.execute('ws.tick(0.1); ws.follow(HOST, "Hosty"); ws.tick(0.1); LIVE["Difficulty.TraderCurrencyAmount"] = 99; ws.follow(HOST, "Hosty"); ws.tick(0.1); '
+                  'LIVE["Difficulty.TraderCurrencyAmount"] = 98; ws.follow(HOST, "Hosty"); cmds()')
+        check(L.eval('#NOTES') == 2, "a new join: a change there gets its message again, once (%d)" % L.eval('#NOTES'))
+        L = lua()
+        L.execute(setup)
+        L.execute('own(5000, 3); LIVE["Difficulty.Permadeath"] = true; SLOT, PLAYER = "B", nil; look()')
+        check(L.eval('cmds()') == "" and L.eval('pend()') == "A no", "after a crash, no player in the world yet: nothing set")
+        L.execute('PLAYER, FAIL = obj({}), "Difficulty.XPMultiplier"')
+        check(L.eval('ws.restore_now()') is False and L.eval('pend()') == "A no",
+              "one setting wouldn't set: the restore stays owed")
+        L.execute('N1 = TRIES; ws.tick(0.01)')
+        check(L.eval('TRIES') == L.eval('N1') + 1, "...the next frame tries once more (no 5 s wait while owed)")
+        L.execute('N1 = TRIES; ws.tick(0.01); ws.tick(0.01)')
+        check(L.eval('TRIES') == L.eval('N1'), "...then a second later, not every frame")
+        L.execute('local clock = os.clock; os.clock = function() return clock() + 2 end; FAIL = nil; ws.tick(0.01); os.clock = clock')
+        c = L.eval('cmds()')
+        check(c == "Difficulty.Permadeath 0,Difficulty.TraderCurrencyAmount 1200,Difficulty.XPMultiplier 1.5",
+              "after a crash, in another own save still running the host's values: mine are set (%s)" % c)
+        L.execute('look()')
+        mine, name = L.eval('(dif.mine())'), L.eval('select(2, dif.mine())')
+        check(name == "B" and mine["Difficulty.TraderCurrencyAmount"] == "1200" and L.eval('pend()') == "none",
+              "...then kept as save B's (%s %s)" % (name, mine["Difficulty.TraderCurrencyAmount"]))
+
+        # a load that sets them from the save: another own save keeps its own, and the host's are never mine
+        L.execute('STATE = "requested"; ws.tick(0.1)')
+        L.execute('own(5000, 2); LIVE["Difficulty.Permadeath"] = true; STATE, SLOT, INW = "joined", "Coop1", true; ws.follow(HOST, "Hosty")')
+        check(L.eval('cmds()') == "" and L.eval('pend()') == "B yes", "the join's load set the host's itself (%s)" % L.eval('pend()'))
+        L = lua()
+        L.execute(setup)
+        L.execute('own(700, 1.1); SLOT = "A"; look()')
+        check(L.eval('cmds()') == "", "after a crash, save A's load set A's own: nothing is changed")
+        L.execute('look()')
+        mine, name = L.eval('(dif.mine())'), L.eval('select(2, dif.mine())')
+        check(name == "A" and mine["Difficulty.TraderCurrencyAmount"] == "700" and L.eval('pend()') == "none",
+              "...and save A's values are kept, not the host's (%s %s)" % (name, mine["Difficulty.TraderCurrencyAmount"]))
+        L.execute('SLOT = nil; look(); STATE = "requested"; ws.tick(0.1)')
+        check(L.eval('pend()') == "A ?", "a join from the main menu owes the restore to the save I was last in (%s)" % L.eval('pend()'))
+        L = lua()
+        L.execute(setup)
+        L.execute('dif.clear_pending(); STATE = "requested"; ws.tick(0.1)')
+        check(L.eval('pend()') == "A ?", "...right after a start too: to the save my own values came from (%s)" % L.eval('pend()'))
+
+        # the wire: the host's world.lua puts "diff" (kept) on change only, the guest's follows it
+        L = lua()
+        L.execute(setup + r"""
+            PUT, BLOB = {}, nil
+            package.loaded["mirror.link"] = { put_blob = function(n, t, keep) if n == "diff" then PUT[#PUT + 1] = { t, keep } end end,
+                get_blob = function(n) if n == "diff" then local b = BLOB; BLOB = nil; return b end end,
+                peer_name = function() return "Hosty" end }
+            package.loaded["mirror.sleep"] = { init = function() end, tick = function() end, forget = function() end }
+            FindAllOf = function() return {} end
+            own(1000, 1.5)
+            dif.clear_pending()
+            world = require("mirror.world")
+            world.init({}, "host", package.loaded["mirror.session"])
+            world.tick(2.0)
+        """)
+        check(L.eval('#PUT') == 1 and L.eval('PUT[1][2]') is True and "TraderCurrencyAmount=1000" in L.eval('PUT[1][1]'),
+              "host: the world settings go over at once, kept for a link that comes back")
+        L.execute('world.tick(2.0)')
+        check(L.eval('#PUT') == 1, "...once while nothing changes")
+        L.execute('local clock = os.clock; os.clock = function() return clock() + 4 end; own(4000, 1.5); for i = 1, 3 do world.tick(2.0) end')
+        check(L.eval('#PUT') == 2 and "TraderCurrencyAmount=4000" in L.eval('PUT[2][1]'), "...and again when one changes")
+        L.execute('world.init({}, "guest", package.loaded["mirror.session"]); STATE, SLOT, INW = "joined", "Coop1", true; '
+                  'BLOB = HOST; world.tick(2.0); world.tick(2.0)')
+        check("Difficulty.TraderCurrencyAmount 5000" in L.eval('cmds()'), "guest: the host's are set from the blob")
+        check(L.eval('pend()') == "A ?", "...a join the mod didn't see start still owes my own save the restore (%s)" % L.eval('pend()'))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -5432,6 +9110,16 @@ def peers_give_every_player_their_own_copy():
         check(L.eval('STOPPED') == 2, "stop stops every copy")
         check(L.eval('#STARTED') == 1 and L.eval('STARTED[1].role') == "mate" and L.eval('STARTED[1].out') == "to1",
               "guest: a mate copy for the other guest, none for the host link")
+        # a Realm host leaves: only the guest in the lowest slot takes it over (report 2026-10-29 22:28: both did)
+        L.execute('FIRST, NEXT = peers.first_guest()')
+        check(L.eval('FIRST') is False and L.eval('NEXT') == "Ann", "guest in slot 2 with a guest in slot 1: Ann takes the Realm over")
+        L.execute('peers.stop(); STARTED = {}; peers.start({}, "guest"); '
+                  'roster("me 1 1002 guest\\npeer guest host 0 1001 connected Host\\npeer to2 from2 2 1003 connected Bob\\n"); peers.tick(1.1); '
+                  'FIRST = peers.first_guest()')
+        check(L.eval('FIRST') is True, "the guest in slot 1 takes it over")
+        L.execute('peers.stop(); STARTED = {}; peers.start({}, "guest"); roster("me 1 1002 guest\\npeer guest host 0 1001 connected Host\\n"); '
+                  'peers.tick(1.1); FIRST = peers.first_guest()')
+        check(L.eval('FIRST') is True, "the only guest takes it over (as before)")
 
         # ghosts of every copy count
         L.execute('''
@@ -5555,6 +9243,155 @@ def settings_pages_cycle_save_and_follow_the_host():
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+def a_realm_plays_by_its_owners_rules():
+    """user 2026-10-30 'owner rules': in a Realm only its owner sets the rules (the server keeps them), whoever hosts;
+    the host plays by the server's, a change of the owner's goes to the server and isn't undone by its older copy."""
+    print("a_realm_plays_by_its_owners_rules")
+    d = tempfile.mkdtemp()
+    try:
+        L = lua()
+        L.execute('''
+            local d = ...
+            NOW = 0; os.clock = function() return NOW end
+            ROLE = "host"; BLOBS = {}; SEEN = {}; NOTES = {}; PUSHES = {}
+            package.loaded["mirror.notify"] = { show = function(m) NOTES[#NOTES + 1] = m end, clear = function() end }
+            package.loaded["mirror.peers"] = { each = function(_, fn) fn(package.loaded["mirror.link"], nil) end }
+            package.loaded["mirror.link"] = { dir = function() return d end, reset_blob = function() end,
+                put_blob = function(n, s) BLOBS[n] = s end,
+                get_blob = function(n) local b = BLOBS[n]; if b ~= SEEN[n] then SEEN[n] = b; return b end end }
+            hr = require("mirror.hostrules")
+            hr.init(function() return ROLE end)
+            REALM = nil
+            hr.set_realm(function() return REALM end,
+                function(id, rules, cb) PUSHES[#PUSHES + 1] = { id = id, rules = rules, cb = cb } end)
+            function note_has(s) for _, m in ipairs(NOTES) do if m:find(s, 1, true) then return true end end return false end
+            function file() local f = io.open(d .. "/mirror_host_settings.txt"); local s = f and f:read("*a") or ""; if f then f:close() end; return s end
+        ''', d.replace("\\", "/"))
+        # hosting someone else's Realm: the owner's rules from the server, into the Realm's file and out to the guests
+        L.execute('REALM = { id = "R1", owner = false, rules = "pvp on players 2 debugmenu off" }; hr.tick()')
+        check(L.eval('hr.my_value("pvp")') == "on" and L.eval('hr.my_value("players")') == "2"
+              and L.eval('hr.my_value("debugmenu")') == "off" and L.eval('hr.my_value("teleport")') == "on",
+              "a host in a Realm plays by the owner's rules (keys they lack keep their value)")
+        check("pvp on" in L.eval("file()") and "debugmenu off" in (L.eval("BLOBS.rules") or ""),
+              "...saved to the Realm's settings file and sent to the guests")
+        check(L.eval("hr.can_edit()") is False and L.eval("hr.note()") == "The Realm's rules - only its owner can change them.",
+              "a host who isn't the owner can't edit them, and the page says so")
+        L.execute('hr.toggle("debugmenu"); hr.tick()')
+        check(L.eval('hr.my_value("debugmenu")') == "off" and L.eval("#PUSHES") == 0
+              and L.eval('note_has("Only the Realm\'s owner can change its rules.")'),
+              "a non-owner host's toggle changes nothing, sends nothing and tells them why")
+        L.execute('REALM.rules = "pvp off players 3 debugmenu off"; hr.tick()')
+        check(L.eval('hr.my_value("pvp")') == "off" and L.eval('hr.my_value("players")') == "3",
+              "the owner's later change (in the next heartbeat) applies on the host")
+        # the owner hosting: a change goes to the server; the server's older copy doesn't undo it meanwhile
+        L.execute('REALM.owner = true; hr.tick(); hr.toggle("debugmenu")')
+        check(L.eval("#PUSHES") == 1 and L.eval("PUSHES[1].id") == "R1" and "debugmenu on" in L.eval("PUSHES[1].rules")
+              and "players 3" in L.eval("PUSHES[1].rules") and L.eval('hr.my_value("debugmenu")') == "on",
+              "the owner hosting: their toggle applies and goes to the server with every rule")
+        check(L.eval("hr.note()") == "Your Realm's rules. Everyone in it plays by them, whoever hosts.",
+              "...and the page tells the owner the rules are theirs")
+        L.execute("NOW = 5; hr.tick()")
+        check(L.eval('hr.my_value("debugmenu")') == "on", "the server's older rules don't undo the change while it's on its way")
+        L.execute('PUSHES[1].cb(true); REALM.rules = PUSHES[1].rules; NOW = 6; hr.tick()')
+        check(L.eval('hr.my_value("debugmenu")') == "on" and "debugmenu on" in L.eval("file()"), "...and it holds once the server has it")
+        L.execute('hr.toggle("pvp"); NOW = 7; PUSHES[2].cb(false, nil, "owner_only"); hr.tick()')
+        check(L.eval('note_has("Couldn\'t save the Realm\'s rules (owner_only).")') and L.eval('hr.my_value("pvp")') == "off",
+              "a refused change is reported and the server's rules come back")
+        L.execute('hr.toggle("pvp"); NOW = 80; hr.tick()')
+        check(L.eval('hr.my_value("pvp")') == "off", "an unanswered change lets the server's rules back in after 60 s")
+        # a Realm the server has no rules for (made before): its owner sends theirs, once a minute at most
+        L.execute('PUSHES = {}; REALM = { id = "R2", owner = true, rules = nil }; NOW = 100; hr.tick(); hr.tick()')
+        check(L.eval("#PUSHES") == 1 and L.eval("PUSHES[1].id") == "R2" and L.eval("PUSHES[1].rules:find('pvp off', 1, true)") is not None,
+              "the owner hosting a Realm with no rules on the server sends theirs, once")
+        L.execute('PUSHES[1].cb(true); NOW = 120; hr.tick()')
+        check(L.eval("#PUSHES") == 1, "...not again within the minute")
+        L.execute('PUSHES = {}; REALM = { id = "R3", owner = false, rules = nil }; NOW = 300; hr.tick()')
+        check(L.eval("#PUSHES") == 0, "a host who isn't the owner never sends rules for a Realm")
+        # the owner visiting as a guest: they edit a copy of the host's rules, sent to the server; their own stay
+        L.execute('ROLE = "guest"; REALM = { id = "R1", owner = true, rules = "pvp off" }; '
+                  'BLOBS.rules = "pvp off itemclean off loadsplit off players 4 joins ask teleport on weather on debugmenu on"; '
+                  'MINE = hr.my_value("pvp"); PUSHES = {}; NOTES = {}; hr.toggle("pvp")')
+        rows = {r["key"]: r["text"] for r in L.eval("hr.rows()").values()}
+        check(rows.get("pvp") == "ON" and L.eval("#PUSHES") == 1 and "pvp on" in L.eval("PUSHES[1].rules")
+              and L.eval('hr.my_value("pvp")') == L.eval("MINE"),
+              "the owner visiting: the page shows their change, it goes to the server, their own settings stay (%s)" % rows.get("pvp"))
+        L.execute('BLOBS.rules = PUSHES[1].rules')
+        rows = {r["key"]: r["text"] for r in L.eval("hr.rows()").values()}
+        check(rows.get("pvp") == "ON" and L.eval("hr.value('pvp')") == "on", "...until the host plays by it")
+        L.execute('REALM.owner = false; NOTES = {}; PUSHES = {}; hr.toggle("pvp")')
+        check(L.eval("#PUSHES") == 0 and L.eval('note_has("Only the Realm\'s owner")'), "a guest who isn't the owner can't change them")
+        # outside a Realm nothing changes: the host edits their own, nothing goes to a server
+        L.execute('ROLE = "host"; REALM = nil; PUSHES = {}; hr.toggle("weather")')
+        check(L.eval("hr.can_edit()") is True and L.eval("#PUSHES") == 0 and L.eval("hr.note()") is None,
+              "outside a Realm the host edits their own rules and nothing goes to the server")
+        # kit 2026-10-30 20:09:09: a guest taking a Realm over played ~1 s by the Realm file's older rules before the tick
+        rf = os.path.join(d, "realm_rules.txt")
+        with open(rf, "w") as f:
+            f.write("pvp off\ndebugmenu on\nplayers 4\n")
+        L.execute('REALM = { id = "R5", owner = false, rules = "pvp on debugmenu off" }; hr.use_file(...)', rf.replace("\\", "/"))
+        check(L.eval('hr.my_value("debugmenu")') == "off" and L.eval('hr.my_value("pvp")') == "on"
+              and L.eval('hr.my_value("players")') == "4",
+              "taking a Realm over: the owner's rules apply the moment its file is loaded, before any tick")
+        check("debugmenu off" in open(rf).read(), "...and go into the Realm's file")
+        L.execute('REALM = nil; hr.use_file(nil)')
+        check(L.eval('hr.my_value("debugmenu") == file():match("debugmenu (%w+)") and hr.my_value("pvp") == file():match("pvp (%w+)")'),
+              "...back home my own file's rules again")
+        # kit 2026-10-30: the first send of a Realm's rules failing on the server gave a red notice every minute
+        L.execute('REALM = { id = "R6", owner = true, rules = nil }; PUSHES = {}; NOTES = {}; NOW = 500; hr.tick()')
+        L.execute('PUSHES[1].cb(false, nil, "server_error x"); NOW = 561; hr.tick(); PUSHES[2].cb(false, nil, "server_error x");'
+                  ' NOW = 622; hr.tick(); PUSHES[3].cb(false, nil, "server_error x")')
+        check(L.eval("#PUSHES") == 3 and L.eval("#NOTES") == 1,
+              "the Realm's rules failing to reach the server: retried each minute, told once (%s notices)" % L.eval("#NOTES"))
+        L.execute('REALM.rules = PUSHES[3].rules; NOW = 700; hr.tick(); hr.toggle("pvp"); PUSHES[#PUSHES].cb(false, nil, "server_error y")')
+        check(L.eval("#NOTES") == 2 and L.eval('note_has("server_error y")'), "...the owner's own change failing is still told")
+        # a bridge older than the rules verb (Sentinel R1): one log line, no red notice every minute, nothing more sent
+        L.execute('REALM = { id = "R4", owner = true, rules = nil }; PUSHES = {}; NOTES = {}; NOW = 1000; hr.tick()')
+        L.execute('PUSHES[1].cb(false, nil, "bad_command unknown Realm command rules"); NOW = 1100; hr.tick(); NOW = 1200; hr.tick()')
+        check(L.eval("#PUSHES") == 1 and L.eval("#NOTES") == 0, "an old bridge (bad_command): no notice, no more sends")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+def reshade_follows_the_syncfx_switch():
+    """User 2026-10-30: ReShade off when SyncFX goes off (GPU crash tests). ReShade's dxgi.dll loads with the game, so
+    MY SETTINGS' SyncFX switch moves it for the next start through SyncFX's own syncfx/reshade.lua."""
+    print("reshade_follows_the_syncfx_switch")
+    src = os.path.join(os.environ["USERPROFILE"], "Desktop", "DreadFX", "mod", "SyncFX", "Scripts", "syncfx", "reshade.lua")
+    if not os.path.exists(src):
+        check(False, "SyncFX's reshade.lua is at %s" % src)
+        return
+    d = tempfile.mkdtemp(prefix="reshade-")
+    try:
+        w64 = os.path.join(d, "Win64")
+        fx = os.path.join(w64, "ue4ss", "Mods", "SyncFX")
+        os.makedirs(os.path.join(fx, "Scripts", "syncfx"))
+        shutil.copy(src, os.path.join(fx, "Scripts", "syncfx", "reshade.lua"))
+        dll = b"MZ ... ReShade by crosire ..."
+        with open(os.path.join(w64, "dxgi.dll"), "wb") as f:
+            f.write(dll)
+        open(os.path.join(w64, "ReShade.ini"), "w").close()
+        L = lua()
+        L.globals().W64 = w64
+        L.execute('ml = require("mirror.modlist"); ml.configure{ io_root = W64 .. "\\\\", reset = true }')
+        top = lambda: sorted(x for x in os.listdir(w64) if x != "ue4ss")
+        check(L.eval('ml.follow_reshade(false)') == "off" and top() == ["ReShade.ini", "dxgi.dll.syncfx-off"],
+              "SyncFX switched off: ReShade's dxgi.dll is set aside for the next start (%s)" % top())
+        check(L.eval('ml.follow_reshade(true)') is None and top() == ["ReShade.ini", "dxgi.dll.syncfx-off"],
+              "SyncFX switched on with its own F8 switch off (nothing saved): ReShade stays off")
+        with open(os.path.join(fx, "SyncFX.user.ini"), "w") as f:
+            f.write("enabled = on\n")
+        check(L.eval('ml.follow_reshade(true)') == "on" and top() == ["ReShade.ini", "dxgi.dll"]
+              and open(os.path.join(w64, "dxgi.dll"), "rb").read() == dll,
+              "SyncFX switched on with F8 on: the same dxgi.dll comes back")
+        with open(os.path.join(w64, "dxgi.dll"), "wb") as f:
+            f.write(b"MZ ... another dxgi proxy ...")
+        check(L.eval('ml.follow_reshade(false)') is None and top() == ["ReShade.ini", "dxgi.dll"],
+              "a dxgi.dll that isn't ReShade is left alone")
+        shutil.rmtree(os.path.join(fx, "Scripts"))
+        check(L.eval('ml.follow_reshade(false)') is None, "a SyncFX without reshade.lua: nothing happens")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def mods_switch_restart_and_match_the_host():
     print("mods_switch_restart_and_match_the_host")
     d = tempfile.mkdtemp(prefix="mods-")
@@ -5653,18 +9490,25 @@ def mods_switch_restart_and_match_the_host():
         shutil.rmtree(d, ignore_errors=True)
 
 
-for t in (corpse_looted_at_the_same_moment_keeps_one_copy, same_moment_container_takes_keep_one_copy, one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, player_rip_in_a_container_is_a_take, ui_no_room_removal_is_not_a_take, lights_come_back_on_a_respawned_ghost, perf_run_puts_the_outer_step_back, fs_write_is_whole_or_old, utf8_cut_never_splits_a_character, crumb_keeps_the_last_64_steps, unanswered_join_keeps_the_friends_list, coop_tab_in_a_realm_has_nothing_of_it, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, jig_probe_names_what_a_patch_removed, jig_price_follows_the_traders_table, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, military_trader_follows_the_host, role_switch_reads_nothing_of_its_own_old_role, new_realm_character_gets_the_starting_kit, realm_takes_the_creators_difficulty, zombies_stop_at_arms_length, human_copies_hold_the_hosts_weapon, hounds_bark_when_they_come_for_you, airdrops_follow_the_host, event_sites_follow_the_host, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, link_restart_puts_the_games_blobs_again, link_keeps_putting_the_hello, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
-          jig_stats_copy_the_asset_defaults, tactical_reads_only_lights_the_class_has,
+for t in (drops_pickup_reaches_every_guest, drops_rejoin_pairs_the_saved_pickups, drops_pile_pickups_take_only_their_own_item, loose_magazine_picked_up_by_both_at_once_is_kept_once,corpse_looted_at_the_same_moment_keeps_one_copy,corpse_partial_takes_at_the_same_moment_keep_the_total,same_moment_container_takes_keep_one_copy, same_moment_partial_takes_keep_the_total, refused_put_in_taken_back_tells_the_host_nothing,one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, player_rip_in_a_container_is_a_take, bench_output_made_on_a_guest_reaches_the_host, ui_no_room_removal_is_not_a_take, lights_come_back_on_a_respawned_ghost, perf_run_puts_the_outer_step_back, fs_write_is_whole_or_old, utf8_cut_never_splits_a_character, crumb_keeps_the_last_64_steps,unanswered_join_keeps_the_friends_list, coop_tab_in_a_realm_has_nothing_of_it, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, plain_events_skip_late_lines_and_bound_the_window, jig_probe_names_what_a_patch_removed, jig_price_follows_the_traders_table, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, military_trader_follows_the_host, role_switch_reads_nothing_of_its_own_old_role, new_realm_character_gets_the_starting_kit, realm_takes_the_creators_difficulty, coop_guest_runs_the_hosts_world_settings, zombies_stop_at_arms_length, human_copies_hold_the_hosts_weapon, hounds_bark_when_they_come_for_you, airdrops_follow_the_host, event_sites_follow_the_host, a_destroyed_sites_address_can_come_back_as_a_new_site, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, a_player_in_the_game_menu_is_not_a_frozen_game, link_restart_puts_the_games_blobs_again, link_keeps_putting_the_hello, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
+          jig_stats_copy_the_asset_defaults, weapon_slots_get_their_stats, tactical_reads_only_lights_the_class_has, host_rules_and_mod_list_survive_a_full_disk,
           vehicles_keep_this_worlds_fuel, car_horn_reaches_the_other_game, raiders_can_hit_the_guests_ghost, harvest_uses_up_nodes_once, zombie_spawn_pins_hold_or_refuse,
           zombie_copies_take_the_hosts_look,
+          copy_deaths_and_removals_wait_for_the_animation_gate,
+          animgate_runs_waiting_calls_once_animation_is_on_the_game_thread,
           copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_tooltip_reads_the_item_once, foreach_keeps_temporary_arrays_alive, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
-          ghost_swims_without_its_own_water_detection, ghost_never_blocks_cars, audio_spatializes_and_shares_without_echo,
-          throws_and_mines_reach_the_other_game, map_pings_reach_the_other_game, keycard_doors_open_on_both_games, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, loose_magazine_picked_up_without_hooks_still_gets_its_rounds, ground_weapon_attachments_reach_the_other_game, ghost_gun_in_hand_is_known, missing_zombie_looks_get_loaded,
+          ghost_swims_without_its_own_water_detection, a_player_sitting_down_sits_on_the_other_screen, all_players_must_sleep_before_the_night_is_skipped, sleeping_screen_stays_until_everyone_sleeps, door_code_locks_keep_other_players_out_until_they_type_it, ghost_stands_on_cars_but_never_pushes_them,zombies_go_after_the_ghost_again_after_a_save, a_ghost_the_game_removed_is_let_go_and_made_again, a_ghost_destroyed_for_a_save_is_never_touched_again, zombie_loot_tables_are_all_looked_up_and_misses_stay_few, a_host_zombie_hit_reaches_a_guest_with_three_players, audio_spatializes_and_shares_without_echo,
+          throws_and_mines_reach_the_other_game, map_pings_reach_the_other_game, keycard_doors_open_on_both_games, doors_of_one_master_are_found_in_one_walk, doors_forget_the_old_world_at_a_load, refused_realm_join_disarms_the_realm, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, a_picked_up_items_address_can_come_back_as_a_new_drop, loose_magazine_picked_up_without_hooks_still_gets_its_rounds, ground_weapon_attachments_reach_the_other_game, ground_weapon_parts_changed_by_both_at_once_keep_both_changes, ghost_gun_in_hand_is_known, ghost_wears_its_players_face_beard_and_tattoos, ghost_look_is_applied_over_frames, missing_zombie_looks_get_loaded,
           random_and_debug_weather_is_shared,
           trader_stock_is_the_hosts, instances_walk_once_then_follow_beginplay, grouped_classes_share_one_walk, walk_skip_is_measured_after_a_load, unloaded_tracked_classes_cost_few_lookups,
           link_reads_only_blobs_the_index_says_changed, corpse_loot_reaches_every_player, host_settled_corpses_cost_almost_nothing,
+          human_corpses_get_their_inventory_made_first, the_nuke_goes_off_on_both_screens,
+          the_host_can_switch_the_debug_menu_off_for_everyone, a_realm_plays_by_its_owners_rules,
+          the_message_of_the_day_shows_once_in_a_world_and_on_the_main_menu, a_new_ghost_leaves_no_name_tag_behind,
+          an_ended_zombie_is_never_read_from_the_zombie_list, a_copy_the_game_keeps_removing_is_held_back,
+          reshade_follows_the_syncfx_switch,
           standing_hooks_skip_the_lookup, hook_lookups_share_one_budget, find_remembers_misses, container_items_keep_their_cell_and_rotation, loot_skips_containers_gone_since_listed, bags_are_never_consumed_and_twin_grids_are_counted,
-          load_split_switches_only_when_both_agree, load_split_hands_the_ai_to_the_guest,
+          a_turret_switched_off_is_off_for_everyone, a_teleport_landing_lets_off_the_first_hits, load_split_waits_after_a_respawn_and_for_a_teleport, load_split_switches_only_when_both_agree, load_split_hands_the_ai_to_the_guest, a_looping_reload_stops_on_the_other_game,
           loot_first_open_never_undoes_a_take_the_host_has_not_acked, loot_first_open_takes_over_an_older_list_without_takes,
           twin_compartments_are_merged_into_one):
     try:

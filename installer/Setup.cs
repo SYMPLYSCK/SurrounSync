@@ -27,6 +27,8 @@ namespace SurrounSyncSetup
         const string ModPath = "game/ue4ss/Mods/SurrounSync/";
         const string FxPath = "game/ue4ss/Mods/SyncFX/";   // the graphics mod: installed off, switched in MY SETTINGS
         const string BpPath = "game/ue4ss/Mods/BPModLoaderMod/";   // UE4SS's loader of Paks\LogicMods (the dog sounds)
+        // what BPModLoaderMod requires first ("module 'UEHelpers' not found" on a player's PC: no dog sounds, 2026-10-30)
+        const string UeHelpersPath = "game/ue4ss/Mods/shared/UEHelpers/";
         const string ContentPath = "content/";             // into SurrounDead\Content: the intro movie, the sound pak
         const string Intro = "Movies/UE5 Intro.mp4";
         // UE4SS's own files (the mods are installed on their own)
@@ -220,6 +222,15 @@ namespace SurrounSyncSetup
             }
             Extract(z, ContentPath, content, null);
             rec["sounds"] = "ours";
+            // UE4SS's shared UEHelpers wherever it's missing - also next to a BPModLoaderMod that is already there (a
+            // player's report 2026-10-30: theirs was, without UEHelpers, and failed at every start)
+            string uh = Path.Combine(mods, "shared", "UEHelpers");
+            if (PayloadHasIn(z, UeHelpersPath) && !File.Exists(Path.Combine(uh, "UEHelpers.lua")))
+            {
+                Extract(z, UeHelpersPath, uh, null);
+                rec["uehelpers"] = "ours";
+                Log("Installed UE4SS's UEHelpers (BPModLoaderMod needs it to load SurrounSync's sounds).");
+            }
             if (!PayloadHasIn(z, BpPath)) return;
             string bp = Path.Combine(mods, "BPModLoaderMod");
             if (Directory.Exists(bp)) return;
@@ -254,7 +265,12 @@ namespace SurrounSyncSetup
                 if (!IsLink(bp) && Directory.Exists(bp)) DeleteDir(bp);
                 DisableMod(mods, "BPModLoaderMod");
             }
-            rec.Remove("sounds"); rec.Remove("intro"); rec.Remove("intro_none"); rec.Remove("bploader");
+            if (mods != null && rec.TryGetValue("uehelpers", out v) && v == "ours")
+            {
+                string uh = Path.Combine(mods, "shared", "UEHelpers");
+                if (!IsLink(uh) && Directory.Exists(uh)) DeleteDir(uh);
+            }
+            rec.Remove("sounds"); rec.Remove("intro"); rec.Remove("intro_none"); rec.Remove("bploader"); rec.Remove("uehelpers");
         }
 
         // PDS and its pak, only when an older setup installed them ("ours" in the record); a PDS the player
@@ -448,6 +464,17 @@ namespace SurrounSyncSetup
             catch (Exception e) { Log("WARNING: couldn't test the Steam connection: " + e.Message); }
         }
 
+        // SyncFX switched off sets ReShade's dxgi.dll aside (its syncfx/reshade.lua): without SyncFX it comes back.
+        internal void RestoreReShade(string w64)
+        {
+            try
+            {
+                string off = Path.Combine(w64, "dxgi.dll.syncfx-off"), live = Path.Combine(w64, "dxgi.dll");
+                if (File.Exists(off) && !File.Exists(live)) { File.Move(off, live); Log("Put ReShade back on (SyncFX had it off)."); }
+            }
+            catch (Exception e) { Log("Couldn't put ReShade back (" + e.Message + ") - rename dxgi.dll.syncfx-off to dxgi.dll."); }
+        }
+
         public bool Uninstall(string game)
         {
             var rec = ReadRecord();
@@ -469,7 +496,7 @@ namespace SurrounSyncSetup
                         string fx = Path.Combine(mods, "SyncFX");
                         if (IsLink(fx)) Log("Mods\\SyncFX is a developer link - left as it is.");
                         else if (Directory.Exists(fx)) { DeleteDir(fx); Log("Removed SyncFX."); }
-                        if (!IsLink(fx)) DisableMod(mods, "SyncFX");
+                        if (!IsLink(fx)) { DisableMod(mods, "SyncFX"); RestoreReShade(w64); }
                     }
                     RemoveOldPds(game, mods, rec);
                     RemoveContent(game, mods, rec);

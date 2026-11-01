@@ -12,6 +12,7 @@ local P = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C"
 game.PLAYER_CLASS = P
 
 local controller, player, world = nil, nil, nil
+local in_range = false
 local tick_handlers, ready_handlers = {}, {}
 local pending_hooks = {}
 local installed, ready_done = false, false
@@ -19,6 +20,8 @@ local installed, ready_done = false, false
 function game.player() return player end
 function game.world() return world end
 function game.controller() return controller end
+-- the player is the Shooting Range's (BP_PlayerCharacter_ShootingRange_C): a save made now is the range, not a world
+function game.in_shooting_range() return in_range end
 
 -- tick_steps[i] = "tick <file:line>" of handler i: the crash step names the handler (a crash inside
 -- one used to show only "hook ReceiveTick" - the GetFName crash was in itemclean, seven times)
@@ -73,6 +76,7 @@ end
 local function adopt(pawn, pc)
     local old, old_world = player, world
     player, controller, world = pawn, pc, nil
+    in_range = (util.class_name(pawn) or ""):find("ShootingRange", 1, true) ~= nil
     pcall(function() world = player:GetWorld() end)
     -- A new pawn in the same, still-live world (the old pawn still exists) is not a world reset.
     if old and util.valid(old) and old_world and util.same(old_world, world) then old = nil end
@@ -135,7 +139,7 @@ function game.keybind(name, mods, fn, always)
     always = always and function() return slot.always and slot.always() end or nil
     local key = Key[name:upper()] or Key[name]
     if not key then log.warn("game.keybind: unknown key " .. name); return end
-    local fkey = ({ ESCAPE = "Escape", ONE = "One", TWO = "Two", THREE = "Three" })[name:upper()] or name
+    local fkey = ({ ESCAPE = "Escape", ONE = "One", TWO = "Two", THREE = "Three", OEM_TWO = "Slash" })[name:upper()] or name
     local cb = function() pending_keys[#pending_keys + 1] = { name = fkey, fn = fn, at = os.clock(), always = always } end
     if mods then RegisterKeyBind(key, mods, cb) else RegisterKeyBind(key, cb) end
 end

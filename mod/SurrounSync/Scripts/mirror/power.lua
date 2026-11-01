@@ -13,6 +13,10 @@ local CLASSES = {
     w = { "BP_PowerGenerator_C" },
     l = { "Buildable_Lamp_C", "Buildable_CampingLamp_C", "Buildable_CeilingLight_C", "Buildable_CeilingLight2_C",
           "Buildable_ConstructionLight_C", "Buildable_WallLight_C" },
+    -- auto turrets: switched on and off through Buildable_MASTER's power (PoweredOn?), each game its own copy -
+    -- one switched off still shot on the other games (player report 2026-10-31: "Turret needs to be disabled by
+    -- all players, doesn't sync")
+    t = { "Buildable_Turret_C", "Buildable_SmallTurret_C" },
 }
 local SCAN = {}
 for kind, list in pairs(CLASSES) do for _, c in ipairs(list) do SCAN[#SCAN + 1] = { kind, c } end end
@@ -21,8 +25,18 @@ local GEN_MASTER = "/Game/Blueprints/BuildingSystem/Actors/Generator/Buildable_G
 -- the three generators are direct children of it (game files): one walk finds all three
 local GEN_GROUP = "Buildable_GeneratorMaster_C"
 util.instance_group(GEN_GROUP, CLASSES.g)
+-- the two turrets are the only children of their master (game files 26303910): one walk, both BeginPlays
+local TURRET_GROUP = "Buildable_TurretMASTER_C"
+util.instance_group(TURRET_GROUP, CLASSES.t)
+local TURRET_HOOKS = {}
+for _, c in ipairs(CLASSES.t) do
+    local n = c:gsub("_C$", "")
+    TURRET_HOOKS[#TURRET_HOOKS + 1] = "/Game/Blueprints/BuildingSystem/Actors/Turret/" .. n .. "." .. c
+end
+local GROUP = { g = GEN_GROUP, t = TURRET_GROUP }
 local function hooks_of(kind, cls)
     if kind == "g" then return GEN_MASTER end
+    if kind == "t" then return TURRET_HOOKS end
     if kind == "l" then local n = cls:gsub("_C$", ""); return "/Game/Blueprints/BuildingSystem/Actors/Lights/" .. n .. "." .. cls end
     return nil
 end
@@ -54,6 +68,7 @@ local function read(a, kind)
     local on, fuel = false, nil
     pcall(function()
         if kind == "l" then on = a.LightOn == true
+        elseif kind == "t" then on = a["PoweredOn?"] == true
         else on = a["TurnedOn?"] == true end
         if kind == "g" then fuel = tonumber(a.CurrentFuel) end
     end)
@@ -63,7 +78,7 @@ end
 local function scan_step()
     scan_at = scan_at % #SCAN + 1
     local kind, cls = SCAN[scan_at][1], SCAN[scan_at][2]
-    local objs, walked = util.instances(cls, hooks_of(kind, cls), kind == "g" and GEN_GROUP or nil)
+    local objs, walked = util.instances(cls, hooks_of(kind, cls), GROUP[kind])
     if not walked then return end
     local seen = {}
     for _, a in ipairs(objs) do
@@ -148,6 +163,12 @@ local function apply(id, kind, on, fuel, why)
     elseif kind == "l" then
         if on ~= cur_on then
             pcall(function() a:MC_OnInteractBuildable(game.player()) end)
+            changed = true
+        end
+    elseif kind == "t" then
+        -- (Buildable_MASTER's own switch: sets PoweredOn?, whose OnRep fires the turret's On/Off)
+        if on ~= cur_on then
+            pcall(function() a[on and "Power On" or "Power Off"](a, game.player()) end)
             changed = true
         end
     end
@@ -237,6 +258,8 @@ function power.dev_toggle(kinds)
     elseif k.kind == "w" then
         pcall(function() k.a["GasAdded?"] = true; k.a["ItemUsed?"] = true end)
         pcall(function() k.a:Event_TurnOn(game.player()) end)
+    elseif k.kind == "t" then
+        pcall(function() k.a[on and "Power Off" or "Power On"](k.a, game.player()) end)
     else
         pcall(function() k.a:MC_OnInteractBuildable(game.player()) end)
     end
@@ -254,7 +277,7 @@ function power.init(c, r, s)
     game.on_world_reset(forget_world)
     cfg, role, session = c, r, s
     if cfg.power_sync == false then role = "off" end
-    log.info("power: " .. (role == "off" and "off" or "generators and lights are shared"))
+    log.info("power: " .. (role == "off" and "off" or "generators, lights and turrets are shared"))
 end
 
 return power

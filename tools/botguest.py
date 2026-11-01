@@ -122,7 +122,8 @@ class Bot:
 
 
 # Commands while running (one per write): "ride <host's car name>" puts every bot in that car as a rider,
-# "ride -" gets them out.
+# "ride -" gets them out; "req" sends a co-op join request from every bot, like a guest game's JOIN (the host's
+# copy of the session for that player saves and exports its world - the 3-player double save, DBG-20261030-003).
 CMD = os.path.join(SD, "mirror_bots_cmd.txt")
 
 
@@ -131,6 +132,12 @@ def commands(bots):
     if not s:
         return
     write(CMD, "")
+    if s == "req":
+        for b in bots:
+            nonce = int(time.time()) + b.id
+            write(os.path.join(b.dir, "mirror_req_guest.txt"), "join %d coop\nEND\n" % nonce)
+            b.log("asked to join (%d)" % nonce)
+        return
     m = re.match(r"^ride (\S+)$", s)
     if not m:
         print("bots: unknown command %r" % s, flush=True)

@@ -1,7 +1,7 @@
 -- Crash breadcrumb: mirror_step.txt (next to the game exe) always holds the mod
 -- step that is running right now, flushed each time (~2 us), so after a native
--- crash the file names the tick part or hook the game died in. The previous
--- run's file is kept as mirror_step.1.txt and its step is logged at start.
+-- crash the file names the tick part or hook the game died in. The last runs'
+-- files are kept as mirror_step.1-3.txt and the last one's step is logged at start.
 
 local crumb = {}
 
@@ -18,13 +18,19 @@ local last = nil
 
 function crumb.configure(cfg) enabled = not (cfg and cfg.crash_steps == false) end
 
-local function rotate(name, older)
+-- The last KEEP runs' files: <base>.1.txt (the last run) .. <base>.KEEP.txt. A rename keeps the file's time, which
+-- is when that run wrote its last step: the bug report picks the run that ended at a crash by it. One run only
+-- lost a crash's steps after a few restarts (player report 2026-10-31: crash 23:14, three runs, report 01:05).
+local KEEP = 3
+local function rotate(name)
     local prev = io.open(name, "r")
     if not prev then return nil end
     local first = prev:read("*l")
     prev:close()
-    os.remove(older)
-    os.rename(name, older)
+    local base = name:gsub("%.txt$", "")
+    os.remove(base .. "." .. KEEP .. ".txt")
+    for i = KEEP - 1, 1, -1 do os.rename(base .. "." .. i .. ".txt", base .. "." .. (i + 1) .. ".txt") end
+    os.rename(name, base .. ".1.txt")
     return first
 end
 
@@ -32,8 +38,8 @@ local function open_file()
     if out ~= nil then return out end
     out = false
     pcall(function()
-        crumb.previous = rotate(FILE, "mirror_step.1.txt")
-        rotate(RING, "mirror_steps.1.txt")
+        crumb.previous = rotate(FILE)
+        rotate(RING)
         out = io.open(FILE, "w") or false
         ring = io.open(RING, "wb") or false   -- (binary: text mode's \r\n would shift the fixed-width slots)
     end)

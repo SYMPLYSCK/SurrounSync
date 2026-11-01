@@ -148,6 +148,14 @@ local function apply_hit(payload)
     if not util.valid(p) then return end
     -- Damage_Headshot kills outright whatever the amount; the amount already carries the headshot bonus.
     if cls:find("Damage_Headshot", 1, true) then cls = cls:gsub("Damage_Headshot", "Damage_Body") end
+    -- a hit that kills me runs my death inside ApplyDamage, which waits for my animation task: then only with
+    -- animation on the game thread (animgate.lua: a few frames later); other hits at once
+    local hp
+    pcall(function() hp = tonumber(p.MedicalComponent.Health) end)
+    if (not hp or math.min(amt, MAX_HIT) >= hp) and not require("mirror.animgate").safe_now() then
+        require("mirror.animgate").later(function() apply_hit(payload) end, "pvp.apply_hit")
+        return
+    end
     local dtc = util.find(cls)
     local ok, err = pcall(function() util.cdo(GS):ApplyDamage(p, math.min(amt, MAX_HIT), nil, g, dtc) end)
     stats.taken = stats.taken + 1

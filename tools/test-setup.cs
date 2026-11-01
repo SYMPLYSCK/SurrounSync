@@ -195,6 +195,18 @@ static class SetupTest
             Ok(File.ReadAllText(Path.Combine(fxMods, "mods.txt")).Contains("SyncFX : 0") && !File.Exists(fxUser),
                "update with SyncFX not loaded: the player's OFF kept, nothing written");
 
+            // uninstall takes SyncFX away: a ReShade it had set aside (SyncFX off) comes back; a reinstalled one is kept
+            string rw = Path.Combine(root, "rsgame");
+            W(Path.Combine(rw, "dxgi.dll.syncfx-off"), "reshade");
+            inst.RestoreReShade(rw);
+            Ok(File.Exists(Path.Combine(rw, "dxgi.dll")) && File.ReadAllText(Path.Combine(rw, "dxgi.dll")) == "reshade"
+               && !File.Exists(Path.Combine(rw, "dxgi.dll.syncfx-off")), "uninstall: ReShade set aside by SyncFX is put back");
+            W(Path.Combine(rw, "dxgi.dll.syncfx-off"), "older");
+            inst.RestoreReShade(rw);
+            Ok(File.ReadAllText(Path.Combine(rw, "dxgi.dll")) == "reshade", "uninstall: a dxgi.dll already there is not overwritten");
+            inst.RestoreReShade(null);
+            Ok(true, "uninstall: no game folder - no throw");
+
             // SurrounSync's content: the intro (the player's own kept and put back), the sound pak, BPModLoaderMod
             string cg = Path.Combine(root, "cgame"), cmods = Path.Combine(cg, "Mods");
             string movies = Path.Combine(cg, "SurrounDead", "Content", "Movies"), intro = Path.Combine(movies, "UE5 Intro.mp4");
@@ -244,6 +256,29 @@ static class SetupTest
             bool introIn = File.ReadAllText(intro) == "ours" && !File.Exists(intro + ".surrounsync-original");
             inst.RemoveContent(cg, cmods, nrec);
             Ok(introIn && !File.Exists(intro), "no intro of the game's own: ours in, and gone again at uninstall (also after an update)");
+            // a player's own BPModLoaderMod without UE4SS's shared UEHelpers ("module 'UEHelpers' not found" at every start,
+            // player report 2026-10-30: no dog sounds): UEHelpers goes in, theirs stays; uninstall takes only ours
+            var hms = new MemoryStream();
+            using (var za = new System.IO.Compression.ZipArchive(hms, System.IO.Compression.ZipArchiveMode.Create, true))
+                foreach (var n in new[] { "content/Paks/LogicMods/SurrounSyncSounds.pak", "game/ue4ss/Mods/BPModLoaderMod/Scripts/main.lua",
+                                          "game/ue4ss/Mods/shared/UEHelpers/UEHelpers.lua" })
+                    using (var w = new StreamWriter(za.CreateEntry(n).Open())) w.Write("ours");
+            string uhf = Path.Combine(cmods, "shared", "UEHelpers", "UEHelpers.lua");
+            var hrec = new Dictionary<string, string>();
+            hms.Position = 0;
+            using (var za = new System.IO.Compression.ZipArchive(hms, System.IO.Compression.ZipArchiveMode.Read, true))
+                inst.InstallContent(za, cg, cmods, hrec);
+            Ok(File.Exists(uhf) && File.ReadAllText(Path.Combine(cmods, "BPModLoaderMod", "Scripts", "main.lua")) == "their loader",
+               "UEHelpers added next to the player's own BPModLoaderMod (left as it was)");
+            inst.RemoveContent(cg, cmods, hrec);
+            Ok(!File.Exists(uhf) && File.Exists(Path.Combine(cmods, "BPModLoaderMod", "Scripts", "main.lua")), "uninstall: our UEHelpers gone, their loader kept");
+            W(uhf, "their helpers");
+            var hrec2 = new Dictionary<string, string>();
+            hms.Position = 0;
+            using (var za = new System.IO.Compression.ZipArchive(hms, System.IO.Compression.ZipArchiveMode.Read, true))
+                inst.InstallContent(za, cg, cmods, hrec2);
+            inst.RemoveContent(cg, cmods, hrec2);
+            Ok(File.ReadAllText(uhf) == "their helpers", "a UEHelpers already there is never replaced or removed");
         }
         finally
         {

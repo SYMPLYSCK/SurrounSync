@@ -36,12 +36,16 @@ end
 local function out(l) return function(m) LOGS[#LOGS + 1] = l .. " " .. tostring(m) end end
 package.preload["mirror.log"] = function() return { info = out("INFO"), warn = out("WARN"), error = out("ERROR"), debug = function() end } end
 package.preload["mirror.util"] = function()
+    -- (players: { a = address, name = full name }; mark/marked as util.lua's)
     return { safe = function(fn, _, ...) return pcall(fn, ...) end, valid = function(o) return o ~= nil end,
-             addr = function() return 1 end, ensure_hook = function() return true end }
+             addr = function(o) return type(o) == "table" and o.a or 1 end, ensure_hook = function() return true end,
+             mark = function(t, o) if o then t[o.a or 1] = o.name or true end end,
+             marked = function(t, o) local n = o and t[o.a or 1]; return n ~= nil and (n == true or n == o.name) end }
 end
 TICKS = {}
+PLAYER = { a = 1, name = "BP_PlayerCharacter_C_1" }
 package.preload["mirror.game"] = function()
-    return fake("game", { on_tick = function(fn) TICKS[#TICKS + 1] = fn end, player = function() return {} end })
+    return fake("game", { on_tick = function(fn) TICKS[#TICKS + 1] = fn end, player = function() return PLAYER end })
 end
 package.preload["mirror.notify"] = function() return { show = function(m, k) SAID[#SAID + 1] = m end, clear = function() end } end
 LOGFILE = nil
@@ -161,6 +165,24 @@ def clean_end_takes_over_in_place():
           "that save goes up as generation 8 (my world over the old host's)")
 
 
+def no_upload_reads_the_realm_save_while_the_game_writes_it():
+    """Save audit 2026-10-30: the upload after a save comes once UPLOAD_EVERY has passed, and then read the Realm save
+    whatever the game was doing - a file read while the game writes it is cut short, still passes the header check
+    and would have become every member's world. An upload waits for the save to end."""
+    print("no_upload_reads_the_realm_save_while_the_game_writes_it")
+    L = fresh()
+    L.execute('realmplay.promote(RID, "76561100"); READY = true; run(1.5); answer("claim", true, { "won", "7" }); '
+              'answer("download", true, { "7" }); run(2.1); SAVING = true; run(0.3); SAVING = false; run(0.5)')
+    check(L.eval('last("upload").args') == L.eval('RID') + " 8", "hosting: a save goes up as generation 8")
+    L.execute('answer("upload", true, {}); SAVING = true; run(0.3); SAVING = false; run(0.5)')
+    # the next upload comes due 60 s later - just as the game saves again
+    L.execute('n0 = #SENT; SAVING = true; run(61)')
+    check(not any(L.eval('SENT[%d].verb' % i) == "upload" for i in range(L.eval('n0') + 1, L.eval('#SENT') + 1)),
+          "no upload while the game is saving")
+    L.execute('SAVING = false; run(0.2)')
+    check(L.eval('last("upload").args') == L.eval('RID') + " 9", "...it goes once the save is over (generation 9)")
+
+
 def another_member_won_the_realm():
     print("another_member_won_the_realm")
     L = fresh()
@@ -171,9 +193,37 @@ def another_member_won_the_realm():
     L.execute('ROLE = nil; run(2.0)')
     check(L.eval('last("upload")') is None, "nothing of this world is uploaded")
     check(L.eval('count("realm.store_character")') >= 1, "the Realm character is stored")
+    # (the save name is my own a few frames before the load starts: not home yet - a rejoin then ran into the load)
     L.execute('n0 = nclaims(); CUR = "MySave"; run(1.0)')
+    check(L.eval('nclaims()') == L.eval('n0') and L.eval('st()') == "going_home",
+          "my save's name but the Realm's player still here: not home yet, no rejoin into the load")
+    # the load put a new player in my own world - at the old one's address (the load's garbage collection)
+    L.execute('PLAYER = { a = 1, name = "BP_PlayerCharacter_C_2" }; run(1.0)')
     check(L.eval('nclaims()') == L.eval('n0') + 1 and L.eval('LOGFILE') is None,
           "home again: asks for the Realm once more, to join whoever hosts it")
+
+
+def a_host_that_leaves_while_a_member_took_over_is_told_calmly():
+    # kit 2026-10-30 11:16: the host left, a member took it over in place, the host's final upload was refused
+    # (lease_lost) and it read "Someone else is hosting this Realm now" - for the hand-over working
+    print("a_host_that_leaves_while_a_member_took_over_is_told_calmly")
+    L = fresh()
+    L.execute('realmplay.promote(RID, "76561100"); READY = true; run(1.5); answer("claim", true, { "won", "7" }); '
+              'answer("download", true, { "7" }); run(2.1); SAVING = true; run(0.3); SAVING = false; run(0.5)')
+    # a lease lost while playing: the alarm stays
+    L.execute('SAID = {}; answer("upload", false, { "lease_lost", "you", "are", "not", "hosting" })')
+    check(any("Someone else is hosting this Realm now" in str(m) for m in L.eval('SAID').values()),
+          "lease lost while playing: the player is warned their game no longer saves to it")
+    L = fresh()
+    L.execute('realmplay.promote(RID, "76561100"); READY = true; run(1.5); answer("claim", true, { "won", "7" }); '
+              'answer("download", true, { "7" }); run(2.1); SAVING = true; run(0.3); SAVING = false; run(0.5); '
+              'answer("upload", true, {}); ROLE = nil; realmplay.leave(); run(3.0)')
+    up = L.eval('last("upload")')
+    check(up is not None and L.eval('last("upload").answered') is None, "leaving: the final upload goes")
+    L.execute('SAID = {}; answer("upload", false, { "lease_lost", "you", "are", "not", "hosting" })')
+    said = list(L.eval('SAID').values())
+    check(not any("Someone else is hosting" in str(m) for m in said) and any("carries on" in str(m) for m in said),
+          "leaving, a member hosts it now: told it carries on with them, no alarm (%s)" % said)
 
 
 def no_old_host_known_waits_out_the_lease():
@@ -238,9 +288,131 @@ def leaving_saves_once_coop_and_the_first_save_are_over():
           "a save still running after 20 s: on with what it writes, no second save into it")
 
 
-for t in (clean_end_takes_over_in_place, another_member_won_the_realm, no_old_host_known_waits_out_the_lease,
+def a_second_guest_follows_the_one_who_takes_over():
+    # player report 2026-10-29 22:28: three in a Realm, the host left, BOTH guests took it over in place; the server
+    # gave it to one and the other saved, went home and loaded back in. Now only the lowest slot takes it over; the
+    # other goes home and waits - no claim that could win it from under them - then joins them.
+    print("a_second_guest_follows_the_one_who_takes_over")
+    L = fresh()
+    L.execute('ROLE = nil; CUR = "MySave"; LISTHOST = "76561100"; realmplay.takeover(RID, "76561100", true); run(5.0)')
+    lists = L.eval('(function() local n = 0; for _, s in ipairs(SENT) do if s.verb == "list" then n = n + 1 end end; return n end)()')
+    check(L.eval('nclaims()') == 0 and lists >= 1, "while the old host still holds it: no claim, the list is asked (%d)" % lists)
+    L.execute('LISTHOST = "76561999"; run(1.5)')
+    check(L.eval('nclaims()') == 1, "the other guest hosts it now: ask for it once, to join them")
+    L.execute('answer("claim", true, { "hosted", "76561999", "First_Guest" }); answer("download", true, { "none" })')
+    check(L.eval('count("menu.realm_join")') == 1 and L.eval('st()') == "idle", "and join them (never host it here)")
+
+
+def the_old_host_is_known_from_when_it_left():
+    # hardening: once home, the list can already show the next host - the old host's lease id is the one from when
+    # it left, else the follower took the next host for the old one and waited out its tries
+    print("the_old_host_is_known_from_when_it_left")
+    L = fresh()
+    L.execute('ROLE = nil; CUR = "MySave"; LISTHOST = "76561999"; realmplay.takeover(RID, "1001", true, "76561100"); run(1.5)')
+    check(L.eval('nclaims()') == 1, "the next host already holds it when I get home: join them at once")
+    L.execute('answer("claim", true, { "hosted", "76561999", "First_Guest" }); answer("download", true, { "none" })')
+    check(L.eval('count("menu.realm_join")') == 1, "joined")
+
+
+def nobody_takes_it_over_then_open_it_myself():
+    print("nobody_takes_it_over_then_open_it_myself")
+    L = fresh()
+    L.execute('ROLE = nil; CUR = "MySave"; LISTHOST = nil; realmplay.takeover(RID, "76561100", true); run(58.0)')
+    check(L.eval('nclaims()') == 0, "nobody hosts it yet: still waiting for the other guest")
+    L.execute('run(6.0)')
+    check(L.eval('nclaims()') == 1, "a minute without a host: open it myself, so the Realm isn't left without one")
+
+
+def opening():
+    # opening a Realm from my own save: claim won, the world is here already, my save is saved, then the load
+    L = fresh()
+    L.execute(r'''
+        ROLE, CUR, LOADED, POINTED, ANIM = nil, "MySave", nil, nil, nil
+        PLAYER, WORLD = { a = 11 }, { a = 21 }
+        local U, G = package.loaded["mirror.util"], package.loaded["mirror.game"]
+        U.addr = function(o) return o and o.a end
+        G.player = function() return PLAYER end
+        G.world = function() return WORLD end
+        local S, SG = package.loaded["mirror.session"], package.loaded["mirror.slotguard"]
+        S.current_slot = function() return "MySave" end
+        S.next_coop_slot = function() return "Coop_2" end
+        S.load_slot = function(s) LOADED = s; return LOADOK ~= false end
+        S.point_at = function(s) POINTED = s; return true end
+        S.anim_on_game_thread = function(on) ANIM = on end
+        SG.stamp = function() return "st" end
+        SG.build_realm = function() return true end
+        realmplay.start(RID)
+        answer("claim", true, { "won", "5" })
+        run(1.6)
+    ''')
+    return L
+
+
+def realm_load_that_never_runs_goes_back_home():
+    # hardening 2026-10-30: a load call that failed left the session in "loading" for good, the lease held and the
+    # game pointing at the Realm's save - my own world's next save would have gone there
+    print("realm_load_that_never_runs_goes_back_home")
+    L = opening()
+    check(L.eval('st()') == "loading" and L.eval('LOADED') == "Coop_2", "the Realm's save is loading")
+    L.execute('run(29.0)')
+    check(L.eval('st()') == "loading", "still waiting before 30 s")
+    L.execute('run(2.0)')
+    check(L.eval('realmplay.active()') is False, "the same world and player after 30 s: the Realm is given up")
+    check(L.eval('POINTED') == "MySave", "the game points at my own save again")
+    check(L.eval('last("release") ~= nil') and L.eval('LOGFILE') is None and L.eval('count("slotguard.purge")') >= 1,
+          "the lease is released, the Realm's save emptied, the session record cleared")
+    check(L.eval('ANIM') is False, "animation is back on its threads")
+
+
+def realm_load_that_runs_is_not_given_up():
+    print("realm_load_that_runs_is_not_given_up")
+    L = opening()
+    L.execute('run(10.0); PLAYER, WORLD, CUR = { a = 12 }, { a = 22 }, "Coop_2"; run(25.0)')
+    check(L.eval('st()') == "playing" and L.eval('POINTED') is None and L.eval('last("release") == nil'),
+          "a new world and player: hosting the Realm, nothing given up")
+
+
+def load_call_refused_goes_back_home():
+    print("load_call_refused_goes_back_home")
+    L = fresh()
+    L.execute('LOADOK = false')
+    L.execute(r'''
+        ROLE, CUR = nil, "MySave"
+        local S, SG = package.loaded["mirror.session"], package.loaded["mirror.slotguard"]
+        S.current_slot = function() return "MySave" end
+        S.next_coop_slot = function() return "Coop_2" end
+        S.load_slot = function() return false end
+        S.point_at = function(s) POINTED = s; return true end
+        SG.stamp = function() return "st" end
+        SG.build_realm = function() return true end
+        realmplay.start(RID); answer("claim", true, { "won", "5" }); run(1.6)
+    ''')
+    check(L.eval('realmplay.active()') is False and L.eval('POINTED') == "MySave" and L.eval('last("release") ~= nil'),
+          "the load can't even start: back on my own save at once, the Realm released")
+
+
+def coop_started_meanwhile_stops_the_realm():
+    print("coop_started_meanwhile_stops_the_realm")
+    L = fresh()
+    L.execute(r'''
+        ROLE, CUR, LOADED = nil, "MySave", nil
+        package.loaded["mirror.session"].current_slot = function() return "MySave" end
+        package.loaded["mirror.session"].load_slot = function(s) LOADED = s; return true end
+        realmplay.start(RID); answer("claim", true, { "won", "5" })
+        ROLE = "host"   -- (hosting co-op started while my save was being saved)
+        run(1.6)
+    ''')
+    check(L.eval('realmplay.active()') is False and L.eval('LOADED') is None and L.eval('last("release") ~= nil'),
+          "co-op started during the opening: the Realm isn't loaded, its lease released")
+
+
+for t in (clean_end_takes_over_in_place, no_upload_reads_the_realm_save_while_the_game_writes_it, another_member_won_the_realm,
+          a_host_that_leaves_while_a_member_took_over_is_told_calmly, no_old_host_known_waits_out_the_lease,
           old_host_known_by_its_lease_id, session_gone_falls_back_home, handover_times_out,
-          leaving_saves_once_coop_and_the_first_save_are_over):
+          leaving_saves_once_coop_and_the_first_save_are_over, a_second_guest_follows_the_one_who_takes_over,
+          the_old_host_is_known_from_when_it_left, nobody_takes_it_over_then_open_it_myself,
+          realm_load_that_never_runs_goes_back_home, realm_load_that_runs_is_not_given_up,
+          load_call_refused_goes_back_home, coop_started_meanwhile_stops_the_realm):
     try:
         t()
     except Exception as e:

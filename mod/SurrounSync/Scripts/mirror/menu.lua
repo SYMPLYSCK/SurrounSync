@@ -8,6 +8,7 @@ local notify = require("mirror.notify")
 local session = require("mirror.session")
 local page = require("mirror.menu_backups")
 local journal_tab = require("mirror.journal_tab")
+local quickchat = require("mirror.quickchat")
 local instance = require("mirror.instance")
 
 local menu = {}
@@ -151,7 +152,8 @@ local function leave_link_tick()
     if not home or my_role() ~= "guest" or pending_join then return end
     local waited = os.clock() - home
     if waited < LEAVE_LINK_MIN then return end
-    local left = require("mirror.events").unconfirmed()
+    -- (door code changes too: a code set just before leaving, the host still paused, would be gone)
+    local left = require("mirror.events").unconfirmed() + require("mirror.doorlock").unconfirmed()
     if left > 0 and waited < LEAVE_LINK_MAX then return end
     session.forget_home()
     if left > 0 then log.warn("menu: home - " .. left .. " message(s) the host never confirmed; disconnecting after " .. LEAVE_LINK_MAX .. " s")
@@ -280,6 +282,7 @@ local function model()
     m.settings = require("mirror.hostrules").rows()
     m.my_settings = require("mirror.mysettings").rows()
     m.settings_editable = require("mirror.hostrules").can_edit()
+    m.settings_note = require("mirror.hostrules").note()
     if steam then
         m.me = l and ("Signed in as " .. (l.name or "?")) or
             "The Steam connection isn't running. Make sure Steam is running and your antivirus isn't blocking SurrounSyncBridge."
@@ -452,6 +455,8 @@ local function watch_requests()
         if l.joinerror and JOIN_ERRORS[l.joinerror] then
             notify.show(JOIN_ERRORS[l.joinerror], "bad", "join_wait")
             pending_join, wait_since = false, nil
+            -- (a refused Realm join: the next join of this host - Ctrl+F10 skips join() - is a co-op one again)
+            if session.state() == "idle" then session.realm_guest(nil) end
             -- removed by the host: straight home with everything (no "wait for the host?" choice)
             if l.joinerror == "kicked" and my_role() == "guest" then session.go_home_now() end
         end
@@ -586,6 +591,7 @@ local function tick(dt)
         pending_join = false
         if session.state() == "idle" then session.request_toggle() end
     end
+    util.safe(quickchat.tick, "quickchat.tick", dt)
     journal_tab.tick(dt)
 end
 
@@ -677,8 +683,11 @@ function menu.init(c)
                     if not ml.set(ms.SYNCFX, not on) then
                         notify.show("Couldn't switch SyncFX (is a file in use or read-only?).", "bad"); return
                     end
-                    notify.show(on and "SyncFX goes off from your next game start."
-                        or "SyncFX goes on from your next game start. Its own menu opens with F6.", "info", nil, true)
+                    -- ReShade (a dxgi.dll that loads with the game) goes and comes with it
+                    local rs = ml.follow_reshade(not on)
+                    local who = rs and "SyncFX and ReShade go " or "SyncFX goes "
+                    notify.show(who .. (on and "off from your next game start." or "on from your next game start. Its own menu opens with F6.")
+                        .. (rs == false and " ReShade couldn't be switched (see the log)." or ""), "info", nil, true)
                     if ml.restart_needed() then mods_restart_note() end
                 elseif tab == "mine" then require("mirror.mysettings").toggle(key)
                 else require("mirror.hostrules").toggle(key) end
@@ -722,6 +731,7 @@ function menu.init(c)
             realm_open = function(id, how) require("mirror.realmplay").open(id, how) end,
             realm_invite = function(id) require("mirror.realmmembers").invite(id) end,
             realm_key = function(id) require("mirror.realmmembers").copy_key(id) end,
+            realm_remove = function(id) require("mirror.realmplay").remove(id) end,
             realm_my_difficulty = function() require("mirror.realmplay").use_my_difficulty() end,
             realm_create = function(name) require("mirror.realmplay").create(name) end,
             realm_add = function(text)
@@ -745,6 +755,12 @@ function menu.init(c)
         end,
         backups = page,
         can_restore = function() return p1().can_switch() and not require("mirror.slotguard").log_exists() end,
+    }
+    quickchat.configure{
+        active = function() return my_role() ~= nil end,
+        send = function(txt) return require("mirror.chat").send(txt) end,
+        recent = function(n) return require("mirror.chat").recent(n) end,
+        tip = function(txt) return require("mirror.teleport").tip(txt) end,
     }
     game.keybind("H", { ModifierKey.CONTROL }, function() want_host = true end)
     for i, k in ipairs({ "One", "Two", "Three" }) do

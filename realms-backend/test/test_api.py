@@ -148,14 +148,11 @@ def main():
     check("pruned generation gone", call("GET", "/v1/realms/%s/world/1" % rid, auth=A)[0] == 404)
     check("kept generation readable", call("GET", "/v1/realms/%s/world/4" % rid, auth=A)[1] == b"world-4")
 
-    # characters: own only, generation-checked
+    # no character store: characters live on each player's PC (the unused routes wrote the database before storage)
     ch = b"character-A"
-    cu = call("PUT", "/v1/realms/%s/character" % rid, auth=A, raw=ch, headers={"x-base-gen": "0", "x-sha256": sha(ch)})
-    check("character upload", cu[0] == 201 and j(cu)["gen"] == 1, cu)
-    check("stale character refused", call("PUT", "/v1/realms/%s/character" % rid, auth=A, raw=ch,
-                                          headers={"x-base-gen": "0", "x-sha256": sha(ch)})[0] == 409)
-    check("own character download", call("GET", "/v1/realms/%s/character" % rid, auth=A)[1] == ch)
-    check("B has no character", call("GET", "/v1/realms/%s/character" % rid, auth=B)[0] == 404)
+    check("character upload is gone", call("PUT", "/v1/realms/%s/character" % rid, auth=A, raw=ch,
+                                           headers={"x-base-gen": "0", "x-sha256": sha(ch)})[0] == 404)
+    check("character download is gone", call("GET", "/v1/realms/%s/character" % rid, auth=A)[0] == 404)
 
     # members
     check("member can't remove others", call("DELETE", "/v1/realms/%s/members/%s" % (rid, A["member_id"]), auth=B)[0] == 403)
@@ -181,6 +178,13 @@ def main():
     dl = call("DELETE", "/v1/realms/" + rid, auth=B)
     check("owner deletes realm", dl[0] == 200, dl)
     check("deleted realm gone", call("GET", "/v1/realms/" + rid, auth=B)[0] in (403, 404))
+
+    # message of the day: public to read; on a server without the MOTD_TOKEN secret nobody can set it
+    g = call("GET", "/v1/motd")
+    check("motd readable without auth", g[0] == 200 and "id" in j(g), g)
+    for token in ("", "x" * 40):
+        p = call("PUT", "/v1/motd", {"text": "hi"}, headers={"authorization": "Admin " + token} if token else None)
+        check("motd can't be set without the server's secret (%s)" % ("no token" if not token else "a token"), p[0] == 404, p)
 
     print("\n%d failure(s)" % len(failures) if failures else "\nALL PASSED")
     return 1 if failures else 0

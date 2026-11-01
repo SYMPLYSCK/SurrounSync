@@ -332,6 +332,7 @@ static class TestReport
         GameWatch.HangDirOverride = Path.Combine(d, "hangs");
         var lines = new List<string>();
         var p = Process.Start(new ProcessStartInfo(self, "--hang") { UseShellExecute = false });
+        GameWatch.StartingS = 0;   // (the frozen process is seconds old: not "while the game starts" here)
         try
         {
             new GameWatch(m => { lock (lines) lines.Add(m); }, Path.GetFileNameWithoutExtension(self)).Start();
@@ -354,11 +355,71 @@ static class TestReport
         {
             try { p.Kill(); } catch (InvalidOperationException) { }
             GameWatch.HangDirOverride = noHangs;
+            GameWatch.StartingS = 60;
         }
         string ring = Path.Combine(d, "steps.txt");
         File.WriteAllText(ring, "66 21:20:19 812.400 session".PadRight(99) + "\n" + "65 21:20:19 812.390 zombies".PadRight(99) + "\n" + "garbage\n");
         string steps = Report.RecentSteps(ring);
         Check(steps != null && steps.IndexOf("zombies") < steps.IndexOf("session") && !steps.Contains("garbage"), "recent steps come out oldest first");
+    }
+
+    // report 2026-10-31 00:49 (and 20:32, 22:47): the mod starts the bridge while the game boots, the watch's first
+    // look found the window not answering 10 s into the game's start (4 s, before the main menu), and the report led
+    // with "The game stopped responding" every time. A stall that early is the game starting.
+    static void StallWhileTheGameStarts()
+    {
+        Console.WriteLine("stall_while_the_game_starts");
+        string self = Process.GetCurrentProcess().MainModule.FileName;
+        string d = Dir("starting");
+        GameWatch.HangDirOverride = Path.Combine(d, "hangs");
+        var lines = new List<string>();
+        var p = Process.Start(new ProcessStartInfo(self, "--hang") { UseShellExecute = false });
+        try
+        {
+            new GameWatch(m => { lock (lines) lines.Add(m); }, Path.GetFileNameWithoutExtension(self)).Start();
+            string seen = null;
+            var until = DateTime.Now.AddSeconds(20);
+            while (DateTime.Now < until && seen == null)
+            {
+                System.Threading.Thread.Sleep(500);
+                lock (lines) seen = lines.FirstOrDefault(l => l.Contains("watch: the game stopped responding"));
+            }
+            Check(seen != null && seen.Contains(GameWatch.WhileStarting), "a stall in a process seconds old is marked as the game starting (" + seen + ")");
+        }
+        finally
+        {
+            try { p.Kill(); } catch (InvalidOperationException) { }
+            GameWatch.HangDirOverride = noHangs;
+        }
+
+        // the guest's own lines, as the new watch writes them: no freeze finding
+        string w = " " + GameWatch.WhileStarting;
+        File.WriteAllLines(Path.Combine(d, "local", "mirror_bridge.log"), new[] {
+            "00:44:08 bridge idle up - my id 7656, folder x, looking for a Steam friend",
+            "00:44:08 watch: the game stopped responding" + w + " - RAM 3.8/15.9 GB free, commit 17.8 of 23.7 GB used",
+            "00:44:12 watch: the game responds again after 4 s" + w });
+        var g = Run(d);
+        Check(!g.Findings.Any(f => f.Category == "Freeze"), "a short stall while the game starts is no freeze finding ("
+            + string.Join(" / ", g.Findings.Select(f => f.Title)) + ")");
+
+        // one of 8 s+ while starting is a slow start (with its note); a later stall is still a freeze
+        GameWatch.HangDirOverride = Path.Combine(d, "hangs2");
+        Directory.CreateDirectory(GameWatch.HangDirOverride);
+        File.WriteAllText(Path.Combine(GameWatch.HangDirOverride, "hang-20261031-004416-1.txt"), "frozen 8 s" + w + " | busiest: #1 900 ms\r\n");
+        File.AppendAllLines(Path.Combine(d, "local", "mirror_bridge.log"), new[] {
+            "00:50:00 watch: the game stopped responding - RAM 2.0/15.9 GB free, commit 22.2 of 23.7 GB used",
+            "00:50:03 watch: the game responds again after 3 s" });
+        try
+        {
+            g = Run(d);
+            var start = Find(g, "took a long time to start");
+            var fr = g.Findings.FirstOrDefault(f => f.Category == "Freeze");
+            Check(start != null && start.Severity == "MINOR" && start.Evidence.Any(e => e.Contains("busiest")), "a hang of 8 s+ while starting is a slow start with its note");
+            Check(fr != null && fr.Severity == "MINOR" && fr.Count == 2 && !fr.Evidence.Any(e => e.Contains(GameWatch.WhileStarting)),
+                "a stall after the start is still a freeze, without the start's lines (" + (fr == null ? "none" : fr.Count + "x") + ")");
+            Check(fr != null && !fr.Cause.Contains("dump in hang/"), "a short stall's cause doesn't point to a dump it doesn't have");
+        }
+        finally { GameWatch.HangDirOverride = noHangs; }
     }
 
     // audit N35/N36/N4: a friend's game freeze is named as such, the peer name has no state word, a load isn't a freeze
@@ -436,7 +497,7 @@ static class TestReport
         GameWatch.HangDirOverride = noHangs;
         var tests = new Action[] { RepeatedErrorsAreGroupedAndExplained, VersionMismatchSaveSafetyAndConnection, CrashesAreExplainedWithTheModStep,
                                    TheCrashedRunIsTheOneExplained, MissingLogsAndQuietRuns, SensitiveDataIsFiltered, ReportPackageAndDuplicates,
-                                   PerformanceIsBounded, FrozenGameGetsAHangDump, GameWatchCatchesAFreeze, PeerFreezeLoadAndPeerName, PeerFreezeWithSeveralPlayers };
+                                   PerformanceIsBounded, FrozenGameGetsAHangDump, GameWatchCatchesAFreeze, StallWhileTheGameStarts, PeerFreezeLoadAndPeerName, PeerFreezeWithSeveralPlayers };
         foreach (var t in tests)
         {
             try { t(); }

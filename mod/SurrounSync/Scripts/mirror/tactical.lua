@@ -201,7 +201,9 @@ local function ease_beams(dt)
             c.at.Z = c.at.Z + (c.ends.Z - c.at.Z) * f
             if to_world(c.actor, c.at, world_end) then
                 beam_end_name = beam_end_name or FName("User.Beam End")
-                pcall(function() c.actor.NS_LaserSight:SetVectorParameter(beam_end_name, world_end) end)
+                local comp
+                pcall(function() comp = c.actor.NS_LaserSight end)
+                if comp then util.set_beam(util.addr(c.actor) or 0, comp, beam_end_name, world_end) end
             end
         end
     end

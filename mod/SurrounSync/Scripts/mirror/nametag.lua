@@ -104,7 +104,20 @@ function nametag.tick(dt)
     end
 end
 
+-- The ghost goes (a save, a respawn, the game removed it): its tag is hidden now. A ghost waiting for its destroy is
+-- only hidden (animgate.destroy), and a screen-space tag on a hidden actor still draws where the ghost was left.
+local function drop_tag()
+    local t = tag
+    made_for, tag = nil, nil
+    if t and ghost.get() and util.valid(t.comp) then pcall(function() t.comp:SetVisibility(false, false) end) end
+end
+
+local registered = false
 -- Respawn/reload: the old world's objects are freed - drop them without touching them.
-function nametag.init(c) cfg = c; game.on_world_reset(function() made_for, tag = nil, nil end) end
+function nametag.init(c)
+    cfg = c
+    game.on_world_reset(function() made_for, tag = nil, nil end)
+    if not registered then registered = true; ghost.on_destroy(drop_tag) end
+end
 
 return nametag

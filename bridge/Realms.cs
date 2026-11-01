@@ -22,7 +22,7 @@ class Realms
 {
     public const string DefaultUrl = "https://surrounsync-realms.surrounsync-realms.workers.dev";   // realms-backend, deployed 2026-10-26
     const int FORMAT = 1;                           // bundle layout version (the server keeps it per Realm)
-    const int HEARTBEAT_MS = 60000;
+    public static int HeartbeatMs = 60000;          // --realm-beat <ms> (tests)
     const int MAX_FILES = 32;
     const long MAX_BUNDLE = 16L * 1024 * 1024, MAX_UNPACKED = 32L * 1024 * 1024;
     const int MAX_OPS = 24;
@@ -30,6 +30,8 @@ class Realms
     static readonly Regex ID = new Regex("^[0-9A-HJKMNP-TV-Z]{10}$");
     static readonly Regex FILE = new Regex("^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$");
     static readonly Regex MEMBER = new Regex("^[0-9A-Z]{8}$");
+    // the owner's game rules, "<key> <value> ..." (the server checks the same shape)
+    static readonly Regex RULES = new Regex("^[a-z]{1,16} [a-z0-9]{1,8}( [a-z]{1,16} [a-z0-9]{1,8}){0,31}$");
     static readonly Regex KEY = new Regex("^[A-Za-z0-9_-]{43}$");
     static readonly Regex TOKEN = new Regex("^[A-Za-z0-9_-]{32}$");
 
@@ -42,7 +44,15 @@ class Realms
     readonly List<string> ops = new List<string>();                         // newest last
     readonly Dictionary<string, string> listed = new Dictionary<string, string>();  // id -> "realm ..." line
     readonly Dictionary<string, string> leases = new Dictionary<string, string>();  // id -> held|lost
+    readonly Dictionary<string, string> rulesOf = new Dictionary<string, string>(); // id -> the owner's rules (none = not set)
     long lastBeat = Environment.TickCount;
+    // The mod says "hosting <id>" about every 30 s while it holds a Realm (game tick, or a timer while paused). A lease
+    // it stopped confirming isn't heartbeated any more, so the server frees it within its 2 min: a hung game, or a
+    // host who left without a release (0.14.2: the game's MAIN MENU), kept the Realm "hosted" for as long as the game
+    // stayed open. A mod that never sent one (older) keeps the old behaviour. A late confirmation picks it up again.
+    public static int HostingStaleMs = 150000;      // --hosting-stale <ms> (tests)
+    readonly Dictionary<string, int> hostingAt = new Dictionary<string, int>();   // id -> TickCount of the last one
+    readonly HashSet<string> staleLogged = new HashSet<string>();
 
     class Job { public string seq, verb; public string[] args; public string rest; public ulong steam; public string name; }
 
@@ -61,6 +71,53 @@ class Realms
         var th = new Thread(Work) { IsBackground = true, Name = "realms" };
         th.Start();
         Write();
+        if (url != "") new Thread(MotdLoop) { IsBackground = true, Name = "motd" }.Start();
+    }
+
+    // ---- message of the day (tools/motd.ps1 sets it on the server): mirror_motd.txt for the mod ----
+
+    // every minute, so a sent message shows within one (user 2026-10-31); one ~80-byte GET, 60 an hour per player
+    public static int MotdSeconds = 60;             // --motd-every <s> (tests)
+    const int MAX_MOTD = 500;
+    static readonly Regex MOTD_ID = new Regex("^[0-9A-HJKMNP-TV-Z]{8}$");
+    string lastMotd, lastMotdError;
+
+    void MotdLoop()
+    {
+        for (;;)
+        {
+            try { Motd(); lastMotdError = null; }
+            catch (Exception e)
+            {
+                // (a server without the motd route, or offline: logged once until it changes, not every minute)
+                string err = e is Api ? ((Api)e).Code + " " + Clean(e.Message) : Clean(e.Message);
+                if (err != lastMotdError) log("motd: couldn't fetch the message of the day: " + err);
+                lastMotdError = err;
+            }
+            Thread.Sleep(Math.Max(1, MotdSeconds) * 1000);
+        }
+    }
+
+    // "motd <id> <expires, unix s, 0 = never> <text>" or "motd none", then END. A failed fetch keeps the file as it was.
+    void Motd()
+    {
+        int status;
+        byte[] data = CallRaw("GET", "/motd", null, null, null, null, out status, false);
+        Dictionary<string, object> j;
+        try { j = new JavaScriptSerializer().DeserializeObject(Encoding.UTF8.GetString(data)) as Dictionary<string, object>; }
+        catch { throw new Api("bad_reply", "the server sent something unreadable"); }
+        if (j == null) throw new Api("bad_reply", "the server sent something unreadable");
+        string id = Str(j, "id"), text = Clean(Str(j, "text")).Trim();
+        long exp;
+        string line;
+        if (id == "") line = "motd none";
+        else if (!MOTD_ID.IsMatch(id) || text == "" || text.Length > MAX_MOTD || !long.TryParse(Str(j, "expires_at"), out exp) || exp < 0)
+            throw new Api("bad_reply", "the server sent a message without its checks");
+        else line = "motd " + id + " " + exp + " " + text;
+        if (line == lastMotd) return;
+        lock (writeLock) WriteFile(Path.Combine(dir, "mirror_motd.txt"), line + "\nEND\n");
+        lastMotd = line;
+        log("motd: " + (id == "" ? "no message of the day" : "message of the day " + id));
     }
 
     // the server's address: --realms-url, else %LOCALAPPDATA%\SurrounSync\realms_url.txt, else the built-in one
@@ -89,6 +146,23 @@ class Realms
         var j = new Job { seq = parts[0], verb = parts[1], rest = parts.Length > 2 ? parts[2] : "", steam = steam, name = name };
         j.args = j.rest.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
         if (!Regex.IsMatch(j.seq, "^[0-9]{1,9}$")) { log("realms: bad sequence in '" + line + "'"); return; }
+        if (j.verb == "hosting")
+        {
+            // (no server call: noted here, answered at once)
+            string result = "fail bad_input not a Realm id";
+            if (j.args.Length == 1 && ID.IsMatch(j.args[0]))
+            {
+                lock (state)
+                {
+                    hostingAt[j.args[0]] = Environment.TickCount;
+                    if (staleLogged.Remove(j.args[0])) log("realms: " + j.args[0] + " confirmed again - heartbeats go on");
+                }
+                result = "ok";
+            }
+            lock (state) { ops.Add("op " + j.seq + " hosting " + result); while (ops.Count > MAX_OPS) ops.RemoveAt(0); }
+            Write();
+            return;
+        }
         lock (jobs) jobs.Enqueue(j);
         signal.Set();
     }
@@ -99,7 +173,7 @@ class Realms
     {
         while (true)
         {
-            signal.WaitOne(5000);
+            signal.WaitOne(Math.Max(100, Math.Min(5000, HeartbeatMs)));
             for (;;)
             {
                 Job j = null;
@@ -117,7 +191,7 @@ class Realms
                 }
                 Write();
             }
-            if (Environment.TickCount - lastBeat >= HEARTBEAT_MS) { lastBeat = Environment.TickCount; Heartbeats(); }
+            if (Environment.TickCount - lastBeat >= HeartbeatMs) { lastBeat = Environment.TickCount; Heartbeats(); }
         }
     }
 
@@ -138,6 +212,9 @@ class Realms
             case "rename":
                 if (j.args.Length < 2) throw new Api("bad_input", "no name");
                 return Rename(Id(j, 0), j.rest.Substring(j.rest.IndexOf(' ') + 1));
+            case "rules":
+                if (j.args.Length < 3) throw new Api("bad_input", "no rules");
+                return Rules(Id(j, 0), j.rest.Substring(j.rest.IndexOf(' ') + 1));
             case "leave": return Leave(Id(j, 0));
             case "delete": return Delete(Id(j, 0));
             case "rekey": return Rekey(Id(j, 0));
@@ -172,13 +249,16 @@ class Realms
             {
                 var s = Call("GET", "/realms/" + id, id, null, null);
                 seen[id] = RealmLine(id, s);
+                TakeRules(id, s);
                 SaveInfo(id, Str(s, "name"));
+                if (File.Exists(RefusedFile(id))) DeleteLogged(RefusedFile(id));   // (the server knows the key again)
             }
             catch (Api e)
             {
                 bad++;
-                // removed from the Realm or the Realm deleted: the key is useless now
-                if (e.Code == "not_member" || e.Code == "no_realm") { Forget(id); continue; }
+                // removed from the Realm or the Realm deleted - or the server got it wrong for a while (2026-10-30: ids
+                // starting with R were refused): the key is kept until the refusals have lasted for days
+                if ((e.Code == "not_member" || e.Code == "no_realm") && Refused(id)) { Forget(id); continue; }
                 seen[id] = "realm " + id + " offline - 0 0 - " + Clean(ReadInfo(id) ?? id);
             }
         }
@@ -275,7 +355,7 @@ class Realms
     {
         string token = Token(id);
         if (token == null) { DropLease(id, "lost"); throw new Api("lease_lost", "no lease to resume"); }
-        try { Call("POST", "/realms/" + id + "/lease/heartbeat", id, null, Lease(token)); }
+        try { TakeRules(id, Call("POST", "/realms/" + id + "/lease/heartbeat", id, null, Lease(token))); }
         catch (Api e) { if (e.Code == "lease_lost") DropLease(id, "lost"); throw; }
         lock (state) leases[id] = "held";
         lastBeat = Environment.TickCount;
@@ -309,7 +389,16 @@ class Realms
         {
             string token = Token(id);
             if (token == null) { DropLease(id, "lost"); continue; }
-            try { Call("POST", "/realms/" + id + "/lease/heartbeat", id, null, Lease(token)); }
+            int at; bool stale;
+            lock (state) stale = hostingAt.TryGetValue(id, out at) && unchecked(Environment.TickCount - at) > HostingStaleMs;
+            if (stale)
+            {
+                bool first; lock (state) first = staleLogged.Add(id);
+                if (first) log("realms: the game hasn't confirmed hosting " + id + " for " + HostingStaleMs / 1000 + " s - no more heartbeats, the server frees it");
+                continue;
+            }
+            // (the answer carries the owner's rules: a change reaches the host's game within a minute)
+            try { if (TakeRules(id, Call("POST", "/realms/" + id + "/lease/heartbeat", id, null, Lease(token)))) Write(); }
             catch (Api e)
             {
                 log("realms: heartbeat for " + id + ": " + e.Code);
@@ -376,17 +465,55 @@ class Realms
         return "ok";
     }
 
+    // The game rules every host of the Realm plays by (hostrules.lua): only the owner may set them (the server answers
+    // owner_only otherwise); hosts get them with the list and the heartbeat.
+    string Rules(string id, string rules)
+    {
+        rules = rules.Trim();
+        if (rules.Length > 512 || !RULES.IsMatch(rules)) throw new Api("bad_input", "bad rules");
+        TakeRules(id, Call("PUT", "/realms/" + id + "/rules", id, new Dictionary<string, object> { { "rules", rules } }, null));
+        return "ok";
+    }
+
+    // the owner's rules out of a status, heartbeat or rules answer; true when they changed. An answer without the
+    // field (an older server) changes nothing.
+    bool TakeRules(string id, Dictionary<string, object> r)
+    {
+        if (r == null || !r.ContainsKey("rules")) return false;
+        string s = Str(r, "rules");
+        if (s.Length > 512 || !RULES.IsMatch(s)) s = "";
+        lock (state)
+        {
+            string old;
+            if (!rulesOf.TryGetValue(id, out old)) old = "";
+            if (old == s) return false;
+            if (s == "") rulesOf.Remove(id); else rulesOf[id] = s;
+        }
+        return true;
+    }
+
+    // LEAVE / DELETE of a Realm the server no longer has me in (removed, left on another PC, deleted): the player wants
+    // it gone, so it is forgotten here too. It wasn't (2026-10-30 17:46: "Couldn't leave TEst (not_member ...)" twice,
+    // the Realm stayed in the list).
     string Leave(string id)
     {
-        string mid = Member(id).Key;
-        Call("DELETE", "/realms/" + id + "/members/" + mid, id, null, null);
+        try { Call("DELETE", "/realms/" + id + "/members/" + Member(id).Key, id, null, null); }
+        catch (Api e) { if (!Gone(e, id, "leave")) throw; }
         return Forget(id);
     }
 
     string Delete(string id)
     {
-        Call("DELETE", "/realms/" + id, id, null, null);
+        try { Call("DELETE", "/realms/" + id, id, null, null); }
+        catch (Api e) { if (!Gone(e, id, "delete")) throw; }
         return Forget(id);
+    }
+
+    bool Gone(Api e, string id, string verb)
+    {
+        if (e.Code != "not_member" && e.Code != "no_realm") return false;
+        log("realms: " + verb + " " + id + ": " + e.Code + " - forgetting it on this PC");
+        return true;
     }
 
     string Rekey(string id)
@@ -424,12 +551,49 @@ class Realms
         return "ok " + id + " " + Clean(Str(s, "name"));
     }
 
-    // the key only: the Realm's world copies stay on disk until the mod clears them
+    // One more "not a member" / "no such Realm" for this key: true once they have come REFUSED_TIMES times over at
+    // least REFUSED_DAYS days (refused.txt: "<first unix s> <count>"; a good answer removes it)
+    const int REFUSED_TIMES = 5;
+    const long REFUSED_DAYS = 3;
+    bool Refused(string id)
+    {
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), first = now;
+        int count = 0;
+        string path = RefusedFile(id);
+        if (File.Exists(path))
+        {
+            try
+            {
+                var p = File.ReadAllText(path).Trim().Split(' ');
+                long f; int c;
+                if (p.Length == 2 && long.TryParse(p[0], out f) && int.TryParse(p[1], out c) && f <= now) { first = f; count = c; }
+            }
+            catch (Exception e) { log("realms: can't read " + path + " (" + e.Message + ") - counting from now"); }
+        }
+        count++;
+        // (unwritten, the count stays low and the key is kept: the safe side)
+        try { WriteFile(path, first + " " + count + "\n"); }
+        catch (Exception e) { log("realms: can't write " + path + " (" + e.Message + ")"); }
+        bool gone = count >= REFUSED_TIMES && now - first >= REFUSED_DAYS * 86400;
+        if (!gone && count == 1) log("realms: the server doesn't know my key for " + id + " - kept, shown offline");
+        return gone;
+    }
+
+    // the key only: the Realm's world copies stay on disk until the mod clears them. The key is moved aside, never
+    // deleted (member.key.forgotten): one a server mistake took can be put back by hand
     string Forget(string id)
     {
-        try { File.Delete(KeyFile(id)); } catch { }
+        string k = KeyFile(id), old = k + ".forgotten";
+        try { if (File.Exists(k)) { if (File.Exists(old)) File.Delete(old); File.Move(k, old); } }
+        catch (Exception e)
+        {
+            // (it must stop counting as a membership: as before, removed outright)
+            log("realms: can't move the key of " + id + " aside (" + e.Message + ") - deleting it");
+            DeleteLogged(k);
+        }
+        DeleteLogged(RefusedFile(id));
         DropLease(id, null);
-        lock (state) listed.Remove(id);
+        lock (state) { listed.Remove(id); rulesOf.Remove(id); }
         log("realms: no longer a member of " + id);
         return "ok";
     }
@@ -490,6 +654,12 @@ class Realms
     string RealmDir(string id) { return Path.Combine(root, id); }
     string KeyFile(string id) { return Path.Combine(RealmDir(id), "member.key"); }
     string LeaseFile(string id) { return Path.Combine(RealmDir(id), "lease.token"); }
+    string RefusedFile(string id) { return Path.Combine(RealmDir(id), "refused.txt"); }
+    void DeleteLogged(string path)
+    {
+        try { File.Delete(path); }
+        catch (Exception e) { log("realms: can't delete " + path + " (" + e.Message + ")"); }
+    }
     string InfoFile(string id) { return Path.Combine(RealmDir(id), "realm.txt"); }
 
     List<string> Known()
@@ -538,6 +708,8 @@ class Realms
         {
             foreach (var l in listed.Values) sb.Append(l).Append('\n');
             foreach (var kv in leases) sb.Append("lease ").Append(kv.Key).Append(' ').Append(kv.Value).Append('\n');
+            // "rules <id> <key> <value> ..." (older mods skip the unknown key)
+            foreach (var kv in rulesOf) sb.Append("rules ").Append(kv.Key).Append(' ').Append(kv.Value).Append('\n');
             foreach (var o in ops) sb.Append(o).Append('\n');
         }
         sb.Append("END\n");

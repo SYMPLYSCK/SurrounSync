@@ -130,22 +130,38 @@ local function find_row(w, vb)
     return util.valid(c) and c or nil
 end
 
-local function add_row(w, vb)
+-- all of our rows (doorlock.lua's own doors show two)
+local function list_rows(w, vb)
+    local kids, n, out = 0, count(w.Options), {}
+    pcall(function() kids = vb:GetChildrenCount() end)
+    for i = n, kids - 1 do
+        local c
+        pcall(function() c = vb:GetChildAt(i) end)
+        if util.valid(c) then out[#out + 1] = c end
+    end
+    return out
+end
+
+-- have = how many of our rows the box holds already (the new one goes after them)
+local function add_row(w, vb, label, have)
+    label = label or "Rename"
+    have = have or 0
     local cls, wbl, pc = StaticFindObject(OPTION), util.cdo(WBL), game.controller()
     if not (util.valid(cls) and wbl and util.valid(pc)) then return nil end
     local kids = 0
     pcall(function() kids = vb:GetChildrenCount() end)
-    if kids ~= count(w.Options) then return nil end
+    if kids ~= count(w.Options) + have then return nil end
     local row
     pcall(function() row = wbl:Create(pc, cls, pc) end)
     if not util.valid(row) then return nil end
-    pcall(function() row.OptionName = FText("Rename") end)
+    pcall(function() row.OptionName = FText(label) end)
     local slot
     pcall(function() slot = vb:AddChildToVerticalBox(row) end)
     pcall(function() slot:SetPadding({ Left = 0, Top = 2, Right = 0, Bottom = 2 }) end)
-    pcall(function() row:UpdateText(FText("Rename")) end)
+    pcall(function() row:UpdateText(FText(label)) end)
     pcall(function() row:SetSelected(false) end)
-    return find_row(w, vb)
+    if have == 0 then return find_row(w, vb) end
+    return list_rows(w, vb)[have + 1]
 end
 
 local function select_row(w, row, on)
@@ -236,6 +252,9 @@ function bedtags.init(session, send_fn, shared_fn)
     path = session and session.data_file and function() return session.data_file("mirror_coop_bed_names.txt") end
     send, shared = send_fn, shared_fn
 end
+
+-- the extra hover-menu row, for doorlock.lua's door rows
+bedtags.rows = { find = find_row, add = add_row, select = select_row, count = count, list = list_rows }
 
 function bedtags.forget() cur, want_box, cycled_down, interacted = nil, nil, false, false end
 game.on_world_reset(bedtags.forget)

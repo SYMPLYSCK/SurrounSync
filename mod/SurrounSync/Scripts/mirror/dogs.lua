@@ -28,7 +28,7 @@ local OBJ_TYPES = { 1, 2 }
 
 local hounds = {}                             -- address -> { z, d, near_done, chase_until, next_at, snd, seen, dead }
 local clock, poll_in, missing_told = 0.0, 0.0, false
-local stats = { near = 0, chase = 0, stopped = 0 }
+local stats = { seen = 0, near = 0, chase = 0, stopped = 0 }
 local cfg
 
 local function sound(k)
@@ -76,6 +76,28 @@ local function chase_kind()
     return r < 0.4 and "fit" or (r < 0.65 and "bark1" or (r < 0.9 and "bark2" or "growl"))
 end
 
+-- Every player here: me and each other player's ghost. A hound near or chasing any of them barks - judged by my
+-- player alone, a hound chasing the friend next to me stayed silent on my game (user 2026-10-30: other players
+-- cannot hear dog barks).
+local players = {}
+local function player_spots(at)
+    for i = #players, 1, -1 do players[i] = nil end
+    players[1] = at
+    require("mirror.peers").each("mirror.ghost", function(g)
+        local l = g.location and g.location()
+        if l then players[#players + 1] = l end
+    end)
+    return players
+end
+local function nearest(spots, l)
+    local best, bi = math.huge, 0
+    for i, s in ipairs(spots) do
+        local d = util.dist(s, l)
+        if d < best then best, bi = d, i end
+    end
+    return best, bi
+end
+
 local function poll(dt)
     if not util.valid(sound("bark1")) then
         if not missing_told then
@@ -97,6 +119,7 @@ local function poll(dt)
         elseif clock - h.seen > FORGET then stop(h); hounds[a] = nil end
     end
     if not util.valid(cls) then return end
+    local spots = player_spots(at)
     local out = {}
     pcall(function() k:SphereOverlapActors(w, at, RANGE, OBJ_TYPES, cls, { p }, out) end)
     for _, o in ipairs(out) do
@@ -107,11 +130,15 @@ local function poll(dt)
         if a then pcall(function() l = util.vec(z:K2_GetActorLocation()) end) end
         if l then
             local h = hounds[a]
-            if not h then h = { z = z, near_done = false, chase_until = -1, next_at = 0 }; hounds[a] = h end
+            if not h then
+                h = { z = z, near_done = false, chase_until = -1, next_at = 0 }; hounds[a] = h
+                stats.seen = stats.seen + 1
+            end
             h.seen = clock
-            local d = util.dist(at, l)
-            local closing = h.d and (h.d - d) / dt or 0
-            h.d = d
+            local d, who = nearest(spots, l)
+            -- (closing in on the same player as last poll: another player turning nearest isn't a chase)
+            local closing = (h.d and h.who == who) and (h.d - d) / dt or 0
+            h.d, h.who = d, who
             if not h.dead then
                 if not h.near_done and d <= NEAR then
                     h.near_done = true
@@ -138,7 +165,9 @@ local function tick(dt)
 end
 
 function dogs.status()
-    return string.format("hounds: %d near bark(s), %d chase bark(s), %d stopped at death", stats.near, stats.chase, stats.stopped)
+    -- (seen: hounds within RANGE so far - none seen and no barks = no hound came close, not a broken bark)
+    return string.format("hounds: %d seen, %d near bark(s), %d chase bark(s), %d stopped at death", stats.seen, stats.near,
+        stats.chase, stats.stopped)
 end
 
 function dogs.init(c)

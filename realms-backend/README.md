@@ -2,7 +2,7 @@
 
 A small Cloudflare Worker that keeps each Realm's newest world between sessions and decides who hosts.
 - **D1** (database): Realms, members, invites, the host lease, the generation list.
-- **R2** (storage): the world files (`realms/<id>/world/<gen>`) and each member's Realm character.
+- **R2** (storage): the world files (`realms/<id>/world/<gen>`). Characters stay on each player's PC.
 
 Players never touch this. Their SurrounSync bridge talks to it.
 
@@ -46,6 +46,7 @@ Auth header for member calls: `Authorization: Member <member_id>:<key>`.
 | `POST /realms` | anyone (5/day/IP) | create; returns code, owner member id + key |
 | `GET /realms/<code>` | member | name, newest generation, who is hosting, members |
 | `PATCH` / `DELETE /realms/<code>` | owner | rename / delete everything |
+| `PUT /realms/<code>/rules` | owner | the game rules every host plays by (`{"rules": "pvp off players 4 ..."}`); `GET` and the heartbeat return them |
 | `POST /realms/<code>/lease` | member | claim the host lease. 200 = you host; 409 = someone does (their SteamID) |
 | `POST .../lease/heartbeat`, `DELETE .../lease` | host (`X-Lease-Token`) | keep (every ~60 s; it expires after 120 s) / release |
 | `PUT .../world/<gen>` | host (`X-Lease-Token`, `X-Sha256`) | upload generation head+1 (binary, ≤16 MB); the last 10 are kept |
@@ -54,7 +55,12 @@ Auth header for member calls: `Authorization: Member <member_id>:<key>`.
 | `POST /invites/redeem` | invitee (20/h/IP) | invite → member id + key |
 | `POST .../key` | member | new key (the old one stops working) |
 | `DELETE .../members/<id>`, `POST .../members/<id>/owner` | owner (or yourself to leave) | remove / hand over ownership |
-| `PUT` / `GET .../character` | that member (`X-Base-Gen`, `X-Sha256`) | own Realm character backup, ≤2 MB |
+| `GET /motd` | anyone | the message of the day (`{"id": null}` when none); every bridge asks every minute (0.14.2 and older: every 10 min) |
+| `PUT` / `DELETE /motd` | admin (`Authorization: Admin <token>`, 30/h/IP) | set (`{"text": "...", "hours": 48}` or `"minutes": 30`, 1-500 characters, the expiry optional, not both) / clear. Only exists once the `MOTD_TOKEN` secret is set; `tools/motd.ps1` does all of it |
+
+Message of the day, once: `tools\motd.ps1 -Setup` (makes `tools\motd-token.txt`, not in git), then
+`tools\MOTD-setup-server.cmd` (the motd table, that token as the `MOTD_TOKEN` secret, `npx wrangler deploy`).
+All of it in a window (current message, send with an expiry, clear, Make token, Set up server): double-click `tools\MOTD.cmd`.
 
 Keys and invite codes are random; only their sha256 is stored. Steam IDs are as the client claims them
 (display and connection only, not proof of identity).

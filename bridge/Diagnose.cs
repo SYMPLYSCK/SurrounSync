@@ -40,6 +40,9 @@ namespace SurrounSyncShared
     public static class Diagnose
     {
         const int MaxGroups = 200, TimelineLines = 25, CrashWindowHours = 3;
+        // crumb.lua keeps the current run's step files and the last three runs' (.1 = the last run)
+        public static readonly string[] StepFiles = { "mirror_step.txt", "mirror_step.1.txt", "mirror_step.2.txt", "mirror_step.3.txt" };
+        public static readonly string[] StepRings = { "mirror_steps.txt", "mirror_steps.1.txt", "mirror_steps.2.txt", "mirror_steps.3.txt" };
         public static DateTime? ReplayAt;   // explaining an old report: its time instead of now
 
         public static int Rank(string sev)
@@ -186,6 +189,27 @@ namespace SurrounSyncShared
             catch (UnauthorizedAccessException e) { d.Missing.Add("Couldn't read the game watch's freeze notes: " + e.Message); }
             if (notes.Count == 0 && stalls.Count == 0) return;
             notes.Sort();
+            // the first seconds after the game starts (UE4SS, the mods' start-up, the main menu's load): a short stall
+            // there is the game starting, not a freeze; one of 8 s+ is a slow start (its dump still goes in the report)
+            stalls.RemoveAll(s => s.Contains(GameWatch.WhileStarting));
+            var starts = notes.FindAll(n => n.Contains(GameWatch.WhileStarting));
+            notes.RemoveAll(n => n.Contains(GameWatch.WhileStarting));
+            if (starts.Count > 0)
+            {
+                var fs = new Finding
+                {
+                    Title = "The game took a long time to start", Category = "Performance", Severity = "MINOR", Confidence = "confirmed",
+                    Count = starts.Count,
+                    What = "The game didn't respond for 8 s or more while it started (before or while the main menu loaded).",
+                    Affects = "Only the game's start.",
+                    Cause = "Starting the game, UE4SS and its mods holds the game until the main menu is up; slow disks, low memory or a fresh antivirus scan make it longer.",
+                    PlayerTry = "Nothing needed if it carried on. If it never gets to the menu, see the dump in hang/.",
+                    DevLook = "hang/*.txt ('while the game starts', mod step), hang/*.dmp, game/UE4SS.log (time between 'Starting Lua mod' lines).",
+                };
+                foreach (var n in starts) fs.Evidence.Add(Trunc(n, 400));
+                d.Findings.Add(fs);
+            }
+            if (notes.Count == 0 && stalls.Count == 0) return;
             // a join load blocks the game thread 10-30 s: under the mod's load marker that is a slow load, not a freeze
             var loads = notes.FindAll(n => n.Contains(GameWatch.DuringLoad));
             notes.RemoveAll(n => n.Contains(GameWatch.DuringLoad));
@@ -214,7 +238,8 @@ namespace SurrounSyncShared
                 What = froze ? "The game stopped responding for 8 s or more; SurrounSync's connector saved what every part of the game was doing."
                              : "The game stopped responding for a few seconds and then carried on.",
                 Affects = froze ? "The whole session for this player while frozen." : "A short freeze for this player.",
-                Cause = "The dump in hang/ shows the call the game was stuck in. 'busiest' = threads using CPU: one thread near 1000 ms is a loop; all near 0 is waiting (a deadlock, disk or memory).",
+                Cause = froze ? "The dump in hang/ shows the call the game was stuck in. 'busiest' = threads using CPU: one thread near 1000 ms is a loop; all near 0 is waiting (a deadlock, disk or memory)."
+                              : "Under 8 s, so no dump was taken: the mod's steps and log around the time show what ran (a big load, a save, low memory).",
                 PlayerTry = froze ? "If it freezes again, leave it frozen for 30 s before closing - a second snapshot shows whether it moves." : "",
                 DevLook = "hang/*.dmp (stacks: WinDbg/VS, game thread first), hang/*.txt (CPU per thread, memory), game/recent_mirror_steps*.txt (the mod's last 64 steps), windows/events.txt.",
             };
@@ -568,7 +593,7 @@ namespace SurrounSyncShared
             string module = Regex.Match(stack, @"^\s*([A-Za-z0-9_\-]+)").Groups[1].Value;
             string step = null, stepFile = null;
             if (win64 != null)
-                foreach (var n in new[] { "mirror_step.txt", "mirror_step.1.txt" })
+                foreach (var n in StepFiles)
                 {
                     string p = Path.Combine(win64, n);
                     if (!File.Exists(p)) continue;

@@ -41,6 +41,8 @@ local cfg, role, session
 local now = 0.0
 local state, epoch = "merged", 0
 local far_since, asked_at, retry_at = nil, 0.0, 0.0
+local near_since = nil      -- split/following: players within merge_radius since (merge only after merge_after)
+local follow_wait = {}      -- slot -> since: a higher-slot guest next to this one, far from the host, not following yet
 local gone_since = nil
 local eval_in = 0.0
 local sent = nil
@@ -77,18 +79,31 @@ function split.host_state() return state end
 
 -- How far this guest is from the nearest other player: the host, or (more than two players) another guest's ghost.
 -- A guest runs its own AI only alone - or in a group: its leader and the leader's other followers don't count
--- (group split). Anyone else coming near merges it, so players together otherwise share the host's AI.
+-- (group split). Nor does a guest with a higher slot near me but far from the host: it follows me once I'm split
+-- (find_leader) - counted, two guests together far from the host never split (neither one leads). Anyone else
+-- coming near merges it, so players together otherwise share the host's AI.
 -- Returns that distance, my ghost's location and the distance to the host.
 local function players_apart()
     local gl, hl = ghost.location(), nil
     pcall(function() hl = game.player():K2_GetActorLocation() end)
     if not (gl and hl) then return nil, gl end
     local dh = util.dist(gl, hl)
-    local d, grp = dh, leader or split.slot()
+    local d, grp, me = dh, leader or split.slot(), split.slot()
+    local c = sp()
+    local r = c.split_radius
     others(function(m)
-        local l = m.ghost_loc()
-        if not l or m.slot() == grp or m.lead_slot() == grp then return end
-        d = math.min(d, util.dist(gl, l))
+        local l, s = m.ghost_loc(), m.slot() or 0
+        if not l or s == grp or m.lead_slot() == grp then follow_wait[s] = nil; return end
+        local dm = util.dist(gl, l)
+        if not leader and me and s > me and dm < r and util.dist(l, hl) > r then
+            -- (my follower to be - unless it hasn't followed in time: blocked, or an answer that never came. Then it
+            -- counts again, and we share the host's AI as before rather than each seeing other zombies)
+            follow_wait[s] = follow_wait[s] or now
+            if now - follow_wait[s] < c.split_after + 3 * c.ack_timeout then return end
+        else
+            follow_wait[s] = nil
+        end
+        d = math.min(d, dm)
     end)
     return d, gl, dh
 end
@@ -117,13 +132,25 @@ local function blocked(gl)
     return nil
 end
 
+-- Reasons not to start a split (a split already on is left alone): a guest just respawned at its bed far away
+-- usually teleports back, and an open teleport brings the players together - each split there ended in a merge a
+-- few seconds later (live 2026-10-30 02:28:40 respawn, 02:28:51 split, 02:28:53 teleport asked, 02:28:59 merge).
+local RESPAWN_HOLD = 20.0
+local revived_age_fn = function() return math.huge end
+local tp_busy_fn = function() return false end
+local function held()
+    if revived_age_fn() < RESPAWN_HOLD then return "just respawned" end
+    if tp_busy_fn() then return "teleport open" end
+    return nil
+end
+
 local function merge(why)
     local idx = ghost.exists() and ghost.set_invoker(true) or -1
     zombies.set_split(false)
     -- zombies spawned for the guest's in a hand-back get their ids now (the merge resets them): "H key id"
     local map = zombies.bind_taken()
     local was = state
-    state, epoch, far_since, leader = "merged", epoch + 1, nil, nil
+    state, epoch, far_since, leader, near_since = "merged", epoch + 1, nil, nil, nil
     put("m " .. epoch .. (map ~= "" and ("\n" .. map) or ""))
     if was == "following" then
         stats.merges = stats.merges + 1
@@ -140,11 +167,19 @@ local function merge(why)
     end
 end
 
+-- Players within d < merge_radius for merge_after s (or within force_radius: at once). A player driving by left
+-- a split after 16 s (live 2026-10-30) - a whole hand-back and a new split for nothing.
+local function near_enough(d, c)
+    if d >= c.merge_radius then near_since = nil; return false end
+    near_since = near_since or now
+    return d < c.force_radius or now - near_since >= c.merge_after
+end
+
 -- Players close again: the guest hands its zombies back first (zombies.begin_taking / take_offer), so nothing pops
 -- when the host's AI returns. Fights, the setting and a guest who left still merge at once.
 local merge_why, offered, merging_tick = nil, false, nil
 local function begin_merge(why)
-    state, epoch, asked_at, eval_in, merge_why, offered = "merging", epoch + 1, now, 0.25, why, false
+    state, epoch, asked_at, eval_in, merge_why, offered, near_since = "merging", epoch + 1, now, 0.25, why, false, nil
     zombies.begin_taking()
     put("M " .. epoch)
     log.info(string.format("split: %s - asking the guest to hand its zombies back first (epoch %d)", why, epoch))
@@ -181,6 +216,7 @@ local function host_tick(dt)
         -- (zombies near the guest no longer block a split: the guest takes them over where they stand)
         local _, age = zombies.near_guest()
         local live = age < 2.0
+        if not why then why = held() end
         -- near a split guest (lower slot), far from the host: follow it - its game runs the AI here too
         local lead_m = not why and dh > c.split_radius and now >= retry_at and find_leader(gl)
         if lead_m then
@@ -226,7 +262,7 @@ local function host_tick(dt)
         if not ll then merge("the leader isn't split any more")
         elseif why then merge(why)
         elseif apart > c.split_radius * 1.25 then merge(string.format("%.0f m from the leader", apart / 100))
-        elseif d < c.force_radius or (d < c.merge_radius and not guest_fighting) then merge(string.format("players %.0f m apart", d / 100))
+        elseif near_enough(d, c) and (d < c.force_radius or not guest_fighting) then merge(string.format("players %.0f m apart", d / 100))
         elseif state == "asking" then
             if guest_state == "f" and guest_epoch == epoch then
                 local idx = ghost.set_invoker(false)
@@ -255,7 +291,7 @@ local function host_tick(dt)
         end
         -- (a fight no longer holds the merge back: the guest's zombies are handed back where they stand)
         if why then merge(why)
-        elseif d < c.merge_radius then
+        elseif near_enough(d, c) then
             begin_merge(string.format("players %.0f m apart%s", d / 100, guest_fighting and ", mid-fight" or ""))
         end
     end
@@ -380,15 +416,17 @@ function split.status()
 end
 
 local function forget_world()
-    state, far_since, gone_since, sent, measure = "merged", nil, nil, nil, nil
+    state, far_since, gone_since, sent, measure, near_since, follow_wait = "merged", nil, nil, nil, nil, nil, {}
     guest_state, guest_epoch, guest_fighting = "m", -1, false
     host_want, was_in = "m", false
     -- (zombies.lua drops its hand-back state itself: nothing of the old world is touched here)
     merge_why, offered, offered_epoch, handed_epoch = nil, false, nil, {}
 end
 
-function split.init(c, r, s)
+-- revived_age / tp_busy (phase1, teleport of this link): seconds since the guest came back alive, a teleport open
+function split.init(c, r, s, revived_age, tp_busy)
     cfg, role, session = c, r, s
+    revived_age_fn, tp_busy_fn = revived_age or revived_age_fn, tp_busy or tp_busy_fn
     game.on_world_reset(forget_world)
 end
 

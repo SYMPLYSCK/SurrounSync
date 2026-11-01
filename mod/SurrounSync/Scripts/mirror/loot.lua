@@ -26,6 +26,7 @@ local ITEMS, ITEM_ID, DURABILITY, INFO, COUNT, UID = F.ITEMS, F.ITEM_ID, F.DURAB
 local cfg, role, session
 -- Taken/put-in events must not expire: replaying a full contents list over a lost one dupes or loses items.
 local channel = events.reliable("loot")
+channel.past_cut = function(p) return p:sub(1, 2) == "L " end   -- a give-back: my bag, in no join save
 -- Host -> guest full contents ("C <id> <ack> <items>"), kept apart so the event blob stays small.
 local cchan = events.reliable("lootc", 64)
 local applying = false
@@ -236,12 +237,26 @@ local function removed(actor, uid)
     last_removed.key, last_removed.at = key, now
     local da = da_of[uid]
     local sent_uid = rev[uid] or uid
+    if role ~= "host" and held[id] and held[id][sent_uid] then
+        -- the host had no room for it (R): it is only in my copy, taking it back is mine alone. Sent, the host
+        -- matched it by kind and took its own same item out, or found none and had me give it back - lost either
+        -- way (T10 audit 2026-10-31)
+        count_seen[uid] = left > 0 and left or nil
+        if left == 0 then release(id, sent_uid); forget(uid, rev[uid]) end
+        log.info("loot: took back an item the host had no room for in " .. id .. " - only in my copy, nothing to tell")
+        return
+    end
     if role ~= "host" and da then
         local n = (count_seen[uid] or (left + 1)) - left
         if n > 0 then sent_takes[id .. " " .. sent_uid] = { da = da, n = n, at = now } end
     end
+    -- how many this take moved, when this game knew the count before it: the other game removes that many, not
+    -- down to my "left" (T10 audit 2026-10-31: both took part of one stack within a round trip - 10, host 3, guest
+    -- 4 - and "left 6" made the host remove 1, the host's "left 7" nothing on the guest: 13 items from 10)
+    local moved = count_seen[uid] and (count_seen[uid] - left) or 0
     count_seen[uid] = left > 0 and left or nil
-    channel:send(string.format("%s %s %d %d", id, sent_uid, left, next_seq(id)) .. (da and (" " .. da) or ""))
+    channel:send(string.format("%s %s %d %d", id, sent_uid, left, next_seq(id))
+        .. (da and (" " .. da .. (moved > 0 and (" " .. moved) or "")) or ""))
     stats.sent = stats.sent + 1
     if left == 0 then release(id, uid) end
     mark_dirty(id, comp)
@@ -265,11 +280,11 @@ end
 -- host never got it. Looked at the next frame (the hook may run before the game did the move):
 -- out of a shared container it is a take, onto a stack in one an "N" (count up).
 local stacks = {}
-local function stack_up(actor, uid)
+local function stack_up(actor, uid, have)
     local comp = comp_of(actor)
     local ok, id = pcall(id_of, actor)
     if not (comp and ok) then return end
-    local have = count_of(comp, uid)
+    have = have or count_of(comp, uid)
     local was = count_seen[uid]
     if not was and host_list[id] then
         local theirs = rev[uid] or uid
@@ -372,8 +387,9 @@ end
 local emptied, emptied_n = {}, 0
 local function apply(payload)
     if not shared() then return end
-    local id, uid, left, s, da = payload:match("^(%S+) (%S+) (%d+) ?(%d*) ?(%S*)$")
+    local id, uid, left, s, da, moved = payload:match("^(%S+) (%S+) (%d+) ?(%d*) ?(%S*) ?(%d*)$")
     if not id then return end
+    moved = tonumber(moved)
     list_take(id, uid, tonumber(left) or 0)
     local actor = find(id)
     local comp = actor and comp_of(actor)
@@ -423,11 +439,18 @@ local function apply(payload)
             .. " - none of it here (taken here at the same moment?) - they give it back")
         return
     end
-    local take = have - (tonumber(left) or 0)
+    local take = moved and moved > 0 and math.min(moved, have) or (have - (tonumber(left) or 0))
     if take <= 0 then return end
     applying = true
     local ok, err = jig.take(comp, uid, take, have)
     applying = false
+    if ok and role == "host" and moved and moved > have then
+        -- part of it was taken here at the same moment: the guest gives back what this world didn't have
+        channel:send("L " .. id .. " " .. theirs .. " " .. (moved - have))
+        stats.lost = (stats.lost or 0) + 1
+        log.info(string.format("loot: the other player took %d from %s - only %d here (taken here at the same moment?) - they give %d back",
+            moved, id, have, moved - have))
+    end
     if ok then count_seen[uid] = (have - take) > 0 and (have - take) or nil end
     if ok and tonumber(left) == 0 then
         if emptied_n > 200 then emptied, emptied_n = {}, 0 end
@@ -562,6 +585,52 @@ local function is_main(actor)
     return r
 end
 
+-- Items a container makes itself (a disassembly bench's output: W_DisassemblyWorkbenchUI calls
+-- JigTryAddItemSomewhere on the bench's component) fire no added event: that function adds with AddNewItemToSlot,
+-- or onto a stack with CLIENT_UpdateCount (decompiled BP_JigComponent). The host never heard of a guest's output,
+-- acked the input's consume and its next list took the output away (user 2026-10-31: "the decrafted items appear
+-- in the lower section, then immediately despawn"). Looked at the next frame (the hook may run before the add):
+-- an item of that kind this game hasn't seen there is a put-in, a stack of it that grew is an "N".
+local made = {}
+local made_fn = function(self, LocalComp, ItemID)
+    util.safe(function()
+        if applying or not shared() then return end
+        local comp = util.obj(LocalComp) or util.obj(self)
+        local da
+        pcall(function() da = full_path(ItemID:get()) end)
+        if comp and da then made[#made + 1] = { comp = comp, da = da } end
+    end, "loot.made")
+end
+local function flush_made()
+    if not made[1] then return end
+    local list = made
+    made = {}
+    local looked = {}
+    for _, m in ipairs(list) do
+        local owner
+        if util.valid(m.comp) then pcall(function() owner = m.comp:GetOwner() end) end
+        local ok, id = false, nil
+        if util.valid(owner) and is_main(owner) then ok, id = pcall(id_of, owner) end
+        if ok and role == "host" then
+            mark_dirty(id, m.comp)
+        elseif ok then
+            for _, it in ipairs(jig.contents_of(m.comp)) do
+                if it.da == m.da and not it.parent and not looked[it.uid] then
+                    looked[it.uid] = true
+                    local was = count_seen[it.uid]
+                    if not was and not rev[it.uid] and now - (put_sent[it.uid] or -10) >= 1.0 then
+                        da_of[it.uid], count_seen[it.uid], put_sent[it.uid] = it.da, it.count or 1, now
+                        add_q[#add_q + 1] = { uid = it.uid, id = id, comp = m.comp, da = it.da, count = it.count,
+                                              dur = { X = it.dx, Y = it.dy } }
+                    elseif was and (it.count or 1) > was then
+                        stack_up(owner, it.uid, it.count or 1)
+                    end
+                end
+            end
+        end
+    end
+end
+
 local function player_jig()
     local c
     pcall(function() c = game.player().BP_JigMultiplayer end)
@@ -570,7 +639,7 @@ end
 local function local_uid(theirs) return alias[theirs] or theirs end
 
 local function give_back(p)
-    local id, uid = p:match("^L (%S+) (%S+)")
+    local id, uid, part = p:match("^L (%S+) (%S+) ?(%d*)$")
     local t = id and sent_takes[id .. " " .. uid]
     if not t or now - t.at > 120 then return end
     sent_takes[id .. " " .. uid] = nil
@@ -585,7 +654,7 @@ local function give_back(p)
         log.warn("loot: the host had no " .. name .. " left in " .. id .. " - couldn't find it here to give back")
         return
     end
-    local n = math.min(t.n, best.count or 1)
+    local n = math.min(tonumber(part) or t.n, t.n, best.count or 1)
     applying = true
     local ok, err = jig.take(pc, best.uid, n, best.count or 1)
     applying = false
@@ -671,7 +740,7 @@ local function apply_add(payload)
     local asset = util.find(da)
     if not asset then
         log.info("loot: the other player put " .. (da:match("[^%.]+$") or da) .. " into " .. id .. " - not loaded here")
-        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
+        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da .. " " .. s) end
         return
     end
     local slots = 0
@@ -688,7 +757,7 @@ local function apply_add(payload)
     applying = false
     if not mine then
         log.warn("loot: couldn't add the other player's " .. (da:match("[^%.]+$") or da) .. " to " .. id .. ": " .. tostring(err))
-        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
+        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da .. " " .. s) end
         return
     end
     acked(id, s, comp)
@@ -743,7 +812,7 @@ local function apply_count(payload)
         applying = false
         if not made then
             log.warn("loot: couldn't add the other player's stacked " .. (da:match("[%w_]+$") or da) .. " to " .. id .. ": " .. tostring(err))
-            if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da) end
+            if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da .. " " .. s) end
             return
         end
         acked(id, s, comp)
@@ -1088,8 +1157,8 @@ local function retry_later()
             if x.k == "A" then apply_add(x.p) elseif x.k == "N" then apply_count(x.p) else apply(x.p) end
         elseif x.k == "A" and now - x.t > LATER_S then
             log.warn(string.format("loot: gave up on a kept put-in for %s after %d s - that container never showed up here", x.id, LATER_S))
-            local id, uid, da = x.p:match("^A (%S+) (%S+) (%S+)")
-            if id then channel:send("R " .. id .. " " .. uid .. " " .. da) end
+            local id, uid, da, s = x.p:match("^A (%S+) (%S+) (%S+) %S+ %S+ %S+ (%d+)")
+            if id then channel:send("R " .. id .. " " .. uid .. " " .. da .. " " .. s) end
         else
             local dup = false
             for _, y in ipairs(later) do if y.p == x.p then dup = true end end
@@ -1126,6 +1195,7 @@ function loot.tick(dt)
         util.ensure_hook(JIG_COMP .. ":HandleSameContainerMoveToIndex", move_fn)
         util.ensure_hook(JIG_COMP .. ":SERVER_RequestStackItem", stack_fn)
         util.ensure_hook(JIG_COMP .. ":SERVER_RequestSplitItem", split_fn)
+        util.ensure_hook(JIG_COMP .. ":JigTryAddItemSomewhere", made_fn)
         uiremove.ensure_hook()
         util.ensure_hook(JIG_COMP .. ":HandleLocalRequestConsumeItem", consume_req_fn)
         for _, c in ipairs(MAIN) do
@@ -1148,6 +1218,7 @@ function loot.tick(dt)
     util.safe(flush_stacks, "loot.stacks")
     util.safe(flush_eaten, "loot.consumed")
     util.safe(flush_moves, "loot.moves")
+    util.safe(flush_made, "loot.made")
     util.safe(flush_adds, "loot.adds")
     if role == "host" then
         crumb.at("loot: push")
@@ -1195,10 +1266,13 @@ function loot.tick(dt)
         elseif k == "C " then take_contents(p)
         elseif k == "R " then
             if role ~= "host" and shared() then
-                local id, uid, da = p:match("^R (%S+) (%S+) (%S+)$")
+                local id, uid, da, s = p:match("^R (%S+) (%S+) (%S+) ?(%d*)$")
                 if id then
                     held[id] = held[id] or {}
                     held[id][uid] = true
+                    -- the host never acks a refused action: was it my last one here, it no longer waits for one (the
+                    -- host's lists stayed un-taken-over until some other action of mine there was acked)
+                    if tonumber(s) and (pending[id] or 0) <= tonumber(s) then pending[id] = nil end
                     stats.rejected = (stats.rejected or 0) + 1
                     local name = (da:match("([%w_]+)$") or da):gsub("^DA_", "")
                     log.warn("loot: the host had no room for your " .. name .. " in " .. id .. " - it is only in your copy")

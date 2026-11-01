@@ -57,12 +57,13 @@ local pending = {}      -- { p = message, n = tries }
 -- quest marker tag -> the copy made here (BP_QuestMarker isn't saved with the world: a copy ends with the session,
 -- and the scanner's game spawns its icon again when the quest loads)
 local theirs_q = {}
-local theirs_c = {}     -- addr -> true: crate copies made here (searching one of them is nothing to send)
+local theirs_c = {}     -- crate copies made here, util.mark (searching one of them is nothing to send)
 -- my bounty icons and crates still active, by quest tag: sent again when a guest arrives (a bounty bought before the
 -- guest joined only went out at my world's load, to nobody - kit 2026-10-27: the host's 004 missing on the guest)
 local mine_q, mine_c = {}, {}
 local hook_in, retry_in = 0.0, 0.0
 local stats = { sent = 0, removed = 0, made = 0, unmade = 0, scans = 0, crates = 0 }
+local gone = {}         -- places of the pings destroyed since the last tick (their stray compass icons go too)
 
 local function shared() return role == "host" or (session and session.in_world()) end
 local function share_mine() return shared() and mysettings.on("pings") end
@@ -103,6 +104,7 @@ end
 local function on_destroyed(m)
     local a, l = util.addr(m), loc_of(m)
     if a and l then dying = { a = a, l = l } end
+    if l then gone[#gone + 1] = l end
 end
 
 local function on_remove(actor)
@@ -177,7 +179,7 @@ end
 local function on_crate_open(c)
     if busy.on or not share_mine() then return end
     local l, cls = loc_of(c), util.class_name(c)
-    if l and cls and theirs_c[util.addr(c) or 0] == nil then
+    if l and cls and not util.marked(theirs_c, c) then
         channel:send(string.format("O %s %.1f %.1f %.1f", cls, l.X, l.Y, l.Z))
     end
 end
@@ -206,6 +208,46 @@ local function walk()
     local all
     pcall(function() all = FindAllOf("BP_PlayerMarker_C") end)
     for _, m in ipairs(all or {}) do if util.valid(m) then remember(m) end end
+end
+
+-- A respawn (SD_GameInstance Survival_Respawn / Survival_SuicideRespawn) runs RespawnMarker on every ping, which spawns
+-- a new BP_CompassMarker over the one the ping holds in CompassMarker and never destroys the old one (decompiled
+-- BP_PlayerMarker). A removed ping destroys only the one it holds (ReceiveDestroyed), and the compass draws an icon
+-- for every BP_CompassMarker (Compass NavPoints), so after a death a removed ping stayed on the compass for good (user
+-- 2026-10-31: "other players marks are stuck on a compass after deleting the marks" - the host died at 21:22,
+-- K3YBOARD32's 15 removals came at 21:23). After a ping goes, the compass markers at its place that no ping or quest
+-- marker holds go too.
+local HOLDERS = { "BP_PlayerMarker_C", "BP_QuestMarker_C" }
+local function sweep_compass()
+    local places = gone
+    gone = {}
+    local list, strays = nil, {}
+    pcall(function() list = FindAllOf("BP_CompassMarker_C") end)
+    for _, c in ipairs(list or {}) do
+        local l = util.valid(c) and loc_of(c)
+        if l then
+            for _, p in ipairs(places) do
+                if util.dist(l, p) < SAME then strays[#strays + 1] = c; break end
+            end
+        end
+    end
+    if #strays == 0 then return end
+    local held = {}
+    for _, cls in ipairs(HOLDERS) do
+        local all
+        pcall(function() all = FindAllOf(cls) end)
+        for _, o in ipairs(all or {}) do
+            local cm
+            if util.valid(o) then pcall(function() cm = o.CompassMarker end) end
+            local a = cm and util.addr(cm)
+            if a then held[a] = true end
+        end
+    end
+    local n = 0
+    for _, c in ipairs(strays) do
+        if not held[util.addr(c) or 0] and pcall(function() c:K2_DestroyActor() end) then n = n + 1 end
+    end
+    if n > 0 then log.info(string.format("pings: %d compass icon(s) of a removed ping taken away (left over from a respawn)", n)) end
 end
 
 local function make(p)
@@ -264,8 +306,9 @@ local function make_quest_marker(p)
     local l = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
     if not (tag and l.X and l.Y and l.Z) then return true end
     if util.valid(theirs_q[tag]) then return true end
+    -- (never LoadAsset from our Lua - a load there can deadlock on UE4SS's Lua lock, L-014: not loaded yet = tried
+    -- again, RETRY s apart)
     local cls = StaticFindObject(QMARKER)
-    if not util.valid(cls) then pcall(function() LoadAsset(QMARKER) end); cls = StaticFindObject(QMARKER) end
     local cdo, w = StaticFindObject(QMARKER_CDO), game.world()
     if not (util.valid(cls) and util.valid(cdo) and w) then return false end
     local old = {}
@@ -311,8 +354,9 @@ local function make_crate(p)
         local cl = util.valid(c) and loc_of(c)
         if cl and util.dist(cl, l) < SAME then return true end
     end
-    local cls = StaticFindObject(path)
-    if not util.valid(cls) then pcall(function() LoadAsset(path) end); cls = StaticFindObject(path) end
+    -- (only a class already loaded here - the path comes from the other game, and a load from our Lua can deadlock,
+    -- L-014; not loaded yet = tried again)
+    local cls = path:find("^/Game/[%w_/]+%.[%w_]+$") and StaticFindObject(path) or nil
     local w = game.world()
     if not (util.valid(cls) and w) then return false end
     local c
@@ -322,7 +366,7 @@ local function make_crate(p)
     if not (ok and util.valid(c)) then log.warn("pings: couldn't place the other player's laptop crate: " .. tostring(err)); return true end
     -- searched already: its item and the quest's progress are the scanner's
     pcall(function() c.Opened = true end)
-    theirs_c[util.addr(c) or 0] = true
+    util.mark(theirs_c, c)
     stats.crates = stats.crates + 1
     log.info(string.format("pings: the other player's laptop crate at %.0f %.0f", l.X, l.Y))
     return true
@@ -377,6 +421,7 @@ function pings.tick(dt)
         util.ensure_hook(SPAWNER, spawner_fn)
         util.ensure_hook(CRATE_OPEN, crate_open_fn)
     end
+    if #gone > 0 then util.safe(sweep_compass, "pings.compass") end
     channel:pump(function(p)
         if not shared() then return end
         -- false = no map component / world yet (respawning, loading): try again; an error is logged and dropped

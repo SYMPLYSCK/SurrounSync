@@ -122,7 +122,8 @@ local function send(snd, l, vol, pitch, copy)
     if now - sec_at >= 1 then sec_at, sent_this_s = now, 0 end
     if sent_this_s >= MAX_PER_S then return end
     sent_this_s = sent_this_s + 1
-    channel:send(string.format("%s %.0f %.0f %.0f %.2f %.2f%s", snd, l.X, l.Y, l.Z, vol or 1, pitch or 1, copy and (" " .. copy) or ""))
+    channel:send(string.format("%s %.0f %.0f %.0f %.2f %.2f %d%s", snd, l.X, l.Y, l.Z, vol or 1, pitch or 1,
+        math.floor(now * 1000), copy and (" " .. copy) or ""))
     stats.sent = stats.sent + 1
 end
 
@@ -207,9 +208,34 @@ local function sound(path)
     return nil
 end
 
-local function play(payload)
-    local path, x, y, z, vol, pitch, copy = payload:match("^(%S+) (%S+) (%S+) (%S+) (%S+) (%S+) ?(%d*)$")
-    if not path then return end
+-- Late replays: a growl or a tool sound heard seconds after it happened (after a link stall, the whole backlog at once)
+-- sounds broken (user 2026-10-31: the other player's game sounds were glitchy, 229 ms over Steam). The channel's own
+-- age check works in whole seconds plus 2 s of clock slack on Steam, so it let sounds through ~5 s late. Each sound
+-- carries the sender's clock (ms); its delay here minus the smallest delay seen lately is how late it is - the
+-- clocks' different starts cancel out, no clock sync needed.
+local LATE_S = 0.5
+local RESET_S = 30          -- that much later than ever: the other game restarted (its clock began again)
+local WINDOW_S = 10         -- the smallest delay is taken over the last one to two windows
+local base = { cur = nil, prev = nil, at = -100 }
+local function lateness(d, now)
+    if now - base.at >= WINDOW_S then base.prev, base.cur, base.at = base.cur, nil, now end
+    if not base.cur or d < base.cur then base.cur = d end
+    local b = base.cur
+    if base.prev and base.prev < b then b = base.prev end
+    return d - b
+end
+function audio.late_reset() base.cur, base.prev, base.at = nil, nil, -100 end
+
+local function parse(payload)
+    local path, x, y, z, vol, pitch, rest = payload:match("^(%S+) (%S+) (%S+) (%S+) (%S+) (%S+) ?(.*)$")
+    if not path then return nil end
+    local t, copy = rest:match("^(%d+) ?(%d*)$")
+    if not t then return nil end
+    return { path = path, x = x, y = y, z = z, vol = vol, pitch = pitch, t = tonumber(t), copy = copy }
+end
+
+local function play(m)
+    local path, x, y, z, vol, pitch, copy = m.path, m.x, m.y, m.z, m.vol, m.pitch, m.copy
     local s = sound(path)
     if not s then return end
     local l = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
@@ -238,7 +264,24 @@ function audio.tick(dt)
     end
     queue = keep
     local hear = require("mirror.mysettings").on("sounds")
-    channel:pump(function(p) if hear and shared() then util.safe(play, "audio.play", p) end end)
+    -- the whole batch first: its newest sound sets the smallest delay before any of the batch is judged
+    local got = {}
+    channel:pump(function(p) got[#got + 1] = p end)
+    if #got == 0 then return end
+    local ms, msgs = now * 1000, {}
+    for _, p in ipairs(got) do
+        local m = parse(p)
+        if m then
+            m.d = ms - m.t
+            if base.cur and m.d - math.min(base.cur, base.prev or base.cur) > RESET_S * 1000 then audio.late_reset() end
+            msgs[#msgs + 1] = m
+        else drop("format") end
+    end
+    for _, m in ipairs(msgs) do lateness(m.d, now) end
+    for _, m in ipairs(msgs) do
+        if lateness(m.d, now) > LATE_S * 1000 then drop("late")
+        elseif hear and shared() then util.safe(play, "audio.play", m) end
+    end
 end
 
 function audio.status()
@@ -249,7 +292,10 @@ end
 
 function audio.init(c, r, s, z, f)
     cfg, role, session, zombies, fire = c, r, s, z, f
-    game.on_world_reset(function() paths, paths_n, att_of, att_obj, recent, queue, cache = {}, 0, {}, {}, {}, {}, {} end)
+    game.on_world_reset(function()
+        paths, paths_n, att_of, att_obj, recent, queue, cache = {}, 0, {}, {}, {}, {}, {}
+        audio.late_reset()
+    end)
     if cfg.audio_sync == false then role = "off" end
     log.info("audio: " .. (role == "off" and "off" or "AI and tool sounds are shared"))
 end

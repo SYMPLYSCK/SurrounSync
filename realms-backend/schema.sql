@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS realms (
     lease_steam   TEXT,
     lease_name    TEXT,
     lease_token   TEXT,
-    lease_expires INTEGER
+    lease_expires INTEGER,
+    rules         TEXT                        -- the owner's game rules, "<key> <value> ..." (NULL = not set yet)
 );
 
 CREATE TABLE IF NOT EXISTS members (
@@ -53,6 +54,15 @@ CREATE TABLE IF NOT EXISTS generations (
     member_id  TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (realm_id, gen)
+);
+
+-- The message of the day for every player (one row; tools/motd.ps1 sets it).
+CREATE TABLE IF NOT EXISTS motd (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    msg_id     TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER
 );
 
 -- Fixed-window rate limits: bucket = "<action>:<ip>:<window start>".

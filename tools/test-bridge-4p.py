@@ -30,13 +30,59 @@ def check(cond, what):
         fails.append(what)
 
 
-def start(role, d, test_id=None):
-    args = [EXE, "--role", role, "--dir", d, "--test-net", str(PORT), "--no-game-check"]
+def start(role, d, test_id=None, env=None, port=None):
+    args = [EXE, "--role", role, "--dir", d, "--test-net", str(port or PORT), "--no-game-check"]
     if role == "guest":
         args += ["--peer", "1001"]
     if test_id:
         args += ["--test-id", str(test_id)]
-    return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+
+def dead_lane_relay():
+    # T10 audit 2026-10-31: the host's reliable lane to both guests dies for good (DBG-20261030-005). Guest -> guest
+    # traffic goes through the host, which passed it on reliable - on the dead lane - so it never arrived.
+    print("guest -> guest through a host whose reliable lane is dead")
+    port = free_port()
+    base = tempfile.mkdtemp(prefix="mirror_bridge_dead_")
+    H, B, C = (os.path.join(base, n) for n in ("host", "g1002", "g1003"))
+    for d in (H, B, C):
+        os.makedirs(d)
+    fast = dict(os.environ, SURROUNSYNC_TEST_STALL_MS="4000")
+    procs = []
+    try:
+        procs.append(start("host", H, env=dict(fast, SURROUNSYNC_TEST_DEAD_RELIABLE="2"), port=port))
+        time.sleep(0.5)
+        procs.append(start("guest", B, 1002, env=fast, port=port))
+        time.sleep(1.0)
+        procs.append(start("guest", C, 1003, env=fast, port=port))
+        both = tb.wait_for(lambda: tb.log_of(H, "mirror_bridge_host.log").count("still stopped arriving after") >= 2, 90)
+        check(both, "(setup) the host switched both guests to the unreliable lane")
+        def mates(d, want):
+            r = roster(d)
+            return r and want <= set(r["peers"].keys())
+        check(tb.wait_for(lambda: mates(B, {"1001", "1003"}) and mates(C, {"1001", "1002"}), 30), "(setup) each guest knows the other")
+        tb.put_blob(B, "look", "to2", "1 to 2 over a dead lane")
+        check(tb.wait_for(lambda: tb.get_blob(C, "look", "from1"), 30) == "1 to 2 over a dead lane",
+              "guest 1 -> guest 2 arrives through the host")
+        tb.put_blob(C, "life", "to1", "2 to 1 over a dead lane")
+        check(tb.wait_for(lambda: tb.get_blob(B, "life", "from2"), 30) == "2 to 1 over a dead lane",
+              "guest 2 -> guest 1 arrives through the host")
+        big = "".join(random.choice("abcdefgh \n") for _ in range(30000))
+        tb.put_blob(B, "doors", "to2", big)
+        check(tb.wait_for(lambda: tb.get_blob(C, "doors", "from1"), 30) == big, "a 30 KB blob arrives through the host too")
+    finally:
+        for p in procs:
+            try:
+                p.kill(); p.wait()
+            except OSError:
+                pass   # (it had exited already)
+        if fails:
+            for d in (H, B, C):
+                for name in os.listdir(d):
+                    if name.startswith("mirror_bridge_") and name.endswith(".log"):
+                        print("--- %s/%s\n%s" % (os.path.basename(d), name, tb.log_of(d, name).strip()[-2000:]))
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def roster(d):
@@ -173,6 +219,7 @@ def main():
                     if name.startswith("mirror_bridge_") and name.endswith(".log"):
                         print("--- %s/%s\n%s" % (os.path.basename(d), name, tb.log_of(d, name).strip()[-3000:]))
         shutil.rmtree(base, ignore_errors=True)
+    dead_lane_relay()
     print("\n%s" % ("ALL PASSED" if not fails else "%d FAILED" % len(fails)))
     return 1 if fails else 0
 

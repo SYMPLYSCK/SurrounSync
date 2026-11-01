@@ -57,7 +57,7 @@ local BEACON = "/Game/Blueprints/HordeSystem/Beacon/Buildable_HordeBeacon.Builda
 
 local function alive(a)
     if not util.valid(a) then return false end
-    if ended[util.addr(a) or 0] then return false end
+    if util.marked(ended, a) then return false end
     local ksl = util.cdo(KSL)
     if not ksl then return true end
     local ok, r = pcall(function() return ksl:IsValid(a) end)
@@ -121,7 +121,7 @@ local contents_of = jig.contents_of
 -- out of the inventory. A pickup message carries the picker's slot (a relayed one would look like the host's).
 local mine, mine_w = {}, {}       -- drop uid / world items -> { item = inventory uid, da = asset, at = now }
 local RACE_S = 15
-local lost_race
+local lost_race, caught_pickup
 local function drop_da(uid)
     local c = copies[uid]
     if c and c.da then return c.da end
@@ -169,7 +169,10 @@ end
 
 local function shared() return role == "host" or (session and session.in_world()) end
 local function traded() if session and session.checkpoint and shared() then session.checkpoint("drops") end end
-channel.send = function(self, p) if p:find("^[DT] ") then traded() end return events.send(self, p) end
+-- (on top of the relay send above: replacing it left a 3-4 player host's pickup unsent to the other guests, whose
+-- copy of the item stayed for them to pick up again - T10 audit 2026-10-31)
+local relay_send = channel.send
+channel.send = function(self, p) if p:find("^[DT] ") then traded() end return relay_send(self, p) end
 
 -- " <name>" when the item has a custom name (names.lua), else ""
 local function name_field(uid)
@@ -390,8 +393,12 @@ end
 
 -- An attachment put on (or taken off) a weapon lying on the ground is a comp-to-comp move into (out of) the
 -- pickup's own Jig component: nothing is dropped or picked up, so the other game's copy kept the old parts.
--- After such a move the dropped item's whole contents go over again ("C <uid> <list>").
+-- After such a move the dropped item's whole contents go over again ("C <uid> <base> <list>").
+-- Both players changing parts at once each sent a whole list, and each list put back the part the other had just
+-- taken off: a duplicate (T10 item-sync audit 2026-10-31). A list now carries the one both games last agreed on
+-- (sent_list: "-" empty, "*" unknown), and the other game applies only what changed from it on top of its own parts.
 resend, sent_list = {}, {}
+local function wire(line) if line == nil then return "*" end return line == "" and "-" or line end
 local applying = false
 local function on_comp_move(From, To)
     if applying or not shared() then return end
@@ -412,8 +419,9 @@ local function send_contents()
                 local inside = contents_of(comp)
                 local line = jig.encode(inside)
                 if line ~= sent_list[uid] then
+                    local base = sent_list[uid]
                     sent_list[uid] = line
-                    channel:send("C " .. uid .. " " .. line)
+                    channel:send("C " .. uid .. " " .. wire(base) .. " " .. wire(line))
                     log.info(string.format("drops: a dropped item's parts changed here - now [%s], sent", describe(inside)))
                 end
             end
@@ -434,32 +442,92 @@ local function poll_parts(uid, a, pl)
     if sent_list[uid] == nil then sent_list[uid] = line
     elseif line ~= sent_list[uid] and not resend[uid] then resend[uid] = now end
 end
+-- An item's place in a parts list: its holder's place, its kind and slot, and which one of those it is there.
+local function places(list)
+    local key, at, n = {}, {}, {}
+    for i, h in ipairs(list) do
+        local k = (h.parent and key[h.parent] or "") .. "/" .. tostring(h.da) .. "#" .. tostring(h.slot)
+        n[k] = (n[k] or 0) + 1
+        k = k .. "~" .. n[k]
+        key[i], at[k] = k, h
+    end
+    return key, at
+end
+local function part(h, parent)
+    return { da = h.da, count = h.count, dx = h.dx, dy = h.dy, slot = h.slot, cell = h.cell, rot = h.rot,
+             name = h.name, parent = parent }
+end
+local function moved_num(a, b) return math.abs((a or 0) - (b or 0)) > 0.001 end
+-- mine, with what changed from base to theirs: their removals, additions and count/durability changes
+local function merged_parts(base, theirs, mine)
+    local _, was = places(base)
+    local tkey, now_ = places(theirs)
+    local mkey = places(mine)
+    local out, idx, out_at = {}, {}, {}
+    for i, h in ipairs(mine) do
+        local k = mkey[i]
+        local holder = h.parent and idx[h.parent]
+        if (not h.parent or holder) and not (was[k] and not now_[k]) then
+            local w = part(h, holder)
+            local b, t = was[k], now_[k]
+            if b and t then
+                w.count = (w.count or 1) + (t.count or 1) - (b.count or 1)
+                if moved_num(t.dx, b.dx) or moved_num(t.dy, b.dy) then w.dx, w.dy = t.dx, t.dy end
+            end
+            if w.count > 0 then out[#out + 1] = w; idx[i] = #out; out_at[k] = #out end
+        end
+    end
+    for i, h in ipairs(theirs) do
+        local k = tkey[i]
+        local holder = h.parent and out_at[tkey[h.parent] or ""]
+        if not was[k] and not out_at[k] and (not h.parent or holder) then
+            out[#out + 1] = part(h, holder)
+            out_at[k] = #out
+        end
+    end
+    return out
+end
+local function same_parts(a, b)
+    if #a ~= #b then return false end
+    local _, at = places(b)
+    for k, h in pairs(select(2, places(a))) do
+        local o = at[k]
+        if not o or (o.count or 1) ~= (h.count or 1) or moved_num(o.dx, h.dx) or moved_num(o.dy, h.dy) then return false end
+    end
+    return true
+end
 local function take_changed(payload)
-    local uid, line = payload:match("^C (%S+) ?(.*)$")
+    local uid, base, line = payload:match("^C (%S+) (%S+) (%S+)$")
     if not uid then return end
-    local list = jig.decode(line)
-    contents[uid], sent_list[uid] = list, nil
+    local function list_of(s) return jig.decode(s == "-" and "" or s) end
+    local theirs = list_of(line)
     local a = finished[uid] or tracked[uid]
     local comp = alive(a) and jig_of(a)
-    if not comp then return end
+    if not comp then contents[uid], sent_list[uid] = theirs, nil; return end
+    local list, here = theirs, jig.encode(contents_of(comp))
+    -- a change of mine not sent yet (the 0.5 s check hasn't seen it): theirs lacks it for good
+    local unsent = sent_list[uid] ~= nil and here ~= sent_list[uid]
+    if base ~= "*" then list = merged_parts(list_of(base), theirs, jig.decode(here)) end
+    contents[uid] = list
     applying = true
     local ok, placed, missing = pcall(apply_contents, uid, comp, list, "changed parts")
     applying = false
     if ok then note_unfilled(uid, a, placed, missing) end
+    -- that change goes over on top of their list. One already sent isn't sent again: they merge it from my own
+    -- list, and both games answering a same-moment change applied each count change twice (Sentinel R5: a 30 -> 12
+    -- mag beside a scope taken off there lost the mag on both sides).
+    if unsent and base ~= "*" and not same_parts(list, theirs) then
+        channel:send("C " .. uid .. " " .. line .. " " .. wire(jig.encode(list)))
+        log.info(string.format("drops: parts changed on both sides at once - now [%s], sent", describe(list)))
+    end
 end
 
+local SAME_CM = 15
 local function remove_world(payload)
     if not shared() then return end
     local cls, x, y, z, da, from = payload:match("^W (%S+) (%S+) (%S+) (%S+) (%S+) ?(%d*)$")
     if not cls then return end
     local at = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
-    for i, m in ipairs(mine_w) do
-        if m.da == da and now - m.at <= RACE_S and util.dist(m.loc, at) < 60 then
-            table.remove(mine_w, i)
-            if lost_race then lost_race(m, tonumber(from)) end
-            break
-        end
-    end
     local best, best_d = nil, 60
     local function pick(list)
         for _, o in ipairs(list) do
@@ -476,9 +544,27 @@ local function remove_world(payload)
     local list, age = util.all_of(cls, 2.0)
     pick(list)
     if not best and age > 0 then pick(util.all_of(cls, 0)) end
+    -- the same item I picked up (a race) only when my pickup lay within SAME_CM of theirs, or nothing of the kind still
+    -- lies here: in a pile, their pickup of the can next to mine took my can back out of my bag and removed theirs here
+    -- too, and a real race removed the neighbour - an item lost each time (T10 audit 2026-10-31). Both games decide
+    -- from what both know (the two pickups' distance is the same number on each side; a pile's leftovers lie in
+    -- both), never from which lying item is nearest here: with cans closer together than the two worlds' drift, that
+    -- split - one game a race, the other a neighbour - and made a can more than there was (Sentinel R4). Either
+    -- answer, taken on both sides, keeps the count.
+    local race_i, race_d
+    for i, m in ipairs(mine_w) do
+        local d = m.da == da and now - m.at <= RACE_S and util.dist(m.loc, at)
+        if d and d < 60 and (not race_d or d < race_d) then race_i, race_d = i, d end
+    end
+    if race_i and (not best or race_d < SAME_CM) then
+        local m = table.remove(mine_w, race_i)
+        if lost_race then lost_race(m, tonumber(from)) end
+        log.info("drops: the other player picked up the " .. (da:match("[^%.]+$") or da) .. " I picked up at the same moment")
+        return
+    end
     if best then
         pcall(function() best:K2_DestroyActor() end)
-        ended[util.addr(best) or 0] = true
+        util.mark(ended, best)
         world_stats.removed = world_stats.removed + 1
         log.info(string.format("drops: the other player picked up %s - removed here (%.0f cm off)",
             da:match("[^%.]+$") or da, best_d))
@@ -496,12 +582,66 @@ local function remove(payload)
         if now - m.at <= RACE_S and lost_race then lost_race(m, tonumber(from)) end
     end
     local a = uid and tracked[uid]
+    if a and not m and caught_pickup then caught_pickup(uid, a, tonumber(from)) end
     if a and on_ground(a) then
         pcall(function() a:K2_DestroyActor() end)
         stats.removed = stats.removed + 1
         log.info("drops: the other player picked up a dropped item - removed here")
     end
     if uid then forget(uid) end
+end
+
+-- A join or rejoin (T10 audit 2026-10-31): the join save holds the dropped items as plain saved pickups, and a guest
+-- at home forgets which of its pickups were drops. Its pickup of one then went out as a world item the host skipped
+-- (its copy is tracked), the host's by a uid the guest didn't know: both kept the item. The host sends its tracked
+-- drops as the join save starts (drops.join_started); the guest pairs each with the saved pickup lying there.
+local PAIR_CM = 60
+local to_pair = {}
+local function pair_all()
+    local q = to_pair
+    to_pair = {}
+    if not shared() then return end
+    local by_cls, want = {}, 0
+    for _, p in ipairs(q) do
+        local uid, cls, x, y, z, da = p:match("^P (%S+) (%S+) (%S+) (%S+) (%S+) (%S+)$")
+        if uid and not (tracked[uid] and alive(tracked[uid])) then
+            by_cls[cls] = by_cls[cls] or {}
+            table.insert(by_cls[cls], { uid = uid, da = da, at = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) } })
+            want = want + 1
+        end
+    end
+    if want == 0 then return end
+    local taken = {}
+    for _, a in pairs(tracked) do local k = util.addr(a); if k then taken[k] = true end end
+    -- every pickup near a wanted spot, nearest first: a pile of the same item pairs one to one
+    local cands = {}
+    for cls, list in pairs(by_cls) do
+        for _, o in ipairs(util.all_of(cls, 0)) do
+            local l
+            pcall(function() l = util.vec(o:K2_GetActorLocation()) end)
+            if l then
+                local da
+                for _, w in ipairs(list) do
+                    local d = util.dist(l, w.at)
+                    if d < PAIR_CM then
+                        da = da or item_of(o) or false
+                        if da == w.da then cands[#cands + 1] = { w = w, o = o, d = d } end
+                    end
+                end
+            end
+        end
+    end
+    table.sort(cands, function(a, b) return a.d < b.d end)
+    local n = 0
+    for _, c in ipairs(cands) do
+        local k = util.addr(c.o)
+        if not c.w.got and k and not taken[k] and on_ground(c.o) then
+            c.w.got, taken[k] = true, true
+            tracked[c.w.uid], copies[c.w.uid] = c.o, { da = c.w.da }
+            n = n + 1
+        end
+    end
+    log.info(string.format("drops: the host's %d dropped item(s) - %d found here as saved pickups", want, n))
 end
 
 local function finish_copies()
@@ -563,6 +703,25 @@ lost_race = function(m, from)
     else
         log.warn("drops: picked up " .. name .. " at the same moment as another player - couldn't take it back out (" .. tostring(err) .. ")")
     end
+end
+-- A loose mag's pickup here is only seen at the next ground check (0.5 s): the other game's "T" for the same mag in
+-- between found nothing of mine, the copy was forgotten and my check never told it - both kept the mag (T10 audit
+-- 2026-10-31). A mag of its kind that wasn't in the bag while the copy lay near (held) is my pickup: tell it, and the
+-- slot rule settles it on both sides as for any same-moment pickup.
+caught_pickup = function(uid, a, from)
+    local before = held[uid]
+    if not before or on_ground(a) then return end
+    local pc = inventory()
+    if not pc then return end
+    local da = drop_da(uid)
+    local new
+    for _, h in ipairs(contents_of(pc)) do
+        if h.da == da and not before[h.uid] then new = h; break end
+    end
+    if not new then return end
+    channel:send("T " .. uid .. " " .. peers.my_slot())
+    if not from or from >= peers.my_slot() then queue_refill(uid, new.uid, before) end
+    lost_race({ item = new.uid, da = da, at = now }, from)
 end
 local function do_refill(r)
     local pc = inventory()
@@ -718,8 +877,7 @@ local end_play_fn = function(self)
     util.safe(function()
         local owner
         pcall(function() owner = self:get():GetOwner() end)
-        local a = util.addr(owner)
-        if a and tracked_uid(owner) then ended[a] = true end
+        if util.addr(owner) and tracked_uid(owner) then util.mark(ended, owner) end
     end, "drops.end_play")
 end
 local equipped_fn = function(self, ActorRef, ContainerName, ItemUID)
@@ -800,12 +958,34 @@ function drops.tick(dt)
         elseif k == "W" then util.safe(remove_world, "drops.world", payload)
         elseif k == "I" then util.safe(take_content, "drops.content", payload)
         elseif k == "C" then util.safe(take_changed, "drops.changed", payload)
+        elseif k == "P" then to_pair[#to_pair + 1] = payload; return
         else util.safe(remove, "drops.remove", payload) end
         -- host, more than two players: the other guests get it too; a pickup also removes the host's copy,
         -- which the copy of this module of whoever dropped it holds
         if k == "T" then peers.relay("mirror.drops", drops, function(m) m.relay_take(payload) end)
         else peers.relay("mirror.drops", drops, function(m) m.relay_send(payload) end) end
     end)
+    if #to_pair > 0 then util.safe(pair_all, "drops.pair") end
+end
+
+-- host, a join (pair_all): the tracked drops lying here now
+function drops.lines_for_join()
+    local out = {}
+    for uid, a in pairs(tracked) do
+        local w = on_ground(a) and world_info(a)
+        if w then out[#out + 1] = string.format("P %s %s %.1f %.1f %.1f %s", uid, w.cls, w.loc.X, w.loc.Y, w.loc.Z, w.da) end
+    end
+    return out
+end
+
+-- host: a join's save starts now (session.lua, after events.marks: these come after what the save holds)
+function drops.join_started()
+    if role ~= "host" or not (cfg and cfg.mirror_drops) then return end
+    local n = 0
+    peers.each("mirror.drops", function(m)
+        for _, line in ipairs(m.lines_for_join()) do channel:send(line); n = n + 1 end
+    end)
+    if n > 0 then log.info(string.format("drops: told the joining player which %d saved pickup(s) are dropped items", n)) end
 end
 
 function drops.relay_send(p) channel:send(p) end
@@ -831,14 +1011,14 @@ function drops.cleanup_remove(actor)
         forget(uid)
         channel:send("T " .. uid .. " " .. peers.my_slot())
     else
-        ended[util.addr(actor) or 0] = true
+        util.mark(ended, actor)
         if w then channel:send(string.format("W %s %.1f %.1f %.1f %s %d", w.cls, w.loc.X, w.loc.Y, w.loc.Z, w.da, peers.my_slot())) end
     end
     return true
 end
 
 local function forget_world()
-    mine, mine_w = {}, {}
+    mine, mine_w, to_pair = {}, {}, {}
     tracked, finish, finished, ended, filled, picking, begun, rewards, unfilled, refill = {}, {}, {}, {}, {}, nil, {}, {}, {}, {}
     resend, sent_list, held = {}, {}, {}
 end

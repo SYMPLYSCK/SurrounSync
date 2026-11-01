@@ -19,7 +19,8 @@ local realm = {}
 local L = backups.LAYOUT
 realm.WORLD = { "Level.sav", "General.sav", "Difficulties.sav", "Slot.sav", "Thumb.sav" }
 -- the mod's own files that belong to a world, not to a PC (bed names, death bag owners, the host rules)
-realm.SIDECARS = { "mirror_coop_bed_names.txt", "mirror_coop_bags.txt", "mirror_host_settings.txt" }
+realm.SIDECARS = { "mirror_coop_bed_names.txt", "mirror_coop_bags.txt", "mirror_host_settings.txt",
+                   "mirror_coop_door_locks.txt" }
 local MAX_SIDECAR = 256 * 1024
 local MAX_STARTER_FILE = 16 * 1024 * 1024
 local TIMEOUT = { download = 150, upload = 150 }
@@ -51,7 +52,7 @@ end
 
 local seq = (os.time() % 100000) * 1000
 local pending = {}     -- seq -> { verb, cb, t }
-local state = { realms = nil, list = {}, leases = {} }
+local state = { realms = nil, list = {}, leases = {}, rules = {} }
 local read_in = 0.0
 
 -- cb(ok, words, text): words = the answer after "ok"/"fail" split on spaces; text = the same unsplit
@@ -85,7 +86,7 @@ end
 local function read_state()
     local s = fs.read(link.dir() .. "\\mirror_realms.txt")
     if not s or s:sub(-4) ~= "END\n" then return nil end
-    local t = { list = {}, leases = {}, ops = {} }
+    local t = { list = {}, leases = {}, ops = {}, rules = {} }
     for line in s:gmatch("[^\n]+") do
         local k, rest = line:match("^(%a+) (.*)$")
         if k == "realms" then
@@ -105,6 +106,10 @@ local function read_state()
         elseif k == "lease" then
             local id, st = rest:match("^(%S+) (%a+)$")
             if id then t.leases[id] = st end
+        elseif k == "rules" then
+            -- "rules <id> <key> <value> ...": the owner's game rules (hostrules.lua)
+            local id, r = rest:match("^(%S+) (.+)$")
+            if id then t.rules[id] = r end
         elseif k == "op" then
             local n, verb, res, more = rest:match("^(%d+) (%S+) (%a+) ?(.*)$")
             if n then t.ops[tonumber(n)] = { verb = verb, ok = res == "ok", text = more } end
@@ -128,13 +133,14 @@ function realm.tick(dt)
     if read_in > 0 then return end
     read_in = any and 0.25 or 2.0
     local t = read_state()
-    if t then state.realms, state.realms_at, state.list, state.leases = t.realms, t.realms_at, t.list, t.leases end
+    if t then state.realms, state.realms_at, state.list, state.leases, state.rules = t.realms, t.realms_at, t.list, t.leases, t.rules end
     -- answers are handed out after the walk: a handler that sends the next request adds to `pending`, and a
     -- table that grows during pairs() fails ("invalid key to 'next'" in-game: claim_new -> upload)
     local ready = {}
     for n, p in pairs(pending) do
         p.t = p.t + (any and 0.25 or 2.0)
         local op = t and t.ops[n]
+        if op and op.verb ~= p.verb then op = nil end   -- (an answer to another request under this number: not ours)
         if op then ready[#ready + 1] = { n, p, op.ok, op.text }
         elseif p.t > p.limit then ready[#ready + 1] = { n, p, false, "timeout no answer from the Steam connection" } end
     end
@@ -149,6 +155,8 @@ function realm.service_at() return state.realms_at end
 function realm.list() return state.list end
 function realm.find(id) for _, r in ipairs(state.list) do if r.id == id then return r end end return nil end
 function realm.lease(id) return state.leases[id] end
+-- the owner's game rules as the server has them ("pvp off players 4 ..."; nil = not set yet or an older bridge)
+function realm.rules(id) return state.rules[id] end
 function realm.busy() return next(pending) ~= nil end
 
 -- ---- the local copy of the newest world ----
@@ -268,10 +276,23 @@ function realm.world(id)
     return { files = world, side = side, gen = realm.head(id) }
 end
 
+-- A world whose Level.sav is a fraction of the one it came from isn't the Realm any more: a load into the Shooting
+-- Range saved its 2 KB Level over a 452 KB base and every member lost the base (DBG-20261031-003). Played worlds grow;
+-- a small base (a new world) isn't judged. Returns why, or nil when the world may go up.
+realm.SHRINK_BASE, realm.SHRINK_KEEP = 64 * 1024, 0.25
+function realm.level_shrunk(id, world)
+    local base = realm.world(id)
+    local b, n = base and #base.files["Level.sav"], world and world["Level.sav"] and #world["Level.sav"]
+    if not (b and n) or b < realm.SHRINK_BASE or n >= b * realm.SHRINK_KEEP then return nil end
+    return string.format("its map is %d bytes, the Realm's was %d", n, b)
+end
+
 -- world files + sidecars into the bridge's upload folder (only these: the bridge sends whatever is there)
 function realm.stage_upload(id, world, side)
     local ok, why = slotguard.check_world(world)
     if not ok then return nil, why end
+    local shrunk = realm.level_shrunk(id, world)
+    if shrunk then return nil, "not the Realm's world (" .. shrunk .. ")" end
     local dir = sub(id, "up")
     if not ensure(dir) then return nil, "can't make " .. dir end
     for _, n in ipairs(bundle_names()) do os.remove(dir .. "\\" .. n) end

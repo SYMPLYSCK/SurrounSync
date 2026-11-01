@@ -75,6 +75,7 @@ local function heading()
 end
 
 local function duration(c)
+    if c.secs then return c.secs end
     if c.sticky then return STICKY_MAX end
     return math.min(LONGEST, KINDS[c.kind].secs + math.max(0, #c.text - 60) * PER_CHAR)
 end
@@ -111,12 +112,15 @@ end
 
 -- text: the message. kind: "info" (default), "good", "warn", "bad". key: one live card for this key.
 -- always: shown whatever MY SETTINGS' messages setting says (chat lines have their own).
--- opts: { title = heading, progress = 0..1 (a bar), sticky = stays until shown again or cleared }
+-- opts: { title = heading, progress = 0..1 (a bar), sticky = stays until shown again or cleared,
+--         secs = how long it stays (instead of the kind's time), quiet = not logged (a countdown's later seconds:
+--         29 log lines per countdown) }
 function notify.show(text, kind, key, always, opts)
     kind = KINDS[kind] and kind or "info"
     text = tostring(text):gsub("^%l", string.upper)
     opts = opts or {}
-    if kind == "bad" or kind == "warn" then log.warn("notify: " .. text) else log.info("notify: " .. text) end
+    if opts.quiet then
+    elseif kind == "bad" or kind == "warn" then log.warn("notify: " .. text) else log.info("notify: " .. text) end
     local shown = enabled
     if shown and not always then
         local ok, level = pcall(function() return require("mirror.mysettings").value("messages") end)
@@ -131,14 +135,14 @@ function notify.show(text, kind, key, always, opts)
         for _, c in ipairs(cards) do
             if c.key == key then
                 if c.text ~= text or c.kind ~= kind or c.progress ~= opts.progress or c.title ~= title then dirty = true end
-                c.text, c.kind, c.title, c.progress, c.sticky = text, kind, title, opts.progress, opts.sticky
+                c.text, c.kind, c.title, c.progress, c.sticky, c.secs = text, kind, title, opts.progress, opts.sticky, opts.secs
                 c.till = clock + duration(c)
                 return
             end
         end
         for _, c in ipairs(waiting) do
             if c.key == key then
-                c.text, c.kind, c.title, c.progress, c.sticky = text, kind, title, opts.progress, opts.sticky
+                c.text, c.kind, c.title, c.progress, c.sticky, c.secs = text, kind, title, opts.progress, opts.sticky, opts.secs
                 return
             end
         end
@@ -156,7 +160,8 @@ function notify.show(text, kind, key, always, opts)
         if c.text == text and not c.key then c.count = (c.count or 1) + 1; return end
     end
     if not key and recent[text] and clock - recent[text] < REPEAT_S then return end
-    local c = { text = text, kind = kind, key = key, title = title, progress = opts.progress, sticky = opts.sticky }
+    local c = { text = text, kind = kind, key = key, title = title, progress = opts.progress, sticky = opts.sticky,
+                secs = opts.secs }
     if #cards >= MAX_CARDS and kind == "bad" then
         local i = evictable()
         if i then table.remove(cards, i); dirty = true end

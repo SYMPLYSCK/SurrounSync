@@ -5,6 +5,7 @@ local util = require("mirror.util")
 local game = require("mirror.game")
 local events = require("mirror.events")
 local bedtags = require("mirror.bedtags")
+local doorlock = require("mirror.doorlock")
 
 local builds = {}
 
@@ -99,6 +100,7 @@ local function on_spawn_build(self, SpawnTransform)
             if not id then ok, id = pcall(id_of, actor) end
             if ok then
                 channel:send(string.format("M %s %.1f %.1f %.1f %.2f %.2f %.2f", id, l.X, l.Y, l.Z, r.Pitch, r.Yaw, r.Roll))
+                util.safe(function() doorlock.moved(doorlock.loc_of_id(id), { X = l.X, Y = l.Y, Z = l.Z }) end, "builds.doorlock")
                 stats.moved = stats.moved + 1
                 log.info("builds: moved " .. id .. " - telling the other game")
             end
@@ -114,6 +116,12 @@ local function on_spawn_build(self, SpawnTransform)
     stats.placed = stats.placed + 1
     log.info("builds: placed " .. (da:match("[^%.]+$") or da) .. " - telling the other game")
     util.safe(function() bedtags.placed(da, { X = l.X, Y = l.Y, Z = l.Z }) end, "builds.bedtag")
+    util.safe(function()
+        local cname
+        pcall(function() cname = util.fname(comp.DARef.BuildActorClass) end)
+        local at = { X = l.X, Y = l.Y, Z = l.Z }
+        doorlock.placed(cname or doorlock.class_at(at, da), at)
+    end, "builds.doorlock")
 end
 
 local known_ids = {}
@@ -131,6 +139,7 @@ local function on_gone(self, why)
     if not ok then log.info("builds: one of our builds went (" .. why .. ") - its place unknown, not sent"); return end
     if expect_gone[id] then expect_gone[id] = nil; return end
     pcall(function() bedtags.gone(util.vec(b:K2_GetActorLocation())) end)
+    util.safe(function() doorlock.gone(doorlock.loc_of_id(id)) end, "builds.doorlock")
     channel:send("R " .. id)
     stats.removed = stats.removed + 1
     log.info("builds: " .. id .. " " .. why .. " - telling the other game")
@@ -173,6 +182,7 @@ local function exploded(payload)
     log.info("builds: the other player's land mine " .. id .. " went off - shown here")
 end
 
+local SAME_PIECE, STACKED = 15, 100   -- cm (a piece sent again is within 1 cm; land mines can lie 20 cm apart)
 local function place(payload)
     local da, x, y, z, pi, ya, ro, sx, sy, sz =
         payload:match("^P (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+)$")
@@ -189,9 +199,12 @@ local function place(payload)
     local rot = { Pitch = tonumber(pi), Yaw = tonumber(ya), Roll = tonumber(ro) }
     local cname
     pcall(function() cname = util.fname(cls) end)
-    if cname and find(string.format("%s@%d,%d,%d", cname, grid(loc))) then return end
-    -- (diagnosis for "turrets stacking up", 2026-10-27: is a copy being built on top of one that's already here?)
-    local near = cname and find(string.format("%s@%d,%d,%d", cname, grid(loc)), 300)
+    -- (one of that kind within SAME_PIECE is this one: a place sent again - a join's save already holding it - lands a
+    -- few cm off across a 10 cm grid line, and the exact id alone built it twice)
+    if cname and find(string.format("%s@%d,%d,%d", cname, grid(loc)), SAME_PIECE) then return end
+    -- (diagnosis for "turrets stacking up", 2026-10-27: is a copy being built on top of one that's already here?
+    -- Within 3 m it fired for every fence row - its pieces stand 2-2.6 m apart, live 2026-10-30)
+    local near = cname and find(string.format("%s@%d,%d,%d", cname, grid(loc)), STACKED)
     if near then
         local d
         pcall(function() d = util.dist(util.vec(near:K2_GetActorLocation()), loc) end)
@@ -221,6 +234,9 @@ local function move(payload)
     if not id then return end
     local b = find(id, 100)
     if not b then stats.missing = stats.missing + 1; log.info("builds: " .. id .. " moved - not here"); return end
+    util.safe(function()
+        doorlock.moved(util.vec(b:K2_GetActorLocation()), { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) })
+    end, "builds.doorlock")
     pcall(function()
         b:K2_SetActorLocationAndRotation({ X = tonumber(x), Y = tonumber(y), Z = tonumber(z) },
             { Pitch = tonumber(pi), Yaw = tonumber(ya), Roll = tonumber(ro) }, false, {}, true)
@@ -239,6 +255,7 @@ local function remove(payload)
     local ok_id, our_id = pcall(id_of, b)
     expect_gone[ok_id and our_id or id] = true
     pcall(function() bedtags.gone(util.vec(b:K2_GetActorLocation())) end)
+    util.safe(function() doorlock.gone(util.vec(b:K2_GetActorLocation())) end, "builds.doorlock")
     applying = true
     pcall(function() b:K2_DestroyActor() end)
     applying = false
@@ -254,6 +271,7 @@ local destroy_fn = function(self) util.safe(on_gone, "builds.destroy", self, "de
 local horde_done_fn = function(self) util.safe(on_gone, "builds.horde_done", self, "finished its horde") end
 
 function builds.tick(dt)
+    util.safe(doorlock.tick, "doorlock.tick", dt)   -- (door locks hold with build sharing off too)
     if role == "off" then return end
     util.safe(bedtags.tick, "bedtags.tick", dt)
     if shared() then
@@ -324,6 +342,7 @@ function builds.init(c, r, s)
     cfg, role, session = c, r, s
     if cfg.build_sync == false then role = "off" end
     bedtags.init(s, function(p) channel:send(p) end, shared)
+    doorlock.init(s, function() return require("mirror.localdir").get() .. "\\mirror_coop_lock_id_" .. tostring(r) .. ".txt" end)
     log.info("builds: " .. (role == "off" and "off" or "builds are shared"))
 end
 

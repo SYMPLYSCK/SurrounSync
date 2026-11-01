@@ -109,6 +109,33 @@ function jig.write_stats(info, asset)
     return n
 end
 
+-- An item's stats as fresh tables (game structs are never passed back in).
+local function copy_stats(arr)
+    local out = {}
+    pcall(function()
+        util.each(arr, function(_, e)
+            local s = e:get()
+            out[#out + 1] = { [S_TAG] = { TagName = FName(name_str(s[S_TAG].TagName) or "None") },
+                              [S_PREFIX] = FName(name_str(s[S_PREFIX]) or "None"), [S_MIN] = tonumber(s[S_MIN]) or 0,
+                              [S_MAX] = tonumber(s[S_MAX]) or 0, [S_TXT] = FName(name_str(s[S_TXT]) or "None") }
+        end)
+    end)
+    return out
+end
+jig.copy_stats = copy_stats
+
+-- An item's slot in a window keeps its own copy of the stats (JSI_Slot.ItemStats, set from the info the slot was
+-- made with) and a weapon's damage is read from that copy (BP_FirearmPickup FindStat -> EquippedItem
+-- GetStatByName, 1 when missing). Stats written into the data after the slot was made reach it only through its
+-- UpdateStats. info = the item's info in the container data. Returns true when a slot took them.
+function jig.refresh_slot_stats(comp, uid, info)
+    local st = copy_stats(info and info[STATS])
+    if #st == 0 then return false end
+    local out = {}
+    if not pcall(function() comp:FindItemByUID(jig.guid(uid), out) end) or not util.valid(out.Found) then return false end
+    return (pcall(function() out.Found:UpdateStats(st) end))
+end
+
 -- A game-made item of this asset always has stats (a fixed one or a 100% roll).
 function jig.always_has_stats(asset)
     if not util.valid(asset) then return false end
@@ -165,9 +192,12 @@ function jig.repair_stats(comp)
     for _, h in ipairs(jig.contents_of(comp)) do
         local asset = jig.asset(h.da)
         if asset and jig.always_has_stats(asset) then
-            local n
-            pcall(function() n = jig.write_stats(h.el:get()[INFO], asset) end)
-            if n and n > 0 then fixed = fixed + 1; names[#names + 1] = h.da:match("[%w_]+$") end
+            local n, info
+            pcall(function() info = h.el:get()[INFO]; n = jig.write_stats(info, asset) end)
+            if n and n > 0 then
+                fixed = fixed + 1; names[#names + 1] = h.da:match("[%w_]+$")
+                jig.refresh_slot_stats(comp, h.uid, info)   -- its slot was made without them
+            end
         end
     end
     return fixed, names
@@ -293,17 +323,26 @@ function jig.flush_ui()
         if util.valid(e.comp) then
             for _, h in ipairs(jig.contents_of(e.comp)) do
                 if h.uid == e.uid then
-                    local mother, info
+                    local mother, info, data
                     pcall(function()
                         local it = h.el:get()
                         local m = it[MOTHER]
                         mother = { A = m.A, B = m.B, C = m.C, D = m.D }
+                        data = it[INFO]
                         local v = e.asset.SlotDimensions
                         info = { [ITEM_ID] = e.asset, [COUNT] = h.count, [DURABILITY] = { X = h.dx, Y = h.dy },
                                  [ITEM_VEC] = { X = v.X, Y = v.Y }, [WEIGHT] = e.asset.Weight or 0, [PRICE] = jig.price_in(e.comp, e.asset),
                                  [PENDING] = -1.0 }
                     end)
+                    -- with its stats: the slot copies them from this info, and a weapon's damage comes from the slot
+                    -- (without them every hit did 1 - reports on 0.14.2)
+                    if info then
+                        local st = copy_stats(data and data[STATS])
+                        if #st > 0 then info[STATS] = st end
+                    end
                     if mother and info and h.cell then show_added(e.comp, h.uid, info, mother, h.cell, h.rot) end
+                    -- a slot made without them on the way (by the add itself, or the plain retry above) gets them now
+                    jig.refresh_slot_stats(e.comp, h.uid, data)
                     break
                 end
             end
@@ -757,6 +796,11 @@ function jig.set_starting(comp, want, index)
 end
 
 function jig.is_empty(comp) return #jig.contents_of(comp) == 0 end
+-- the body's own (top-level) containers: none means nothing can be put in yet
+function jig.container_count(comp)
+    local ok, n = pcall(function() return #containers_of(comp, nil) end)
+    return ok and n or 0
+end
 
 function jig.generate(comp)
     return pcall(function() comp:InitializeJigComponent() end)

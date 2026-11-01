@@ -23,6 +23,9 @@ for _, n in ipairs(NAMES) do PATHS[#PATHS + 1] = DIR .. "DA_LootTable_" .. n .. 
 -- (the folder's walk includes its Test subfolder too)
 PATHS[#PATHS + 1] = DIR .. "Test/DA_LootTable_Test.DA_LootTable_Test"
 
+local WANTED = {}
+for _, p in ipairs(PATHS) do WANTED[p] = true end
+
 local found = {}             -- path -> object
 local pinned = false
 local missing_n = #PATHS
@@ -32,13 +35,16 @@ function loottables.ready()
     if pinned then return true end
     local missing = 0
     for _, p in ipairs(PATHS) do
-        local o = found[p]
-        if not util.valid(o) then
-            o = StaticFindObject(p)
-            if not util.valid(o) then o = nil end
-            found[p] = o
+        if not util.valid(found[p]) then found[p] = nil; missing = missing + 1 end
+    end
+    if missing > 0 then
+        -- One walk of the tables' class (~9 ms, kit 2026-10-31: 46 objects, these and the AI ones) finds every loaded
+        -- one. A StaticFindObject per table cost ~15 ms, found or not: "perf: prefabs took 139 ms" after a join.
+        for _, o in ipairs(FindAllOf("ContainerItems_DataAsset_C") or {}) do
+            local p
+            pcall(function() p = o:GetFullName():match("^%S+ (.+)$") end)
+            if p and WANTED[p] and not found[p] and util.valid(o) then found[p] = o; missing = missing - 1 end
         end
-        if not o then missing = missing + 1 end
     end
     missing_n = missing
     if missing > 0 then return false end
@@ -58,5 +64,6 @@ function loottables.missing() return pinned and 0 or missing_n end
 
 -- a load leaves the pinned ones in the game instance (it outlives worlds); the found objects are re-checked by IsValid
 function loottables._reset() found, pinned, missing_n = {}, false, #PATHS end
+loottables._paths = PATHS
 
 return loottables

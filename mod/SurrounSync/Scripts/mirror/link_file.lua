@@ -34,7 +34,7 @@ end
 local MAX_AGE = 5
 
 function link.send(seq, line)
-    local f = io.open(path(me), "wb")
+    local f = dir and me and io.open(path(me), "wb")
     if not f then return false end
     f:write(string.format("%d %d %s END\n", seq, os.time(), line))
     f:close()
@@ -42,7 +42,7 @@ function link.send(seq, line)
 end
 
 function link.poll()
-    local f = io.open(path(peer), "rb")
+    local f = dir and peer and io.open(path(peer), "rb")
     if not f then return nil end
     local s = f:read("*l")
     f:close()
@@ -57,10 +57,12 @@ function link.poll()
 end
 
 local blob_seen = {}
-local function blob_path(name, who) return dir .. "\\mirror_" .. name .. "_" .. who .. ".txt" end
+-- (nil before the link is opened: session.recover put a blob then and raised 31 times a second, kit 2026-10-29 23:41)
+local function blob_path(name, who) return who and (dir .. "\\mirror_" .. name .. "_" .. who .. ".txt") or nil end
+local function open_blob(name, who, mode) local p = blob_path(name, who); return p and io.open(p, mode) or nil end
 
 function link.put_blob(name, text)
-    local f = io.open(blob_path(name, me), "wb")
+    local f = open_blob(name, me, "wb")
     if not f then return false end
     f:write(text, "\nEND\n")
     f:close()
@@ -88,7 +90,7 @@ local function read_index()
     local t = os.clock()
     if t - index.at < 0.004 then return index.ok end
     index.at = t
-    local f = io.open(blob_path("index", peer), "rb")
+    local f = open_blob("index", peer, "rb")
     if not f then index.ok = false; return false end
     local s = f:read("*a")
     f:close()
@@ -112,7 +114,7 @@ function link.get_blob(name)
         if g == nil or g == index.seen[name] then return nil end
         if SLOW[name] and not due(name) then return nil end
     elseif not due(name) then return nil end
-    local f = io.open(blob_path(name, peer), "rb")
+    local f = open_blob(name, peer, "rb")
     if not f then return nil end
     local s = f:read("*a")
     f:close()

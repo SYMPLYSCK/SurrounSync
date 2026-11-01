@@ -28,6 +28,7 @@ local PLAYER = "/Game/Blueprints/BP_PlayerCharacter.BP_PlayerCharacter_C"
 
 local cfg, role, zombies, session
 local channel = events.reliable("zloot")
+channel.past_cut = function(p) return p:sub(1, 2) == "G " end   -- a give-back: my bag, in no join save
 local first_seen = {}
 local sent = {}
 local dead_seen, dead_sent = {}, {}
@@ -253,14 +254,30 @@ local function guest_check()
             checked[id] = (not c.dead_at and "alive") or (st == "first" and true) or "first"
             local comp = comp_of(c.z)
             if comp then
+                -- (the rolls below run with the hooks off: an item-added event for what the body rolls itself must
+                -- never reach the host as something this player put in)
+                set_applying(true)
                 -- a trader's stock is made on its first init: make it now so applying the host's list doesn't add it twice
                 if c.trader and not c.dead_at then jig.generate(comp) end
-                set_applying(true)
+                -- a human copy's body has no containers until its inventory is made (the host's is made before it's
+                -- read, corpses.host_check): every item failed on all 8 human corpses of 2026-10-30, 0 on 153 zombies.
+                -- Made once; whatever it rolls itself is removed by the host's list.
+                if c.fam == "human" and not c.inv_made then
+                    c.inv_made = true
+                    if jig.container_count(comp) == 0 then jig.generate(comp) end
+                end
                 local ok, set, added, removed, missing = pcall(jig.apply_contents, comp, lists[id].items)
                 set_applying(false)
                 if not ok then error(set) end
                 stats.applied = stats.applied + 1
                 stats.missing = stats.missing + missing
+                if missing > 0 and set + added == 0 then
+                    local names = {}
+                    for _, w in ipairs(lists[id].items) do names[#names + 1] = (w.da or "?"):match("[%w_]+$") or "?" end
+                    local boxes = jig.container_count and jig.container_count(comp) or -1
+                    log.info(string.format("corpses: nothing of zombie %d's loot fit its %s copy (%d container(s)): %s",
+                        id, tostring(c.fam), boxes, table.concat(names, ",")))
+                end
                 log.info(string.format("corpses: zombie %d's corpse holds the host's loot (%d items: %d matched, %d added, %d removed%s)",
                     id, #lists[id].items, set, added, removed,
                     missing > 0 and (", " .. missing .. " couldn't be added (not loaded here / no room)") or ""))
@@ -341,6 +358,10 @@ local function apply_take(id, da, left, took)
         if have < took then
             channel:send(string.format("G %d %s %d", id, da, took - have))
             left = 0
+        else
+            -- what the guest took comes off what is here: down to its "left" kept the host's own take of the same
+            -- moment on the body too (T10 audit 2026-10-31: body 5, host took 1, guest 2 -> 3 left, one copied)
+            left = have - took
         end
     end
     set_applying(true)
@@ -532,7 +553,11 @@ function corpses.tick(dt)
             local id, rest = p:match("^L (%d+) ?(.*)$")
             if id then
                 id = tonumber(id)
-                lists[id], checked[id] = { items = jig.decode(rest), at = zombies.now() }, nil
+                -- (the host sends a body's list again once it died: the same list doesn't set the corpse again - it
+                -- did, 3-4 times per corpse live 2026-10-30)
+                local same = lists[id] and lists[id].raw == rest
+                lists[id] = { items = same and lists[id].items or jig.decode(rest), at = zombies.now(), raw = rest }
+                if not same then checked[id] = nil end
                 replay_own(id)
             end
         elseif k == "T" then

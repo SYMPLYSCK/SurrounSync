@@ -2,6 +2,54 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 1.0.0 (2026-10-31)
+
+**SurrounSync 1.0: door code locks, shared sleep, controller support and a long list of co-op fixes.** Everyone needs 1.0.0: it doesn't play with 0.14.x.
+
+Most of the fixes below are covered by the mod's offline tests, but not all of them have been played in a real game yet. If something here still happens, please send a bug report.
+
+**New**
+- Door code locks: a door you built gets Lock door / Set door code in its menu and the game's keypad opens. Other players need the code to use your doors. Remove access takes everyone's access away at once, so you can change the code. Storage crates lock the same way, and players without access can't move or pick up your buildables near them.
+- Shared sleep: the night is skipped only once every player is asleep. The sleeping screen stays up until then; move to cancel.
+- Controller support (early): pad bindings with a BINDINGS screen, LB/RB switch the hotbar, the D-pad works in the inventory (X quick take, A grab, LB/RB rotate), L3 while aiming zooms, D-pad up/down switch the options of what you look at.
+- Quick chat: in a co-op or Realm session press / to open a chat box in the bottom left.
+- World settings: a joined friend plays by the host's world settings (trader currency cap and the rest) and gets their own back at home.
+- Host rule DEBUG MENU: the host can switch the debug menu off for everyone.
+- Realms: the owner can DELETE a Realm from the list, and a Realm keeps its owner's game rules whoever hosts it.
+- Messages from the developer show in your world and at the main menu.
+- The other player's name tag says why they are quiet (in the game menu, not responding) instead of pop-up cards.
+
+**Now shared between players**
+- Sitting on the floor, standing on top of a car, auto turrets switched on or off, the nuke easter egg, hound barks, and the Humvee2.
+
+**Co-op fixes**
+- When the host's game crashes, a friend sitting in the pause menu is sent home too. Before, they could stay stuck in the host's world.
+- Compass marks of deleted pings no longer stay on the compass.
+- The other player's reload no longer loops forever on shotguns and revolvers.
+- Zombies no longer all come back after a friend takes over as host.
+- Cars can run zombies over again after the other player has driven them.
+- Items made on a decrafting table by a friend no longer vanish.
+- A passenger whose driver gets out stays a passenger.
+- Less lag in the first seconds after joining.
+- Weapons doing 1 damage: items the mod adds now carry their stats.
+- Two players taking from the same stack, pile, crate or magazine at the same moment no longer duplicate or lose items. A refuel or repair just before someone gets in a car is kept.
+- Destroyed camps, picked-up items and laptop crates no longer come back after a while.
+- A friend's game no longer freezes in big zombie fights, and with three players guests take zombie damage again.
+- Zombies go after the other player again after a save.
+- Looting bodies of human enemies and traders works for a friend.
+- Going to the main menu while in a friend's world ends the session properly.
+- Steadier connection: large messages no longer stall the link, and links between three or four players hold up better.
+- Empty co-op save folders no longer show in the load list.
+
+**Realms fixes**
+- A Realm whose host left no longer shows as hosted.
+- A load never lands in the Shooting Range, and opening a Realm on a brand-new game works.
+- When a host leaves with two or more friends in the Realm, only one of them takes it over.
+- LEAVE and DELETE work for a Realm the server no longer lists you in.
+
+**SyncFX**
+- Switching SyncFX off in MY SETTINGS switches ReShade off with it.
+
 ## 0.14.2 (2026-10-29)
 
 **Fewer freezes, Realms that let everyone in, and SyncFX light that stays in its room.** Plays with friends on 0.14.0 and 0.14.1, but get everyone on 0.14.2 for the freeze fixes.

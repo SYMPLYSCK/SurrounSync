@@ -22,6 +22,8 @@ mysettings.LIST = {
     { key = "dmgnumbers", label = "DAMAGE NUMBERS", hint = "The numbers that pop up when you hit something.", default = "on" },
     { key = "perf", label = "GUEST PERFORMANCE", hint = "As a guest: zombies are copied to you within 150 / 100 / 60 m.",
       values = { { "full", "FULL" }, { "balanced", "BALANCED" }, { "low", "LOW" } }, default = "full" },
+    { key = "gamepad", label = "CONTROLLER", hint = "Xbox-style pad. Turn Steam Input off for SurrounDead in Steam.", default = "on",
+      extra = "BINDINGS" },   -- a second button on the row: the pad's bindings screen   -- (Steam Input on turns the pad into keys: doubled hotbar, no aim - kit 2026-10-31)
 }
 -- the zombie copy range each GUEST PERFORMANCE value asks the host for (share of config zombies.radius)
 mysettings.PERF_SHARE = { full = 1.0, balanced = 100 / 150, low = 60 / 150 }
@@ -98,7 +100,7 @@ function mysettings.rows()
     for _, o in ipairs(mysettings.LIST) do
         local text = mine[o.key]
         for _, x in ipairs(o.values) do if x[1] == mine[o.key] then text = x[2] end end
-        out[#out + 1] = { key = o.key, label = o.label, hint = o.hint, text = text }
+        out[#out + 1] = { key = o.key, label = o.label, hint = o.hint, text = text, extra = o.extra }
     end
     return out
 end

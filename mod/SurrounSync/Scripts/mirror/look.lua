@@ -214,53 +214,74 @@ local function add_comp(g, kind)
     return util.valid(c) and c or nil
 end
 
-function look.apply(g, blob)
-    if not (util.valid(g) and blob) then return end
-    clear_gear(g)
-    pcall(function() g.Mesh:SetCastShadow(true) end)
-    missing = {}
-    local parts, gear_n, nodes, root_sock = 0, 0, {}, {}
-    for line in blob:gmatch("[^\n]+") do
-        local f = {}
-        for v in (line .. "\t"):gmatch("([^\t]*)\t") do f[#f + 1] = v end
-        if f[1] == "C" then
-            local c; pcall(function() c = g[f[2]] end)
-            if util.valid(c) then
-                set_mesh(c, f[3], f[4])
-                set_materials(c, f[6])
-                pcall(function() c:SetVisibility(f[5] == "1", false) end)
-                pcall(function() c:SetCastShadow(true) end)
-                parts = parts + 1
-            end
-        elseif f[1] == "A" then
-            local id, parent, kind, socket = tonumber(f[2]), tonumber(f[3]), f[4], f[5]
-            local c = add_comp(g, (f[6] ~= "-") and kind or "N")
-            if c then
-                gear[#gear + 1] = c
-                root_sock[id] = (parent == 0) and socket or root_sock[parent] or ""
-                in_hand[#gear] = root_sock[id]:lower():find("hand", 1, true) ~= nil
-                pcall(function() c:SetCastShadow(true) end)
-                nodes[id] = c
-                local parent_comp = (parent == 0) and g.Mesh or nodes[parent]
-                pcall(function()
-                    c:K2_AttachToComponent(parent_comp, FName(socket), 0, 0, 0, false)
-                end)
-                pcall(function() c:K2_SetRelativeLocationAndRotation(vec(f[8]), rot(f[9]), false, {}, true) end)
-                pcall(function() c:SetRelativeScale3D(vec(f[10])) end)
-                if f[6] ~= "-" then
-                    set_mesh(c, kind, f[6])
-                    set_materials(c, f[7])
-                    pcall(function() c:SetCollisionEnabled(0) end)
-                    if kind == "K" and f[11] == "1" then pcall(function() c:SetLeaderPoseComponent(g.Mesh, false) end) end
-                    gear_n = gear_n + 1
-                end
+local function apply_line(job, line)
+    local g = job.g
+    local f = {}
+    for v in (line .. "\t"):gmatch("([^\t]*)\t") do f[#f + 1] = v end
+    if f[1] == "C" then
+        local c; pcall(function() c = g[f[2]] end)
+        if util.valid(c) then
+            set_mesh(c, f[3], f[4])
+            set_materials(c, f[6])
+            pcall(function() c:SetVisibility(f[5] == "1", false) end)
+            pcall(function() c:SetCastShadow(true) end)
+            job.parts = job.parts + 1
+        end
+    elseif f[1] == "A" then
+        local id, parent, kind, socket = tonumber(f[2]), tonumber(f[3]), f[4], f[5]
+        local c = add_comp(g, (f[6] ~= "-") and kind or "N")
+        if c then
+            local nodes, root_sock = job.nodes, job.root_sock
+            gear[#gear + 1] = c
+            root_sock[id] = (parent == 0) and socket or root_sock[parent] or ""
+            in_hand[#gear] = root_sock[id]:lower():find("hand", 1, true) ~= nil
+            pcall(function() c:SetCastShadow(true) end)
+            nodes[id] = c
+            local parent_comp = (parent == 0) and g.Mesh or nodes[parent]
+            pcall(function()
+                c:K2_AttachToComponent(parent_comp, FName(socket), 0, 0, 0, false)
+            end)
+            pcall(function() c:K2_SetRelativeLocationAndRotation(vec(f[8]), rot(f[9]), false, {}, true) end)
+            pcall(function() c:SetRelativeScale3D(vec(f[10])) end)
+            if f[6] ~= "-" then
+                set_mesh(c, kind, f[6])
+                set_materials(c, f[7])
+                pcall(function() c:SetCollisionEnabled(0) end)
+                if kind == "K" and f[11] == "1" then pcall(function() c:SetLeaderPoseComponent(g.Mesh, false) end) end
+                job.gear_n = job.gear_n + 1
             end
         end
     end
-    log.info(string.format("look: applied %d body parts, %d gear meshes%s", parts, gear_n,
+end
+
+-- budget (seconds, optional): stop after that long and go on at the next call with the same ghost and blob - nil
+-- back while not done. A 46-line look with 17 gear meshes took 153 ms in one frame at a join (live 2026-10-30
+-- 02:34:29). Without a budget all of it now, as before. Done: the number of assets not loaded here yet.
+local job = nil
+function look.apply(g, blob, budget)
+    if not (util.valid(g) and blob) then return end
+    if not (job and job.blob == blob and util.same(job.g, g)) then
+        clear_gear(g)
+        pcall(function() g.Mesh:SetCastShadow(true) end)
+        missing = {}
+        job = { g = g, blob = blob, lines = {}, i = 1, parts = 0, gear_n = 0, nodes = {}, root_sock = {} }
+        for line in blob:gmatch("[^\n]+") do job.lines[#job.lines + 1] = line end
+    end
+    local t = os.clock()
+    while job.i <= #job.lines do
+        -- (past the line first: one that raises isn't run again at every call)
+        local line = job.lines[job.i]
+        job.i = job.i + 1
+        apply_line(job, line)
+        if budget and job.i <= #job.lines and os.clock() - t >= budget then return nil end
+    end
+    local done = job
+    job = nil
+    log.info(string.format("look: applied %d body parts, %d gear meshes%s", done.parts, done.gear_n,
         #missing > 0 and (", NOT loaded here yet (retrying): " .. table.concat(missing, ", ")) or ""))
     return #missing
 end
+function look.applying() return job ~= nil end
 
 function look.gear_summary(blob)
     local out = {}
@@ -272,7 +293,7 @@ function look.gear_summary(blob)
     return table.concat(out, ",")
 end
 
-function look.forget() gear, in_hand = {}, {} end
+function look.forget() gear, in_hand, job = {}, {}, nil end
 
 function look.components() return gear end
 function look.in_hand(i) return in_hand[i] == true end

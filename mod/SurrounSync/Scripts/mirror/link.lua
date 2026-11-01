@@ -45,10 +45,14 @@ local function flush_cmds()
     if #cmd_queue == 0 then return end
     local busy = io.open(cmd_path(), "rb")
     if busy then busy:close(); return end
-    local f = io.open(cmd_path(), "wb")
+    -- written next to it and renamed in: the bridge polls the file, and one read between our create and write found
+    -- it empty and deleted it - the command was lost
+    local tmp = cmd_path() .. ".tmp"
+    local f = io.open(tmp, "wb")
     if not f then return end
-    f:write(table.remove(cmd_queue, 1))
+    f:write(cmd_queue[1])
     f:close()
+    if os.rename(tmp, cmd_path()) then table.remove(cmd_queue, 1) else os.remove(tmp) end
 end
 function link.bridge_cmd(text)
     if kind ~= "steam" or tags then return false end
@@ -253,12 +257,17 @@ function link.start_bridge(role)
     if cfg.steam and cfg.steam.test_port then extra = extra .. " --test-net " .. cfg.steam.test_port end
     local cmd = string.format('start "" /min "%s" --role %s%s%s', exe, role,
         peer ~= "" and (" --peer " .. peer) or "", extra)
+    -- (os.execute waits for cmd's start: a guest's game start had 3.8 s unaccounted for around it, report
+    -- 2026-10-31 00:49 - the time it took goes in the log when it is long)
+    local t0 = os.clock()
     local ok, err = pcall(function() os.execute(cmd) end)
+    local ms = (os.clock() - t0) * 1000
     if not ok then
         log.error("link: couldn't start the bridge (" .. tostring(err) .. ") - start " .. exe .. " --role " .. role .. " yourself")
     else
         log.info("link: started SurrounSyncBridge (" .. role .. ") - Steam P2P; its log: "
-            .. (role == "auto" and "mirror_bridge.log" or ("mirror_bridge_" .. role .. ".log")))
+            .. (role == "auto" and "mirror_bridge.log" or ("mirror_bridge_" .. role .. ".log"))
+            .. (ms >= 250 and string.format(" (starting it took %.0f ms)", ms) or ""))
     end
 end
 
@@ -351,12 +360,19 @@ function link.lobby()
 end
 
 function link.idle_tick(dt) now = now + dt; resend_after_restart(); flush_cmds() end
+-- (queued bridge commands, from where no link tick runs: the main menu)
+function link.flush_cmds() flush_cmds() end
 
+-- (the bridge replaces its status file every few seconds, and a read in that moment finds none: "not running?" in the
+-- log while it ran - live 2026-10-30 02:30:16. Only a status missing for a while is reported.)
+local last_status, status_ok_at = nil, -100
 function link.status()
     local s = kind
     if kind == "steam" and bridge_role then
         local f = io.open(app_dir() .. "\\mirror_bridge_status_" .. out_tag() .. ".txt", "r")
-        if f then s = f:read("*a") or s; f:close() else s = "steam: bridge not reporting (not running?)" end
+        if f then s = f:read("*a") or s; f:close(); last_status, status_ok_at = s, os.clock()
+        elseif last_status and os.clock() - status_ok_at < 10 then s = last_status
+        else s = "steam: bridge not reporting (not running?)" end
     end
     if sim() then
         s = s .. string.format(" + netsim %d+-%d ms, %.0f%% loss", cfg.netsim.latency_ms or 0, cfg.netsim.jitter_ms or 0,

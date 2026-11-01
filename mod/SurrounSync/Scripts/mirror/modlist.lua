@@ -17,6 +17,7 @@ local NOT_MODS = { shared = true, SurrounSync = true, MirrorCoop = true }
 -- Mods SurrounSync switches from its own settings (MY SETTINGS), not from the MODS list: they only change how this
 -- PC's game looks, so they're never matched with the host either.
 modlist.BUILT_IN = { SyncFX = true }
+modlist.FX = "SyncFX"
 local PAKS = { "~mods", "LogicMods" }
 local PAK_PARTS = { ".pak", ".ucas", ".utoc", ".sig" }
 
@@ -32,13 +33,9 @@ local function read(p)
     f:close()
     return s
 end
-local function write(p, s)
-    local f = io.open(p, "wb")
-    if not f then return false end
-    f:write(s)
-    f:close()
-    return true
-end
+-- whole file or the old one: UE4SS starts SurrounSync from mods.txt, and a write in place that failed half-way (a full
+-- disk) left it empty - the next start without SurrounSync, so without its save protection
+local function write(p, s) return require("mirror.fs").write(p, s) == true end
 local function exists(p)
     local f = io.open(p, "rb")
     if f then f:close(); return true end
@@ -222,6 +219,24 @@ function modlist.set(id, on)
     log.info("modlist: " .. e.id .. " -> " .. (on and "on" or "off") .. " (from the next game start)")
     scan()
     return true
+end
+
+-- ReShade's dxgi.dll follows SyncFX from the next game start, through SyncFX's own syncfx/reshade.lua (no requires).
+-- Switched off in MY SETTINGS, SyncFX doesn't run next time to do it itself; switched on, ReShade comes back when
+-- SyncFX's own switch (F8, in its SyncFX.user.ini) is on too. "on" / "off" = moved, nil = nothing to do, false = failed.
+function modlist.follow_reshade(on)
+    local src = read(mods_io() .. modlist.FX .. "\\Scripts\\syncfx\\reshade.lua")
+    if not src then return nil end
+    local ok, done, err = pcall(function()
+        local fn, lerr = load(src, "@SyncFX/reshade.lua")
+        if not fn then error(lerr) end
+        local rs = fn()
+        return rs.follow(on and rs.syncfx_on(mods_io() .. modlist.FX .. "\\"), io_root)
+    end)
+    if not ok then log.warn("modlist: SyncFX's reshade.lua failed: " .. tostring(done)); return false end
+    if done == false then log.warn("modlist: couldn't switch ReShade for the next start: " .. tostring(err)) end
+    if done then log.info("modlist: ReShade " .. done .. " from the next game start (follows SyncFX)") end
+    return done
 end
 
 function modlist.toggle(id)

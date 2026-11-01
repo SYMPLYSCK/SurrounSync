@@ -31,6 +31,31 @@ local function push(line)
     dirty = true
 end
 
+-- My last mirrored montage, watched until it stops playing on me. A looping one (the shotgun's and revolver's ReloadB:
+-- its one section's next section is itself) is ended by the game without MC_StopMontage, so the other game played it
+-- forever (user 2026-10-31: "a never ending reload animation"). Once it stops here a "stop" goes out - for a looping
+-- montage, or one that stopped well before its end (a non-looping one ending on its own ends there too).
+local watch = nil
+local WATCH_START, EARLY = 1.0, 0.3
+
+-- does a section lead back to itself or an earlier one? (unreadable: taken as looping - a stop too many only cuts
+-- the other game's last moment short)
+local function loops(m)
+    local r
+    pcall(function()
+        local names, back = {}, false
+        util.each(m.CompositeSections, function(_, e)
+            local s = e:get()
+            local own, nxt = s.SectionName:ToString(), s.NextSectionName:ToString()
+            names[own] = true
+            if nxt ~= "None" and names[nxt] then back = true end
+        end)
+        r = back
+    end)
+    if r == nil then return true end
+    return r
+end
+
 local function record(kind, montage, rate)
     local m = montage and montage:get()
     local p = util.valid(m) and path_of(m) or nil
@@ -39,6 +64,33 @@ local function record(kind, montage, rate)
         p = "-"
     end
     push(string.format("%s %s %.3f", kind, p, rate or 1.0))
+    if kind == "play" then
+        local len
+        pcall(function() len = m:GetPlayLength() / math.max(rate or 1.0, 0.01) end)
+        watch = { m = m, p = p, at = os.clock(), seen = false, loops = loops(m), len = len }
+    elseif watch and (p == "-" or p == watch.p) then
+        watch = nil
+    end
+end
+
+local function watch_tick()
+    local w = watch
+    if not w then return end
+    local playing
+    if util.valid(w.m) then
+        pcall(function() playing = game.player().Mesh:GetAnimInstance():Montage_IsPlaying(w.m) == true end)
+    else
+        playing = false
+    end
+    if playing == nil then return end   -- (no player or anim instance this frame)
+    local age = os.clock() - w.at
+    if playing then w.seen = true; return end
+    if not w.seen and age <= WATCH_START then return end   -- (not started yet)
+    watch = nil
+    if w.seen and (w.loops or not w.len or age < w.len - EARLY) then   -- (never played here: nothing to end)
+        push(string.format("stop %s 1.000", w.p))
+        log.debug("anim: " .. (w.p:match("[^%.]+$") or w.p) .. " stopped here - stopping it on the other game")
+    end
 end
 
 local function record_use(asset, montage, mesh)
@@ -67,7 +119,8 @@ local function apply_use(g, asset_p, extra)
     end
     local o = op ~= "-" and find_montage(op) or nil
     local ok, err = pcall(function() g:PlayUsingItemMontage(asset, m, o) end)
-    if ok then log.info("anim: ghost uses " .. (asset_p:match("[^%.]+$") or asset_p))
+    -- (every swing, loot and hit is one: debug only, ~1000 lines in 75 min of play, live 2026-10-30)
+    if ok then log.debug("anim: ghost uses " .. (asset_p:match("[^%.]+$") or asset_p))
     else log.warn("anim: PlayUsingItemMontage failed: " .. tostring(err)) end
 end
 
@@ -92,7 +145,7 @@ local function apply(g, kind, p, rate, extra)
     if not m then log.warn("anim: montage not found: " .. p); return end
     if kind == "play" then
         local ok, err = pcall(function() g:PlayAnimMontage(m, rate, FName("None")) end)
-        if ok then log.info("anim: ghost plays " .. p:match("[^%.]+$") .. string.format(" x%.2f", rate))
+        if ok then log.debug("anim: ghost plays " .. p:match("[^%.]+$") .. string.format(" x%.2f", rate))
         else log.warn("anim: PlayAnimMontage failed: " .. tostring(err)) end
     else
         pcall(function() g:StopAnimMontage(m) end)
@@ -100,6 +153,7 @@ local function apply(g, kind, p, rate, extra)
 end
 
 function anim.tick()
+    util.safe(watch_tick, "anim.watch")
     if dirty then
         dirty = false
         link.put_blob("anim", table.concat(recent, "\n"))

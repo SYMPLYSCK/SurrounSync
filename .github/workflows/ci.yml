@@ -39,8 +39,8 @@ jobs:
         shell: pwsh
         run: |
           $failed = @()
-          foreach ($t in 'test-sync', 'test-saves', 'test-journal-ui', 'test-realm-lua', 'test-takeover', 'test-setup', 'test-report',
-                         'test-bridge', 'test-bridge-4p', 'test-link-e2e', 'test-realms') {
+          foreach ($t in 'test-sync', 'test-saves', 'test-journal-ui', 'test-quickchat', 'test-realm-lua', 'test-takeover', 'test-setup', 'test-report',
+                         'test-bridge', 'test-bridge-4p', 'test-link-e2e', 'test-realms', 'test-sessionwatch') {
             Write-Host "== $t"
             python tools/$t.py
             if ($LASTEXITCODE -ne 0) { $failed += $t }

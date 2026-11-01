@@ -35,6 +35,7 @@ def free_port():
 # REALMS_TEST_PORT: a fixed port for the local Realms server (default: any free one)
 PORT_API, PORT_NET = int(os.environ.get("REALMS_TEST_PORT") or free_port()), free_port()
 URL = "http://127.0.0.1:%d" % PORT_API
+MOTD_TOKEN = "test-motd-token-0123456789abcdefghijklmnop"
 failures = []
 
 
@@ -58,14 +59,14 @@ class B:
     """One bridge with its own folder, driven like the mod drives it."""
     seq = 0
 
-    def __init__(self, name, test_id):
-        self.name, self.test_id = name, test_id
+    def __init__(self, name, test_id, extra=None):
+        self.name, self.test_id, self.extra = name, test_id, extra or []
         self.dir = tempfile.mkdtemp(prefix="realms_%s_" % name)
         self.proc = None
 
     def start(self):
         args = [EXE, "--role", "auto", "--dir", self.dir, "--test-net", str(PORT_NET), "--no-game-check",
-                "--test-id", str(self.test_id), "--realms-url", URL]
+                "--test-id", str(self.test_id), "--realms-url", URL, "--motd-every", "1"] + self.extra
         if os.path.exists(os.path.join(self.dir, "mirror_realms.txt")):
             os.remove(os.path.join(self.dir, "mirror_realms.txt"))
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -140,7 +141,7 @@ def start_backend():
     out = open(out_path, "w", encoding="utf-8", errors="replace")
     # (no --ip 127.0.0.1: with it the local server answered every Realm request with "not a Realm code")
     p = subprocess.Popen([npx, "wrangler", "dev", "--local", "--port", str(PORT_API), "--persist-to",
-                          ".wrangler/test-state", "--var", "LEASE_SECONDS:3"], cwd=BACKEND,
+                          ".wrangler/test-state", "--var", "LEASE_SECONDS:3", "--var", "MOTD_TOKEN:" + MOTD_TOKEN], cwd=BACKEND,
                          stdout=out, stderr=subprocess.STDOUT)
 
     def up():
@@ -170,6 +171,104 @@ def write_world(folder, files):
             f.write(data)
 
 
+def motd_checks(a):
+    """The message of the day: only the admin token sets it, the bridge writes it for the mod."""
+    path = os.path.join(a.dir, "mirror_motd.txt")
+
+    def motd_file():
+        try:
+            with open(path, encoding="utf-8") as f:
+                s = f.read()
+        except OSError:
+            return None
+        return s if s.endswith("END\n") else None
+
+    def put(body, token):
+        h = {"authorization": "Admin " + token} if token else {}
+        return http("PUT", "/motd", headers=h, raw=json.dumps(body).encode())
+
+    st, body = http("GET", "/motd")
+    check(st == 200 and json.loads(body).get("id") is None, "motd: none at first: %d %s" % (st, body[:80]))
+    check(wait_for(lambda: motd_file() == "motd none\nEND\n", 10) is not None, "motd: the bridge writes 'motd none': %r" % motd_file())
+    st, body = put({"text": "hello"}, None)
+    check(st == 403 and b"not_admin" in body, "motd: PUT without the token refused: %d %s" % (st, body[:80]))
+    st, body = put({"text": "hello"}, MOTD_TOKEN + "x")
+    check(st == 403 and b"not_admin" in body, "motd: PUT with a wrong token refused: %d %s" % (st, body[:80]))
+    st, body = http("DELETE", "/motd", headers={"authorization": "Member AAAAAAAA:" + MOTD_TOKEN})
+    check(st == 403, "motd: DELETE with a member header refused: %d" % st)
+    st, body = put({"text": "x" * 501}, MOTD_TOKEN)
+    check(st == 400 and b"bad_input" in body, "motd: 501 characters refused: %d %s" % (st, body[:80]))
+    st, body = put({"text": "line\nbreak"}, MOTD_TOKEN)
+    check(st == 400, "motd: control characters refused: %d" % st)
+    st, body = put({"text": "hi", "hours": 0}, MOTD_TOKEN)
+    check(st == 400, "motd: hours 0 refused: %d" % st)
+    st, body = put({"text": "hi", "minutes": 0}, MOTD_TOKEN)
+    check(st == 400, "motd: minutes 0 refused: %d" % st)
+    st, body = put({"text": "hi", "minutes": 90 * 24 * 60 + 1}, MOTD_TOKEN)
+    check(st == 400, "motd: more than 90 days of minutes refused: %d" % st)
+    st, body = put({"text": "hi", "minutes": 5, "hours": 1}, MOTD_TOKEN)
+    check(st == 400 and b"not both" in body, "motd: hours and minutes together refused: %d %s" % (st, body[:80]))
+    st, body = http("GET", "/motd")
+    check(json.loads(body).get("id") is None, "motd: still none after the refusals")
+
+    text = "Servers down tonight, café open - see you at 9!"
+    st, body = put({"text": text}, MOTD_TOKEN)
+    m = json.loads(body) if st == 200 else {}
+    check(st == 200 and len(m.get("id") or "") == 8 and m.get("expires_at") == 0, "motd: the admin sets one: %d %s" % (st, body[:120]))
+    want = "motd %s 0 %s\nEND\n" % (m.get("id"), text)
+    check(wait_for(lambda: motd_file() == want, 10) is not None, "motd: the bridge writes it (UTF-8 kept): %r" % motd_file())
+
+    st, body = put({"text": "Weekend event", "hours": 2}, MOTD_TOKEN)
+    m2 = json.loads(body) if st == 200 else {}
+    check(st == 200 and m2.get("id") != m.get("id") and m2.get("expires_at", 0) > time.time() + 7000,
+          "motd: a new one replaces it with its own id and an expiry: %s" % body[:120])
+    check(wait_for(lambda: (motd_file() or "").startswith("motd %s %d Weekend event\n" % (m2.get("id"), m2.get("expires_at", 0))), 10)
+          is not None, "motd: the bridge writes the new one: %r" % motd_file())
+    st, body = put({"text": "Back in 5", "minutes": 5}, MOTD_TOKEN)
+    m3 = json.loads(body) if st == 200 else {}
+    check(st == 200 and 290 <= m3.get("expires_at", 0) - m3.get("created_at", 0) <= 310,
+          "motd: minutes set a short expiry (5 min): %s" % body[:120])
+    st, body = http("DELETE", "/motd", headers={"authorization": "Admin " + MOTD_TOKEN})
+    check(st == 200, "motd: the admin clears it: %d" % st)
+    check(wait_for(lambda: motd_file() == "motd none\nEND\n", 10) is not None, "motd: the bridge writes 'motd none' again: %r" % motd_file())
+
+
+def hosting_guard_checks(c, d):
+    # 0.14.2 report 2026-10-31: a host left the Realm and it stayed "hosted" - the bridge heartbeats a held lease for
+    # as long as it runs. Now the game confirms hosting; a lease it stopped confirming isn't heartbeated any more.
+    c.start(); d.start()
+    r = c.cmd("create Guard World")
+    rid = r.split(" ")[1] if r.startswith("ok ") else "0000000000"
+    code = (c.cmd("invite " + rid).split(" ") + ["X", "X"])[1]
+    check(d.cmd("redeem " + code).startswith("ok " + rid), "(setup) D joins C's Realm")
+    check(c.cmd("claim " + rid) == "ok won 0", "(setup) C hosts")
+    check(c.cmd("hosting " + rid) == "ok", "the game's hosting confirmation is answered at once")
+    check(c.cmd("hosting not-an-id").startswith("fail bad_input"), "...a bad id is refused")
+    for _ in range(4):
+        time.sleep(1.0)
+        c.cmd("hosting " + rid)
+    r = d.cmd("claim " + rid)
+    check(r.startswith("ok hosted"), "a confirmed host keeps the Realm past the 3 s lease: " + r)
+    # the game stops confirming (hung, or left without a release)
+    time.sleep(7)
+    r = d.cmd("claim " + rid)
+    check(r == "ok won 0", "unconfirmed: C's bridge stopped heartbeating and D can host: " + r)
+    check("no more heartbeats" in tb_log(c), "C's bridge logged why")
+    # D never confirms (an older mod): its bridge heartbeats as before
+    time.sleep(5)
+    r = c.cmd("claim " + rid)
+    check(r.startswith("ok hosted"), "a host that never confirmed keeps its lease as before: " + r)
+    d.cmd("release " + rid)
+
+
+def tb_log(x):
+    try:
+        with open(os.path.join(x.dir, "mirror_bridge.log"), encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
 def main():
     global EXE
     if "--exe" in sys.argv:
@@ -178,6 +277,9 @@ def main():
         sys.exit("build the bridge first: tools\\build-bridge.ps1")
     server = start_backend()
     a, b = B("A", 1002), B("B", 1003)
+    # (1 s heartbeats against the server's 3 s leases; a lease the game stopped confirming goes after 2.5 s)
+    fast = ["--realm-beat", "1000", "--hosting-stale", os.environ.get("REALMS_TEST_STALE_MS", "2500")]
+    c, d = B("C", 1004, fast), B("D", 1005, fast)
     try:
         # an id can itself start with R (1 in 32): read as an id, not as a code losing its R (CI 2026-10-30: the
         # server turned RWE288BGVE into WE288BGVE and refused every request for that Realm)
@@ -188,6 +290,7 @@ def main():
         check(st == 400 and b"not a Realm code" in body, "a 9-character id is still refused: %d %s" % (st, body[:80]))
         a.start(); b.start()
         check(a.state().startswith("realms on "), "A: Realms switched on by --realms-url")
+        motd_checks(a)
 
         r = a.cmd("create My Test World")
         check(r.startswith("ok "), "A creates a Realm: " + r)
@@ -297,6 +400,31 @@ def main():
         check(r.startswith("fail owner_only"), "a member can't rename: " + r)
         r = a.cmd("rename %s Renamed World" % rid)
         check(r == "ok", "the owner renames: " + r)
+        # user 2026-10-30 'owner rules': only the owner sets the Realm's rules; members get them with the list,
+        # the host with its heartbeat
+        check(not any(l[0] == rid for l in a.lines("rules")), "A: no rules line while the server has none")
+        r = b.cmd("rules %s pvp on" % rid)
+        check(r.startswith("fail owner_only"), "a member can't set the rules: " + r)
+        r = a.cmd("rules %s PVP on" % rid)
+        check(r.startswith("fail bad_input"), "the bridge refuses malformed rules: " + r)
+        r = a.cmd("rules %s pvp on debugmenu off" % rid)
+        check(r == "ok" and [rid, "pvp", "on", "debugmenu", "off"] in a.lines("rules"), "the owner sets the rules: %s %s" % (r, a.lines("rules")))
+        akey_now = open(os.path.join(a.realm_dir(rid), "member.key")).read().strip()
+        for bad in (b'{"rules":"pvp"}', b'{"rules":"pvp on; drop"}', b'{"rules":7}', b'{}'):
+            st, body = http("PUT", "/realms/%s/rules" % rid, akey_now, raw=bad)
+            check(st == 400 and b"bad_input" in body, "the server refuses rules %s: %d %s" % (bad, st, body[:60]))
+        b.cmd("list")
+        check([rid, "pvp", "on", "debugmenu", "off"] in b.lines("rules"), "a member gets the owner's rules with the list: %s" % b.lines("rules"))
+        st, body = http("PUT", "/realms/%s/rules" % rid, akey_now, raw=b'{"rules":"pvp off players 2"}')
+        check(st == 200, "test setup: the owner's rules changed on the server (%d)" % st)
+        renew()
+        token = open(os.path.join(a.realm_dir(rid), "lease.token")).read().strip()
+        st, body = http("POST", "/realms/%s/lease/heartbeat" % rid, akey_now, {"x-lease-token": token})
+        check(st == 200 and json.loads(body).get("rules") == "pvp off players 2", "the heartbeat answer carries the rules: %d %s" % (st, body[:80]))
+        r = a.cmd("resume " + rid)
+        check(r == "ok" and [rid, "pvp", "off", "players", "2"] in a.lines("rules"),
+              "the host's bridge takes the new rules from its heartbeat, no list needed: %s %s" % (r, a.lines("rules")))
+
         r = b.cmd("rekey " + rid)
         check(r == "ok", "B gets a new key: " + r)
         st, _ = http("GET", "/realms/" + rid, open(os.path.join(a.realm_dir(rid), "member.key")).read().strip())
@@ -319,10 +447,44 @@ def main():
         r = b.cmd("copykey XXXXXXXXXX")
         check(r.startswith("fail not_member"), "copykey only for my Realms: " + r)
 
+        # a key the server refuses (a server mistake - 2026-10-30 ids starting with R - or the Realm gone): kept and
+        # shown offline; forgotten only after refusals over days, and then moved aside, never deleted
+        gone = "ZZZZZZZZZZ"
+        gdir = b.realm_dir(gone)
+        os.makedirs(gdir, exist_ok=True)
+        gkey = os.path.join(gdir, "member.key")
+        with open(gkey, "w") as f:
+            f.write("ABCDEFGH:" + "A" * 43 + "\n")
+        b.cmd("list")
+        check(os.path.exists(gkey) and any(l[0] == gone and l[1] == "offline" for l in b.lines("realm")),
+              "a refused key is kept, its Realm shown offline: %s" % b.lines("realm"))
+        refused = os.path.join(gdir, "refused.txt")
+        check(os.path.exists(refused) and open(refused).read().split()[1] == "1", "...one refusal counted")
+        with open(refused, "w") as f:
+            f.write("%d 4\n" % (time.time() - 4 * 86400))
+        b.cmd("list")
+        check(not os.path.exists(gkey) and os.path.exists(gkey + ".forgotten"),
+              "refused 5 times over 4 days: the key is moved aside, not deleted")
+        ok_refused = os.path.join(b.realm_dir(rid), "refused.txt")
+        with open(ok_refused, "w") as f:
+            f.write("%d 3\n" % (time.time() - 86400))
+        b.cmd("list")
+        check(not os.path.exists(ok_refused) and os.path.exists(bkey_path), "the server knows the key again: the count is cleared")
+
         r = b.cmd("leave " + rid)
         check(r == "ok" and not os.path.exists(os.path.join(b.realm_dir(rid), "member.key")), "B leaves; its key is gone")
+        check(os.path.exists(os.path.join(b.realm_dir(rid), "member.key.forgotten")), "...moved aside, not deleted")
         b.cmd("list")
         check(b.lines("realm") == [], "B lists no Realms")
+        # 2026-10-30 17:46: LEAVE of a Realm the server no longer has me in failed with not_member and it stayed listed
+        bkey_back = os.path.join(b.realm_dir(rid), "member.key")
+        shutil.copyfile(bkey_back + ".forgotten", bkey_back)
+        b.cmd("list")
+        r = b.cmd("leave " + rid)
+        check(r == "ok" and not os.path.exists(bkey_back) and os.path.exists(bkey_back + ".forgotten"),
+              "LEAVE of a Realm the server says I'm not in: forgotten here, key moved aside: " + r)
+        b.cmd("list")
+        check(b.lines("realm") == [], "...and no longer listed")
         r = a.cmd("leave " + rid)
         check(r.startswith("fail owner_must_transfer"), "the owner can't just leave: " + r)
         r = a.cmd("bogus " + rid)
@@ -333,10 +495,16 @@ def main():
         check(r == "ok", "the owner deletes the Realm")
         a.cmd("list")
         check(a.lines("realm") == [], "A lists no Realms")
-    finally:
+        akey = os.path.join(a.realm_dir(rid), "member.key")
+        shutil.copyfile(akey + ".forgotten", akey)
+        r = a.cmd("delete " + rid)
+        check(r == "ok" and not os.path.exists(akey), "DELETE of a Realm already gone on the server: forgotten here: " + r)
         a.stop(); b.stop()
+        hosting_guard_checks(c, d)
+    finally:
+        a.stop(); b.stop(); c.stop(); d.stop()
         kill_tree(server)
-        for x in (a, b):
+        for x in (a, b, c, d):
             shutil.rmtree(x.dir, ignore_errors=True)
     print("\n%d failure(s)" % len(failures))
     return 1 if failures else 0

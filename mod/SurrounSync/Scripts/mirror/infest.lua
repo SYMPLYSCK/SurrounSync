@@ -51,7 +51,7 @@ local nests, by_addr = {}, {}
 local now, scan_in, state_in = 0.0, 0.0, 0.0
 local guest_hit_at = -1e9
 local active = false
-local warm = 0
+local warm, warm_wait = 0, false
 local last_nests = nil -- guest: the host's last "nests" blob
 local sent_state = nil
 local shown_dead = {}
@@ -373,6 +373,7 @@ local function set_active(on)
     shown_dead, sent_state = {}, nil
     if on then
         nests, by_addr, warm, guarded = {}, {}, #CLASSES, {}
+        warm_wait = true
         scan_in = RESCAN
         log.info("infest: syncing nests")
     else
@@ -415,6 +416,9 @@ function infest.tick(dt)
     if role == "host" then util.ensure_hook(SAI .. ":SetBB_LockOnTarget", lock_fn) end
 
     if warm > 0 then
+        -- (the first walk a frame after the hooks above went in: both in one frame took 72 ms at a join, live
+        -- 2026-10-30 02:19:46)
+        if warm_wait then warm_wait = false; return end
         if rescan_class(CLASSES[warm]) then warm = warm - 1 end
         if warm == 0 then warmed() end
         return

@@ -104,6 +104,25 @@ function util.fname(obj)
     return ok and n or nil
 end
 
+-- An actor destroyed here stays listed until garbage collection (~1 min), and after that its address can come back
+-- as a new actor. A mark keeps the object's full name: only the same object at that address counts as marked.
+function util.mark(t, obj)
+    local a = util.addr(obj)
+    if not a then return end
+    local ok, n = pcall(obj.GetFullName, obj)
+    t[a] = ok and type(n) == "string" and n or true
+end
+function util.marked(t, obj, a)
+    a = a or util.addr(obj)
+    local n = a and t[a]
+    if not n then return false end
+    if n == true then return true end
+    local ok, now = pcall(obj.GetFullName, obj)
+    if ok and now == n then return true end
+    t[a] = nil
+    return false
+end
+
 function util.class_name(obj)
     if not util.valid(obj) then return nil end
     local ok, c = pcall(obj.GetClass, obj)
@@ -641,6 +660,32 @@ end
 function util.find_reset() find_missed = {}; forget_ids() end
 
 local cdo_cache = {}
+-- A laser beam's end on its Niagara effect (comp:SetVectorParameter), guarded: at most BEAM_HZ a second per key, only
+-- when the end moved, and a set that took longer than BEAM_SLOW_S pauses that key for BEAM_PAUSE_S. Set every frame on
+-- two lasers, single calls took 90-125 ms for 6 s (8 fps while aiming, live 2026-10-30 02:42:32 - the effect's own
+-- work, not ours: the same family as the animation-task waits). Returns true when it was set.
+local BEAM_HZ, BEAM_MOVE, BEAM_SLOW_S, BEAM_PAUSE_S = 15, 5.0, 0.02, 5.0
+local beams = {}              -- key -> { at, until_t, X, Y, Z }
+util.beam_slow = 0
+function util.set_beam(key, comp, name, v)
+    local b = beams[key]
+    if not b then b = { at = -100, until_t = -100 }; beams[key] = b end
+    local t = os.clock()
+    if t < b.until_t or t - b.at < 1 / BEAM_HZ then return false end
+    if b.X and math.abs(v.X - b.X) + math.abs(v.Y - b.Y) + math.abs(v.Z - b.Z) < BEAM_MOVE then return false end
+    b.at = t
+    local ok = pcall(function() comp:SetVectorParameter(name, v) end)
+    local d = os.clock() - t
+    if ok then b.X, b.Y, b.Z = v.X, v.Y, v.Z end
+    if d > BEAM_SLOW_S then
+        b.until_t = t + BEAM_PAUSE_S
+        util.beam_slow = util.beam_slow + 1
+        log.every("util.beam_slow", 10, string.format("laser beam: setting its end took %.0f ms - paused %.0f s", d * 1000, BEAM_PAUSE_S))
+    end
+    return ok
+end
+function util.forget_beam(key) beams[key] = nil end
+
 function util.cdo(path)
     local o = util.cached(cdo_cache, path)
     if o then return o end

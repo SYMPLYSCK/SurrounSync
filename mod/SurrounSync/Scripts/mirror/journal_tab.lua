@@ -28,7 +28,7 @@ local GEAR_TEX = "/Game/UI/Textures/over_250_survival_flat_icons/gear.gear"
 local CLOSE_TEX = "/Game/UI/Textures/CrossX.CrossX"
 local INK = { R = 0.12, G = 0.08, B = 0.06, A = 1.0 }
 local GREEN = { R = 0.03, G = 0.40, B = 0.08, A = 1.0 }   -- (dark enough to read on the page's paper)
-local SETTING_ROWS = 10   -- MY SETTINGS: SyncFX on top of the 9 others
+local SETTING_ROWS = 11   -- MY SETTINGS: SyncFX on top of the 10 others
 local TAG_COLOR = { R = 0.6, G = 0.13, B = 0.0, A = 1.0 }   -- burnt orange tag in front of a label (a row's tag_color wins)
 local MOD_ROWS = 9
 local REALM_ROWS = 3   -- per page on the lined note (more Realms: < PREV / NEXT >)
@@ -367,9 +367,11 @@ local function build_settings(page)
     u.gear, u.gear_img = icon_button(page, GEAR_TEX, "SETTINGS", 827.0, 932.0, 96.0, 6)
     u.set_box = new("VerticalBox", S.tree, "Settings")
     tilt(u.set_box, TILT.list)
-    -- (9 rows: from 230 the last one ran off the page, screenshot 2026-10-27; 10 rows from 150 too: 120, tighter rows)
+    -- (9 rows: from 230 the last one ran off the page, screenshot 2026-10-27; 10 rows from 150 too: 120, tighter rows.
+    -- 11 rows (CONTROLLER) at title 58 / rows 26 / hints 16 measured 1049 high in game, past the ~970 that fits from
+    -- 120 (10 rows ended at 1091 and fit); title 46, rows 24, hints 15, pads 1 measured 945, kit 2026-10-31)
     place(page, u.set_box, 420.0, 120.0, 580.0, 875.0, 6)
-    u.set_title = text("SETTINGS", 58, DARK_RED); vadd(u.set_box, u.set_title)
+    u.set_title = text("SETTINGS", 46, DARK_RED); vadd(u.set_box, u.set_title)
     -- two pages: the host's rules for the shared world, and this PC's own settings
     local tabs = new("HorizontalBox", S.tree, "SettingTabs"); vadd(u.set_box, tabs, 2)
     u.set_tab_host, u.set_tab_host_t = button("HOST RULES", 28, DARK_RED); hadd(tabs, u.set_tab_host)
@@ -380,18 +382,63 @@ local function build_settings(page)
     u.set_sub = text("", 16, GREY, 560); vadd(u.set_box, u.set_sub, 4)
     u.set_rows = {}
     for i = 1, SETTING_ROWS do
-        local row = new("HorizontalBox", S.tree, "SettingRow"); vadd(u.set_box, row, i == 1 and 8 or 2)
-        local tag = text("", 26, TAG_COLOR)   -- e.g. SyncFX's "Optimizes Performance": collapsed on rows without one
-        local label = text("", 26)
-        local b, bt = button("OFF", 26, DARK_RED)
-        hadd(row, tag); hadd(row, label); hadd(row, b, 24)
-        local hint = text("", 16, GREY, 560); vadd(u.set_box, hint, 2)
-        u.set_rows[i] = { row = row, tag = tag, label = label, btn = b, btn_t = bt, hint = hint }
+        local row = new("HorizontalBox", S.tree, "SettingRow"); vadd(u.set_box, row, i == 1 and 8 or 1)
+        local tag = text("", 24, TAG_COLOR)   -- e.g. SyncFX's "Optimizes Performance": collapsed on rows without one
+        local label = text("", 24)
+        local b, bt = button("OFF", 24, DARK_RED)
+        -- a second button on rows that have one (CONTROLLER: BINDINGS), on the same line so no height is added
+        local b2, bt2 = button("", 24, DARK_RED)
+        hadd(row, tag); hadd(row, label); hadd(row, b, 24); hadd(row, b2, 24)
+        vis_hit(b2, false)
+        local hint = text("", 15, GREY, 560); vadd(u.set_box, hint, 1)
+        u.set_rows[i] = { row = row, tag = tag, label = label, btn = b, btn_t = bt, btn2 = b2, btn2_t = bt2, hint = hint }
     end
     -- (moved up with the box: at 215 it covered the MODS tab)
     u.set_close, u.set_close_img = icon_button(page, CLOSE_TEX, "X", 930.0, 135.0, 72.0, 7)
     vis_hit(u.set_box, false); vis_hit(u.set_close, false); vis(u.set_close_img, false)
     u.settings_mode = false
+end
+
+-- MY SETTINGS -> CONTROLLER -> BINDINGS: each pad action with its button and SET (then press the pad button
+-- it should go on); RESET puts the defaults back. Same place on the paper as the settings; X goes back there.
+local function build_binds(page)
+    local u = S.ui
+    local n = #require("mirror.gamepad").ACTIONS
+    u.bind_box = new("VerticalBox", S.tree, "Bindings")
+    tilt(u.bind_box, TILT.list)
+    place(page, u.bind_box, 420.0, 120.0, 580.0, 875.0, 6)
+    vadd(u.bind_box, text("CONTROLLER", 46, DARK_RED))
+    u.bind_sub = text("", 16, GREY, 560); vadd(u.bind_box, u.bind_sub, 2)
+    u.bind_rows = {}
+    for i = 1, n do
+        local row = new("HorizontalBox", S.tree, "BindRow"); vadd(u.bind_box, row, i == 1 and 8 or 1)
+        local label = text("", 22)
+        pcall(function() label:SetMinDesiredWidth(270.0) end)
+        local pad = text("", 22, DARK_RED)
+        pcall(function() pad:SetMinDesiredWidth(170.0) end)
+        local b, bt = button("SET", 22, DARK_RED)
+        hadd(row, label); hadd(row, pad, 8); hadd(row, b, 8)
+        u.bind_rows[i] = { label = label, pad = pad, btn = b, btn_t = bt }
+    end
+    u.bind_reset = button("RESET TO DEFAULT", 22, DARK_RED); vadd(u.bind_box, u.bind_reset, 10)
+    vis_hit(u.bind_box, false)
+end
+
+local function refresh_binds()
+    local u = S.ui
+    local gp = require("mirror.gamepad")
+    local rows = gp.binds_model()
+    local waiting = gp.capturing()
+    set(u.bind_sub, waiting and "Press the pad button for it now (6 s)."
+        or "SET, then press the pad button you want. A button already in use swaps.")
+    for i, r in ipairs(u.bind_rows) do
+        local o = rows[i]
+        if o then
+            set(r.label, o.label)
+            set(r.pad, o.button)
+            set(r.btn_t, o.id == waiting and "..." or "SET")
+        end
+    end
 end
 
 -- The MODS tab's page (on the CO-OP page's paper, like the settings): this PC's mods with ON/OFF, the other
@@ -496,8 +543,13 @@ local function build_realms(page, qtree, qpage, itree, ipage)
         local inv = button("INVITE", 16, GREY)
         local key = button("KEY", 16, GREY)
         hadd(row, sized(name, REALM_NAME_W)); hadd(row, open, 10); hadd(row, inv, 14); hadd(row, key, 10)
-        local info = text("", 14, GREY, 460); vadd(list, info, 0)
-        u.realms_rows[i] = { row = row, name = name, open = open, open_t = open_t, invite = inv, key = key, info = info }
+        -- the second line: the Realm's state, then DELETE (owner) / LEAVE (member) / REMOVE (an offline copy)
+        -- (on this line: the top one has no room left - KEY already ran past the note at a wider name)
+        local line2 = new("HorizontalBox", S.tree, "RealmRowInfo"); vadd(list, line2, 0)
+        local info = text("", 14, GREY, 360); hadd(line2, info)
+        local del, del_t = button("REMOVE", 14, GREY); hadd(line2, del, 10)
+        u.realms_rows[i] = { row = row, name = name, open = open, open_t = open_t, invite = inv, key = key, info = info,
+                             line2 = line2, del = del, del_t = del_t }
     end
     u.realms_none = text("No Realms yet. Start one in the folder below, or add one with a friend's invite code.", 16, GREY, 440)
     vadd(list, u.realms_none, 14)
@@ -524,6 +576,8 @@ local function build_realms(page, qtree, qpage, itree, ipage)
     u.realms_here = here
     u.realms_friends, u.realms_friends_t = button("ADD FRIENDS HERE", 20, DARK_RED); hadd(here, u.realms_friends)
     u.realms_end, u.realms_end_t = button("END REALM", 20, DARK_RED); hadd(here, u.realms_end, 24)
+    -- the Realm's rules (its owner's, whoever hosts): the settings page, opened from here (no gear on CO-OP in a Realm)
+    u.realms_rules = button("RULES", 20, DARK_RED); hadd(here, u.realms_rules, 24)
     u.realms_cancel, u.realms_cancel_t = button("CANCEL", 20, DARK_RED); hadd(here, u.realms_cancel, 24)
     -- (two lines: a third ran into the folder's tab; measured in-game it starts under END REALM's bottom)
     u.realms_hint = text("Saved to its server after your saves and at END REALM. Everyone keeps their own Realm "
@@ -638,6 +692,8 @@ end
 local function set_view(v)
     local u = S.ui
     if u.view == v then return end
+    -- (set_back: the page X goes back to - the REALMS page when its RULES opened the settings)
+    if v == nil or v == "realms" then u.set_back = nil end
     local was = u.view
     u.view, u.settings_mode = v, v == "settings"
     if v and not was then
@@ -654,6 +710,7 @@ local function set_view(v)
     end
     vis_hit(u.gear, not v); vis(u.gear_img, not v)
     vis_hit(u.set_box, v == "settings")
+    if u.bind_box then vis_hit(u.bind_box, v == "binds") end
     -- (no X on the REALMS page: its own ribbon tab and CO-OP's switch pages)
     local x = v ~= nil and v ~= "realms"
     vis_hit(u.set_close, x); vis(u.set_close_img, x)
@@ -785,6 +842,7 @@ local function refresh_realms()
         -- (a visiting member leaves here too, like LEAVE CO-OP; one still asking to come in cancels here)
         vis_hit(u.realms_end, m.hosting == true or m.visiting == true or m.joining == true)
         vis_hit(u.realms_cancel, m.armed == true)
+        vis_hit(u.realms_rules, m.hosting == true or m.visiting == true)
         vis_hit(u.realms_my_diff, m.hosting == true and cur.owner == true)
         if u.realms_end_armed and clock > u.realms_end_armed + 4 then u.realms_end_armed = nil end
         set(u.realms_end_t, m.joining and "CANCEL" or m.visiting and "LEAVE REALM"
@@ -793,10 +851,16 @@ local function refresh_realms()
     end
     local line = m.state or m.note or ""
     set(u.realms_state, line); vis(u.realms_state, line ~= "")
+    local armed = u.realms_del_armed
+    if armed and clock > armed.at + 4 then u.realms_del_armed, armed = nil, nil end
     for i, r in ipairs(u.realms_rows) do
         local o = rows[(u.realms_page - 1) * REALM_ROWS + i]
-        vis_hit(r.row, o ~= nil); vis(r.info, o ~= nil)
+        vis_hit(r.row, o ~= nil); vis_hit(r.line2, o ~= nil); vis(r.info, o ~= nil)
+        vis_hit(r.del, o ~= nil and o.remove ~= nil and m.free == true and not o.here)
         if o then
+            local sure = armed and armed.id == o.id
+            set(r.del_t, sure and ("SURE? " .. (o.remove or "")) or (o.remove or "REMOVE"))
+            style_text(r.del_t, 14, sure and DARK_RED or GREY)
             local name = o.name or ""
             if #name > 15 then name = name:sub(1, 14) .. "..." end
             set(r.name, (o.here and "> " or "") .. name)
@@ -824,6 +888,7 @@ local function refresh_settings(m)
     style_text(u.set_tab_host_t, 28, host and DARK_RED or GREY)
     style_text(u.set_tab_mine_t, 28, host and GREY or DARK_RED)
     set(u.set_sub, not host and "Only for your own game - saved on this PC."
+        or m.settings_note
         or m.settings_editable and "Your rules. Friends in your world play by them too."
         or "The host's rules - only the host can change them.")
     local list = settings_list(m)
@@ -833,11 +898,13 @@ local function refresh_settings(m)
         if o then
             vis(r.tag, o.tag ~= nil)
             set(r.tag, o.tag and (o.tag .. " ") or "")
-            if o.tag and o.tag_color ~= r.tag_color then r.tag_color = o.tag_color; style_text(r.tag, 26, o.tag_color or TAG_COLOR) end
+            if o.tag and o.tag_color ~= r.tag_color then r.tag_color = o.tag_color; style_text(r.tag, 24, o.tag_color or TAG_COLOR) end
             set(r.label, o.label .. ":")
             set(r.btn_t, o.text or "OFF")
             set(r.hint, o.hint)
         end
+        vis_hit(r.btn2, o ~= nil and o.extra ~= nil)
+        if o and o.extra then set(r.btn2_t, o.extra) end
     end
 end
 
@@ -913,6 +980,7 @@ local function inject(jui)
     step("settings")
     S.realms_on = ctx.realms_on ~= nil and ctx.realms_on() == true
     build_settings(page)
+    build_binds(page)
     step("mods")
     build_mods(page)
     if S.realms_on then
@@ -1023,6 +1091,7 @@ local function refresh()
     local m, u = ctx.model(), S.ui
     S.model = m
     if u.view == "settings" then refresh_settings(m); return end
+    if u.view == "binds" then refresh_binds(); return end
     if u.view == "mods" then refresh_mods(); return end
     if u.view == "realms" then refresh_realms(); return end
     set(u.headline, m.headline or "")
@@ -1036,6 +1105,7 @@ local function refresh()
     vis_hit(u.stop, m.show_stop)
     -- in a Realm this page has no session and no controls: the REALMS tab has all of it (fully separate, user 2026-10-30)
     local inert = m.realm_session == true
+    vis_hit(u.gear, not inert); vis(u.gear_img, not inert)   -- (the Realm's rules: RULES on the REALMS page)
     vis_hit(u.go_home, m.host_gone and not inert)
     vis_hit(u.wait, m.host_gone and not inert)
     -- in co-op the join section can't be used: hidden, so the players, chat and teleport rows fit the folder
@@ -1118,7 +1188,7 @@ local function chat_enter()
     ctx.refresh_now = true
 end
 
-function journal_tab.tick(dt)
+local function tick_body(dt)
     clock = clock + dt
     if not enter_bound then
         enter_bound = true
@@ -1166,7 +1236,7 @@ function journal_tab.tick(dt)
     end
     refresh_in = refresh_in - dt
     if u.view == "mods" then
-        if clicked(u.set_close) then set_view(nil); ctx.refresh_now = true end
+        if clicked(u.set_close) then set_view(u.set_back); ctx.refresh_now = true end
         local mm = S.mods_model or { rows = {} }
         local pages = math.max(1, math.ceil(#(mm.rows or {}) / MOD_ROWS))
         if clicked(u.mods_prev) then u.mods_page = (u.mods_page - 2) % pages + 1; ctx.refresh_now = true end
@@ -1190,10 +1260,21 @@ function journal_tab.tick(dt)
         -- (every button is checked every frame: clicked() follows each one's press state)
         for i, r in ipairs(u.realms_rows) do
             local o = rows[(u.realms_page - 1) * REALM_ROWS + i]
-            local c_open, c_inv, c_key = clicked(r.open), clicked(r.invite), clicked(r.key)
+            local c_open, c_inv, c_key, c_del = clicked(r.open), clicked(r.invite), clicked(r.key), clicked(r.del)
             if o and c_open and o.open and rm.free then a.realm_open(o.id, o.open); ctx.refresh_now = true end
             if o and c_inv then a.realm_invite(o.id) end
             if o and c_key then a.realm_key(o.id) end
+            -- DELETE / LEAVE / REMOVE: the first press asks (SURE?), a second within 4 s does it
+            if o and c_del and o.remove and rm.free and not o.here then
+                local armed = u.realms_del_armed
+                if armed and armed.id == o.id and clock <= armed.at + 4 then
+                    u.realms_del_armed = nil
+                    a.realm_remove(o.id)
+                else
+                    u.realms_del_armed = { id = o.id, at = clock }
+                end
+                ctx.refresh_now = true
+            end
         end
         local cur = rm.current
         local c_fr, c_end, c_cancel = clicked(u.realms_friends), clicked(u.realms_end), clicked(u.realms_cancel)
@@ -1235,6 +1316,9 @@ function journal_tab.tick(dt)
         if cur and cur.id and c_inv then a.realm_invite(cur.id) end
         if cur and cur.id and c_key then a.realm_key(cur.id) end
         if clicked(u.realms_my_diff) and rm.hosting and cur and cur.owner then a.realm_my_difficulty(); ctx.refresh_now = true end
+        if clicked(u.realms_rules) and (rm.hosting or rm.visiting) then
+            set_view("settings"); u.set_back, u.set_tab = "realms", "host"; refresh(); return
+        end
         local function typed(box)
             local txt = ""
             pcall(function() txt = box:GetText():ToString() end)
@@ -1252,19 +1336,32 @@ function journal_tab.tick(dt)
         if refresh_in <= 0 or ctx.refresh_now then refresh_in, ctx.refresh_now = 0.5, false; refresh() end
         return
     end
+    if u.view == "binds" then
+        if clicked(u.set_close) then set_view("settings"); refresh(); return end
+        local gp = require("mirror.gamepad")
+        local rows = gp.binds_model()
+        for i, r in ipairs(u.bind_rows) do
+            if rows[i] and clicked(r.btn) then gp.capture(rows[i].id); ctx.refresh_now = true end
+        end
+        if clicked(u.bind_reset) then gp.reset(); ctx.refresh_now = true end
+        -- (fast while SET waits: the row shows the new button as soon as it's pressed)
+        if refresh_in <= 0 or ctx.refresh_now then refresh_in, ctx.refresh_now = 0.2, false; refresh() end
+        return
+    end
     if u.settings_mode then
-        if clicked(u.set_close) then set_mode(false); ctx.refresh_now = true end
+        if clicked(u.set_close) then set_view(u.set_back); ctx.refresh_now = true end
         if u.set_tab_mods and clicked(u.set_tab_mods) then set_view("mods"); refresh(); return end
         if clicked(u.set_tab_host) then u.set_tab = "host"; ctx.refresh_now = true end
         if clicked(u.set_tab_mine) then u.set_tab = "mine"; ctx.refresh_now = true end
         local opts = S.model and settings_list(S.model) or {}
         for i, r in ipairs(u.set_rows) do
             if opts[i] and clicked(r.btn) then a.setting(opts[i].key, u.set_tab); ctx.refresh_now = true end
+            if opts[i] and opts[i].extra and clicked(r.btn2) then set_view("binds"); refresh(); return end
         end
         if refresh_in <= 0 or ctx.refresh_now then refresh_in, ctx.refresh_now = 0.5, false; refresh() end
         return
     end
-    if clicked(u.gear) then set_mode(true); refresh(); return end
+    if clicked(u.gear) and not (S.model and S.model.realm_session == true) then set_mode(true); refresh(); return end
     if clicked(u.copy) then a.copy() end
     if clicked(u.host) then a.host() end
     if clicked(u.join_local) then a.join_local() end
@@ -1324,6 +1421,15 @@ function journal_tab.tick(dt)
         a.join_code(txt)
     end
     if refresh_in <= 0 or ctx.refresh_now then refresh_in, ctx.refresh_now = 0.5, false; refresh() end
+end
+
+-- UE4SS runs queued game-thread work inside the next engine call, so any widget call here can run a world reset
+-- (a Realm New Game's main-menu exit, live 2026-10-30 13:36:49) that clears S mid-tick: that tick just ends,
+-- the next one builds the tab again. Any other error still goes to the caller.
+function journal_tab.tick(dt)
+    local s = S
+    local ok, err = pcall(tick_body, dt)
+    if not ok and (s == nil or S == s) then error(err, 0) end
 end
 
 function journal_tab.open()

@@ -5,6 +5,11 @@ local link = require("mirror.link")
 
 local netq = {}
 
+-- What the other game is doing while no poses come from it (phase1: away menu, a load, the link's view)
+local WHY = { menu = "Paused", loading = "Loading", paused = "Not responding", gone = "Disconnected" }
+local why_fn = nil
+function netq.set_why(fn) why_fn = fn end
+
 local pings = events.new("ping", 8, 10)
 local next_id, ping_in = 0, 0.0
 local rtt = nil
@@ -68,7 +73,9 @@ local COLOR = {
 function netq.tag(name)
     local s = netq.status()
     local shown = s.net or s.rtt
-    local extra = s.state == "lost" and " · no signal" or (shown and string.format(" · %d ms", math.floor(shown + 0.5)) or "")
+    -- no poses: the tag says why, where it is known (no pop-up cards for these: user 2026-10-31)
+    local lost = s.state == "lost" and (" · " .. (WHY[why_fn and why_fn() or ""] or "No signal"))
+    local extra = lost or (shown and string.format(" · %d ms", math.floor(shown + 0.5)) or "")
     return name .. extra, COLOR[s.state]
 end
 

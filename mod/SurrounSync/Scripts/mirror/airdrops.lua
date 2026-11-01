@@ -143,7 +143,8 @@ local function guest_tick()
                 end
             end
         else
-            local cls = StaticFindObject(DIR .. w.cls:gsub("_C$", "") .. "." .. w.cls)
+            -- (util.find: a class not loaded here is asked again after 2 s doubling up to 60 s - a miss costs ~15 ms)
+            local cls = util.find(DIR .. w.cls:gsub("_C$", "") .. "." .. w.cls)
             if not util.valid(cls) then
                 log.every("airdrops.nocls." .. w.cls, 60, "airdrops: " .. w.cls .. " isn't loaded here - not spawning it")
             elseif not loottables.ready() then

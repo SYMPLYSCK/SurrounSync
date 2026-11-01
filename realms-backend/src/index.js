@@ -14,7 +14,6 @@ let leaseSeconds = LEASE_SECONDS;     // LEASE_SECONDS env var overrides it (tes
 const INVITE_SECONDS = 7 * 24 * 3600;
 const KEEP_GENERATIONS = 10;
 const MAX_WORLD = 16 * 1024 * 1024;
-const MAX_CHARACTER = 2 * 1024 * 1024;
 const MAX_JSON = 4 * 1024;
 const MAX_MEMBERS = 16;
 const MAX_OPEN_INVITES = 20;
@@ -24,7 +23,9 @@ const LIMITS = {                      // per IP: [requests, window seconds]
     // every member call (list, heartbeat, uploads): only an abuse guard. 600 was hit in one evening by two games
     // on one connection (each list = one call per known Realm) - the host's heartbeat got refused, its lease lapsed
     auth: [10000, 3600],
+    admin: [30, 3600],                // setting the message of the day (a wrong token counts too)
 };
+const MAX_MOTD = 500;
 
 const B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"; // Crockford: no I, L, O, U
 const enc = new TextEncoder();
@@ -189,7 +190,6 @@ async function newMember(env, rid, steam, name, role) {
 }
 
 const worldKey = (rid, gen) => `realms/${rid}/world/${String(gen).padStart(10, "0")}`;
-const charKey = (rid, mid) => `realms/${rid}/char/${mid}`;
 
 // ---- handlers ----
 
@@ -222,7 +222,19 @@ async function status(env, r, me) {
         host: leaseActive(r, t) ? { member_id: r.lease_member, steam_id: r.lease_steam, name: r.lease_name, expires_in: r.lease_expires - t } : null,
         members: results,
         you: { member_id: me.member_id, role: me.role },
+        rules: r.rules ?? null,
     });
+}
+
+// The game rules every host of the Realm plays by ("pvp off players 4 ..."): only the owner sets them. The keys and
+// values are the mod's; the server only checks the shape.
+const RULES = /^[a-z]{1,16} [a-z0-9]{1,8}( [a-z]{1,16} [a-z0-9]{1,8}){0,31}$/;
+async function setRules(env, request, r, me) {
+    if (me.role !== "owner") fail(403, "owner_only");
+    const b = await body(request);
+    if (typeof b.rules !== "string" || b.rules.length > 512 || !RULES.test(b.rules)) fail(400, "bad_input", "bad rules");
+    await env.DB.prepare("UPDATE realms SET rules = ? WHERE id = ?").bind(b.rules, r.id).run();
+    return json({ rules: b.rules });
 }
 
 async function rename(env, request, r, me) {
@@ -277,7 +289,8 @@ async function heartbeat(env, request, r, me) {
         "UPDATE realms SET lease_expires = ? WHERE id = ? AND lease_token = ? AND lease_member = ?")
         .bind(now() + leaseSeconds, r.id, token, me.member_id).run();
     if (res.meta.changes !== 1) fail(409, "lease_lost", "someone else is hosting this Realm now");
-    return json({ expires_in: leaseSeconds });
+    // (the host picks up the owner's rule changes here, within a minute)
+    return json({ expires_in: leaseSeconds, rules: r.rules ?? null });
 }
 
 async function release(env, request, r, me) {
@@ -401,7 +414,6 @@ async function removeMember(env, r, me, mid) {
     } else if (me.role !== "owner") fail(403, "owner_only");
     const res = await env.DB.prepare("DELETE FROM members WHERE realm_id = ? AND member_id = ?").bind(r.id, mid).run();
     if (res.meta.changes !== 1) fail(404, "no_member");
-    await env.WORLDS.delete(charKey(r.id, mid));
     // a removed host loses the lease too
     await env.DB.prepare(
         `UPDATE realms SET lease_member = NULL, lease_steam = NULL, lease_name = NULL, lease_token = NULL, lease_expires = NULL
@@ -429,31 +441,44 @@ async function rotateKey(env, r, me) {
     return json({ member_id: me.member_id, key });
 }
 
-// Each member's own Realm character: only they can read or write it. X-Base-Gen must match the stored
-// generation, so two copies of the same player can't silently overwrite each other.
-async function uploadCharacter(env, request, r, me) {
-    const base = Number(request.headers.get("x-base-gen"));
-    if (!Number.isInteger(base) || base < 0) fail(400, "bad_input", "X-Base-Gen header missing");
-    if (base !== me.char_gen) fail(409, "stale", `your newest character is generation ${me.char_gen}`);
-    const want = claimedHash(request);
-    const data = await blob(request, MAX_CHARACTER);
-    const got = await sha256hex(data);
-    if (got !== want) fail(400, "bad_hash", "upload damaged in transit");
-    const gen = base + 1;
-    const res = await env.DB.prepare(
-        "UPDATE members SET char_gen = ?, char_hash = ?, char_size = ? WHERE realm_id = ? AND member_id = ? AND char_gen = ?")
-        .bind(gen, got, data.byteLength, r.id, me.member_id, base).run();
-    if (res.meta.changes !== 1) fail(409, "stale", "your character changed during the upload");
-    await env.WORLDS.put(charKey(r.id, me.member_id), data, { customMetadata: { sha256: got, gen: String(gen) } });
-    return json({ gen, sha256: got, size: data.byteLength }, 201);
+// ---- message of the day: one message from the mod's makers to every player ----
+// GET is public (every bridge asks every minute, Realms or not). PUT/DELETE need Authorization: Admin <token>,
+// the token being the MOTD_TOKEN secret (npx wrangler secret put MOTD_TOKEN); without that secret they don't exist.
+
+async function admin(env, request) {
+    const want = env.MOTD_TOKEN;
+    if (typeof want !== "string" || want.length < 32) fail(404, "not_found");
+    await limit(env, request, "admin");
+    const m = /^Admin (\S{1,256})$/.exec(request.headers.get("authorization") || "");
+    if (!m || !sameHash(await sha256hex(m[1]), await sha256hex(want))) fail(403, "not_admin", "not allowed");
 }
 
-async function downloadCharacter(env, r, me) {
-    if (me.char_gen < 1) fail(404, "no_character", "no character uploaded yet");
-    const obj = await env.WORLDS.get(charKey(r.id, me.member_id));
-    if (!obj) fail(404, "no_character");
-    return new Response(obj.body, { headers: {
-        "content-type": "application/octet-stream", "x-gen": obj.customMetadata.gen, "x-sha256": obj.customMetadata.sha256 } });
+async function getMotd(env) {
+    const r = await env.DB.prepare("SELECT msg_id, text, created_at, expires_at FROM motd WHERE id = 1").first();
+    if (!r || (r.expires_at && r.expires_at <= now())) return json({ id: null });
+    return json({ id: r.msg_id, text: r.text, created_at: r.created_at, expires_at: r.expires_at || 0 });
+}
+
+// { text, and optionally hours (1-2160) or minutes (1-129600): it goes by itself after that }; a new message
+// replaces the old one
+async function setMotd(env, request) {
+    await admin(env, request);
+    const b = await body(request);
+    const t = text(b.text, "text", MAX_MOTD);
+    const given = (v) => v !== undefined && v !== null;
+    if (given(b.hours) && given(b.minutes)) fail(400, "bad_input", "give hours or minutes, not both");
+    const life = given(b.minutes) ? int(b.minutes, "minutes", 1, 90 * 24 * 60) * 60
+        : given(b.hours) ? int(b.hours, "hours", 1, 90 * 24) * 3600 : 0;
+    const id = randomB32(8), at = now(), till = life ? at + life : null;
+    await env.DB.prepare("INSERT OR REPLACE INTO motd (id, msg_id, text, created_at, expires_at) VALUES (1, ?, ?, ?, ?)")
+        .bind(id, t, at, till).run();
+    return json({ id, text: t, created_at: at, expires_at: till || 0 });
+}
+
+async function clearMotd(env, request) {
+    await admin(env, request);
+    await env.DB.prepare("DELETE FROM motd WHERE id = 1").run();
+    return json({ id: null });
 }
 
 // ---- routing ----
@@ -466,6 +491,11 @@ async function route(request, env) {
     if (p.length === 1 && m === "GET") return json({ service: "surrounsync-realms", time: now() });
     if (p[1] === "realms" && p.length === 2 && m === "POST") return createRealm(env, request);
     if (p[1] === "invites" && p[2] === "redeem" && p.length === 3 && m === "POST") return redeem(env, request);
+    if (p[1] === "motd" && p.length === 2) {
+        if (m === "GET") return getMotd(env);
+        if (m === "PUT") return setMotd(env, request);
+        if (m === "DELETE") return clearMotd(env, request);
+    }
     if (p[1] !== "realms" || p.length < 3) fail(404, "not_found");
 
     const rid = realmId(p[2]);
@@ -476,6 +506,7 @@ async function route(request, env) {
     if (sub === "" && m === "GET") return status(env, r, me);
     if (sub === "" && m === "PATCH") return rename(env, request, r, me);
     if (sub === "" && m === "DELETE") return deleteRealm(env, r, me);
+    if (sub === "rules" && m === "PUT") return setRules(env, request, r, me);
     if (sub === "lease" && m === "POST") return claim(env, request, r, me);
     if (sub === "lease" && m === "DELETE") return release(env, request, r, me);
     if (sub === "lease/heartbeat" && m === "POST") return heartbeat(env, request, r, me);
@@ -489,8 +520,6 @@ async function route(request, env) {
     }
     if (sub === "invites" && m === "POST") return createInvite(env, r, me);
     if (sub === "key" && m === "POST") return rotateKey(env, r, me);
-    if (sub === "character" && m === "PUT") return uploadCharacter(env, request, r, me);
-    if (sub === "character" && m === "GET") return downloadCharacter(env, r, me);
     if (p[3] === "members" && p.length === 5 && m === "DELETE") return removeMember(env, r, me, p[4]);
     if (p[3] === "members" && p[5] === "owner" && p.length === 6 && m === "POST") return transferOwner(env, r, me, p[4]);
     fail(404, "not_found");

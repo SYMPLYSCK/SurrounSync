@@ -29,6 +29,8 @@ local pings = require("mirror.pings")
 local lights = require("mirror.lights")
 local tactical = require("mirror.tactical")
 local throwables = require("mirror.throwables")
+local nuke = require("mirror.nuke")
+local debugmenu = require("mirror.debugmenu")
 local vehicles = require("mirror.vehicles")
 local group = require("mirror.group")
 local harvest = require("mirror.harvest")
@@ -47,6 +49,7 @@ local perf = require("mirror.perf")
 local crumb = require("mirror.crumb")
 local devtest = require("mirror.devtest")
 local peers = require("mirror.peers")
+local away = require("mirror.away")
 
 local phase1 = {}
 
@@ -71,10 +74,13 @@ local my_build = game_build()
 local quiet_logged = false
 local hello_missing_logged = false
 local my_dead = nil
+local deaths, peer_death, death_told = 0, nil, false
 local peer_dead = false
 local revived_at = nil
 
 function phase1.peer_dead() return peer_dead end
+-- seconds since the other player came back alive (math.huge: not since this link started)
+function phase1.revived_age() return revived_at and (now - revived_at) or math.huge end
 local connected = false
 local seq = 0
 local send_in = 0.0
@@ -89,6 +95,7 @@ local peer_look = nil
 local applied_to = nil
 local look_dirty = false
 local look_retry = nil
+local LOOK_BUDGET = 0.006
 local dump_look_in = nil
 local look_anims, look_combat, look_fast_until = 0, nil, 0.0
 
@@ -117,18 +124,7 @@ local function aim_fields(player)
         melee and 1 or 0, pitch, lh.X, lh.Y, lh.Z, hy, hr, view_yaw)
 end
 
-local function flags(player)
-    local f = 0
-    pcall(function() if player.bIsCrouched then f = f + 1 end end)
-    pcall(function() if player.CharacterMovement:IsFalling() then f = f + 2 end end)
-    pcall(function() if player.StaminaComponent.CurrentlySprinting == true then f = f + 4 end end)
-    pcall(function()
-        local sw = player.SwimmingComponent
-        if sw["IsSwimming?"] == true then f = f + 8 end
-        if sw["UnderWater?"] == true then f = f + 16 end
-    end)
-    return f
-end
+local poseline = require("mirror.poseline")
 
 local function move_fields(player)
     local walk, crouch, stam = 0, 0, 100
@@ -155,41 +151,8 @@ local function sample(player)
     pcall(function()
         local l, r, v = player:K2_GetActorLocation(), player:K2_GetActorRotation(), player:GetVelocity()
         pose_line = string.format("%.1f %.1f %.1f %.1f %.1f %.1f %.1f %d",
-            l.X, l.Y, l.Z, r.Yaw, v.X, v.Y, v.Z, flags(player)) .. aim_fields(player) .. move_fields(player)
+            l.X, l.Y, l.Z, r.Yaw, v.X, v.Y, v.Z, poseline.flags(player)) .. aim_fields(player) .. move_fields(player)
     end)
-end
-
-local function parse(payload)
-    local x, y, z, yaw, vx, vy, vz, c, rest = payload:match(
-        "^(%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%d+)(.*)$")
-    if not c then return nil end
-    local pose = {
-        loc = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) },
-        yaw = tonumber(yaw),
-        vel = { X = tonumber(vx), Y = tonumber(vy), Z = tonumber(vz) },
-        crouch = (tonumber(c) or 0) % 2 == 1,
-        falling = math.floor((tonumber(c) or 0) / 2) % 2 == 1,
-        sprint = math.floor((tonumber(c) or 0) / 4) % 2 == 1,
-        swim = math.floor((tonumber(c) or 0) / 8) % 2 == 1,
-        underwater = math.floor((tonumber(c) or 0) / 16) % 2 == 1,
-    }
-    local combat, ads, hip, melee, pitch, lx, ly, lz, hy, hr, vy, mv =
-        rest:match("^ (%-?%d+) (%d) (%d) (%d) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+)(.*)$")
-    local walk, crouch_speed, stam, sent, lean = (mv or ""):match("^ (%S+) (%S+) (%S+) (%S+) ?(%S*)$")
-    if walk then
-        pose.move = { walk = tonumber(walk), crouch = tonumber(crouch_speed), stamina = tonumber(stam) }
-        pose.sent = tonumber(sent)
-    end
-    if pitch then
-        pose.aim = { combat = tonumber(combat), ads = ads == "1", hip = hip == "1", melee = melee == "1",
-                     pitch = tonumber(pitch) or 0,
-                     lhand = { X = tonumber(lx) or 0, Y = tonumber(ly) or 0, Z = tonumber(lz) or 0 },
-                     head = { Yaw = tonumber(hy) or 0, Roll = tonumber(hr) or 0 },
-                     view_yaw = tonumber(vy) }
-        local lv, ls = (lean or ""):match("^(%-?[%d%.]+),(%d)$")
-        if lv then pose.aim.lean, pose.aim.lean_side = tonumber(lv), tonumber(ls) end
-    end
-    return pose
 end
 
 local function status()
@@ -223,6 +186,9 @@ local my_where, peer_where = nil, nil
 local guest_gone_t = nil
 local time_check_in = 0.0
 local guest_announced = false
+-- "X's game closed" was shown: the link's own timeout a moment later is no news (live 2026-10-30 16:08:26 then
+-- 16:08:46: a guest who quit got both, the second as a red "Lost connection")
+local guest_closed = false
 local function busy_where(w) return w == "loading" or w == "arriving" or w == "leaving" end
 local function same_world()
     if mate then return session.in_world() and peer_where == "joined" end
@@ -238,6 +204,7 @@ local function step(name)
     local s = steps[name]
     if not s then s = "p1 " .. name .. (tags and (" " .. tags.out) or ""); steps[name] = s end
     crumb.at(s)
+    if not tags then perf.glue(name) end
 end
 
 local started = false
@@ -247,9 +214,10 @@ local bye_seen = nil
 local opened_at = nil          -- os.time() when this link opened (phase1.init)
 local function on_tick(dt)
     if not started then return end
-    if not tags then perf.frame_begin(); peers.tick(dt) end
+    if not tags then perf.frame_begin(); perf.run("peers", peers.tick, dt) end
     now = now + dt
     perf.run("link", util.safe, link.tick, "link.tick", dt)
+    away.tick()
     local player = game.player()
 
     send_in = send_in - dt
@@ -258,14 +226,17 @@ local function on_tick(dt)
         perf.run("pose", sample, player)
         step("send")
         if pose_line then
+            local ps = perf.start()
             seq = seq + 1
             -- The car we're driving travels with the pose: same rate, same redundancy.
             local car = vehicles.drive_line()
             link.send(seq, pose_out:pack(seq, car and (pose_line .. "|" .. car) or pose_line))
+            perf.stop("pose.send", ps)
         end
     end
 
     step("poll")
+    local ps = perf.start()
     local pseq, payload = link.poll()
     pseq = tonumber(pseq)
     if pseq and payload then
@@ -277,7 +248,7 @@ local function on_tick(dt)
             if e.live then pose_gaps.got = pose_gaps.got + 1 else pose_gaps.recovered = (pose_gaps.recovered or 0) + 1 end
             local body, car = e.line:match("^([^|]*)|?(.*)$")
             if car ~= "" then vehicles.drive_sample(car) end
-            local pose = parse(body)
+            local pose = poseline.parse(body)
             if pose then
                 local t = pose_clock:place(pose.sent, now, not e.live)
                 if t or not pose.sent then remote:push(t or now, pose) end
@@ -285,24 +256,30 @@ local function on_tick(dt)
             end
         end
     end
+    perf.stop("pose.poll", ps)
     step("state")
     if not connected and now - last_rx < 1 then
         connected = true
+        guest_closed = false
         local who = link.peer_name()
         if mate then
             log.info("phase1: " .. who .. " (another guest) connected")
         elseif role == "guest" then
-            if session.state() == "joined" then notify.show("Reconnected to " .. who .. ".", "good", "link") end
+            -- (the name tag shows the link's state, netq.tag - no card: user 2026-10-31)
+            if session.state() == "joined" then log.info("phase1: reconnected to " .. who) end
         else
             log.info("phase1: " .. who .. " connected")
         end
-    elseif connected and now - last_rx > 30 and not (busy_where(peer_where) or busy_where(session.where())) then
+    -- (kit 2026-10-31: the host 30 s in its pause menu read "Lost connection" on the guest beside "in the game menu")
+    elseif connected and now - last_rx > 30 and not (busy_where(peer_where) or busy_where(session.where()) or away.in_menu()) then
         connected = false
         if mate then log.info("phase1: lost " .. link.peer_name() .. " (another guest)")
-        elseif role == "host" and peer_where == "own" then
-            -- (a guest that went home ends its link a moment later: "X left your world" already said it)
-            log.info("phase1: " .. link.peer_name() .. " went home and disconnected")
-        else notify.show("Lost connection to " .. link.peer_name() .. ".", "bad", "link") end
+        elseif role == "host" and (peer_where == "own" or guest_closed) then
+            -- (a guest that went home ends its link a moment later: "X left your world" already said it; one whose
+            -- game closed: "X's game closed" did)
+            log.info("phase1: " .. link.peer_name() .. (guest_closed and "'s game closed and the link ended" or " went home and disconnected"))
+        -- (the name tag says it, no card: user 2026-10-31; tools/sessionwatch.py reads this wording)
+        else log.warn("phase1: Lost connection to " .. link.peer_name() .. ".") end
     end
 
     -- (a mate is another guest: only the host's goodbye ends the session)
@@ -312,9 +289,14 @@ local function on_tick(dt)
             bye_seen = bye
             local said = tonumber(bye:match("^stop (%d+)") or "")
             if session.state() == "joined" and session.realm_joined() then
-                -- (the Realm session's live card: realmplay says "You're hosting ..." in it once the takeover is done)
-                notify.show(link.peer_name() .. " left the Realm. You stay right here and host it now - one moment...", "info", "realm")
-                session.realm_host_left()
+                local first, next_host = require("mirror.peers").first_guest()
+                if first then
+                    -- (the Realm session's live card: realmplay says "You're hosting ..." in it once the takeover is done)
+                    notify.show(link.peer_name() .. " left the Realm. You stay right here and host it now - one moment...", "info", "realm")
+                else
+                    notify.show(link.peer_name() .. " left the Realm. " .. tostring(next_host) .. " hosts it next - taking you there...", "info", "realm")
+                end
+                session.realm_host_left(not first)
             elseif session.state() == "joined" then
                 notify.show(link.peer_name() .. " ended the session. Taking you home with your character...", "info", "trip")
                 session.go_home_now()
@@ -360,18 +342,19 @@ local function on_tick(dt)
         end
     end
 
-    if role == "host" and (peer_where == "joined" or busy_where(peer_where)) and link.peer_state(now - last_rx) == "gone" then
+    local ps = away.wrap(link.peer_state(now - last_rx))
+    if role == "host" and (peer_where == "joined" or busy_where(peer_where)) and ps == "gone" then
         guest_gone_t = (guest_gone_t or 0) + dt
         local wait = link.peer_game_gone() and 2 or (cfg.save and cfg.save.guest_gone_reset or 30)
         if guest_gone_t >= wait then
             guest_gone_t = nil
             log.info("phase1: the guest's game is gone - forgetting it was in my world")
-            peer_where, guest_announced = nil, false
+            peer_where, guest_announced, guest_closed = nil, false, true
             if ghost.exists() then ghost.destroy("guest gone") end
             session.save_now()
             notify.show(link.peer_name() .. "'s game closed. Their character is safe on their side.", "info")
         end
-    elseif link.peer_state(now - last_rx) == "ok" then
+    elseif ps == "ok" or ps == "menu" then
         guest_gone_t = nil
     end
 
@@ -387,9 +370,19 @@ local function on_tick(dt)
     pcall(function() dead = player["PlayerDead?"] == true end)
     if dead ~= my_dead then
         my_dead = dead
+        if dead then
+            -- (its own blob: a "life" other than "dead" reads as alive in an older game)
+            deaths = deaths + 1
+            local h = fire.last_hit()
+            local cause = h and string.format("%s, %.0f damage %.1f s before", h.cls, h.amt, os.clock() - h.at) or "no damage seen"
+            link.put_blob("death", deaths .. "|" .. cause)
+            log.info("phase1: I died - last hit: " .. cause)
+        end
         link.put_blob("life", dead and "dead" or "alive")
         log.info("phase1: told the other game I'm " .. (dead and "dead" or "alive"))
     end
+    local death = link.get_blob("death")
+    if death then peer_death, death_told = death, false end
     local life = link.get_blob("life")
     if life then
         local d = life == "dead"
@@ -398,6 +391,11 @@ local function on_tick(dt)
             revived_at = not d and now or nil
             log.info("phase1: the other player is " .. (d and "dead - hiding their ghost" or "alive again"))
         end
+    end
+    -- (a death from before this link, handed out at connect, is only kept: logged with the next death)
+    if peer_dead and peer_death and not death_told then
+        death_told = true
+        log.info("phase1: " .. link.peer_name() .. " died - their last hit: " .. (peer_death:match("^%d+|(.*)$") or peer_death))
     end
 
     local fresh = now - last_rx < cfg.phase1.peer_timeout
@@ -415,6 +413,7 @@ local function on_tick(dt)
         end
     end
     step("ghost check")
+    ghost.check(dt)   -- (one the game removed itself is let go here and spawned again below)
     if peer_dead and ghost.exists() then
         ghost.destroy("peer dead")
     elseif not together and ghost.exists() then
@@ -496,13 +495,19 @@ local function on_tick(dt)
             if look_retry.n > 40 then look_retry = nil else look_retry.t, look_dirty = 3.0, true end
         end
     end
-    if g and peer_look and (look_dirty or applied_to ~= ghost.generation()) then
+    -- (the look swaps the ghost's skeletal meshes, which waits for its animation task: only with animation on the game
+    -- thread, animgate.lua - else this check comes again next frame)
+    -- (a few ms of it a frame: look.apply goes on where it stopped until the whole look is on)
+    if g and peer_look and (look_dirty or look.applying() or applied_to ~= ghost.generation())
+            and require("mirror.animgate").safe_now() then
         if applied_to ~= ghost.generation() then look.forget() end
         applied_to, look_dirty = ghost.generation(), false
         local miss = 0
-        perf.run("look", util.safe, function() miss = look.apply(g, peer_look) or 0 end, "phase1.look")
-        if miss == 0 then look_retry = nil elseif not look_retry then look_retry = { t = 3.0, n = 0 } end
-        if cfg.diagnostics then dump_look_in = 2.0 end
+        perf.run("look", util.safe, function() miss = look.apply(g, peer_look, LOOK_BUDGET) end, "phase1.look")
+        if miss ~= nil then
+            if miss == 0 then look_retry = nil elseif not look_retry then look_retry = { t = 3.0, n = 0 } end
+            if cfg.diagnostics then dump_look_in = 2.0 end
+        end
     end
     if dump_look_in and g then
         dump_look_in = dump_look_in - dt
@@ -513,6 +518,8 @@ local function on_tick(dt)
     end
 
     -- every system runs under util.safe: one that raises must not skip the systems after it (and frame_end) each frame
+    -- (glue "systems": what the ~40 runs below cost besides themselves - live 2026-10-31 "glue look" was 0.4 ms/frame)
+    if not tags then perf.glue("systems") end
     perf.run("save_guard", util.safe, save_guard.tick, "save_guard.tick", dt, game.world())
     if mate then
         -- another guest: only what shows them (the world comes from the host link)
@@ -528,6 +535,7 @@ local function on_tick(dt)
         perf.run("lights", util.safe, lights.tick, "lights.tick", dt, remote:newest())
         perf.run("tactical", util.safe, tactical.tick, "tactical.tick", dt)
         perf.run("throwables", util.safe, throwables.tick, "throwables.tick", dt)
+        perf.run("nuke", util.safe, nuke.tick, "nuke.tick", dt)
         perf.run("vehicles", util.safe, vehicles.tick, "vehicles.tick", dt)
         perf.run("group", util.safe, group.tick, "group.tick", dt)
         perf.run("zombies", util.safe, zombies.tick, "zombies.tick", dt)
@@ -568,6 +576,9 @@ local function on_tick(dt)
     perf.run("lights", util.safe, lights.tick, "lights.tick", dt, remote:newest())
     perf.run("tactical", util.safe, tactical.tick, "tactical.tick", dt)
     perf.run("throwables", util.safe, throwables.tick, "throwables.tick", dt)
+    perf.run("nuke", util.safe, nuke.tick, "nuke.tick", dt)
+    -- (the main link only: a per-player copy would repeat every notice once per guest)
+    perf.run("debugmenu", util.safe, debugmenu.tick, "debugmenu.tick", dt)
     perf.run("vehicles", util.safe, vehicles.tick, "vehicles.tick", dt)
     perf.run("harvest", util.safe, harvest.tick, "harvest.tick", dt)
     perf.run("notify", util.safe, notify.tick, "notify.tick", dt)
@@ -600,12 +611,41 @@ local function reset_link_state()
     link.reset_blob("look")
     link.reset_blob("mods") -- compat.reset forgets the friend's list too
     link.reset_blob("light")
+    -- and the ones whose state was just cleared: a copy stopped for 20 s of silence (peers.lua) starts again with
+    -- peer_where nil, and an unchanged "joined" was never handed out again -> no ghost, the world-gated systems off
+    link.reset_blob("where")
+    link.reset_blob("life")
+    link.reset_blob("death")
+    link.reset_blob("diff")
+    away.reset()
     netq.reset()
     compat.reset()
     pose_gaps.seq = nil
 end
 
 function phase1.peer_where() return peer_where end
+
+-- (the pause/settings menu stops game ticks; LoopAsync + the game thread still run: away.lua)
+function phase1.menu_watch()
+    if not started then return end
+    local can = util.valid(game.player()) and not busy_where(session.where())
+    away.idle(can)
+    -- (the host-gone countdown goes on in the pause menu: session.menu_tick)
+    if can and role == "guest" and not mate and not tags and away.stalled() then
+        util.safe(session.menu_tick, "session.menu_tick")
+    end
+end
+local menu_watching = false
+local function watch_menu()
+    if menu_watching or type(LoopAsync) ~= "function" or type(ExecuteInGameThread) ~= "function" then return end
+    menu_watching = true
+    LoopAsync(1000, function()
+        ExecuteInGameThread(function()
+            util.safe(function() peers.each("mirror.phase1", function(m) m.menu_watch() end) end, "phase1.menu_watch")
+        end)
+        return false
+    end)
+end
 
 -- group split (group.lua): the other guest's ghost here becomes a body the AI goes for ("host") or goes back
 -- to a cosmetic one ("guest"); it respawns as that kind with the next pose
@@ -653,12 +693,18 @@ function phase1.init(c, r, peer_id, t)
     opened_at = os.time()
     link.put_blob("hello", "SurrounSync protocol " .. PROTOCOL .. " role " .. role .. (my_build and (" build " .. my_build) or ""), true)
     notify.configure(cfg)
+    -- (every copy: a mate's name tag says it too)
+    netq.set_why(function()
+        if busy_where(peer_where) then return "loading" end
+        return away.wrap(link.peer_state(now - last_rx))
+    end)
     if mate then
         anim.init(cfg)
         fire.init(cfg, role)
         game.on_world_reset(function() ghost.forget(); look.forget() end)
         tactical.init(cfg)
         throwables.init(cfg)
+        nuke.init()
         vehicles.init(cfg, role, session, true)
         group.init(cfg, session)
         nametag.init(cfg)
@@ -670,7 +716,8 @@ function phase1.init(c, r, peer_id, t)
         return
     end
     session.init(cfg, role, phase1.connected)
-    session.set_peer_state(function() return link.peer_state(now - last_rx) end)
+    if not tags then watch_menu() end
+    session.set_peer_state(function() return away.wrap(link.peer_state(now - last_rx)) end)
     session.set_guest_in(function() return peer_where == "joined" or busy_where(peer_where) end)
     session.set_peer_locator(function()
         local n = remote:newest()
@@ -688,7 +735,7 @@ function phase1.init(c, r, peer_id, t)
     doors.init(cfg, role, session, phase1.connected)
     infest.init(cfg, role, session, same_world)
     horde.init(cfg, role, session, same_world)
-    split.init(cfg, role, session)
+    split.init(cfg, role, session, phase1.revived_age, teleport.busy)
     power.init(cfg, role, session)
     audio.init(cfg, role, session, zombies, fire)
     loot.init(cfg, role, session)
@@ -698,6 +745,8 @@ function phase1.init(c, r, peer_id, t)
     game.on_world_reset(function() ghost.forget(); look.forget(); keepalive.forget(); world.forget() end)
     tactical.init(cfg)
     throwables.init(cfg)
+    nuke.init()
+    debugmenu.init()
     vehicles.init(cfg, role, session)
     harvest.init(cfg, role, same_world)
     deathbags.init(cfg, role, session, same_world)

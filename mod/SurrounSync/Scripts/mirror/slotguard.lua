@@ -56,6 +56,17 @@ end
 
 slotguard.adopt = adopt
 
+-- The firewall's scratch slot, marked ours BEFORE a save is sent there: adopt() only marks it once the save has
+-- landed, from the player's tick - at the main menu none runs, and after a restart the slot was "a save
+-- SurrounSync didn't make", refused by every purge (kit 2026-10-30 12:17). A slot that already holds an
+-- unmarked save is left as it is.
+function slotguard.claim_scratch(slot)
+    if not slotguard.is_coop(slot) or slotguard.foreign(slot) then return false end
+    if marked(slot) then return true end
+    if not savefs.dir_exists(dir(slot)) then savefs.mkdir(dir(slot)) end
+    return (savefs.write(dir(slot) .. "\\" .. MARKER, "SurrounSync co-op session save - emptied when the session ends.\n"))
+end
+
 function slotguard.make_coop_dir(slot)
     if not slotguard.is_coop(slot) then return refuse("make_coop_dir", tostring(slot) .. " is not a co-op save") end
     return savefs.mkdir(dir(slot))
@@ -68,6 +79,15 @@ function slotguard.foreign(slot)
 end
 function slotguard.is_own(n)
     return slotguard.valid_name(n) and not slotguard.is_coop(n) and savefs.exists(dir(n) .. "\\Player.sav")
+end
+-- Why n isn't one of the player's own saves (for the log and the fix-up): "none" (no current save name), "name",
+-- "coop" (a co-op slot), "unsaved" (an own slot the game hasn't written the player into yet: a brand-new game)
+function slotguard.own_problem(n)
+    if not n or n == "" then return "none" end
+    if not slotguard.valid_name(n) then return "name" end
+    if slotguard.is_coop(n) then return "coop" end
+    if not savefs.exists(dir(n) .. "\\Player.sav") then return "unsaved" end
+    return nil
 end
 -- A save name with no folder at all, for the game's New Game to save into (nothing there to overwrite).
 function slotguard.free_own_name()
@@ -88,7 +108,9 @@ end
 function slotguard.repair(slot, file) if slotguard.valid_name(slot) then savefs.repair(dir(slot) .. "\\" .. file) end end
 function slotguard.repair_sidecar(slot, suffix) if slotguard.valid_name(slot) then savefs.repair(saves_dir .. "\\" .. slot .. suffix) end end
 
-local FIELDS = { "step", "own", "coop", "folder", "home", "own_stamp", "host", "time", "version", "realm", "gen", "realm_role" }
+-- (tries: the rescue's count across starts - unlisted, it was dropped and the 5-try give-ups never came)
+local FIELDS = { "step", "own", "coop", "folder", "home", "own_stamp", "host", "time", "version", "realm", "gen", "realm_role",
+                 "tries" }
 local STEPS = { building = "coop", joined = "coop", leaving = "coop", home = "coop", restoring = "folder" }
 local function log_path() return saves_dir .. "\\mirror_coop_session.txt" end
 
@@ -349,6 +371,18 @@ function slotguard.purge(coop)
     os.remove(dir(coop) .. "\\" .. MARKER)
     if n > 0 then log.info(string.format("slotguard: emptied co-op save %s (%d files)", coop, n)) end
     return n
+end
+
+-- An emptied co-op save's folder goes too, so the game's load list doesn't show it (player report 2026-10-31: "session
+-- saved games" there without ever playing co-op - the firewall's scratch slot, emptied but its folder kept). Only a
+-- co-op-named folder without saves; rmdir_empty keeps one that still holds any file. Not for a slot about to be
+-- built: next_coop_slot makes its folder before the purge.
+function slotguard.remove_empty(coop)
+    if not slotguard.is_coop(coop) then return refuse("remove_empty", tostring(coop) .. " is not a co-op save") end
+    if has_saves(coop) or not savefs.dir_exists(dir(coop)) then return false end
+    local ok = savefs.rmdir_empty(dir(coop))
+    if ok then log.info("slotguard: removed the empty co-op save folder " .. coop) end
+    return ok
 end
 
 function slotguard.apply_restore(slot, folder)

@@ -46,11 +46,17 @@ function loader.tick(dt, busy)
     local t = os.clock()
     if t < next_at then return end
     next_at = t + INTERVAL
-    local p = table.remove(queue, 1)
+    loader.load_now(table.remove(queue, 1))
+end
+
+-- One load on the game thread, the crash guard around it (a load that takes the game down leaves the guard file,
+-- and the next start bans that asset). Returns "had" | "loaded" | "failed", ms.
+function loader.load_now(p)
     -- a miss gives a non-nil wrapper around NULL, not nil: only a valid object counts as loaded
     local have = false
     pcall(function() have = StaticFindObject(p):IsValid() end)
-    if have then return end
+    if have then return "had", 0 end
+    guard = guard or (saved_dir() .. "\\mirror_loading.txt")
     local f = io.open(guard, "w")
     if f then f:write(p, "\n"); f:close() end
     local t0 = os.clock()
@@ -59,8 +65,10 @@ function loader.tick(dt, busy)
     local found = false
     pcall(function() found = StaticFindObject(p):IsValid() end)
     if not found then failed[p] = true end
+    local ms = (os.clock() - t0) * 1000
     log.info(string.format("loader: %s %s (%.0f ms)%s", p:match("[^%./]+$") or p, found and "loaded" or "NOT loaded",
-        (os.clock() - t0) * 1000, ok and "" or (": " .. tostring(err))))
+        ms, ok and "" or (": " .. tostring(err))))
+    return found and "loaded" or "failed", ms
 end
 
 function loader.configure(c)
