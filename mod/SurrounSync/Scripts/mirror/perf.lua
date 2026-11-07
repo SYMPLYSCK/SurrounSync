@@ -26,8 +26,9 @@ function perf.configure(cfg) enabled = not (cfg and cfg.perf_log == false) end
 -- run that raised can't leave it counting.
 local depth = 0
 local top_total = 0.0      -- time in top-level parts so far (the glue between them = the rest)
+local top_kb = 0.0         -- Lua memory the top-level parts took so far, the same for the glue's own KB/s
 local function record(name, d, dm, top)
-    if top then top_total = top_total + d end
+    if top then top_total, top_kb = top_total + d, top_kb + dm end
     local p = parts[name]
     if not p then p = { sum = 0.0, max = 0.0, kb = 0.0 }; parts[name] = p end
     p.sum = p.sum + d
@@ -61,6 +62,16 @@ function perf.run(name, fn, ...)
     record(name, os.clock() - t, collectgarbage("count") - m, top)
 end
 
+-- A hook body (it runs inside the game's own call, outside every tick, so no part ever counted it: the per-shot
+-- hooks while a fast gun fired, player report #6): listed like a part, never added to the mod's own frame time
+-- (it isn't inside that frame), no crash step (one write per shot).
+function perf.hook(name, fn, ...)
+    if not enabled then return fn(...) end
+    local t, m = os.clock(), collectgarbage("count")
+    fn(...)
+    record(name, os.clock() - t, collectgarbage("count") - m, false)
+end
+
 -- A span the caller times itself (code whose results perf.run can't hand back): local s = perf.start() ...
 -- perf.stop("name", s). Counts as its own part, at the depth it was started at.
 function perf.start()
@@ -73,35 +84,37 @@ end
 
 -- Glue: the time between two marks that no part took is counted as the part "glue <name of the first mark>"
 -- (live 2026-10-31: 0.66 ms/frame was outside every part, in code between them)
-local glue = { at = nil, top = 0.0, name = nil, names = {} }
-local function glue_flush(t)
+-- (and its Lua memory: "0 KB/s" on every glue part hid what filled the heap to 2.6 GB, live 2026-11-04)
+local glue = { at = nil, top = 0.0, kb = 0.0, top_kb = 0.0, name = nil, names = {} }
+local function glue_flush(t, kb)
     if not glue.at then return end
     local d = (t - glue.at) - (top_total - glue.top)
     if d > 0 then
         local n = glue.names[glue.name]
         if not n then n = "glue " .. glue.name; glue.names[glue.name] = n end
-        record(n, d, 0, true)
+        local own_kb = (kb - glue.kb) - (top_kb - glue.top_kb)
+        record(n, d, own_kb, true)
     end
 end
 function perf.glue(name)
     if not (enabled and frame_start) then return end
-    local t = os.clock()
-    glue_flush(t)
-    glue.at, glue.top, glue.name = t, top_total, name
+    local t, kb = os.clock(), collectgarbage("count")
+    glue_flush(t, kb)
+    glue.at, glue.top, glue.kb, glue.top_kb, glue.name = t, top_total, kb, top_kb, name
 end
 
 function perf.frame_begin()
     depth = 0
     if enabled then
         frame_start = os.clock()
-        glue.at, glue.top, glue.name = frame_start, top_total, "start"
+        glue.at, glue.top, glue.kb, glue.top_kb, glue.name = frame_start, top_total, collectgarbage("count"), top_kb, "start"
     end
 end
 
 function perf.frame_end(dt)
     crumb.at("game (mod tick done)")   -- (before the last glue is taken: the report counts its write)
     if not (enabled and frame_start) then return end
-    glue_flush(os.clock())
+    glue_flush(os.clock(), collectgarbage("count"))
     glue.at = nil
     local d = os.clock() - frame_start
     frame_start = nil
@@ -128,8 +141,9 @@ function perf.frame_end(dt)
         (frame_sum - in_parts) / frames * 1000)
     local gc_on = collectgarbage("isrunning")
     if not gc_on then collectgarbage("restart") end
-    log.info(string.format("perf: mod %.2f ms/frame (worst frame %.0f ms), game %.0f fps, Lua memory %.0f KB (%s GC%s)%s | %s",
-        frame_sum / frames * 1000, frame_max * 1000, frames / wall, collectgarbage("count"), gc_mode,
+    -- ("all ticks": since 2026-11-01 the frame spans every game.on_tick handler, so it reads higher than before)
+    log.info(string.format("perf: mod %.2f ms/frame (all ticks, worst frame %.0f ms, %.0f crash steps/frame), game %.0f fps, Lua memory %.0f KB (%s GC%s)%s | %s",
+        frame_sum / frames * 1000, frame_max * 1000, crumb.taken() / frames, frames / wall, collectgarbage("count"), gc_mode,
         gc_slow > 0 and string.format(", inside %d slow part(s)", gc_slow) or "",
         gc_on and "" or " (GC WAS STOPPED - restarted)", table.concat(top, " | ")))
     parts, frame_sum, frame_max, frames, wall, gc_slow = {}, 0.0, 0.0, 0, 0.0, 0

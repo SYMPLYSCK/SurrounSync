@@ -108,9 +108,14 @@ local function list_add(id, uid, da, count, dx, dy, inside, place)
     local list = host_list[id]
     if not list or synced[id] then return end
     for _, w in ipairs(list) do if w.uid == uid then return end end
-    local at = #list + 1
+    local at, parent = #list + 1, nil
+    if place.holder then
+        for i, w in ipairs(list) do
+            if w.uid == place.holder or w.uid == alias[place.holder] then parent = i; break end
+        end
+    end
     list[at] = { uid = uid, da = da, count = tonumber(count) or 1, dx = tonumber(dx) or 0, dy = tonumber(dy) or 0,
-                 cell = place.cell, rot = place.rot, slot = place.slot }
+                 cell = place.cell, rot = place.rot, slot = place.slot, parent = parent }
     local sub = (inside and inside ~= "") and jig.decode(inside) or {}
     for i = 2, #sub do
         local w = sub[i]
@@ -219,7 +224,7 @@ end
 
 local function forget(mine, theirs)
     if theirs then alias[theirs], added_once[theirs] = nil, nil end
-    if mine then rev[mine], added_once[mine], put_sent[mine] = nil, nil, nil end
+    if mine then rev[mine], added_once[mine], put_sent[mine], da_of[mine] = nil, nil, nil, nil end
 end
 
 local last_removed = { key = nil, at = -100 }
@@ -364,12 +369,19 @@ end
 local later, later_in = {}, 0.0
 local LATER_S = 600
 local LATER_MAX = 200
+-- a kept put-in this world won't apply: the guest keeps the item in its own copy (R), never neither of us
+local function refund_put(payload)
+    local id, uid, da, s = payload:match("^A (%S+) (%S+) (%S+) %S+ %S+ %S+ (%d+)")
+    if id then channel:send("R " .. id .. " " .. uid .. " " .. da .. " " .. s) end
+end
 local function keep_for_later(kind, id, payload)
     if role ~= "host" then return false end
     for _, x in ipairs(later) do if x.p == payload then return true end end
     if #later >= LATER_MAX then
         local x = table.remove(later, 1)
-        log.warn(string.format("loot: too many kept changes - dropped the oldest %s for %s", x.k == "A" and "put-in" or "take", x.id))
+        log.warn(string.format("loot: too many kept changes - dropped the oldest %s for %s%s", x.k == "A" and "put-in" or "take", x.id,
+            x.k == "A" and " (the other player keeps that item)" or ""))
+        if x.k == "A" then refund_put(x.p) end
     end
     later[#later + 1] = { k = kind, id = id, p = payload, t = now }
     log.info(string.format("loot: %s for %s - container not found here yet, kept to apply when it is", kind == "A" and "put-in" or "take", id))
@@ -453,7 +465,12 @@ local function apply(payload)
     end
     if ok then count_seen[uid] = (have - take) > 0 and (have - take) or nil end
     if ok and tonumber(left) == 0 then
-        if emptied_n > 200 then emptied, emptied_n = {}, 0 end
+        if emptied_n > 200 then
+            -- only the old ones go: clearing all of them dropped one a few seconds old, and its echo, taken for a
+            -- take of an item not here, made the guest give a real item back (one every 200 emptied, T18)
+            emptied_n = 0
+            for k, at in pairs(emptied) do if now - at >= 5.0 then emptied[k] = nil else emptied_n = emptied_n + 1 end end
+        end
         emptied[id .. " " .. theirs], emptied_n = now, emptied_n + 1
     end
     stats.applied = stats.applied + 1
@@ -502,9 +519,13 @@ local function flush_adds()
             local id, uid, da, count, dur = e.id, e.uid, e.da, e.count, e.dur
             local inside = jig.subtree(e.comp, uid)
             local me = inside and inside[1] or {}
-            -- where it sits in the grid (cell:rotated:container) so the other game puts it in the same spot
-            channel:send(string.format("A %s %s %s %d %.3f %.3f %d %d:%d:%d", id, uid, da, count or 1, dur and dur.X or 0, dur and dur.Y or 0, next_seq(id),
-                me.cell or -1, me.rot and 1 or 0, me.slot or -1)
+            -- where it sits in the grid (cell:rotated:container[:holder]) so the other game puts it in the same spot;
+            -- holder: the item whose compartment it went into (an ammo tin in a crate), as the other game knows it.
+            -- Without it the other game looked only at the container's own grids: the item landed loose in the
+            -- crate, or nowhere, and the host's next list took it out of the tin here (user 2026-11-03: "vanish")
+            local holder = me.parent and me.holder and (":" .. (rev[me.holder] or me.holder)) or ""
+            channel:send(string.format("A %s %s %s %d %.3f %.3f %d %d:%d:%d%s", id, uid, da, count or 1, dur and dur.X or 0, dur and dur.Y or 0, next_seq(id),
+                me.cell or -1, me.rot and 1 or 0, me.slot or -1, holder)
                 .. (jig.worth_sending(inside) and (" " .. jig.encode(inside)) or ""))
             mark_dirty(id, e.comp)
             stats.put = stats.put + 1
@@ -714,21 +735,25 @@ end
 
 local function apply_add(payload)
     if not shared() then return end
-    local id, uid, da, count, dx, dy, s, cell, rot, slot, inside =
-        payload:match("^A (%S+) (%S+) (%S+) (%-?%d+) (%S+) (%S+) (%d+) (%-?%d+):(%d):(%-?%d+) ?(%S*)$")
+    local id, uid, da, count, dx, dy, s, cell, rot, slot, holder, inside =
+        payload:match("^A (%S+) (%S+) (%S+) (%-?%d+) (%S+) (%S+) (%d+) (%-?%d+):(%d):(%-?%d+):?([%w_%-]*) ?(%S*)$")
     if not id then return end
-    local place = { cell = tonumber(cell) >= 0 and tonumber(cell) or nil, rot = rot == "1", slot = tonumber(slot) >= 0 and tonumber(slot) or nil }
+    local place = { cell = tonumber(cell) >= 0 and tonumber(cell) or nil, rot = rot == "1", slot = tonumber(slot) >= 0 and tonumber(slot) or nil,
+                    holder = holder ~= "" and holder or nil }
     local actor = find(id)
     local comp = actor and comp_of(actor)
     if added_once[uid] then
         -- a repeat of a put already done: skip it while that item is still here, or when it's no newer than what
         -- was acked (a replay). A newer put of an item gone from here is the same item put back: add it again.
+        -- With the container not here it is kept and decided when it shows up: dropped, a guest who took the item
+        -- out of one container the host hadn't loaded (that take waits, so the item still counts as added) and put
+        -- it into another lost it for good (T18: items gone from storage after long sessions).
         local here = comp and (count_of(comp, alias[uid] or uid) > 0 or count_of(comp, uid) > 0)
-        if not comp or here or role ~= "host" or (tonumber(s) or 0) <= (ack[id] or 0) then
+        if role ~= "host" or (comp and (here or (tonumber(s) or 0) <= (ack[id] or 0))) then
             if comp then acked(id, s, comp) end
             return
         end
-        added_once[uid], alias[uid] = nil, nil
+        if comp then added_once[uid], alias[uid] = nil, nil end
     end
     if not comp then
         stats.missing = stats.missing + 1
@@ -752,8 +777,23 @@ local function apply_add(payload)
             da:match("[^%.]+$") or da, id))
         return
     end
+    -- put into an item's compartment (an ammo tin in the crate): that item's grids here; not found (not paired yet,
+    -- gone here) it goes into the container itself, kept on both games, and the host's list puts it right
+    local conts, into = nil, nil
+    if place.holder then
+        local hu = local_uid(place.holder)
+        conts = {}
+        for _, c in ipairs(jig.containers_in(comp, hu)) do
+            if place.slot == nil or c.slot == place.slot then conts[#conts + 1] = c end
+        end
+        if #conts > 0 then into = hu else
+            conts = nil
+            log.info("loot: the other player put " .. (da:match("[^%.]+$") or da) .. " into an item in " .. id
+                .. " that isn't here - put into the container itself")
+        end
+    end
     applying = true
-    local mine, err = jig.add_item(comp, da, tonumber(count) or 1, tonumber(dx) or 0, tonumber(dy) or 0, nil, place)
+    local mine, err = jig.add_item(comp, da, tonumber(count) or 1, tonumber(dx) or 0, tonumber(dy) or 0, conts, place)
     applying = false
     if not mine then
         log.warn("loot: couldn't add the other player's " .. (da:match("[^%.]+$") or da) .. " to " .. id .. ": " .. tostring(err))
@@ -772,7 +812,8 @@ local function apply_add(payload)
         applying = false
         if ok then n, miss = a, m else log.warn("loot: couldn't fill the other player's item: " .. tostring(a)) end
     end
-    log.info(string.format("loot: the other player put %s x%s into %s - added here%s", da:match("[^%.]+$") or da, count, id,
+    log.info(string.format("loot: the other player put %s x%s into %s%s - added here%s", da:match("[^%.]+$") or da, count, id,
+        into and (" (in " .. (da_of[into] and da_of[into]:match("[^%.]+$") or "an item") .. ")") or "",
         (n + miss > 0) and string.format(" (holding %d, %d missing)", n, miss) or ""))
 end
 
@@ -1157,8 +1198,7 @@ local function retry_later()
             if x.k == "A" then apply_add(x.p) elseif x.k == "N" then apply_count(x.p) else apply(x.p) end
         elseif x.k == "A" and now - x.t > LATER_S then
             log.warn(string.format("loot: gave up on a kept put-in for %s after %d s - that container never showed up here", x.id, LATER_S))
-            local id, uid, da, s = x.p:match("^A (%S+) (%S+) (%S+) %S+ %S+ %S+ (%d+)")
-            if id then channel:send("R " .. id .. " " .. uid .. " " .. da .. " " .. s) end
+            refund_put(x.p)
         else
             local dup = false
             for _, y in ipairs(later) do if y.p == x.p then dup = true end end
@@ -1183,6 +1223,8 @@ function loot.tick(dt)
     hook_in = hook_in - dt
     if hook_in <= 0 then
         hook_in = 1.0
+        -- (give_back ignores a take older than 120 s: kept, every take of the session piled up here)
+        for k, t in pairs(sent_takes) do if now - t.at > 120 then sent_takes[k] = nil end end
         crumb.at("loot: hooks")
         -- Blueprint hooks here are pre-hooks only (UE4SS 3.0.1 never runs the post callback).
         util.ensure_hook(GENERATE, generate_fn)
@@ -1307,6 +1349,18 @@ local function forget_world()
     round_at, round_q, round_due = -1, nil, false
     repair_in = 8.0
 end
+-- (tests: how many entries the per-item tables hold - a long session must not pile them up)
+function loot._sizes()
+    local out = {}
+    for name, t in pairs({ alias = alias, rev = rev, added_once = added_once, da_of = da_of, count_seen = count_seen,
+                           put_sent = put_sent, sent_takes = sent_takes, emptied = emptied, later = later }) do
+        local n = 0
+        for _ in pairs(t) do n = n + 1 end
+        out[name] = n
+    end
+    return out
+end
+
 function loot.init(c, r, s)
     game.on_world_reset(forget_world)
     cfg, role, session = c, r, s

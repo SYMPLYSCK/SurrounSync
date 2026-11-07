@@ -37,8 +37,9 @@ the zombies and AI, loot, doors, cars, weather, airdrops and so on.
   smoothest game, and across continents it still works with a little delay. Wired or good Wi-Fi helps. No ports
   to open.
 - The host's PC runs all the AI for everyone, so let the fastest PC host.
-- EVERYONE MUST BE ON THE GAME'S EXPERIMENTAL BRANCH (0.8)! In Steam: SurrounDead → Properties → Betas →
-  experimental. The setup tells you if you're on another one.
+- EVERYONE NEEDS THE GAME'S 0.8 (the normal Steam branch since 2026-11-05, or the experimental branch), and everyone
+  in one game the same branch. The old 0.7.1 ("previous" in Steam → Properties → Game Versions & Betas) doesn't
+  work. The setup tells you if you're on it.
 
 ## Install
 
@@ -125,6 +126,7 @@ you turn it on.
 | Ctrl+H, Ctrl+1–3 | host / join a hosting friend, if the menu won't open |
 | Ctrl+F11 | write an inventory report to the log |
 | Ctrl+F12 | write the connection status to the log |
+| **/** | quick chat, and every key above as a command: type **/** to see them (`/leave`, `/host`, `/join 1`, `/messages`, `/minimap`, `/syncfx toggle`, `/drone menu` and more) |
 
 ## Updates
 
@@ -162,7 +164,7 @@ Run **SurrounSync Setup → Check** first. It catches most problems and tells yo
 
 | Problem | Fix |
 |---|---|
-| No CO-OP tab | Usually the wrong game version: switch SurrounDead to the experimental branch in Steam (Properties → Betas → experimental, then Verify integrity of game files), then run the setup's REPAIR. A different UE4SS version from another mod can also cause it. |
+| No CO-OP tab | Usually the wrong game version: switch SurrounDead to game 0.8 in Steam (Properties → Game Versions & Betas → None, the normal branch, then Verify integrity of game files), then run the setup's REPAIR. A different UE4SS version from another mod can also cause it. |
 | "The Steam connection isn't running" | Start Steam before the game. If it's running, your antivirus may have removed `SurrounSyncBridge.exe`. Restore it, allow it, and run REPAIR. |
 | Friend isn't listed | They have to click **HOST A GAME** first, or you can use their friend code. |
 | "Different version of SurrounSync" | Everyone updates to the newest version. |

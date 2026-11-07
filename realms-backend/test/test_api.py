@@ -6,6 +6,7 @@ after `npm run db:local` on a fresh .wrangler/test-state. Then: python -I test/t
 """
 import hashlib
 import json
+import os
 import sys
 import threading
 import time
@@ -56,6 +57,250 @@ def sha(b):
 def upload(rid, who, token, gen, data, digest=None):
     return call("PUT", "/v1/realms/%s/world/%d" % (rid, gen), auth=who, raw=data,
                 headers={"x-lease-token": token, "x-sha256": digest or sha(data)})
+
+
+def listed(rid):
+    lst = call("GET", "/v1/realms/public")
+    return lst, next((x for x in j(lst).get("realms", []) if x["realm_id"] == rid), None)
+
+
+def public_server_list():
+    S = ["7656119000000010%d" % i for i in range(8)]
+    c = call("POST", "/v1/realms", {"name": "Open Realm", "steam_id": S[0], "player_name": "Carol",
+                                    "format": 1, "protocol": 58, "mod_version": "1.0.0", "game_build": "123"})
+    C = j(c)
+    rid = C["realm_id"]
+    D = j(call("POST", "/v1/invites/redeem", {"invite": j(call("POST", "/v1/realms/%s/invites" % rid, auth=C))["invite"],
+                                              "steam_id": S[1], "player_name": "Dan"}))
+    _, row = listed(rid)
+    check("public: a new Realm is not listed", row is None)
+    check("public: a private Realm can't be joined", call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[2], "player_name": "Eve"})[0] == 404)
+    check("public: only the owner lists it", call("PUT", "/v1/realms/%s/public" % rid, {"public": True}, auth=D)[0] == 403)
+    check("public: bad flag refused", call("PUT", "/v1/realms/%s/public" % rid, {"public": "yes"}, auth=C)[0] == 400)
+    p = call("PUT", "/v1/realms/%s/public" % rid, {"public": True}, auth=C)
+    check("public: owner lists it, open", p[0] == 200 and j(p).get("public") is True and j(p).get("locked") is False, p)
+    lst, row = listed(rid)
+    check("public: listed, offline, 0 players, unlocked", row is not None and row["live"] is False and row["players"] == 0
+          and row["locked"] is False and row["name"] == "Open Realm", row)
+    check("public: the list shows no Steam ids or member names", S[0].encode() not in lst[1] and b"Carol" not in lst[1], lst[1][:300])
+    check("public: status shows the flag to members", j(call("GET", "/v1/realms/" + rid, auth=C)).get("public") is True)
+
+    e = call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[2], "player_name": "Eve"})
+    check("public: anyone joins an open one", e[0] == 201 and j(e)["realm_id"] == rid and j(e).get("key"), e)
+    E = j(e)
+    st = j(call("GET", "/v1/realms/" + rid, auth=E))
+    check("public: a list member sees only itself", [x["member_id"] for x in st.get("members", [])] == [E["member_id"]]
+          and st["you"]["via"] == "public", st)
+    check("public: invited members still see everyone", len(j(call("GET", "/v1/realms/" + rid, auth=D))["members"]) == 3)
+    e2 = call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[2], "player_name": "Eve"})
+    check("public: joining again replaces the old list membership (the newest key works, the old one stops)",
+          e2[0] == 201 and call("GET", "/v1/realms/" + rid, auth=E)[0] == 403
+          and call("GET", "/v1/realms/" + rid, auth=j(e2))[0] == 200
+          and len(j(call("GET", "/v1/realms/" + rid, auth=D))["members"]) == 3, e2)
+    E = j(e2) if e2[0] == 201 else E
+    # (a 409 "already a member" told anyone which Steam ids are in the Realm; audit 2026-11-03)
+    dj = call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[1], "player_name": "Dan"})
+    check("public: an invited member's Steam id joins like any other (no member-or-not answer)",
+          dj[0] == 201 and j(dj).get("member_id") != D["member_id"], dj)
+    check("public: ...and the invited membership keeps working", call("GET", "/v1/realms/" + rid, auth=D)[0] == 200
+          and j(call("GET", "/v1/realms/" + rid, auth=D))["you"]["via"] is None)
+    cl = call("POST", "/v1/realms/%s/lease" % rid, {"steam_id": S[2], "name": "Eve"}, auth=E)
+    check("public: a list member can't host it", cl[0] == 403 and j(cl).get("error") == "invited_only", cl)
+    check("public: ...nor make invites", call("POST", "/v1/realms/%s/invites" % rid, auth=E)[0] == 403)
+    check("public: ...nor download the world", call("GET", "/v1/realms/%s/world" % rid, auth=E)[0] == 403
+          and call("GET", "/v1/realms/%s/world/1" % rid, auth=E)[0] == 403
+          and call("GET", "/v1/realms/%s/generations" % rid, auth=E)[0] == 403)
+    check("public: ...nor become the owner", call("POST", "/v1/realms/%s/members/%s/owner" % (rid, E["member_id"]), auth=C)[0] == 404)
+
+    tok = j(call("POST", "/v1/realms/%s/lease" % rid, {"steam_id": S[0], "name": "Carol"}, auth=C))["lease_token"]
+    hb = lambda b: call("POST", "/v1/realms/%s/lease/heartbeat" % rid, b, auth=C, headers={"x-lease-token": tok})
+    h = hb({"players": 2, "max_players": 4, "ping_loc": "fra=12+1/14+2,ams=20+2"})
+    check("public: the host's heartbeat sends players and ping", h[0] == 200, h)
+    _, row = listed(rid)
+    check("public: listed live with players, cap and ping", row and row["live"] is True and row["players"] == 2
+          and row["max_players"] == 4 and row["ping_loc"] == "fra=12+1/14+2,ams=20+2", row)
+    check("public: an empty heartbeat keeps them", hb(None)[0] == 200 and listed(rid)[1]["players"] == 2)
+    for bad in ({"players": 99}, {"max_players": 0}, {"ping_loc": "a\tb"}, {"ping_loc": "é"}, {"ping_loc": "x" * 1025}, {"players": "2"}):
+        check("public: bad heartbeat refused %s" % str(bad)[:30], hb(bad)[0] == 400)
+    cl = call("POST", "/v1/realms/%s/lease" % rid, {"steam_id": S[2], "name": "Eve"}, auth=E)
+    check("public: a list member is told who hosts", cl[0] == 409 and j(cl)["host"]["steam_id"] == S[0], cl)
+
+    check("public: a password under 6 characters refused",
+          call("PUT", "/v1/realms/%s/public" % rid, {"public": True, "password": "abcde"}, auth=C)[0] == 400)
+    p = call("PUT", "/v1/realms/%s/public" % rid, {"public": True, "password": "hunter2"}, auth=C)
+    check("public: owner locks it; who joined open is removed (Eve and Dan's list join)", j(p).get("locked") is True and j(p).get("removed") == 2
+          and call("GET", "/v1/realms/" + rid, auth=E)[0] == 403, p)
+    check("public: listed as locked", listed(rid)[1]["locked"] is True)
+    r = call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[3], "player_name": "Fay"})
+    check("public: locked, no password refused", r[0] == 403 and j(r).get("error") == "bad_password", r)
+    check("public: locked, wrong password refused",
+          call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[3], "player_name": "Fay", "password": "hunter3"})[0] == 403)
+    f = call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[3], "player_name": "Fay", "password": "hunter2"})
+    check("public: locked, right password joins", f[0] == 201, f)
+    F = j(f)
+    raw = call("GET", "/v1/realms/" + rid, auth=C)[1]
+    check("public: the password is never sent back", b"hunter2" not in raw and b"pass_" not in raw, raw[:200])
+
+    call("DELETE", "/v1/realms/%s/lease" % rid, auth=C, headers={"x-lease-token": tok})
+    _, row = listed(rid)
+    check("public: release clears players and ping", row and row["live"] is False and row["players"] == 0 and row["ping_loc"] is None, row)
+    tok = j(call("POST", "/v1/realms/%s/lease" % rid, {"steam_id": S[0], "name": "Carol"}, auth=C))["lease_token"]
+    _, row = listed(rid)
+    check("public: a new claim starts with no players or ping", row and row["live"] is True and row["players"] == 0 and row["ping_loc"] is None, row)
+    call("DELETE", "/v1/realms/%s/lease" % rid, auth=C, headers={"x-lease-token": tok})
+
+    p = call("PUT", "/v1/realms/%s/public" % rid, {"public": False}, auth=C)
+    check("public: owner takes it off the list", j(p).get("public") is False and listed(rid)[1] is None, p)
+    check("public: off the list, join refused", call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[4], "player_name": "Gil"})[0] == 404)
+    cl = call("POST", "/v1/realms/%s/lease" % rid, {"steam_id": S[3], "name": "Fay"}, auth=F)
+    check("public: unlisting removes list members (no host address for them)", j(p).get("removed") == 1 and cl[0] == 403
+          and b"steam_id" not in cl[1], cl)
+    check("public: invited members stay", call("GET", "/v1/realms/" + rid, auth=D)[0] == 200)
+
+    # wrong passwords: 10 an hour per address, 200 per Realm from all addresses (the 2 wrong ones above count)
+    call("PUT", "/v1/realms/%s/public" % rid, {"public": True, "password": "letmein"}, auth=C)
+    ip = lambda s: {"cf-connecting-ip": s}
+    codes = [call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[6], "player_name": "Ivy", "password": "nope%d" % i},
+                  headers=ip("203.0.113.1"))[0] for i in range(11)]
+    check("public: one address gets 10 wrong passwords an hour, then 429", codes == [403] * 10 + [429], codes)
+    r = call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[6], "player_name": "Ivy", "password": "letmein"}, headers=ip("203.0.113.2"))
+    check("public: ...which doesn't lock the right password out for anyone else", r[0] == 201, r)
+    codes = [call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[6], "player_name": "Ivy", "password": "nope%d" % i},
+                  headers=ip("203.0.113.%d" % (10 + i // 10)))[0] for i in range(200)]
+    check("public: wrong passwords capped per Realm (200 an hour from all addresses, then 429)",
+          codes.count(403) == 188 and codes[188:] == [429] * 12, (codes.count(403), codes[180:]))
+    r = call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[6], "player_name": "Ivy", "password": "letmein"}, headers=ip("203.0.113.99"))
+    check("public: ...then the right one waits too (many addresses can still do that for the hour)", r[0] == 429, r)
+    # one IPv6 /64 is one address for the limits (open again: the wrong-password cap is spent)
+    call("PUT", "/v1/realms/%s/public" % rid, {"public": True}, auth=C)
+    codes =[call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[7], "player_name": "Jo"},
+                  headers={"cf-connecting-ip": "2001:db8:5:6:%x::1" % i})[0] for i in range(22)]
+    check("public: an IPv6 /64 shares one join limit", 429 in codes, codes)
+
+    call("PUT", "/v1/realms/%s/public" % rid, {"public": True}, auth=C)
+    codes = [call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[5], "player_name": "Hal", "password": "x"})[0] for _ in range(22)]
+    check("public: joining is rate limited", 429 in codes, codes)
+    call("DELETE", "/v1/realms/" + rid, auth=C)
+
+
+def security_checks():
+    """Squatting with made-up Steam ids, list spam, the admin delist, pruning list joins that never came back and
+    stale listings. Needs a server started with LIST_STALE_SECONDS:30, PUBLIC_NEVER_SEEN_SECONDS:2 and
+    --test-scheduled; with MOTD_TOKEN set (and REALMS_ADMIN_TOKEN here) the delist is tested too."""
+    ip = lambda s: {"cf-connecting-ip": s}
+    S = ["7656119000000020%d" % i for i in range(8)]
+
+    def new(name, steam, addr):
+        return j(call("POST", "/v1/realms", {"name": name, "steam_id": steam, "player_name": "Own", "format": 1,
+                                             "protocol": 58, "mod_version": "1.0.0", "game_build": "123"}, headers=ip(addr)))
+
+    O = new("Squat Realm", S[0], "198.51.100.1")
+    rid = O["realm_id"]
+    call("PUT", "/v1/realms/%s/public" % rid, {"public": True}, auth=O, headers=ip("198.51.100.1"))
+    # a list join made up in someone else's name blocks neither their invite nor their own list join
+    q = j(call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[1], "player_name": "Fake"}, headers=ip("198.51.100.50")))
+    inv = j(call("POST", "/v1/realms/%s/invites" % rid, auth=O))["invite"]
+    r = call("POST", "/v1/invites/redeem", {"invite": inv, "steam_id": S[1], "player_name": "Real"}, headers=ip("198.51.100.51"))
+    check("squat: a list join in someone's name doesn't block their invite", r[0] == 201, r)
+    check("squat: ...and the made-up list membership is gone", call("GET", "/v1/realms/" + rid, auth=q)[0] == 403)
+    q = j(call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[2], "player_name": "Fake"}, headers=ip("198.51.100.50")))
+    r = call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[2], "player_name": "Real"}, headers=ip("198.51.100.51"))
+    check("squat: ...nor their own list join (the made-up one is replaced)",
+          r[0] == 201 and call("GET", "/v1/realms/" + rid, auth=q)[0] == 403, r)
+
+    # a list join that never opens the Realm (no claim) is pruned after PUBLIC_NEVER_SEEN_SECONDS
+    # ...and a claim while nobody hosts doesn't count as coming back (one call each kept made-up joins for 30 days)
+    gone = j(call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[3], "player_name": "Ghost"}, headers=ip("198.51.100.52")))
+    seen = j(call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[4], "player_name": "Pat"}, headers=ip("198.51.100.52")))
+    poke = j(call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[7], "player_name": "Poke"}, headers=ip("198.51.100.54")))
+    host = call("POST", "/v1/realms/%s/lease" % rid, {"steam_id": S[0], "name": "Own"}, auth=O)
+    cl = call("POST", "/v1/realms/%s/lease" % rid, {"steam_id": S[4], "name": "Pat"}, auth=seen)
+    time.sleep(3.5)   # (the owner's 3 s lease runs out)
+    nobody = call("POST", "/v1/realms/%s/lease" % rid, {"steam_id": S[7], "name": "Poke"}, auth=poke)
+    time.sleep(2.5)
+    sc = call("GET", "/__scheduled?cron=*+*+*+*+*")
+    check("prune: a list join that never came back is removed, one that joined a host stays",
+          sc[0] == 200 and host[0] == 200 and cl[0] == 409 and call("GET", "/v1/realms/" + rid, auth=gone)[0] == 403
+          and call("GET", "/v1/realms/" + rid, auth=seen)[0] == 200, (sc[0], host[0], cl[0]))
+    check("prune: a claim while nobody hosts doesn't keep a list join", nobody[0] == 403
+          and call("GET", "/v1/realms/" + rid, auth=poke)[0] == 403, nobody)
+    # names that pass for another Realm's (direction override, zero-width space)
+    for bad in ("Real\u202emlaeR", "Re\u200bal", "Re\u3164al"):
+        r = call("POST", "/v1/realms", {"name": bad, "steam_id": S[6], "player_name": "Own", "format": 1, "protocol": 58,
+                                        "mod_version": "1.0.0", "game_build": "123"}, headers=ip("198.51.100.60"))
+        check("names: invisible or direction characters refused (%s)" % ascii(bad), r[0] == 400, r)
+    # Steam persona names reach the server as they are: an emoji with a ZWJ, a soft hyphen, a ZWNJ
+    ok = call("POST", "/v1/realms", {"name": "Pride \U0001f3f3\ufe0f\u200d\U0001f308", "steam_id": S[6],
+                                     "player_name": "Ka\u00adt \u200c\U0001f469\u200d\U0001f4bb", "format": 1,
+                                     "protocol": 58, "mod_version": "1.0.0", "game_build": "123"},
+              headers=ip("198.51.100.61"))
+    check("names: player names keep joiners and soft hyphens, Realm names keep emoji joiners", ok[0] == 201, ok)
+    if ok[0] == 201:
+        cl = call("POST", "/v1/realms/%s/lease" % j(ok)["realm_id"], {"steam_id": S[6], "name": "Rainbow \U0001f3f3\ufe0f\u200d\U0001f308"},
+                  auth=j(ok))
+        check("names: a claim with an emoji joiner in the Steam name is not refused", cl[0] == 200, cl)
+
+    # list spam: one address lists at most 3 Realms, and changes listings at most 20 times an hour
+    many = [new("Spam %d" % i, S[5], "198.51.100.9") for i in range(4)]
+    listed_at = time.time()
+    put = lambda x, on: call("PUT", "/v1/realms/%s/public" % x["realm_id"], {"public": on}, auth=x, headers=ip("198.51.100.9"))[0]
+    codes = [put(x, True) for x in many]
+    check("spam: one address lists at most 3 Realms", codes == [200, 200, 200, 429], codes)
+    check("spam: ...taking one off frees a place", put(many[0], False) == 200 and put(many[3], True) == 200)
+    codes = [put(many[0], False) for _ in range(16)]
+    check("spam: listing changes are rate limited per address", 429 in codes, codes)
+    # one IPv6 /48 lists at most 6, though each /64 in it is its own address (audit 2026-11-03)
+    net = [new("Net %d" % i, S[5], "2001:db8:48:%x::1" % i) for i in range(7)]
+    codes = [call("PUT", "/v1/realms/%s/public" % x["realm_id"], {"public": True}, auth=x,
+                  headers=ip("2001:db8:48:%x::1" % i))[0] for i, x in enumerate(net)]
+    check("spam: one IPv6 /48 lists at most 6 Realms", codes == [200] * 6 + [429], codes)
+    o = call("PUT", "/v1/realms/%s/public" % net[6]["realm_id"], {"public": True}, auth=net[6], headers=ip("2001:db8:49::1"))
+    check("spam: ...another /48 still lists", o[0] == 200, o)
+    # the list puts the most recently listed or hosted first, not "AAA..." names nobody plays
+    old = new("AAA Old", S[5], "198.51.100.70")
+    put_at = lambda x, a: call("PUT", "/v1/realms/%s/public" % x["realm_id"], {"public": True}, auth=x, headers=ip(a))[0]
+    put_at(old, "198.51.100.70")
+    time.sleep(1.2)
+    fresh = new("ZZZ Fresh", S[5], "198.51.100.71")
+    put_at(fresh, "198.51.100.71")
+    ids = [x["realm_id"] for x in j(call("GET", "/v1/realms/public")).get("realms", [])]
+    check("list: a newer listing comes before an older one with an earlier name",
+          fresh["realm_id"] in ids and old["realm_id"] in ids and ids.index(fresh["realm_id"]) < ids.index(old["realm_id"]), ids)
+
+    # the admin delist (needs the MOTD_TOKEN secret on the server)
+    token = os.environ.get("REALMS_ADMIN_TOKEN", "")
+    d = call("POST", "/v1/admin/delist", {"realm_id": rid}, headers={"authorization": "Admin " + "x" * 40})
+    if not token:
+        check("delist: a server without the admin secret has no delist", d[0] == 404, d)
+    else:
+        check("delist: a wrong admin token refused", d[0] == 403, d)
+        adm = {"authorization": "Admin " + token}
+        d = call("POST", "/v1/admin/delist", {"realm_id": rid}, headers=adm)
+        check("delist: the admin takes it off the list", d[0] == 200 and j(d).get("delisted") is True and listed(rid)[1] is None, d)
+        check("delist: its list members go and nobody joins it",
+              call("GET", "/v1/realms/" + rid, auth=seen)[0] == 403
+              and call("POST", "/v1/realms/%s/join" % rid, {"steam_id": S[6], "player_name": "Lu"}, headers=ip("198.51.100.53"))[0] == 404)
+        p = call("PUT", "/v1/realms/%s/public" % rid, {"public": True}, auth=O, headers=ip("198.51.100.1"))
+        check("delist: the owner can't put it back", p[0] == 403 and j(p).get("error") == "delisted", p)
+        check("delist: ...but keeps the Realm and its invited members", call("GET", "/v1/realms/" + rid, auth=O)[0] == 200)
+        u = call("POST", "/v1/admin/delist", {"realm_id": rid, "undo": True}, headers=adm)
+        check("delist: undo lets the owner list it again", u[0] == 200
+              and call("PUT", "/v1/realms/%s/public" % rid, {"public": True}, auth=O, headers=ip("198.51.100.1"))[0] == 200, u)
+        check("delist: an unknown Realm", call("POST", "/v1/admin/delist", {"realm_id": "0000000000"}, headers=adm)[0] == 404)
+        codes = [call("POST", "/v1/admin/delist", {"realm_id": "0000000000"}, headers=adm)[0] for _ in range(35)]
+        check("admin: its own calls never hit the cap (35 in a row)", codes == [404] * 35, codes)
+        bad = {"authorization": "Admin " + "y" * 40, "cf-connecting-ip": "198.51.100.77"}
+        codes = [call("POST", "/v1/admin/delist", {"realm_id": rid}, headers=bad)[0] for _ in range(32)]
+        check("admin: wrong tokens are capped per address", codes[:30] == [403] * 30 and codes[30:] == [429, 429], codes)
+
+    # a listed Realm nobody hosts drops off after LIST_STALE_SECONDS and comes back when hosted
+    x = many[1]
+    check("stale: a newly listed Realm shows", listed(x["realm_id"])[1] is not None)
+    time.sleep(max(0.0, listed_at + 32 - time.time()))
+    check("stale: unhosted past the window, it drops off the list", listed(x["realm_id"])[1] is None)
+    check("stale: ...but stays public", j(call("GET", "/v1/realms/" + x["realm_id"], auth=x)).get("public") is True)
+    call("POST", "/v1/realms/%s/lease" % x["realm_id"], {"steam_id": S[5], "name": "Own"}, auth=x)
+    check("stale: hosting it brings it back", (listed(x["realm_id"])[1] or {}).get("live") is True)
 
 
 def main():
@@ -169,6 +414,9 @@ def main():
     check("new owner removes old owner", call("DELETE", "/v1/realms/%s/members/%s" % (rid, A["member_id"]), auth=B)[0] == 200)
     check("removed member locked out", call("GET", "/v1/realms/" + rid, auth=A)[0] == 403)
 
+    public_server_list()
+    security_checks()
+
     # rate limit on invite guessing (20 an hour per IP)
     codes = [call("POST", "/v1/invites/redeem", {"invite": "0000-0000-0000-0000", "steam_id": STEAM_C, "player_name": "Eve"})[0]
              for _ in range(22)]
@@ -182,9 +430,12 @@ def main():
     # message of the day: public to read; on a server without the MOTD_TOKEN secret nobody can set it
     g = call("GET", "/v1/motd")
     check("motd readable without auth", g[0] == 200 and "id" in j(g), g)
+    # (with MOTD_TOKEN set on the server - REALMS_ADMIN_TOKEN here - a wrong token is 403 instead)
+    secret = bool(os.environ.get("REALMS_ADMIN_TOKEN"))
     for token in ("", "x" * 40):
         p = call("PUT", "/v1/motd", {"text": "hi"}, headers={"authorization": "Admin " + token} if token else None)
-        check("motd can't be set without the server's secret (%s)" % ("no token" if not token else "a token"), p[0] == 404, p)
+        want = 403 if secret else 404
+        check("motd can't be set without the server's secret (%s)" % ("no token" if not token else "a token"), p[0] == want, p)
 
     print("\n%d failure(s)" % len(failures) if failures else "\nALL PASSED")
     return 1 if failures else 0

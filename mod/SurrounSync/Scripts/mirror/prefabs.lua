@@ -34,7 +34,7 @@ local tick_in, joined_for = 0.0, 0.0
 local last_sent, want, pending = nil, nil, nil
 local destroyed = {}         -- actors already destroyed here, still listed until the engine lets go (util.mark)
 local spawned_here = {}      -- line -> true: spawned once in this world (never again, even if it isn't seen)
-local stats = { removed = 0, spawned = 0, sent = 0, no_marker = 0 }
+local stats = { removed = 0, spawned = 0, sent = 0, no_marker = 0, kept = 0 }
 
 -- ours to follow: not a settlement (camps.lua), not a quest's, not the empty templates at the world origin
 local function followed(cls)
@@ -163,6 +163,77 @@ local function show_marker(w)
     end
 end
 
+-- The host's sites need their class loaded here (no LoadAsset from our Lua, L-014). A spawner holds its prefab class
+-- (BP_PrefabSpawner.Prefab, a hard class reference loaded with the map), but one whose roll fails destroys itself in
+-- its BeginPlay (decompiled: Random Check false -> K2_DestroyActor), and a class none of this game's spawners placed
+-- was then dropped by the GC: the host's site of it never came here (player report 2026-11-01: a camp, a convoy on one
+-- player's map only; guest logs 2026-10-30/31: "Prefab_LargeBanditCamp2_C / Prefab_AbandonedConvoy_C isn't loaded
+-- here"). A guest keeps the prefab class of every spawner that ends in the game instance's ReferencedObjects, as
+-- loottables.lua keeps the loot tables (it outlives worlds; the map loads these classes with every spawner anyway).
+local SPAWNER_CLASSES = { [SPAWNER] = true, BP_PrefabSpawner_Dynamic_C = true }
+local spawner_cls = {}       -- class address -> is a spawner class
+local kept = {}              -- prefab class address -> true
+local gi_ref = nil
+-- one prefab class into the game instance's ReferencedObjects (once); true when it was kept just now
+local function pin(p)
+    local pa = util.valid(p) and util.addr(p)
+    if not pa or kept[pa] then return false end
+    if not util.valid(gi_ref) then gi_ref = FindFirstOf("SD_GameInstance_C") end
+    if not util.valid(gi_ref) then return false end
+    if not pcall(function() local arr = gi_ref.ReferencedObjects; arr[arr:GetArrayNum() + 1] = p end) then return false end
+    kept[pa] = true
+    stats.kept = stats.kept + 1
+    log.debug("prefabs: keeping " .. (util.fname(p) or "?") .. " loaded - the host may have one")
+    return true
+end
+local function keep_class(_, o)
+    if role ~= "guest" or o == nil then return end
+    local c, ca
+    pcall(function() c = o:GetClass(); ca = util.addr(c) end)
+    if not ca then return end
+    local is = spawner_cls[ca]
+    if is == nil then
+        pcall(function() is = SPAWNER_CLASSES[c:GetFName():ToString()] == true end)
+        spawner_cls[ca] = is or false
+    end
+    if not is then return end
+    local p
+    pcall(function() p = o.Prefab end)
+    pin(p)
+end
+util.on_end(keep_class)
+
+-- The spawners roll in the BeginPlay of the world's streamed level (LongdownValley), at the guest's own save load
+-- too, before co-op starts (kit 2026-11-01: EndPlay hooked too late, 0 kept; hooking the native K2_DestroyActor from
+-- the mod's start crashed the guest at a join, DBG-20261101-004; at LoadMap's end the streamed level isn't in yet,
+-- 0 spawners). Kit 2026-11-01 16:40: a spawner whose roll failed stays listed, its Prefab readable, until the next
+-- garbage collection (103 listed after the load, 60 a few minutes later, 31 site classes down to 20). So when the
+-- player arrives in a world, every listed spawner's class is kept, in every role (a host can become a guest; the
+-- classes are loaded anyway, this only keeps them).
+local function keep_loaded_sites()
+    local seen, new = 0, 0
+    for cn in pairs(SPAWNER_CLASSES) do
+        for _, s in ipairs(FindAllOf(cn) or {}) do
+            local p
+            pcall(function() p = s.Prefab end)
+            if followed(util.fname(p)) then
+                seen = seen + 1
+                if pin(p) then new = new + 1 end
+            end
+        end
+    end
+    log.info(string.format("prefabs: arrived - %d spawner(s) with an event site, %d site class(es) newly kept (%d in all)",
+        seen, new, stats.kept))
+end
+
+-- From the mod's start (main.lua), once: game.lua's new-player event (no hook of our own).
+local watching = false
+function prefabs.watch()
+    if watching then return end
+    watching = true
+    require("mirror.game").on_new_player(function() util.safe(keep_loaded_sites, "prefabs.keep_loaded_sites") end)
+end
+
 -- what to change: the guest's prefabs the host doesn't have, and the host's this game lacks
 local function diff(have, host)
     local used, extra, missing = {}, {}, {}
@@ -264,7 +335,8 @@ end
 
 function prefabs.status()
     if role == "host" then return "prefabs: sending " .. stats.sent .. " event site(s)" end
-    return string.format("prefabs: removed %d, spawned %d (%d without a map icon here)", stats.removed, stats.spawned, stats.no_marker)
+    return string.format("prefabs: removed %d, spawned %d (%d without a map icon here), %d site classes kept loaded",
+        stats.removed, stats.spawned, stats.no_marker, stats.kept)
 end
 
 function prefabs.init(c, r, s, connected)
@@ -273,9 +345,11 @@ function prefabs.init(c, r, s, connected)
     if c and c.prefab_sync == false then role = "off" end
     require("mirror.game").on_world_reset(prefabs.forget)
     last_sent, want, pending, joined_for = nil, nil, nil, 0.0
+    -- (the spawners roll in the map's BeginPlay: EndPlay is watched before the guest's first load)
+    util.watch_ends()
 end
 
--- a new world: its objects are new (an old address may come back as another actor)
-function prefabs.forget() destroyed, spawned_here, pending, last_sent = {}, {}, nil, nil end
+-- a new world: its objects are new (an old address may come back as another actor; a kept class stays where it is)
+function prefabs.forget() destroyed, spawned_here, pending, last_sent, spawner_cls = {}, {}, nil, nil, {} end
 
 return prefabs

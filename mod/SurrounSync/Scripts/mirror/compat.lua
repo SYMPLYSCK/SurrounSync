@@ -17,9 +17,19 @@ local KNOWN = {
     ConsoleCommandsMod = "client", ConsoleEnablerMod = "client", CheatManagerEnablerMod = "client",
     SuppressorHeatGlow = "client", LineTraceMod = "client", AutoContinue = "client",
     SyncFX = "client", DreadFX = "client",   -- graphics only (SyncFX is switched from MY SETTINGS)
+    -- blood on this screen only (MY SETTINGS -> GORE): the Lua mod and its asset pak
+    SurrounDeadGore = "client", ["pak:SurrounDeadGore.pak"] = "client",
     PDS = "gameplay", SDTrainer = "gameplay", WeaponProgression = "gameplay", HeadshotBrains = "gameplay",
     UniversalCraftingNetwork = "gameplay", SplitScreenMod = "gameplay",
     SurrounDeadMP = "gameplay", SurrounDeadMPInput = "gameplay",
+    -- ships with SurrounSync: the glider model and the Hang Glider item; a game without it has no such item
+    ["pak:SurrounSyncGlider.pak"] = "gameplay",
+    -- ships with SurrounSync: the Double Drum Magazine item and the diamond finish; a game without it has no such item
+    ["pak:SurrounSyncArmory.pak"] = "gameplay",
+    -- ships with SurrounSync: the FPV drone's models, only to show another player's quad (drone.lua)
+    ["pak:SurrounSyncDrone.pak"] = "client",
+    -- the FPV drone mod and its model pak: a camera flown on this screen, its quad shown to others through drone.lua
+    FPVDrone = "client", ["pak:FPVDrone_P.pak"] = "client",
 }
 
 local mine = nil
@@ -70,7 +80,6 @@ local function read_mods()
 end
 
 local function kind(name)
-    if name:sub(1, 4) == "pak:" then return "unknown" end
     return KNOWN[name] or "unknown"
 end
 

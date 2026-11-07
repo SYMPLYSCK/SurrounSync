@@ -49,10 +49,31 @@ require("mirror.infest").watch()
 util.safe(function() require("mirror.personalspace").init(cfg) end, "personalspace.init")
 -- dogs bark (the game has no bark sound; SurrounSyncSounds.pak brings them)
 util.safe(function() require("mirror.dogs").init(cfg) end, "dogs.init")
+-- the hang glider: Jump while falling from a height opens it (the model is SurrounSyncGlider.pak)
+util.safe(function() require("mirror.glider").init(cfg) end, "glider.init")
+-- the hover bike: golf carts marked VehicleColor 78 wear SK_HoverBike and fly on FPVDrone's flight engine
+util.safe(function() require("mirror.hoverbike").init(cfg) end, "hoverbike.init")
+util.safe(function()
+    local outrefs, game = require("mirror.outrefs"), require("mirror.game")
+    outrefs.start(log.info)
+    game.on_tick(function(dt) util.safe(outrefs.tick, "outrefs.tick", dt) end)
+end, "outrefs.start")
+-- the Colonel's Revenge Double Drum Magazine and the diamond Colonel's Revenge (SurrounSyncArmory.pak)
+util.safe(function() require("mirror.armory").init(cfg) end, "armory.init")
+-- admin fly: F7, the owner's game only
+util.safe(function() require("mirror.adminfly").init(cfg) end, "adminfly.init")
+-- who may fly the bundled FPV drone (FPVDrone.allowed): the owner always, solo too
+util.safe(function() require("mirror.dronegrant").init() end, "dronegrant.init")
 -- an Xbox-style pad plays the game (MY SETTINGS -> CONTROLLER): pad keys added next to the keyboard's
 util.safe(function() require("mirror.gamepad").init(cfg) end, "gamepad.init")
 -- the message cards' world-reset hook and the history key (Ctrl+F9)
 util.safe(function() require("mirror.notify").init() end, "notify.init")
+-- the round minimap at the top right (M twice, with a GPS worn)
+util.safe(function() require("mirror.minimap").init() end, "minimap.init")
+-- car/buildable radios: the game's Radio folder made, a SONGS FOLDER button on the radio screen opens it
+util.safe(function() require("mirror.radio").init() end, "radio.init")
+-- event site classes kept loaded from every map load on (a guest needs the host's, prefabs.lua)
+util.safe(function() require("mirror.prefabs").watch() end, "prefabs.watch")
 
 local menu = require("mirror.menu")
 if role == "auto" then

@@ -3,7 +3,12 @@
 param(
     [string]$Game = 'C:\Program Files (x86)\Steam\steamapps\common\SurrounDead',
     # the SyncFX graphics mod (its own repo); packed in and installed off
-    [string]$SyncFX = (Join-Path $env:USERPROFILE 'Desktop\DreadFX\mod\SyncFX')
+    [string]$SyncFX = (Join-Path $env:USERPROFILE 'Desktop\DreadFX\mod\SyncFX'),
+    # the gore mod (its own repo): its Lua mod and cooked pak; installed off, switched in MY SETTINGS
+    [string]$Gore = (Join-Path $env:USERPROFILE 'Desktop\SurrounDeadGore'),
+    # the FPV drone mod (its own repo, sold on its own): its committed files, marked bundled.txt, fly only for a
+    # player its owner allows (mirror/dronegrant.lua)
+    [string]$Drone = (Join-Path $env:USERPROFILE 'Desktop\FPVDrone')
 )
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path $PSScriptRoot -Parent
@@ -18,6 +23,21 @@ Write-Host "SurrounSync $Version"
 
 python -I (Join-Path $Repo 'tools\lint\lualint.py') (Get-ChildItem (Join-Path $Repo 'mod\SurrounSync\Scripts') -Recurse -Filter *.lua | ForEach-Object FullName)
 if ($LASTEXITCODE -ne 0) { throw "lint failed" }
+
+# a mod from its own repo: what that repo has committed (git archive HEAD), never work in progress in its folder
+# (audit 2026-11-03: the gore mod was copied from the working tree, 6 changed and 7 new Lua files would have shipped)
+function Copy-Committed([string]$RepoDir, [string]$Sub, [string]$Dest) {
+    $dirty = git -C $RepoDir status --porcelain -- $Sub
+    if ($dirty) { Write-Warning "$RepoDir has uncommitted changes in $Sub - the release packs its last commit, not them" }
+    $tmp = Join-Path $Stage ('git-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force $tmp | Out-Null
+    git -C $RepoDir archive --format=tar -o (Join-Path $tmp 'a.tar') HEAD $Sub
+    if ($LASTEXITCODE -ne 0) { throw "git archive of $Sub in $RepoDir failed" }
+    tar -xf (Join-Path $tmp 'a.tar') -C $tmp
+    if ($LASTEXITCODE -ne 0) { throw "unpacking $Sub from $RepoDir failed" }
+    Copy-Item (Join-Path $tmp $Sub) $Dest -Recurse
+    Remove-Item $tmp -Recurse -Force
+}
 
 if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
 $P = Join-Path $Stage 'payload'
@@ -34,14 +54,49 @@ Get-ChildItem (Join-Path $Ue 'Mods\SurrounSync') -Recurse -Include '*.bak*', '*.
 # without enabled.txt (it stays off until switched on in MY SETTINGS)
 if (-not (Test-Path (Join-Path $SyncFX 'Scripts\main.lua'))) { throw "SyncFX not found in $SyncFX" }
 $Fx = Join-Path $Ue 'Mods\SyncFX'
-Copy-Item $SyncFX $Fx -Recurse
+Copy-Committed (Split-Path (Split-Path $SyncFX -Parent) -Parent) 'mod/SyncFX' $Fx
 Get-ChildItem $Fx -Recurse -Include 'SyncFX.user.ini', 'SyncFX.calib.ini', 'noise.txt', 'enabled.txt', '*.tmp', '*.bak*', '*.log' | Remove-Item -Force
+# the gore mod without enabled.txt (off until switched on in MY SETTINGS); its pak outside content\ (Setup names it
+# .pak or .pak.off to match the player's on/off)
+$GoreLua = Join-Path $Gore 'mod\SurrounDeadGore'
+$GorePak = Join-Path $Gore 'cook\Saved\Pak\SurrounDeadGore.pak'
+if (-not (Test-Path (Join-Path $GoreLua 'Scripts\main.lua'))) { throw "gore mod not found in $GoreLua" }
+if (-not (Test-Path $GorePak)) { throw "gore pak not found: $GorePak" }
+Copy-Committed $Gore 'mod/SurrounDeadGore' (Join-Path $Ue 'Mods\SurrounDeadGore')
+Get-ChildItem (Join-Path $Ue 'Mods\SurrounDeadGore') -Recurse -Include 'enabled.txt', '*.tmp', '*.bak*', '*.log' | Remove-Item -Force
+New-Item -ItemType Directory -Force (Join-Path $P 'gore') | Out-Null
+Copy-Item $GorePak (Join-Path $P 'gore')
+# the FPV drone mod: what its repo has committed (never the developer's own FPVDrone.ini or logs), its radio helper
+# built fresh, bundled.txt so it flies only once its owner allows the player; switched on by Setup (InstallDrone)
+if (-not (Test-Path (Join-Path $Drone 'mod\FPVDrone\Scripts\main.lua'))) { throw "FPVDrone not found in $Drone" }
+$DroneTmp = Join-Path $Stage 'fpvdrone'
+New-Item -ItemType Directory -Force $DroneTmp | Out-Null
+git -C $Drone archive --format=tar -o (Join-Path $DroneTmp 'fpvdrone.tar') HEAD mod/FPVDrone
+if ($LASTEXITCODE -ne 0) { throw "git archive of FPVDrone failed" }
+tar -xf (Join-Path $DroneTmp 'fpvdrone.tar') -C $DroneTmp
+if ($LASTEXITCODE -ne 0) { throw "unpacking FPVDrone failed" }
+$Dr = Join-Path $Ue 'Mods\FPVDrone'
+Copy-Item (Join-Path $DroneTmp 'mod\FPVDrone') $Dr -Recurse
+Get-ChildItem $Dr -Recurse -Include 'enabled.txt' | Remove-Item -Force
+# (owned.txt marks the copy sold on its own, which always flies: never in the SurrounSync copy)
+Remove-Item (Join-Path $Dr 'owned.txt') -Force -ErrorAction SilentlyContinue
+if (Test-Path (Join-Path $Dr 'owned.txt')) { throw "owned.txt is still in the bundled FPVDrone" }
+& (Join-Path $Drone 'tools\build-helper.ps1')
+New-Item -ItemType Directory -Force (Join-Path $Dr 'helper') | Out-Null
+Copy-Item (Join-Path $Drone 'mod\FPVDrone\helper\FPVRadio.exe') (Join-Path $Dr 'helper')
+Set-Content (Join-Path $Dr 'bundled.txt') 'This FPVDrone came with SurrounSync: it flies once its owner allows you (their SETTINGS -> PERMISSIONS).' -Encoding ascii
 # SurrounSync's game content (Setup puts content\ into SurrounDead\Content): the startup intro and the dog sounds pak,
 # with UE4SS's BPModLoaderMod that loads Paks\LogicMods (Setup adds it only where it is missing)
 $Content = Join-Path $P 'content'
 New-Item -ItemType Directory -Force (Join-Path $Content 'Movies'), (Join-Path $Content 'Paks\LogicMods') | Out-Null
 Copy-Item (Join-Path $Repo 'mod\Movies\UE5 Intro.mp4') (Join-Path $Content 'Movies')
 Copy-Item (Join-Path $Repo 'mod\LogicMods\SurrounSyncSounds.pak') (Join-Path $Content 'Paks\LogicMods')
+# the hang glider's model (mirror/glider.lua; tools/glider builds it)
+Copy-Item (Join-Path $Repo 'mod\LogicMods\SurrounSyncGlider.pak') (Join-Path $Content 'Paks\LogicMods')
+# the Double Drum Magazine and the diamond Colonel's Revenge (mirror/armory.lua; tools/armory builds it)
+Copy-Item (Join-Path $Repo 'mod\LogicMods\SurrounSyncArmory.pak') (Join-Path $Content 'Paks\LogicMods')
+# the FPV drone's models, so every player sees another's quad (mirror/drone.lua; a copy of FPVDrone's FPVDrone_P.pak)
+Copy-Item (Join-Path $Repo 'mod\LogicMods\SurrounSyncDrone.pak') (Join-Path $Content 'Paks\LogicMods')
 $Bp = Join-Path $Ue 'Mods\BPModLoaderMod\Scripts'
 New-Item -ItemType Directory -Force $Bp | Out-Null
 Copy-Item (Join-Path $Win64 'ue4ss\Mods\BPModLoaderMod\Scripts\main.lua') $Bp

@@ -2,6 +2,69 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 1.1.0 (2026-11-07)
+
+**SurrounSync 1.1: downed and revive, a minimap, vehicle locks, the hang glider, the forest giant, working radios and a fix for memory that kept climbing in long sessions.** Everyone needs 1.1.0: it doesn't play with 1.0.0.
+
+Many of the fixes below have been checked on two test games on one PC, some only by the mod's offline tests, and not all of them have been played in a real session yet. If something here still happens, please send a bug report.
+
+**Made for SurrounDead 0.8.0 (the Pandemic update, now on Steam's normal branch)**
+- Both the normal branch and Experimental work; the old 0.7.1 (the "previous" branch) doesn't. Everyone in one game needs the same branch. The setup no longer tells players on the normal branch to switch to Experimental.
+- Crawlers are now a kind of zombie the game rolls, not a zombie of their own: they crawl on every player's screen, missing the same legs.
+- Since the game update a zombie's swing on a friend's screen hit them there as well as on the host's game. It only counts once again.
+- The game's new radio screen has the SONGS FOLDER button again, next to PREVIOUS.
+- The ice cream van trader stood somewhere else in each player's game. Guests now find it where the host's is, like the military trader.
+
+**New**
+- Downed instead of dead in co-op: another player can revive you, or you give up or bleed out. The host's REVIVE rule turns it off for everyone.
+- Minimap: a round map at the top right while a GPS is worn, north always up, with compass markers and the other players as coloured dots. M twice switches it. The big map shows the players too. The START WITH GPS host rule gives a GPS, equipped.
+- Vehicle locks: claim a car, then lock it so only you get in.
+- Hang glider item: Jump with 5 m or more of air under your feet opens it, also from a hillside, and it flies in the game's wind.
+- Forest giant: a huge boss guarding a spot in the forest in every world, with richer loot and its own health bar. Ctrl+G (host or solo) moves the spot.
+- Colonel's Revenge: a Double Drum Magazine and a diamond finish.
+- Radios: the game plays songs from a folder it never made, so radios stayed silent. The folder is now made, the radio screen has a SONGS FOLDER button, and songs you add are seen.
+- Handheld radio as a walkie-talkie: when both players carry a Radio and have voice on, voice reaches 150 m, with a radio sound at a distance.
+- FPV drone: other players see and hear SYMPLYSCK's FPV quad, and it ships with SurrounSync. Flying it yourself takes its owner's permission: player by player on the PERMISSIONS tab, or everyone at once with /fpv unlock and /fpv lock.
+- SYMPLYSCK's hover bike: you see and hear it in co-op, with 1000 slots of storage. Only its owner can make it, and only its owner can fly it unless they unlock it for everyone (/unlock, /lock or Ctrl+Shift+P).
+- Every hotkey is also a chat command: press / and type it, /leave, /host, /join 1, /minimap, /messages, /syncfx toggle, /drone menu and more. The box opens outside co-op too, for the commands, and typing / lists them. Only F2 has none: it renames the item under the mouse, where the box doesn't open.
+- Realm character backups: the chest icon on the REALMS page.
+- Realms server list: a SERVERS tab where owners can list a Realm, open or locked with a password, and anyone can join. It works once the Realm server has been updated; until then the tab says it isn't switched on yet.
+- Body limit host rule: the oldest dead zombie and raider bodies go past 20, 40, 60 or 100, on both screens.
+- GORE in MY SETTINGS: the SurrounDeadGore mod is in the setup, off, and switched per PC.
+- One settings page: HOST RULES (REALM RULES in a Realm), MY SETTINGS, BINDINGS and MODS as tabs.
+- Controller: PS5 pads and more bindings.
+
+**Now shared between players**
+- Lab doors, secure doors, light switches and the lab generator.
+- Searched containers, container names and container refills.
+- Tow hitches, on every game and not only the one that hitched.
+- The sound of another player's FPV quad: motors, wind and a crash.
+
+**Co-op fixes**
+- Long sessions: a leak is fixed, memory the mod kept for every game call it made is now let go. Its memory had reached 2.6 GB, with frames of half a second, in a 24 minute session on the hover bike.
+- Long sessions: put-ins into storage are no longer lost, and hooks no longer pile up per co-op start.
+- Guns doing 1 damage: a weapon's roll keeps every stat row the game's roll keeps, and guns cut short get their damage falloff back.
+- A new Realm's character wears what you made on the New Game page, not the default model.
+- REALMS page: both tab names stay up, and the backups chest no longer sits on the SERVERS tab.
+- Passenger car lights follow the driver.
+- A put into a bag or ammo tin inside a crate no longer vanishes.
+- Base building: fewer duplicates, and moving a built piece reaches the other player.
+- The drone no longer crashes a game when another player's quad takes off before its model is read in.
+- Crash pressing R in a car to open the radio, and the lag spike when its songs folder opens.
+- Steam no longer shows the game running after a crash because the bridge stayed behind.
+- Crash after death when the game takes every widget off the screen.
+- Teleports aim at the other player's newest position.
+- A refused landing beside the host tries higher and then to the side.
+- The other player's zombie medical effects, bites and radiation no longer stay on their character on your screen.
+- Airdrops: a removed crate takes its map marker with it.
+- The other player's Geiger and eat and drink sounds stay theirs.
+- Event sites: a host's camp or convoy can always come to a guest.
+- Car copies: smoother with three or four players, and a player on a car roof stays on it.
+- Dogs bark only with a clear line to a player.
+- Fast-firing guns cost less per shot.
+- Fewer stalls from the minimap, boss, radio, voice and new-item code.
+- With more than two players there is one forest giant and one animation gate for the whole game.
+
 ## 1.0.0 (2026-10-31)
 
 **SurrounSync 1.0: door code locks, shared sleep, controller support and a long list of co-op fixes.** Everyone needs 1.0.0: it doesn't play with 0.14.x.

@@ -21,6 +21,7 @@ local MASTER = DIR .. "Master_AirdropContainer.Master_AirdropContainer_C"
 local CLASSES = { "AirdropContainer_Medical_C", "AirdropContainer_Military_C", "AirdropContainer_Supplies_C" }
 local PLANE = "AirdropAircraft_C"
 local PLANE_PATH = "/Game/Blueprints/Events/Airdrop/AirdropAircraft.AirdropAircraft_C"
+local MINIMAP = "/Game/Blueprints/MinimapSystem/Blueprints/BPC_MinimapSystem.BPC_MinimapSystem_C"
 local SAME = 300.0           -- cm: a crate of that class this close is the same crate
 local EXACT = 2.0            -- cm: closer than this is on the host's spot already
 local DROP_FROM = 60.0       -- cm above the host's spot: it lands, which hides the parachute and puts up the marker
@@ -30,8 +31,10 @@ local peer_live = function() return true end
 local tick_in, joined_for = 0.0, 0.0
 local last_sent = nil
 local seen = {}              -- host: crate address -> { l = last position, still = checks it stayed put }
-local made = {}              -- guest: crates spawned here -> { a, key }
+local made = {}              -- guest: crates spawned here -> { a, at }
 local held = {}              -- guest: crate address -> true once on the host's spot and held
+local missed = {}            -- guest: a copy's address -> checks in a row it matched none of the host's crates
+local MISS_CHECKS = 2        -- that many (CHECK_EVERY s apart) and the copy goes
 local stats = { spawned = 0, placed = 0, removed = 0, planes = 0, sent = 0 }
 local function game_world() return require("mirror.game").world() end
 
@@ -52,8 +55,27 @@ local function spot(a)
     return { X = l.X, Y = l.Y, Z = l.Z, P = r and r.Pitch or 0, Y_ = r and r.Yaw or 0, R = r and r.Roll or 0 }
 end
 
+-- A crate's map marker is its own BP_Marker actor (Master_AirdropContainer, decompiled: spawned on landing into
+-- self.Marker), and the game takes it off the map only when the crate is opened (OpenContainer -> Remove World Marker);
+-- the crate has no EndPlay. A crate destroyed here left its marker on the map with nothing there (player report
+-- 2026-11-01: airdrops on the guest's map that aren't on the host's and aren't physically there). So the marker goes
+-- first, the way the game's own open does it (as prefabs.lua drops a site's marker).
+local function drop_crate(a)
+    local m
+    pcall(function() m = a.Marker end)
+    if util.valid(m) then
+        local c
+        pcall(function() c = require("mirror.game").player():GetComponentByClass(StaticFindObject(MINIMAP)) end)
+        if util.valid(c) then pcall(function() c["Remove World Marker"](c, m.Marker, m) end) end
+        pcall(function() m:K2_DestroyActor() end)
+    end
+    return pcall(function() a:K2_DestroyActor() end)
+end
+
 -- host: the crates that came to rest (the same spot two checks in a row), one per line
 local function host_tick()
+    -- (no player: a world loading or left - its "no crates" would take the guest's copies away)
+    if not util.valid(require("mirror.game").player()) then return end
     local lines, alive = {}, {}
     for _, c in ipairs(crates()) do
         local key = util.addr(c.a)
@@ -115,9 +137,8 @@ local function guest_tick()
     end
     if not want or joined_for < SETTLE then return end
     local here = crates()
-    local used, wanted = {}, {}
+    local used = {}
     for _, w in ipairs(want) do
-        wanted[w.key] = true
         local best, bd
         for i, c in ipairs(here) do
             if not used[i] and c.cls == w.cls then
@@ -157,22 +178,38 @@ local function guest_tick()
                     a = game_world():SpawnActor(cls, { X = w.X, Y = w.Y, Z = w.Z + DROP_FROM }, util.rot(w.P, w.Y_, w.R))
                 end)
                 if util.valid(a) then
-                    made[util.addr(a) or 0] = { a = a, key = w.key, at = os.clock() }
+                    made[util.addr(a) or 0] = { a = a, at = os.clock() }
                     stats.spawned = stats.spawned + 1
                     log.info(string.format("airdrops: the host's %s landed at %.0f, %.0f, %.0f - here too", w.cls, w.X, w.Y, w.Z))
                 end
             end
         end
     end
-    -- a crate made here whose host crate is gone goes too
-    for k, m in pairs(made) do
-        if not wanted[m.key] then
-            if util.valid(m.a) and pcall(function() m.a:K2_DestroyActor() end) then
-                stats.removed = stats.removed + 1
-                log.info("airdrops: the host's crate is gone - removed it here")
+    -- A crate here that matched none of the host's goes, marker and all: one made here whose host crate is gone, or
+    -- one this game's own plane dropped before the host's list came. (Matching, not the host's line text: a host crate
+    -- that moved a little changes its line, and its copy was destroyed and spawned again - a stale marker each time.)
+    -- A copy of the host's (made or held here) goes only after MISS_CHECKS checks in a row without a match: a host
+    -- crate drops out of the host's list for a check whenever something nudges it (it is sent only while still), and
+    -- the copy was destroyed under a player looting it and dropped again from above (audit 2026-11-03).
+    for i, c in ipairs(here) do
+        local k = util.addr(c.a)
+        if used[i] then
+            if k then missed[k] = nil end
+        else
+            local mine = k and (made[k] or held[k])
+            if mine then missed[k] = (missed[k] or 0) + 1 end
+            if not mine or missed[k] >= MISS_CHECKS then
+                if drop_crate(c.a) then
+                    stats.removed = stats.removed + 1
+                    log.info(mine and "airdrops: the host's crate is gone - removed it here"
+                        or ("airdrops: took this game's own " .. c.cls .. " away - the host has none there"))
+                end
+                if k then made[k], held[k], missed[k] = nil, nil, nil end
             end
-            made[k], held[k] = nil, nil
         end
+    end
+    for k, m in pairs(made) do
+        if not util.valid(m.a) then made[k], held[k], missed[k] = nil, nil, nil end
     end
 end
 
@@ -201,6 +238,6 @@ function airdrops.init(c, r, s, connected)
 end
 
 -- a new world: its objects are new (an old address may come back as another actor)
-function airdrops.forget() seen, made, held, last_sent = {}, {}, {}, nil end
+function airdrops.forget() seen, made, held, missed, last_sent = {}, {}, {}, {}, nil end
 
 return airdrops

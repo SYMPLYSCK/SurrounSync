@@ -14,8 +14,12 @@ local ONOFF = { { "off", "OFF" }, { "on", "ON" } }
 -- key, label, hint (one line under the option), values ({ value, button text }; on/off when left out), default
 hostrules.LIST = {
     { key = "pvp", label = "PVP", hint = "Players can hurt each other.", default = "off" },
+    { key = "revive", label = "REVIVE", hint = "A deadly hit downs you for 60 s; a friend holds F by you to get you up.",
+      default = "on" },
     { key = "itemclean", label = "ITEM CLEANUP", hint = "Dropped items vanish after this long (death bags stay).",
       values = { { "off", "OFF" }, { "10", "10 MIN" }, { "20", "20 MIN" }, { "40", "40 MIN" } }, default = "off" },
+    { key = "bodycap", label = "BODY LIMIT", hint = "The oldest dead bodies vanish past this many (none near a player).",
+      values = { { "off", "OFF" }, { "20", "20" }, { "40", "40" }, { "60", "60" }, { "100", "100" } }, default = "off" },
     { key = "loadsplit", label = "LOAD SPLITTING", hint = "Experimental: far apart, a friend's PC runs the zombies near them.",
       default = "off" },
     { key = "players", label = "MAX PLAYERS", hint = "How many players fit in your world (you included).",
@@ -26,6 +30,8 @@ hostrules.LIST = {
     { key = "weather", label = "GUEST WEATHER", hint = "Guests can change the shared weather.", default = "on" },
     { key = "debugmenu", label = "DEBUG MENU", hint = "Everyone can open the game's debug menu (items, skills, weather).",
       default = "on" },
+    { key = "gps", label = "START WITH GPS", hint = "Everyone gets a GPS when they arrive and after dying (if none).",
+      default = "off" },
 }
 
 local by_key = {}

@@ -107,6 +107,26 @@ static class TestReport
         Check(g.Missing.Any(m => m.Contains("other player") && m.Contains("Dilucaa")), "asks for the other player's report");
     }
 
+    static void LeftoverCoopSaveIsNotCritical()
+    {
+        Console.WriteLine("leftover_coop_save_is_not_critical");
+        string d = Dir("leftover");
+        var lines = new List<string>();
+        for (int i = 0; i < 3; i++) lines.Add(L("20:0" + i + ":44", "ERROR", "slotguard: refused purge: SurrounSync_Session_3 holds a save SurrounSync didn't make - left alone"));
+        Log(d, "mirror_log.txt", lines, DateTime.Now);
+        var g = Run(d);
+        var f = Find(g, "leftover co-op save is kept on purpose");
+        Check(f != null && f.Severity == "MINOR" && f.Count == 3, "a kept foreign co-op slot is one MINOR finding, grouped");
+        Check(f != null && !f.PlayerTry.Contains("restart") && f.PlayerTry.Contains("SaveGames"), "advice doesn't promise a restart fixes it, names the folder");
+        Check(Find(g, "Save protection refused") == null, "not reported as the CRITICAL save-protection finding");
+        string d2 = Dir("leftover_mixed");
+        Log(d2, "mirror_log.txt", new List<string> {
+            L("20:00:44", "ERROR", "slotguard: refused purge: SurrounSync_Session_3 holds a save SurrounSync didn't make - left alone"),
+            L("20:05:00", "ERROR", "slotguard: refused copy_character_home: AutoSave3 is not one of your saves") }, DateTime.Now);
+        var g2 = Run(d2);
+        Check(g2.Top != null && g2.Top.Title.StartsWith("Save protection") && g2.Top.Severity == "CRITICAL", "other refusals stay CRITICAL and on top");
+    }
+
     static void CrashesAreExplainedWithTheModStep()
     {
         Console.WriteLine("crashes_are_explained_with_the_mod_step");
@@ -121,14 +141,22 @@ static class TestReport
         Check(g.Top != null && g.Top.Cause.Contains("wasn't running any of its own code"), "the mod step shows the mod was idle");
         Check(g.Top != null && g.Top.Evidence.Any(x => x.Contains("GPU Crash dump")), "the crash message is evidence");
 
+        // 1.0.1+: the step is only in the ring (crumb.lua); mirror_step.txt holds a note pointing at it
         d = Dir("ue4ss");
         Log(d, "mirror_log.txt", new[] { L("12:00:00", "INFO", "phase1[guest]: rx 20/s") }, at.AddSeconds(-2));
-        File.WriteAllText(Path.Combine(d, "win64", "mirror_step.txt"), "03:55:43 hook /Game/JigSInventory/Jigsaw/Widgets/JContextMenu/JigContextMenuComp.JigContextMenuComp_C:OnJigItemRightClick");
-        File.SetLastWriteTime(Path.Combine(d, "win64", "mirror_step.txt"), at.AddSeconds(-1));
+        Func<string, string> slot = s => (s.Length > 99 ? s.Substring(0, 99) : s.PadRight(99)) + "\n";
+        File.WriteAllText(Path.Combine(d, "win64", "mirror_steps.txt"),
+            slot("130 03:55:43 812.400 hook /Game/JigSInventory/Jigsaw/Widgets/JContextMenu/JigContextMenuComp.JigContextMenuComp_C:OnJigItemRightClick") +
+            slot("67 03:55:41 810.100 zombies") + slot("129 03:55:43 812.390 game (mod tick done)"));
+        File.SetLastWriteTime(Path.Combine(d, "win64", "mirror_steps.txt"), at.AddSeconds(-1));
+        File.WriteAllText(Path.Combine(d, "win64", "mirror_step.txt"), "(SurrounSync 1.0.1+: the current mod step is the newest line of mirror_steps.txt)\n");
+        File.SetLastWriteTime(Path.Combine(d, "win64", "mirror_step.txt"), at.AddMinutes(-9));
         Crash(d, "UECC-2", "Unhandled Exception: EXCEPTION_ACCESS_VIOLATION reading address 0x0000000000000040", "UE4SS 0x00007ffa + 1aa", at);
         g = Run(d);
         Check(g.Top != null && g.Top.Title.Contains("UE4SS") && g.Top.Confidence == "likely", "UE4SS crash during a mod hook: likely the mod");
         Check(g.Top != null && g.Top.Cause.Contains("backpack names") && g.Top.DevLook.Contains("names.lua"), "the hook maps to backpack names / names.lua");
+        Check(g.Top != null && g.Top.Evidence.Any(x => x.Contains("(mirror_steps.txt): 03:55:43 hook /Game/JigSInventory")),
+            "the step is the ring's newest line (highest number, not the last one in the file)");
 
         d = Dir("known");
         Log(d, "mirror_log.txt", new[] { L("12:00:00", "INFO", "phase1[guest]: rx 20/s") }, at);
@@ -361,6 +389,8 @@ static class TestReport
         File.WriteAllText(ring, "66 21:20:19 812.400 session".PadRight(99) + "\n" + "65 21:20:19 812.390 zombies".PadRight(99) + "\n" + "garbage\n");
         string steps = Report.RecentSteps(ring);
         Check(steps != null && steps.IndexOf("zombies") < steps.IndexOf("session") && !steps.Contains("garbage"), "recent steps come out oldest first");
+        Check(Diagnose.NewestStep(File.ReadAllText(ring)) == "21:20:19 session" && Diagnose.NewestStep("(note)\n") == null,
+            "the ring's newest step is its highest number, as '<time> <step>'");
     }
 
     // report 2026-10-31 00:49 (and 20:32, 22:47): the mod starts the bridge while the game boots, the watch's first
@@ -482,8 +512,55 @@ static class TestReport
         Check(pf != null && pf.Count == 1, "one friend's freeze is counted once while another plays on (" + (pf == null ? "none" : pf.Count + "x: " + string.Join(" / ", pf.Evidence)) + ")");
     }
 
+    // The bridge's game check (GameGone): only the game started from its own install counts (the kit runs two)
+    static void OwnGameIsTheOneFromItsInstall()
+    {
+        Console.WriteLine("own game from its install:");
+        var me = Process.GetCurrentProcess();
+        string name = me.ProcessName, mine = Path.GetDirectoryName(me.MainModule.FileName);
+        string other = Path.Combine(Dir("otherinstall"), "win64");
+        File.WriteAllBytes(Path.Combine(other, name + ".exe"), new byte[] { 77, 90 });
+        Check(Game.RunningFrom(name, mine), "the game from my install runs");
+        Check(!Game.RunningFrom(name, other), "a game of that name from the other install isn't mine");
+        Check(Game.RunningFrom(name, Path.Combine(root, "nogamehere")), "a folder without the game in it matches by name");
+        Check(Game.RunningFrom(name, null), "no folder matches by name");
+        Check(!Game.RunningFrom("surrounsync-no-such-process", mine), "no game running");
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern int PssCaptureSnapshot(IntPtr process, int flags, int contextFlags, out IntPtr snapshot);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern int PssFreeSnapshot(IntPtr process, IntPtr snapshot);
+
+    // Windows' crash copy of a game (Error Reporting's VA clone: same name, no threads, 2026-11-03 PID 15408) is no game
+    static void CrashCopyIsNotTheGame()
+    {
+        Console.WriteLine("crash copy is not the game:");
+        string d = Dir("crashcopy"), name = "ssgame_" + Guid.NewGuid().ToString("N").Substring(0, 10);
+        File.Copy(Process.GetCurrentProcess().MainModule.FileName, Path.Combine(d, name + ".exe"));
+        var p = Process.Start(new ProcessStartInfo(Path.Combine(d, name + ".exe"), "--sleep") { UseShellExecute = false, CreateNoWindow = true });
+        IntPtr snap = IntPtr.Zero;
+        try
+        {
+            System.Threading.Thread.Sleep(300);
+            Check(Game.RunningFrom(name, d), "the live game counts");
+            int r = PssCaptureSnapshot(p.Handle, 1, 0, out snap);   // PSS_CAPTURE_VA_CLONE
+            Check(r == 0, "clone made (" + r + ")");
+            p.Kill();
+            p.WaitForExit(10000);
+            Check(Process.GetProcessesByName(name).Length == 1, "the clone is listed under the game's name (what kept the helper up)");
+            Check(!Game.RunningFrom(name, d) && !Game.RunningFrom(name, null), "...but isn't the game, by folder or by name");
+        }
+        finally
+        {
+            if (snap != IntPtr.Zero) PssFreeSnapshot(Process.GetCurrentProcess().Handle, snap);
+            if (!p.HasExited) p.Kill();
+        }
+    }
+
     static int Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "--sleep") { System.Threading.Thread.Sleep(20000); return 0; }
         if (args.Length > 0 && args[0] == "--hang")
         {
             var f = new System.Windows.Forms.Form();
@@ -495,9 +572,9 @@ static class TestReport
         Directory.CreateDirectory(root);
         noHangs = Path.Combine(Dir("nohangs"), "hangs");
         GameWatch.HangDirOverride = noHangs;
-        var tests = new Action[] { RepeatedErrorsAreGroupedAndExplained, VersionMismatchSaveSafetyAndConnection, CrashesAreExplainedWithTheModStep,
+        var tests = new Action[] { RepeatedErrorsAreGroupedAndExplained, VersionMismatchSaveSafetyAndConnection, LeftoverCoopSaveIsNotCritical, CrashesAreExplainedWithTheModStep,
                                    TheCrashedRunIsTheOneExplained, MissingLogsAndQuietRuns, SensitiveDataIsFiltered, ReportPackageAndDuplicates,
-                                   PerformanceIsBounded, FrozenGameGetsAHangDump, GameWatchCatchesAFreeze, StallWhileTheGameStarts, PeerFreezeLoadAndPeerName, PeerFreezeWithSeveralPlayers };
+                                   PerformanceIsBounded, FrozenGameGetsAHangDump, GameWatchCatchesAFreeze, StallWhileTheGameStarts, PeerFreezeLoadAndPeerName, PeerFreezeWithSeveralPlayers, OwnGameIsTheOneFromItsInstall, CrashCopyIsNotTheGame };
         foreach (var t in tests)
         {
             try { t(); }

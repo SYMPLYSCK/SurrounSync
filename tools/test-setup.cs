@@ -142,9 +142,20 @@ static class SetupTest
 
             Ok(Find(Doctor.Check(game), "wrong Steam branch") == null, "on Experimental: no branch problem");
             string acf = Path.Combine(root, "steamapps", "appmanifest_1645820.acf");
-            File.WriteAllText(acf, File.ReadAllText(acf).Replace("experimental", ""));
+            string acfText = File.ReadAllText(acf);
+            // game 0.8 is on the normal branch too since 2026-11-05: no problem, a line about matching friends' branch
+            File.WriteAllText(acf, acfText.Replace("experimental", ""));
+            var onNormal = Doctor.Check(game);
+            Ok(Find(onNormal, "wrong Steam branch") == null && Find(onNormal, "Both are game 0.8") != null,
+               "normal branch (0.8) -> no branch problem, told both 0.8 branches work");
+            Ok(Find(onNormal, "OLDER version") == null && Find(onNormal, "NEWER (build") == null,
+               "normal branch -> its build isn't compared with the experimental one this was made on");
+            // "previous" is the old 0.7.1
+            File.WriteAllText(acf, acfText.Replace("experimental", "previous"));
             var br = Find(Doctor.Check(game), "wrong Steam branch");
-            Ok(br != null && br.Fix.Contains("\"Experimental 0.8\""), "normal branch -> told to pick Experimental 0.8");
+            Ok(br != null && br.What.Contains("0.7.1") && br.Fix.Contains("\"None\" (the normal branch)"),
+               "previous branch -> wrong branch, told it is 0.7.1 and to pick None");
+            File.WriteAllText(acf, acfText);
 
             // the updater: a download whose connection closes early is a failure, never a cut-off setup to run
             string dl = Path.Combine(root, "dl.exe"), err;
@@ -207,6 +218,106 @@ static class SetupTest
             inst.RestoreReShade(null);
             Ok(true, "uninstall: no game folder - no throw");
 
+            // The gore mod: a new install has it off (mods.txt 0, its pak as .pak.off); an update keeps the player's
+            // on/off and settings.ini and writes the new pak under the matching name; uninstall removes both
+            string gg = Path.Combine(root, "ggame"), gmods = Path.Combine(gg, "Mods");
+            string logic = Path.Combine(gg, "SurrounDead", "Content", "Paks", "LogicMods");
+            string gpak = Path.Combine(logic, "SurrounDeadGore.pak"), gini = Path.Combine(gmods, "SurrounDeadGore", "settings.ini");
+            Directory.CreateDirectory(gmods);
+            Directory.CreateDirectory(Path.Combine(gg, "SurrounDead", "Content"));
+            var gms = new MemoryStream();
+            using (var za = new System.IO.Compression.ZipArchive(gms, System.IO.Compression.ZipArchiveMode.Create, true))
+                foreach (var n in new[] { "game/ue4ss/Mods/SurrounDeadGore/Scripts/main.lua", "game/ue4ss/Mods/SurrounDeadGore/settings.ini",
+                                          "gore/SurrounDeadGore.pak" })
+                    using (var w = new StreamWriter(za.CreateEntry(n).Open())) w.Write("new");
+            var grec = new Dictionary<string, string>();
+            Action<string> gore = list =>
+            {
+                if (list != null) File.WriteAllText(Path.Combine(gmods, "mods.txt"), list);
+                gms.Position = 0;
+                using (var za = new System.IO.Compression.ZipArchive(gms, System.IO.Compression.ZipArchiveMode.Read, true))
+                    inst.InstallGore(za, gg, gmods, grec);
+            };
+            gore("SurrounSync : 1");
+            Ok(File.ReadAllText(Path.Combine(gmods, "mods.txt")) == "SurrounSync : 1\r\nSurrounDeadGore : 0\r\n"
+               && File.Exists(Path.Combine(gmods, "SurrounDeadGore", "Scripts", "main.lua")) && File.ReadAllText(gini) == "new"
+               && File.Exists(gpak + ".off") && !File.Exists(gpak) && grec["gore"] == "ours" && grec["gore_pak"] == "ours",
+               "gore, new install: unpacked, listed off, its pak as .pak.off");
+            W(gini, "blood = 2");
+            W(Path.Combine(gmods, "SurrounDeadGore", "Scripts", "gone.lua"), "old");
+            gore("SurrounSync : 1\r\nSurrounDeadGore : 1\r\n");
+            Ok(File.ReadAllText(Path.Combine(gmods, "mods.txt")) == "SurrounSync : 1\r\nSurrounDeadGore : 1\r\n" && File.ReadAllText(gini) == "blood = 2"
+               && File.Exists(gpak) && !File.Exists(gpak + ".off") && !File.Exists(Path.Combine(gmods, "SurrounDeadGore", "Scripts", "gone.lua")),
+               "gore, update with it on: stays on, its pak live, settings.ini kept, old scripts replaced");
+            gore("SurrounSync : 1\r\nSurrounDeadGore : 0\r\n");
+            Ok(File.ReadAllText(Path.Combine(gmods, "mods.txt")) == "SurrounSync : 1\r\nSurrounDeadGore : 0\r\n"
+               && File.Exists(gpak + ".off") && !File.Exists(gpak), "gore, update with it off: stays off, its pak .pak.off");
+            W(Path.Combine(gmods, "SurrounDeadGore", "enabled.txt"), "");
+            gore("SurrounSync : 1\r\n");
+            Ok(File.ReadAllText(Path.Combine(gmods, "mods.txt")) == "SurrounSync : 1\r\n" && File.Exists(gpak),
+               "gore, a standalone install on through enabled.txt: kept on, nothing added to mods.txt");
+            File.Delete(Path.Combine(gmods, "SurrounDeadGore", "enabled.txt"));
+            File.WriteAllText(Path.Combine(gmods, "mods.txt"), "SurrounSync : 1\r\nSurrounDeadGore : 1\r\n");
+            inst.RemoveGore(gg, gmods, grec);
+            Ok(!Directory.Exists(Path.Combine(gmods, "SurrounDeadGore")) && !File.Exists(gpak) && !File.Exists(gpak + ".off")
+               && !File.ReadAllText(Path.Combine(gmods, "mods.txt")).Contains("SurrounDeadGore : 1"), "gore, uninstall: mod and pak gone, not loaded");
+
+            // The FPV drone's SurrounSync copy (bundled.txt): installed on, the player's FPVDrone.ini kept on an update,
+            // removed on uninstall; a separately installed FPVDrone (no bundled.txt) is never touched
+            string dg = Path.Combine(root, "dgame"), dmods = Path.Combine(dg, "Mods"), ddir = Path.Combine(dmods, "FPVDrone");
+            Directory.CreateDirectory(dmods);
+            var dms = new MemoryStream();
+            using (var za = new System.IO.Compression.ZipArchive(dms, System.IO.Compression.ZipArchiveMode.Create, true))
+                foreach (var n in new[] { "game/ue4ss/Mods/FPVDrone/Scripts/main.lua", "game/ue4ss/Mods/FPVDrone/FPVDrone.ini",
+                                          "game/ue4ss/Mods/FPVDrone/bundled.txt" })
+                    using (var w = new StreamWriter(za.CreateEntry(n).Open())) w.Write("new");
+            var drec = new Dictionary<string, string>();
+            Action dinst = () =>
+            {
+                dms.Position = 0;
+                using (var za = new System.IO.Compression.ZipArchive(dms, System.IO.Compression.ZipArchiveMode.Read, true))
+                    inst.InstallDrone(za, dmods, drec);
+            };
+            File.WriteAllText(Path.Combine(dmods, "mods.txt"), "SurrounSync : 1\r\n");
+            dinst();
+            Ok(File.Exists(Path.Combine(ddir, "Scripts", "main.lua")) && File.Exists(Path.Combine(ddir, "bundled.txt"))
+               && File.ReadAllText(Path.Combine(dmods, "mods.txt")).Contains("FPVDrone : 1") && drec["fpvdrone"] == "ours",
+               "drone, new install: unpacked with its mark, switched on");
+            W(Path.Combine(ddir, "FPVDrone.ini"), "roll_axis = X");
+            W(Path.Combine(ddir, "Scripts", "gone.lua"), "old");
+            dinst();
+            Ok(File.ReadAllText(Path.Combine(ddir, "FPVDrone.ini")) == "roll_axis = X" && !File.Exists(Path.Combine(ddir, "Scripts", "gone.lua")),
+               "drone, update: the player's FPVDrone.ini kept, old scripts replaced");
+            Ok(!Directory.Exists(Path.Combine(dmods, ".FPVDrone.new")), "drone, update: no staging folder left");
+            // an update whose unpack fails (here its staging folder can't be made) leaves the installed mod as it was
+            string dstage = Path.Combine(dmods, ".FPVDrone.new");
+            W(dstage, "in the way");
+            bool dthrew = false;
+            try { dinst(); } catch (IOException) { dthrew = true; }
+            Ok(dthrew && File.Exists(Path.Combine(ddir, "Scripts", "main.lua")) && File.ReadAllText(Path.Combine(ddir, "FPVDrone.ini")) == "roll_axis = X",
+               "drone, update that fails to unpack: the installed scripts and ini stay");
+            File.Delete(dstage);
+            // FPVDrone bought and unpacked over the SurrounSync copy: bundled.txt left behind, owned.txt says it's theirs
+            W(Path.Combine(ddir, "owned.txt"), "");
+            W(Path.Combine(ddir, "Scripts", "main.lua"), "bought");
+            dinst();
+            Ok(File.ReadAllText(Path.Combine(ddir, "Scripts", "main.lua")) == "bought", "drone: a bought copy over the bundled one (owned.txt) is not replaced");
+            inst.RemoveDrone(dmods, drec);
+            Ok(File.ReadAllText(Path.Combine(ddir, "Scripts", "main.lua")) == "bought", "drone, uninstall: a bought copy over the bundled one is never removed");
+            File.Delete(Path.Combine(ddir, "owned.txt"));
+            inst.RemoveDrone(dmods, drec);
+            Ok(!Directory.Exists(ddir) && !File.ReadAllText(Path.Combine(dmods, "mods.txt")).Contains("FPVDrone : 1"), "drone, uninstall: gone, not loaded");
+            W(Path.Combine(ddir, "Scripts", "main.lua"), "bought");
+            var orec = new Dictionary<string, string>();
+            dms.Position = 0;
+            using (var za = new System.IO.Compression.ZipArchive(dms, System.IO.Compression.ZipArchiveMode.Read, true))
+                inst.InstallDrone(za, dmods, orec);
+            Ok(File.ReadAllText(Path.Combine(ddir, "Scripts", "main.lua")) == "bought" && !File.Exists(Path.Combine(ddir, "bundled.txt"))
+               && !orec.ContainsKey("fpvdrone"), "drone: a separately installed FPVDrone is left as it is");
+            orec["fpvdrone"] = "ours";
+            inst.RemoveDrone(dmods, orec);
+            Ok(File.Exists(Path.Combine(ddir, "Scripts", "main.lua")), "drone, uninstall: a separately installed FPVDrone is never removed");
+
             // SurrounSync's content: the intro (the player's own kept and put back), the sound pak, BPModLoaderMod
             string cg = Path.Combine(root, "cgame"), cmods = Path.Combine(cg, "Mods");
             string movies = Path.Combine(cg, "SurrounDead", "Content", "Movies"), intro = Path.Combine(movies, "UE5 Intro.mp4");
@@ -216,6 +327,8 @@ static class SetupTest
             var cms = new MemoryStream();
             using (var za = new System.IO.Compression.ZipArchive(cms, System.IO.Compression.ZipArchiveMode.Create, true))
                 foreach (var n in new[] { "content/Movies/UE5 Intro.mp4", "content/Paks/LogicMods/SurrounSyncSounds.pak",
+                                          "content/Paks/LogicMods/SurrounSyncGlider.pak", "content/Paks/LogicMods/SurrounSyncArmory.pak",
+                                          "content/Paks/LogicMods/SurrounSyncDrone.pak",
                                           "game/ue4ss/Mods/BPModLoaderMod/Scripts/main.lua" })
                     using (var w = new StreamWriter(za.CreateEntry(n).Open())) w.Write("ours");
             var crec = new Dictionary<string, string>();
@@ -226,13 +339,17 @@ static class SetupTest
                     inst.InstallContent(za, cg, cmods, crec);
             }
             string pak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncSounds.pak");
+            string glpak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncGlider.pak");
+            string arpak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncArmory.pak");
+            string drpak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncDrone.pak");
+            Ok(File.Exists(glpak) && File.Exists(arpak) && File.Exists(drpak), "content: the glider, armory and drone paks in LogicMods");
             Ok(File.ReadAllText(intro) == "ours" && File.ReadAllText(intro + ".surrounsync-original") == "theirs",
                "content: our intro in, the player's own kept (also after an update)");
             Ok(File.Exists(pak) && File.Exists(Path.Combine(cmods, "BPModLoaderMod", "Scripts", "main.lua"))
                && File.ReadAllText(Path.Combine(cmods, "mods.txt")).Contains("BPModLoaderMod : 1"),
                "content: the sound pak in LogicMods, BPModLoaderMod added and switched on where it was missing");
             inst.RemoveContent(cg, cmods, crec);
-            Ok(File.ReadAllText(intro) == "theirs" && !File.Exists(intro + ".surrounsync-original") && !File.Exists(pak)
+            Ok(File.ReadAllText(intro) == "theirs" && !File.Exists(intro + ".surrounsync-original") && !File.Exists(pak) && !File.Exists(glpak) && !File.Exists(arpak) && !File.Exists(drpak)
                && !Directory.Exists(Path.Combine(cmods, "BPModLoaderMod")) && !File.ReadAllText(Path.Combine(cmods, "mods.txt")).Contains("BPModLoaderMod"),
                "uninstall: the player's intro back, our pak and BPModLoaderMod gone");
             W(Path.Combine(cmods, "BPModLoaderMod", "Scripts", "main.lua"), "their loader");

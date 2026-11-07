@@ -510,7 +510,45 @@ local function let_go_if_removed(g)
     ghost.destroy("the game removed it - a new one follows", false, true)
     return true
 end
+-- The ghost is a real BP_PlayerCharacter with the game's RadiationComponent. A radiated zombie's hit or death blast
+-- on it (GameFunctionLibrary.ApplyRadiationDamage -> DecreaseRadiation, decompiled) starts that component's Geiger
+-- with SpawnSound2D: heard in this game at full volume at any distance, for radiation its player takes in their own
+-- game (player report 2026-11-01: the host hears the guest's radiation; zombies.lua sends that hit to their game).
+-- The ghost's radiation means nothing here: its Geiger is stopped and its radiation put back to full the frame it
+-- starts (it fades in over 1 s), with the component's timers (the damage tick once at 0). Radiation zones never
+-- radiate it (BP_RadiationArea_Sphere only takes GetPlayerCharacter(0)).
+local RAD_PATH = "/Game/Blueprints/Components/RadiationComponent.RadiationComponent_C"
+local rad = { cls = nil, comp = nil, of = nil, quieted = 0 }
+local function quiet_radiation(g)
+    if rad.of ~= addr or not util.valid(rad.comp) then
+        rad.comp, rad.of = nil, addr
+        rad.cls = util.valid(rad.cls) and rad.cls or StaticFindObject(RAD_PATH)
+        if not util.valid(rad.cls) then return end
+        pcall(function() rad.comp = g:GetComponentByClass(rad.cls) end)
+        if not util.valid(rad.comp) then rad.comp = nil; return end
+    end
+    local c, geiger, cur, max = rad.comp, nil, nil, nil
+    pcall(function() geiger = c.Geiger end)
+    pcall(function() cur, max = c.CurrentRadiation, c.MaxRadiation end)
+    local loud = util.valid(geiger)
+    local low = type(cur) == "number" and type(max) == "number" and cur < max
+    if not (loud or low) then return end
+    if loud then
+        pcall(function() geiger:Stop() end)
+        pcall(function() geiger:K2_DestroyComponent(c) end)
+    end
+    if low then pcall(function() c.CurrentRadiation = max end) end
+    pcall(function() c:ClearTimers() end)
+    rad.quieted = rad.quieted + 1
+    log.every("ghost.radiation", 10, string.format("ghost: radiation on the other player's character here (%s/%s%s) - "
+        .. "put back, the Geiger is only theirs (%d time(s))", tostring(cur), tostring(max), loud and ", Geiger on" or "",
+        rad.quieted))
+end
+ghost._rad = rad
+
 function ghost.check(dt)
+    local cur = ghost.get()
+    if cur then util.safe(quiet_radiation, "ghost.radiation", cur) end
     check_in = check_in - (dt or 0)
     if check_in > 0 then return false end
     check_in = CHECK_S

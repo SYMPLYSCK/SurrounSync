@@ -271,6 +271,32 @@ namespace SurrounSyncShared
             catch (Exception) { return false; }   // (no access to that process's modules)
         }
 
+        // Our own game still runs: a process of that name started from win64. The kit's other install runs a game of the
+        // same name (kit 2026-11-01: the host's game crashed, its bridge saw the guest's game and told the guest "alive"
+        // for good). One whose path can't be read counts as ours, and a win64 without the game in it (another folder
+        // layout) matches by name: a bridge that quits under its running game drops its player. One with no threads isn't
+        // a game: Windows' crash copy of it (2026-11-03 17:10, PID 15408, no path, never ends) kept the radio helper up
+        // from the game folder, and Steam wouldn't start the game again - here it would have kept the bridge up.
+        public static bool RunningFrom(string process, string win64)
+        {
+            bool byName = win64 == null || !File.Exists(Path.Combine(win64, process + ".exe"));
+            foreach (var p in Process.GetProcessesByName(process))
+            {
+                int threads;
+                try { threads = p.Threads.Count; }
+                catch (InvalidOperationException) { threads = 0; }   // ended between the list and the read
+                if (threads == 0) continue;
+                if (byName) return true;
+                try
+                {
+                    string dir = Path.GetDirectoryName(p.MainModule.FileName);
+                    if (string.Equals(Path.GetFullPath(dir).TrimEnd('\\'), Path.GetFullPath(win64).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) return true;
+                }
+                catch (Exception) { return true; }
+            }
+            return false;
+        }
+
         // The game process with a window: the one from win64 when there is one, else the first (win64 null = the first).
         public static Process Pick(string process, string win64)
         {
@@ -434,8 +460,10 @@ namespace SurrounSyncShared
 
         string StepPart()
         {
-            string s = win64 == null ? null : Report.ReadText(Path.Combine(win64, "mirror_step.txt"));
-            return string.IsNullOrWhiteSpace(s) ? "" : " | mod step: " + s.Trim();
+            if (win64 == null) return "";
+            string s = Diagnose.NewestStep(Report.ReadText(Path.Combine(win64, "mirror_steps.txt")));
+            if (s == null) s = Report.ReadText(Path.Combine(win64, "mirror_step.txt"));   // a mod from before 1.0.1
+            return string.IsNullOrWhiteSpace(s) || s.TrimStart().StartsWith("(") ? "" : " | mod step: " + s.Trim();
         }
 
         public void Start()
@@ -810,17 +838,9 @@ namespace SurrounSyncShared
                 catch { }
                 try
                 {
-                    // mirror_step*.txt = the mod step running when that run ended; use the run that ended at the crash
-                    DateTime at = Directory.GetLastWriteTime(crash);
-                    foreach (var n in Diagnose.StepFiles)
-                    {
-                        string p = Path.Combine(win64, n);
-                        if (!File.Exists(p)) continue;
-                        double gap = (at - File.GetLastWriteTime(p)).TotalSeconds;
-                        if (gap < -5 || gap > 600) continue;
-                        sb.AppendLine("  SurrounSync step at the crash: " + File.ReadAllText(p).Trim() + " (" + n + ")");
-                        break;
-                    }
+                    // the mod step running when the run that ended at the crash stopped
+                    string stepFile, step = Diagnose.StepAt(win64, Directory.GetLastWriteTime(crash), out stepFile);
+                    if (step != null) sb.AppendLine("  SurrounSync step at the crash: " + step + " (" + stepFile + ")");
                 }
                 catch { }
             }

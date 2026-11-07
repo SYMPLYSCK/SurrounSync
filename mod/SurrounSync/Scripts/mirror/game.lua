@@ -5,6 +5,7 @@ local util = require("mirror.util")
 local ghost = require("mirror.ghost")
 local peers = require("mirror.peers")
 local crumb = require("mirror.crumb")
+local perf = require("mirror.perf")
 
 local game = {}
 
@@ -67,6 +68,19 @@ function game.on_new_player(fn) register(new_player_handlers, new_player_slot, u
 local reset_handlers, reset_slot = {}, {}
 function game.on_world_reset(fn) register(reset_handlers, reset_slot, util.callsite(2), fn) end
 
+-- The game takes every widget off the screen at once (WidgetLayoutLibrary.RemoveAllWidgets): on a death before the
+-- respawn screen (BP_PlayerController's ubergraph, decompiled) and on the pause menu's MAIN MENU. The controller
+-- stays, so nothing else tells a module its widget is gone; the next GC frees it and the memory comes back as other
+-- objects, where IsValid can pass (DBG-20261101-002: notify filled its cards on freed memory 3 min after a death, a
+-- native crash). Handlers run inside that call, before any GC: they drop their widgets (closing them is still safe).
+local cleared_handlers, cleared_slot = {}, {}
+function game.on_widgets_cleared(fn) register(cleared_handlers, cleared_slot, util.callsite(2), fn) end
+local function widgets_cleared()
+    log.info("game: every widget was taken off the screen - dropping ours")
+    for _, fn in ipairs(cleared_handlers) do util.safe(fn, "game.on_widgets_cleared") end
+end
+game._widgets_cleared = widgets_cleared
+
 -- Runs the reset handlers now: a load that removes the old world's actors itself calls this right away.
 function game.reset_world()
     util.instances_reset()
@@ -115,6 +129,8 @@ local function key_down(name)
     if not ok then return nil end
     return r == true
 end
+-- a key held down in this game (UE4SS key binds fire in every game on the PC; this is the game's own input state)
+function game.key_down(name) return key_down(name) == true end
 
 local function key_seen(name)
     local d = key_down(name)
@@ -200,17 +216,22 @@ local function on_tick(self, DeltaSeconds)
         ready_done = true
         for _, fn in ipairs(ready_handlers) do util.safe(fn, "game.on_ready") end
     end
-    crumb.at("tick keys")
-    util.safe(process_keys, "game.keys", dt)
+    -- the perf frame spans every handler: until 2026-11-01 it began and ended inside phase1's, so keys, the ~18
+    -- other handlers and other guests' links were in no frame. A handler's time outside its own perf parts is its
+    -- glue part ("glue tick dogs.lua:176").
+    perf.frame_begin()
+    perf.run("tick keys", util.safe, process_keys, "game.keys", dt)
     for i = 1, #tick_handlers do
         crumb.at(tick_steps[i])
+        perf.glue(tick_steps[i])
         util.safe(tick_handlers[i], "game.on_tick", dt)
     end
+    perf.frame_end(dt)
 end
 
 -- The player class can exist before its functions are ready: hooking then fails ("UFunction::Func: 0x0").
 -- Only a hook that took counts as installed; until then every new player character tries again.
--- (Not from LoopAsync: that runs in a separate Lua state, a second copy of the mod.)
+-- (Not from LoopAsync's thread: its Lua runs beside the game thread's, DBG-20261101-008.)
 local tick_fn = function(self, DeltaSeconds) util.safe(on_tick, "game.tick", self, DeltaSeconds) end
 local function install()
     if installed then return true end
@@ -221,6 +242,7 @@ local function install()
 end
 
 function game.init()
+    util.hook("/Script/UMG.WidgetLayoutLibrary:RemoveAllWidgets", function() util.safe(widgets_cleared, "game.widgets_cleared") end, nil, true)
     if util.valid(StaticFindObject(P)) then util.safe(install, "game.install") end
     NotifyOnNewObject(P, function() util.safe(install, "game.install") end)
 end

@@ -176,9 +176,11 @@ local function on_tick(dt)
     end
 end
 
+function invdiag.key_report() want = true end   -- (also /inventory, chatcmd.lua)
+
 function invdiag.init(cfg)
     cfg_diag = cfg and cfg.diagnostics or false
-    game.keybind("F11", { ModifierKey.CONTROL }, function() want = true end)
+    game.keybind("F11", { ModifierKey.CONTROL }, invdiag.key_report)
     game.on_tick(on_tick)
     for _, fn in ipairs({ "LoadPlayerInventory", "Event_LoadPlayer" }) do
         game.player_hook(fn, function(self)

@@ -34,6 +34,14 @@ def LAST_IS(L, verb, arg):
     return last is not None and last.endswith(" " + verb + " " + arg) and L.eval('SENT[#SENT]') == last
 
 
+# UE4SS's game-thread loops (util.game_loop): ASYNC() runs the newest loop once and says whether it has stopped.
+# No LoopAsync: a poll still posting from LoopAsync's thread (DBG-20261101-008) never runs here.
+GAME_LOOPS = ('GLOOPS, GLN = {}, 0; LoopAsync = nil; function ExecuteInGameThread(fn) fn() end; '
+              'function LoopInGameThreadWithDelay(ms, fn) GLN = GLN + 1; local h = GLN; GLOOPS[h] = fn; '
+              'ASYNC = function() if GLOOPS[h] then fn() end; return GLOOPS[h] == nil end; return h end; '
+              'function CancelDelayedAction(h) local had = GLOOPS[h] ~= nil; GLOOPS[h] = nil; return had end')
+
+
 RUNTIME_LUA = r'''
         local scripts, tmp = ...
         package.path = scripts .. "\\?.lua;" .. scripts .. "\\mirror\\?.lua;" .. package.path
@@ -1339,7 +1347,7 @@ def session_main_menu_exit_needs_no_ticks(L, tmp):
     """kit 2026-10-30 11:58 + 12:05: the game's MAIN MENU button destroys every player first, so nothing ticks at the
     menu - the exit is polled from the level load on (game thread), and a save still running is waited out."""
     menu_session(L, tmp)
-    L.execute('ASYNC = nil; function LoopAsync(ms, fn) ASYNC = fn end; function ExecuteInGameThread(fn) fn() end')
+    L.execute('ASYNC = nil; ' + GAME_LOOPS)
     L.execute('SAVING = 3; ' + MENU_LOAD)
     check(L.eval('ASYNC') is not None, "polling from the level load on")
     L.execute('ASYNC(); ASYNC(); ASYNC(); ASYNC(); ASYNC()')
@@ -1863,8 +1871,7 @@ def realmplay_host_menu_exit_needs_no_ticks(L, tmp):
     L.execute('session.preinit(CFG)')
     link_dir = os.path.join(tmp, "SurrounDead")
     L.execute(REALM_FAKES, link_dir)
-    L.execute('session.on_main_menu = function(fn) MAIN_MENU = fn end; ASYNC = nil; '
-              'function LoopAsync(ms, fn) ASYNC = fn end; function ExecuteInGameThread(fn) fn() end')
+    L.execute('session.on_main_menu = function(fn) MAIN_MENU = fn end; ASYNC = nil; ' + GAME_LOOPS)
     L.execute('realmplay.init(CFG)')
     rdir = os.path.join(link_dir, "Saved", "SurrounSyncRealms", REALM)
     L.execute('realmplay.start(...)', REALM)
@@ -1898,7 +1905,7 @@ def realm_guest_main_menu_exit(L, tmp):
     L.execute('MAP_HOOKS = {}; function RegisterLoadMapPostHook(fn) MAP_HOOKS[#MAP_HOOKS + 1] = fn end; '
               'HOOKS = {}; require("mirror.util").ensure_hook = function(p, pre) HOOKS[p] = pre; return true end; '
               'for _, fn in ipairs(TICKS) do fn(0.5) end; '
-              'ASYNC = nil; function LoopAsync(ms, fn) ASYNC = fn end; function ExecuteInGameThread(fn) fn() end')
+              'ASYNC = nil; ' + GAME_LOOPS)
     L.execute('GAME_SAVE(); SAVING = 0')
     coop_player = read(os.path.join(saves(tmp), COOP, "Player.sav"))
     L.execute(MENU_LOAD)
@@ -1926,6 +1933,25 @@ def realmplay_hosted_realm_joins_host(L, tmp):
     L.execute('RTICK(2)')
     check(L.eval('JOINED') == "76561197960266730", "joined the lease holder")
     check(L.eval('SAVES') == 0 and L.eval('(realmplay.state())') == "idle", "nothing saved, no Realm session")
+
+
+@test
+def realmplay_list_member_needs_a_host(L, tmp):
+    """Joined from the server list, nobody hosts: the claim's invited_only stops the start with a plain reason;
+    no download, no save built, no join."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.preinit(CFG)')
+    L.execute(REALM_FAKES, os.path.join(tmp, "SurrounDead"))
+    L.execute('realmplay.init(CFG)')
+    own0 = snapshot(tmp, "S1")
+    L.execute('realmplay.start(...)', REALM)
+    L.eval('ANSWER("claim", "fail invited_only")')
+    L.execute('RTICK(2)')
+    check(L.eval('note_has("You joined it from the server list")'), "says why: a list member plays only while someone hosts")
+    check(L.eval('LAST("download")') is None and L.eval('JOINED') is None, "no download, no join")
+    check(L.eval('SAVES') == 0 and L.eval('(realmplay.state())') == "idle", "nothing saved, no Realm session")
+    check(snapshot(tmp, "S1") == own0, "own save untouched")
 
 
 @test
@@ -2082,7 +2108,7 @@ def realm_guest_shooting_range_exit(L, tmp):
     L.execute('MAP_HOOKS = {}; function RegisterLoadMapPostHook(fn) MAP_HOOKS[#MAP_HOOKS + 1] = fn end; '
               'HOOKS = {}; require("mirror.util").ensure_hook = function(p, pre) HOOKS[p] = pre; return true end; '
               'for _, fn in ipairs(TICKS) do fn(0.5) end; '
-              'ASYNC = nil; function LoopAsync(ms, fn) ASYNC = fn end; function ExecuteInGameThread(fn) fn() end')
+              'ASYNC = nil; ' + GAME_LOOPS)
     L.execute('IN_RANGE = true; GAME_SAVE(); SAVING = 0')
     L.execute(MENU_LOAD)
     for _ in range(5):
@@ -2192,10 +2218,207 @@ def realmplay_create_new_world(L, tmp):
     check(read(os.path.join(rdir, "character", "Player.sav")) == coop_player, "creator's Realm character stored")
 
 
+# The game's Save_Player as EMS holds it: one cached object per save name, a slot's file read back after a clear. The
+# New Game page copies the settings actor's looks into the current name's object (SetupPlayerLooks, the Journal's
+# fields go to the controller), and the player dresses from the current name's object (SetSexMesh).
+LOOKS_FAKES = r'''
+ASSET = {}
+local function asset(p)
+    ASSET[p] = ASSET[p] or { IsValid = function() return true end, GetAddress = function() return 1 end,
+        GetFullName = function() return "StaticMesh " .. p end, path = p }
+    return ASSET[p]
+end
+NO_OBJECT = { IsValid = function() return false end, GetAddress = function() return 0 end }
+function CreateInvalidObject() return NO_OBJECT end
+LOOK_FIELDS = { "Sex", "EyebrowsType", "HairType", "HairColor", "BeardType", "BeardColor", "SkinColor", "MouthType",
+    "AccessoryType1", "AccessoryType2", "AccessoryType3" }
+local function look_file(prefix)
+    local o = { IsValid = function() return true end, GetAddress = function() return 2 end,
+        GetFName = function() return { ToString = function() return "Save_Player_C_0" end } end,
+        GetClass = function() return nil end }
+    o.Sex = "Male"
+    for i = 2, #LOOK_FIELDS do o[LOOK_FIELDS[i]] = asset("/Game/" .. prefix .. "/" .. LOOK_FIELDS[i]) end
+    return o
+end
+PSAVE = {}
+function PSAVE_OF(name)
+    local k = name:lower()
+    PSAVE[k] = PSAVE[k] or look_file(k == "s1" and "Own" or "Default")
+    return PSAVE[k]
+end
+function LOOK_OF(o, f)
+    local v = o[f]
+    if f == "Sex" then return v end
+    if v == nil or v == NO_OBJECT then return "none" end
+    return v.path
+end
+CLEARED = {}
+EMSLIB.GetCustomSave = function(_, ctx, cls) assert(ctx and cls, "world context and class"); return PSAVE_OF(CURRENT) end
+EMSLIB.ResetCustomSave = function(_, ctx, o, how)
+    CLEAR_CTX = ctx
+    for k, v in pairs(PSAVE) do if v == o then PSAVE[k] = nil; CLEARED[#CLEARED + 1] = k .. ":" .. tostring(how) end end
+end
+EMSOBJ.CachedCustomSaves = { ForEach = function(_, fn)
+    local all = {}
+    for k, v in pairs(PSAVE) do all[#all + 1] = { k, v } end
+    for _, e in ipairs(all) do
+        fn({ get = function() return "playerinfo@cso@" .. e[1] end }, { get = function() return e[2] end })
+    end
+end }
+NG = { IsValid = function() return true end, GetAddress = function() return 3 end,
+    GetFullName = function() return "BP_NewGameSettings_C /Game/Menu.Menu:PersistentLevel.BP_NewGameSettings_C_0" end,
+    Sex = { ToString = function() return "Female" end } }
+for _, f in ipairs({ "EyebrowsMesh", "HairMesh", "HairColor", "BeardColor", "SkinColor", "MouthMesh", "Accessory2Mesh" }) do
+    NG[f] = asset("/Game/Chosen/" .. f)
+end
+NG.BeardMesh, NG.Accessory1Mesh, NG.Accessory3Mesh = NO_OBJECT, NO_OBJECT, NO_OBJECT
+GS_CDO = { IsValid = function() return true end, GetAddress = function() return 4 end,
+    GetActorOfClass = function(_, ctx, cls) assert(ctx and cls); return NG end }
+local find0 = StaticFindObject
+function StaticFindObject(p)
+    if p:find("Default__GameplayStatics", 1, true) then return GS_CDO end
+    if p:find("BP_NewGameSettings", 1, true) or p:find("Save_Player", 1, true) then return asset(p) end
+    if p:sub(1, 6) == "/Game/" and not p:find("/Game/UI/", 1, true) then
+        if UNLOADED and UNLOADED[p] then return NO_OBJECT end
+        return ASSET[p] or NO_OBJECT
+    end
+    return find0(p)
+end
+-- what the page's click runs on the game's side
+function GAME_SETUP_LOOKS()
+    local s = EMSLIB:GetCustomSave(NG, asset("/Game/Blueprints/Saves/Save_Player.Save_Player_C"), "", "")
+    s.Sex = NG.Sex:ToString()
+    s.EyebrowsType, s.HairType, s.HairColor = NG.EyebrowsMesh, NG.HairMesh, NG.HairColor
+    s.BeardType, s.BeardColor, s.SkinColor = NG.BeardMesh, NG.BeardColor, NG.SkinColor
+    s.MouthType = NG.MouthMesh
+    s.AccessoryType1, s.AccessoryType2, s.AccessoryType3 = NG.Accessory1Mesh, NG.Accessory2Mesh, NG.Accessory3Mesh
+end
+-- the world's player: dresses from the current name's object when spawned and when asked to
+DRESSED, WORN = 0, {}
+function DRESS()
+    DRESSED = DRESSED + 1
+    local s = PSAVE_OF(CURRENT)
+    for _, f in ipairs(LOOK_FIELDS) do WORN[f] = LOOK_OF(s, f) end
+end
+function CHOSEN(f)
+    if f == "Sex" then return "Female" end
+    if f == "BeardType" or f:find("AccessoryType[13]") then return "none" end
+    local g = ({ EyebrowsType = "EyebrowsMesh", HairType = "HairMesh", MouthType = "MouthMesh", AccessoryType2 = "Accessory2Mesh" })[f] or f
+    return "/Game/Chosen/" .. g
+end
+function WRONG_LOOKS(read)
+    local bad = {}
+    for _, f in ipairs(LOOK_FIELDS) do if read(f) ~= CHOSEN(f) then bad[#bad + 1] = f .. "=" .. tostring(read(f)) end end
+    return table.concat(bad, " ")
+end
+function OWN_WRONG()
+    local bad, s = {}, PSAVE_OF("S1")
+    for _, f in ipairs(LOOK_FIELDS) do
+        local want = f == "Sex" and "Male" or ("/Game/Own/" .. f)
+        if LOOK_OF(s, f) ~= want then bad[#bad + 1] = f .. "=" .. tostring(LOOK_OF(s, f)) end
+    end
+    return table.concat(bad, " ")
+end
+'''
+
+
+def looks_play(L, tmp, order, after_play=""):
+    """CREATE up to the new world's save; order is whether the game's looks write runs before or after the mod's hook"""
+    create_rt(L, tmp)
+    L.execute(LOOKS_FAKES)
+    L.execute('PSAVE_OF("S1")')   # (EMS holds the own save's object, as after playing in it)
+    L.execute('MAIN_MENU(); WORLD_PLAYER = PLAYER; PLAYER = nil')
+    L.execute('PAGE = { get = function() return { IsValid = function() return true end, GetAddress = function() return 5 end } end }')
+    hook = 'for p, fn in pairs(HOOKS) do if p:find("PlayButton", 1, true) then fn(PAGE) end end'
+    L.execute('GAME_SETUP_LOOKS(); ' + hook if order == "game first" else hook + '; GAME_SETUP_LOOKS()')
+    check(L.eval('CURRENT') == COOP, "Play: EMS points at the co-op save (%s)" % order)
+    if after_play:
+        L.execute(after_play)
+    L.execute('WORLD_PLAYER.SetSexMesh = function() DRESS() end; PLAYER = WORLD_PLAYER; DRESS(); DRESSED = 0')
+
+
+def looks_kept(L, tmp, order):
+    looks_play(L, tmp, order)
+    bad = L.eval('WRONG_LOOKS(function(f) return LOOK_OF(PSAVE_OF(CURRENT), f) end)')
+    check(bad == "", "the co-op save holds the chosen looks before the world starts: %s" % bad)
+    check(L.eval('WRONG_LOOKS(function(f) return WORN[f] end)') == "", "so the spawned player wears them from the start")
+    L.execute('RTICK(12)')
+    check(L.eval('(realmplay.state())') == "capturing", "the first save started")
+    check(L.eval('DRESSED') >= 1, "the player is dressed again before the first save")
+    bad = L.eval('WRONG_LOOKS(function(f) return WORN[f] end)')
+    check(bad == "", "the player wears the chosen looks: %s" % bad)
+    bad = L.eval('OWN_WRONG()')
+    check(bad == "", "the own save's character is untouched: %s" % bad)
+    check(L.eval('CLEAR_CTX.GetAddress()') == 5, "the own save's object is cleared with the page as context (no world at the menu)")
+    check(L.eval('CURRENT') == COOP, "still the co-op save")
+
+
+@test
+def realmplay_new_game_looks_game_writes_first(L, tmp):
+    """CREATE: the character made on the New Game page is the one the Realm's world wears and saves, and the own save's
+    character isn't touched, when the game's write ran before the mod's hook (the report's order, SUSPECTED; 2026-11-03 16:38)."""
+    looks_kept(L, tmp, "game first")
+
+
+@test
+def realmplay_new_game_looks_hook_first(L, tmp):
+    """The same when the mod's hook runs before the game's write."""
+    looks_kept(L, tmp, "hook first")
+
+
+@test
+def realmplay_new_game_looks_survive_the_load(L, tmp):
+    """The looks don't rest on EMS keeping the co-op object through the level load: dropped there, the settle writes them."""
+    looks_play(L, tmp, "game first", 'PSAVE[string.lower(CURRENT)] = nil')
+    bad = L.eval('WRONG_LOOKS(function(f) return WORN[f] end)')
+    check(bad != "", "(the spawn wears the defaults here, as in the report)")
+    L.execute('RTICK(12)')
+    bad = L.eval('WRONG_LOOKS(function(f) return WORN[f] end)')
+    check(bad == "", "the player wears the chosen looks after the settle: %s" % bad)
+    bad = L.eval('WRONG_LOOKS(function(f) return LOOK_OF(PSAVE_OF(CURRENT), f) end)')
+    check(bad == "", "and they are what the first save stores: %s" % bad)
+
+
+@test
+def realmplay_new_game_looks_part_missing(L, tmp):
+    """An asset gone from memory leaves that field alone and doesn't stop the rest or the Realm (no load from our Lua, L-014)."""
+    looks_play(L, tmp, "game first", 'PSAVE[string.lower(CURRENT)] = nil; UNLOADED = { ["/Game/Chosen/HairMesh"] = true }')
+    L.execute('RTICK(12)')
+    check(L.eval('(realmplay.state())') == "capturing", "the first save still started")
+    check(L.eval('LOOK_OF(PSAVE_OF(CURRENT), "HairType")') == "/Game/Default/HairType", "the missing asset's field stays as it was")
+    check(L.eval('LOOK_OF(PSAVE_OF(CURRENT), "MouthType")') == "/Game/Chosen/MouthMesh", "the other fields are written")
+    check(L.eval('WORN.Sex') == "Female", "the player is still dressed")
+
+
+@test
+def realmplay_new_game_no_settings_actor(L, tmp):
+    """No settings actor to read: the Realm is created as before, with nothing written and no dressing call."""
+    create_rt(L, tmp)
+    L.execute(LOOKS_FAKES)
+    L.execute('NG = nil; GS_CDO.GetActorOfClass = function() return nil end')
+    L.execute('PSAVE_OF("S1"); MAIN_MENU(); WORLD_PLAYER = PLAYER; PLAYER = nil')
+    L.execute('PAGE = { get = function() return { IsValid = function() return true end, GetAddress = function() return 5 end } end }')
+    L.execute('for p, fn in pairs(HOOKS) do if p:find("PlayButton", 1, true) then fn(PAGE) end end')
+    check(L.eval('(realmplay.state())') == "new_game", "Play still starts the Realm's world")
+    L.execute('WORLD_PLAYER.SetSexMesh = function() DRESS() end; PLAYER = WORLD_PLAYER')
+    L.execute('RTICK(12)')
+    check(L.eval('(realmplay.state())') == "capturing", "the first save still started")
+    check(L.eval('DRESSED') == 0, "no dressing without looks to apply")
+
+
 AUTO_FAKES = r'''
 LEVELS, ASYNC, PRESSED_NEW = {}, nil, 0
+GLOOPS, GLN = {}, 0
+LoopAsync = nil
 function ExecuteInGameThread(fn) fn() end
-function LoopAsync(ms, fn) ASYNC = fn end
+function LoopInGameThreadWithDelay(ms, fn)
+    GLN = GLN + 1
+    local h = GLN
+    GLOOPS[h] = fn
+    ASYNC = function() if GLOOPS[h] then fn() end; return GLOOPS[h] == nil end
+    return h
+end
+function CancelDelayedAction(h) local had = GLOOPS[h] ~= nil; GLOOPS[h] = nil; return had end
 function FName(s) return s end
 local gi_load = GI.Event_LoadLevel
 GI.Event_LoadLevel = function(self, l) LEVELS[#LEVELS + 1] = l; return gi_load(self, l) end
@@ -2847,6 +3070,38 @@ def settled(L, tmp):
     check(L.eval('session.in_world()') is True, "(setup) joined and settled")
 
 
+REFUSING_PLAYER = ('POS, TRIES = { X = 1, Y = 2, Z = 3 }, {}; '
+                   'PLAYER.K2_GetActorLocation = function() return { X = POS.X, Y = POS.Y, Z = POS.Z } end; '
+                   'PLAYER.K2_TeleportTo = function(_, l) TRIES[#TRIES + 1] = l; if REFUSE(l) then return false end; '
+                   'POS = { X = l.X, Y = l.Y, Z = l.Z }; return true end')
+
+
+@test
+def join_place_exact_spot_refused(L, tmp):
+    """DBG-20261101-006: K2_TeleportTo refuses the spot next to the host (the capsule overlaps the ground): the guest
+    goes 1 m higher instead of staying where the load put it"""
+    joined_session(L, tmp)
+    L.execute(REFUSING_PLAYER + '; function REFUSE(l) return l.Z == 500050 end')
+    L.execute('session.set_peer_locator(function() return { X = 300000, Y = 0, Z = 500000 } end); TICK(12)')
+    check(L.eval('#TRIES') == 2 and L.eval('POS.Z') == 500150, "refused at the spot, placed 1 m higher (%s tries, Z %s)"
+          % (L.eval('#TRIES'), L.eval('POS.Z')))
+    check(L.eval('session.in_world()') is True and L.eval('log_has("INFO", "moved, 1 m higher")'),
+          "joined next to the host, the log names the spot used")
+
+
+@test
+def join_place_all_refused(L, tmp):
+    """every spot refused: 3 tries of the spot + 1 m higher + 3 rings of 8, logged as refused (not "undone"), then the
+    join goes on without the placement"""
+    joined_session(L, tmp)
+    L.execute(REFUSING_PLAYER + '; function REFUSE() return true end')
+    L.execute('session.set_peer_locator(function() return { X = 300000, Y = 0, Z = 500000 } end); TICK(20)')
+    check(L.eval('#TRIES') == 3 * 26, "26 spots tried per try (%s)" % L.eval('#TRIES'))
+    check(L.eval('log_has("INFO", "teleport refused")') and not L.eval('log_has("INFO", "teleport undone")')
+          and L.eval('log_has("WARN", "didn\'t stick after 3 tries")'), "logged as refused, then given up")
+    check(L.eval('POS.X') == 1 and L.eval('note_has("couldn\'t place you")') is True, "the guest stays put and is told")
+
+
 @test
 def checkpoint_debounce_and_interval(L, tmp):
     settled(L, tmp)
@@ -3195,7 +3450,7 @@ def notify_old_cards_leave_the_screen(L, tmp):
                                           RemoveFromParent = function() REMOVED = REMOVED + 1 end } end
         PC = obj(1)
         package.loaded["mirror.game"] = { player = function() return PC end, controller = function() return PC end,
-            keybind = function() end, on_world_reset = function(fn) RESETS[#RESETS + 1] = fn end }
+            keybind = function() end, on_widgets_cleared = function() end, on_world_reset = function(fn) RESETS[#RESETS + 1] = fn end }
         notify = require("mirror.notify")
         notify.configure({}); notify.init()
         T = notify._test
@@ -3259,6 +3514,9 @@ def link_peer_state_steam(L, tmp):
     check(L.eval('link.peer_state_now(3)') == "gone", "the peer's connector says its game closed -> gone")
     status("-1.0", "?")
     check(L.eval('link.peer_state_now(3)') == "unknown", "no peer yet -> unknown")
+    # (DBG-20261101-010: the bridge re-makes a lost host's link stamped as heard now, before any hello)
+    status("0.0", "?")
+    check(L.eval('link.peer_state_now(0.2)') == "unknown", "a new link with no hello yet -> unknown, not ok")
 
 
 @test
@@ -3266,6 +3524,414 @@ def link_peer_state_file(L, tmp):
     L.execute('link = require("mirror.link"); link.configure(%s); link.open("guest")' % (LINK_CFG % "file"))
     check(L.eval('link.peer_state_now(5)') == "ok" and L.eval('link.peer_state_now(50)') == "gone",
           "file transport: gone after 45 s of silence")
+
+
+# ---- Realm character backups (backups.take_realm / list_realm / restore_realm, the REALMS tab's BACKUPS) ----
+
+def realm_rt(L, tmp, kept=None):
+    """own save S1, backups + Realms set up (kept = how many copies a Realm keeps); returns the Realm's folder"""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    if kept:
+        L.execute('CFG.save.backups_kept = ' + str(kept))
+    L.execute('session.preinit(CFG)')
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    L.execute('rm = require("mirror.realm"); backups = require("mirror.backups")')
+    return os.path.join(link_dir, "Saved", "SurrounSyncRealms", REALM)
+
+
+def rb_store(L, tag):
+    ch = realm_character(tag)
+    check(first(L.eval('rm.store_character(...)', REALM, lua_files(L, ch))) is True, "(setup) Realm character %s stored" % tag.decode())
+    return ch
+
+
+def rb_take(L, reason="backed up by hand"):
+    return first(L.eval('backups.take_realm(...)', REALM, L.eval('rm.char_dir(...)', REALM), reason))
+
+
+def rb_list(L, rid=REALM):
+    t = L.eval('backups.list_realm(...)', rid)
+    return [dict(e.items()) for e in t.values()] if t else []
+
+
+@test
+def realm_backup_take_and_list(L, tmp):
+    """BACK UP NOW / a safe point: the stored Realm character is copied byte-exact under its Realm id, apart from co-op's."""
+    rdir = realm_rt(L, tmp)
+    ch = rb_store(L, b"v0")
+    folder = rb_take(L)
+    bdir = os.path.join(broot(tmp), "SurrounSync Realms", REALM, folder or "?")
+    got = sorted(os.listdir(bdir)) if os.path.isdir(bdir) else []
+    check(got == ["PlayerInfo.sav", "Player.sav", "_SDQuests.sav", "_SkillTree.sav", "backup.txt"] or
+          got == sorted(["Player.sav", "PlayerInfo.sav", "_SDQuests.sav", "_SkillTree.sav", "backup.txt"]),
+          "the character's files and sidecars, by plain name, in the Realm's backup folder (%s)" % got)
+    check(all(os.path.exists(os.path.join(bdir, n)) and read(os.path.join(bdir, n)) == d for n, d in ch.items()),
+          "every file is a byte-exact copy of the stored character")
+    m = read(os.path.join(bdir, "backup.txt")).decode()
+    check("kind=realm" in m and "pinned=0" in m, "manifest: kind realm, nothing pinned (a Realm keeps its newest copies)")
+    lst = rb_list(L)
+    check(len(lst) == 1 and lst[0]["folder"] == folder and lst[0]["size"] == sum(len(d) for d in ch.values()) and lst[0]["reason"] == "backed up by hand",
+          "list_realm: the copy with its reason and the size of all its files (%s)" % lst)
+    check(rb_take(L) == folder and len(rb_list(L)) == 1, "the same character again makes no second copy")
+    check(listing(L, "S1") == [] and listing(L, "SurrounSync Realms") == [] and listing(L, "SurrounSync Realms\\" + REALM) != [],
+          "co-op's lists (the own save, the Realms folder name) don't show Realm copies; only the Realm's own key does")
+    check(first(L.eval('backups.take_realm(...)', "7K2M9P4Q1Z", L.eval('rm.char_dir("7K2M9P4Q1Z")'), "x")) is None
+          and not os.path.exists(os.path.join(broot(tmp), "SurrounSync Realms", "7K2M9P4Q1Z")),
+          "a Realm without a character: nothing to keep, nothing created")
+    check(first(L.eval('backups.take_realm(...)', "..\\x", rdir, "x")) is None, "a Realm id that is a path is refused")
+
+
+@test
+def realm_backup_keeps_newest_n(L, tmp):
+    realm_rt(L, tmp, kept=3)
+    folders = []
+    for i in range(5):
+        rb_store(L, b"v%d" % i)
+        folders.append(rb_take(L, "backed up by hand"))
+    lst = rb_list(L)
+    check(len(lst) == 3 and [e["folder"] for e in lst] == folders[:1:-1], "newest 3 of 5 kept, newest first (%s)" % [e["folder"] for e in lst])
+    d = os.path.join(broot(tmp), "SurrounSync Realms", REALM)
+    on_disk = [x for x in os.listdir(d) if os.path.isdir(os.path.join(d, x))]
+    check(sorted(on_disk) == sorted(e["folder"] for e in lst), "only the kept folders are on disk (%s)" % on_disk)
+    check(not any(e["pinned"] for e in lst), "no copy is pinned")
+    rb_store(L, b"other")
+    L.eval('(function(id) rm.store_character(id, { ["Player.sav"] = "x" }) end)', "7K2M9P4Q1Z")
+    check(len(rb_list(L, "7K2M9P4Q1Z")) == 0, "another Realm's copies are its own (none yet)")
+
+
+@test
+def realm_backup_restore(L, tmp):
+    """RESTORE puts the copy back through the Realm's own store (backups.lua never writes the Realm folder), keeps the
+    character it replaces, and refuses a damaged copy or a held character."""
+    rdir = realm_rt(L, tmp)
+    v1 = rb_store(L, b"v1")
+    f1 = rb_take(L, "before opening")
+    rb_store(L, b"v2")
+    store = '(function(id, files) return rm.store_character(id, files) end)'
+    r = L.eval('(function(...) return { backups.restore_realm(...) } end)(...)', REALM, f1, L.eval('rm.char_dir(...)', REALM), L.eval(store))
+    check(r[1] is True, "restore reports done (%s)" % (r[2],))
+    cdir = os.path.join(rdir, "character")
+    check(all(read(os.path.join(cdir, n)) == d for n, d in v1.items()), "the character files are the backup's again")
+    lst = rb_list(L)
+    check(len(lst) == 2 and lst[0]["reason"] == "before restore", "the character it replaced was backed up first (%s)" % [e["reason"] for e in lst])
+    before = read(os.path.join(broot(tmp), "SurrounSync Realms", REALM, lst[0]["folder"], "Player.sav"))
+    check(before == realm_character(b"v2")["Player.sav"], "...and that copy is the v2 character")
+    # a damaged copy is refused, the character stays
+    bad = os.path.join(broot(tmp), "SurrounSync Realms", REALM, f1, "Player.sav")
+    data = bytearray(read(bad)); data[-1] ^= 1; write(bad, bytes(data))
+    rb_store(L, b"v3")
+    r = L.eval('(function(...) return { backups.restore_realm(...) } end)(...)', REALM, f1, L.eval('rm.char_dir(...)', REALM), L.eval(store))
+    check(r[1] is None and read(os.path.join(cdir, "Player.sav")) == realm_character(b"v3")["Player.sav"],
+          "a copy that fails its checksum is refused, nothing replaced (%s)" % (r[2],))
+    # a held character: the store would report done without writing - not a restore
+    f2 = rb_take(L, "backed up by hand")
+    rb_store(L, b"v4")
+    L.eval('rm.hold_character(..., "arrived without its inventory")', REALM)
+    r = L.eval('(function(...) return { backups.restore_realm(...) } end)(...)', REALM, f2, L.eval('rm.char_dir(...)', REALM), L.eval(store))
+    check(r[1] is None and read(os.path.join(cdir, "Player.sav")) == realm_character(b"v4")["Player.sav"],
+          "a held character is not reported as restored (%s)" % (r[2],))
+    L.eval('rm.hold_character(..., nil)', REALM)
+    r = L.eval('(function(...) return { backups.restore_realm(...) } end)(...)', REALM, f2, L.eval('rm.char_dir(...)', REALM), L.eval(store))
+    check(r[1] is True and read(os.path.join(cdir, "Player.sav")) == realm_character(b"v3")["Player.sav"], "released, it restores")
+    check(r[1] is True and not any(os.path.exists(x) for x in leftovers(os.path.join(cdir, "Player.sav"))), "no temp files left")
+    check(first(L.eval('backups.restore_realm(...)', REALM, "no such folder", L.eval('rm.char_dir(...)', REALM), L.eval(store))) is None,
+          "an unknown backup is refused")
+
+
+@test
+def realm_backup_guest_safe_points(L, tmp):
+    """Joining a Realm backs up the character as it is; leaving stores the played one and backs that up."""
+    rc = realm_character(b"member")
+    before, rdir = realm_guest_session(L, tmp, rc)
+    L.execute('backups = require("mirror.backups")')
+    lst = rb_list(L)
+    check(len(lst) == 1 and lst[0]["reason"] == "before joining", "join: a copy of the stored character (%s)" % [e["reason"] for e in lst])
+    check(lst and read(os.path.join(broot(tmp), "SurrounSync Realms", REALM, lst[0]["folder"], "Player.sav")) == rc["Player.sav"],
+          "...with the character as it was before the session")
+    L.execute('session.request_toggle()')
+    L.execute('TICK(6)')
+    lst = rb_list(L)
+    check(len(lst) == 2 and lst[0]["reason"] == "after leaving", "leave: a copy of the character that was stored (%s)" % [e["reason"] for e in lst])
+    check(lst and read(os.path.join(broot(tmp), "SurrounSync Realms", REALM, lst[0]["folder"], "Player.sav"))
+          == read(os.path.join(rdir, "character", "Player.sav")), "...the one the Realm holds now")
+    check(all(e["kind"] != "realm" for e in listing(L, "S1")), "the Realm copies are not in the own save's co-op list")
+
+
+@test
+def realm_backup_host_safe_points(L, tmp):
+    """Opening a Realm backs up the stored character; the final upload when leaving backs up the one it stored."""
+    stored = realm_character(b"keepme")
+    rdir, _ = realm_host_loaded(L, tmp, stored)
+    L.execute('backups = require("mirror.backups")')
+    lst = rb_list(L)
+    check(len(lst) == 1 and lst[0]["reason"] == "before opening" and
+          read(os.path.join(broot(tmp), "SurrounSync Realms", REALM, lst[0]["folder"], "Player.sav")) == stored["Player.sav"],
+          "open: a copy of the stored character (%s)" % [e["reason"] for e in lst])
+    L.execute('RTICK(8)')
+    check(L.eval('(realmplay.state())') == "playing", "(setup) playing (%s)" % L.eval('(realmplay.state())'))
+    L.execute('realmplay.leave()')
+    realm_home_load(L)
+    L.execute('RTICK(6)')
+    L.eval('ANSWER("upload", "ok 3 1234")')
+    L.execute('RTICK(4)')
+    lst = rb_list(L)
+    now = read(os.path.join(rdir, "character", "Player.sav"))
+    check(now != stored["Player.sav"], "(setup) the leave stored the played character")
+    check(len(lst) == 2 and lst[0]["reason"] == "after leaving" and
+          read(os.path.join(broot(tmp), "SurrounSync Realms", REALM, lst[0]["folder"], "Player.sav")) == now,
+          "leave: a copy of the character it stored (%s)" % [e["reason"] for e in lst])
+
+
+@test
+def realm_backup_before_crash_recovery(L, tmp):
+    """The crash rescue replaces the stored character with the unfinished session's: the stored one is kept first."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    guard(L, tmp)
+    log_write(L, step="joined", own="S1", coop=COOP, realm=REALM, gen="5", own_stamp="x")
+    L.eval('slotguard.build_realm(...)', COOP, lua_files(L, world_files(b"crash")), lua_files(L, realm_character(b"crashchar")))
+    L.execute('session.preinit(CFG)')
+    link_dir = os.path.join(tmp, "SurrounDead")
+    L.execute(REALM_FAKES, link_dir)
+    L.execute('rm = require("mirror.realm"); backups = require("mirror.backups")')
+    old = rb_store(L, b"beforecrash")
+    L.execute('realmplay.init(CFG)')
+    rdir = os.path.join(link_dir, "Saved", "SurrounSyncRealms", REALM)
+    check(read(os.path.join(rdir, "character", "Player.sav")) == realm_character(b"crashchar")["Player.sav"], "(setup) the crash was rescued")
+    lst = rb_list(L)
+    check(len(lst) == 1 and lst[0]["reason"] == "before crash recovery" and
+          read(os.path.join(broot(tmp), "SurrounSync Realms", REALM, lst[0]["folder"], "Player.sav")) == old["Player.sav"],
+          "the character stored before the rescue is kept (%s)" % [e["reason"] for e in lst])
+
+
+def journal_runtime(can_restore=True):
+    """The J handbook on stand-in widgets (test-journal-ui.py's runtime), the REALMS page on, with the Realm backup
+    actions fed from BK and the CO-OP backups page recorded in BK_CALLS."""
+    import re
+    src = open(os.path.join(ROOT, "tools", "test-journal-ui.py"), encoding="utf-8").read()
+    setup = re.search(r"SETUP = r'''(.*?)'''", src, re.S).group(1)
+    for old, new in (("can_restore = function() return false end,", "can_restore = function() return CAN_RESTORE end,"),
+                     ("local act = setmetatable", "act = setmetatable"),
+                     ("refresh = function() end, handle", "refresh = function(s) BK_CALLS[#BK_CALLS + 1] = tostring(s) end, handle")):
+        assert old in setup, "test-journal-ui.py's runtime changed: " + old
+        setup = setup.replace(old, new)
+    L = lua54.LuaRuntime()
+    L.execute('REALMS_ON = true; BK_CALLS = {}; CAN_RESTORE = ' + ("true" if can_restore else "false"))
+    L.execute(setup, SCRIPTS)
+    L.execute('''BK = {}
+        act.realm_backups = function(id) ACTS[#ACTS + 1] = { "realm_backups", id }; return BK[id] or {} end
+        function UNDER(root, target)
+            if root == target then return true end
+            for _, k in ipairs(root.kids) do if UNDER(k, target) then return true end end
+            return false
+        end
+        MODEL = { service = "on", free = true, rows = {
+            { id = "4R5BJRNGWF", name = "Our Farm", info = "i", open = "OPEN" },
+            { id = "7K2M9P4Q1Z", name = "Ann's Base", info = "i", open = "OPEN" } } }
+        BK["4R5BJRNGWF"] = {
+            { folder = "2026-10-31 14.02.11 after leaving", time = "2026-10-31 14:02:11", reason = "after leaving", size = 217000 },
+            { folder = "2026-10-31 13.00.00 before opening", time = "2026-10-31 13:00:00", reason = "before opening", size = 2048 } }
+        BK["7K2M9P4Q1Z"] = { { folder = "2026-10-30 09.00.00 before joining", time = "2026-10-30 09:00:00", reason = "before joining", size = 5000 } }
+        TICK(1)
+        PLAYER["JournalOpen?"] = true
+        TICK(1)
+        for _, o in ipairs(ALL) do if o.cls == "/Script/UMG.Button" and LABEL(o) == "REALMS" then REALMS_TAB = o end end
+        -- the REALMS page's icons: its gear, then the chest (the character backups)
+        function RCHEST()
+            local n, rc = 0, BOX("RealmsCanvas")
+            for _, o in ipairs(ALL) do
+                if o.wname and o.wname:find("SurrounSync_IconButton_", 1, true) == 1 and UNDER(rc, o) then
+                    n = n + 1
+                    if n == 2 then return o end
+                end
+            end
+        end''')
+    return L
+
+
+def jerrors(L):
+    return [l for l in L.eval('LOG').values() if l.startswith("WARN") or l.startswith("ERROR")]
+
+
+@test
+def realm_backup_tab_is_last_and_apart(L, tmp):
+    """The REALMS page's backups open from its chest icon, no tab (a third tab ran off the handbook, user 2026-11-01);
+    the Realm backup controls are on that page only, and none of the CO-OP page's are on it."""
+    L = journal_runtime()
+    check(jerrors(L) == [], "the handbook builds without warnings: %s" % jerrors(L))
+    tabs = list(L.eval('require("mirror.journal_tab").realm_tabs()').values())
+    check(tabs == ["main", "servers"], "the REALMS page's tabs: no BACKUPS tab (%s)" % tabs)
+    L.execute('CLICK(REALMS_TAB); TICK(6)')
+    rc = 'BOX("RealmsCanvas")'
+    check(L.eval('%s ~= nil and RCHEST() ~= nil and SHOWN(RCHEST())' % rc) is True, "(setup) the REALMS page shows its chest icon")
+    check(L.eval('BUTTON("BACKUPS", 2) == nil and not UNDER(%s, BUTTON("BACKUPS", 1))' % rc) is True,
+          "the only BACKUPS tab is the CO-OP page's, not on the REALMS canvas")
+    L.execute('CLICK(RCHEST()); TICK(6)')
+    realm_only = ["BACK UP NOW", "PREV REALM", "NEXT REALM", "NEWER", "OLDER"]
+    for label in realm_only:
+        check(L.eval('BUTTON("%s") ~= nil and UNDER(%s, BUTTON("%s"))' % (label, rc, label)) is True,
+              "%s is on the REALMS page" % label)
+    check(L.eval('(function() for _, o in ipairs(ALL) do if o.cls == "/Script/UMG.Button" and LABEL(o) == "RESTORE" '
+                 'and not UNDER(%s, o) then return true end end return false end)()' % rc) is False,
+          "every RESTORE button is on the REALMS page (the CO-OP page builds its own through menu_backups, not here)")
+    check(L.eval('TEXT_SHOWN("CHARACTER BACKUPS")') is True, "the Realm page is titled CHARACTER BACKUPS")
+    for label in ("FRIENDS", "HOST A GAME", "LEAVE CO-OP", "STOP HOSTING", "GO HOME NOW"):
+        check(L.eval('BUTTON("%s") ~= nil and not UNDER(%s, BUTTON("%s"))' % (label, rc, label)) is True,
+              "co-op's %s is not on the REALMS page" % label)
+    src = open(os.path.join(SCRIPTS, "mirror", "menu_backups.lua"), encoding="utf-8").read().lower()
+    check("realm" not in src, "the CO-OP backups page's code has no Realm in it")
+    check(L.eval('#BK_CALLS') == 0, "opening the REALMS page never asks the CO-OP backups page for anything")
+
+
+@test
+def realm_tab_labels_above_the_front_folder(L, tmp):
+    """Both REALMS tab names show whichever tab is open: each label's layer is above the front folder's, not level with
+    it (user 2026-11-03: "the new realm tabs text is gone and vise versa"; the CO-OP page's tabs never lost theirs)."""
+    L = journal_runtime()
+    L.execute('CLICK(REALMS_TAB); TICK(6)')
+    L.execute('''function Z(o) return o and o.slot_ and o.slot_.props.SetZOrder and o.slot_.props.SetZOrder[1] end
+        function FOLDER_Z()
+            local top = -99
+            for _, o in ipairs(ALL) do
+                local n = tostring(o.wname)
+                if n:find("RealmActiveQuests", 1, true) or n:find("RealmCompletedQuests", 1, true) then top = math.max(top, Z(o) or -99) end
+            end
+            return top
+        end''')
+    for tab in ("NEW REALM", "SERVERS"):
+        L.execute('CLICK(BUTTON("%s")); TICK(6)' % tab)
+        front = L.eval('FOLDER_Z()')
+        check(front == 2, "(setup) %s open: the front folder is on layer 2 (%s)" % (tab, front))
+        for label in ("NEW REALM", "SERVERS"):
+            z = L.eval('Z(BUTTON("%s"))' % label)
+            check(z is not None and z > front, "%s open: the %s label's layer %s is above it" % (tab, label, z))
+
+
+@test
+def realm_servers_tab_lists_and_joins(L, tmp):
+    """SERVERS (user 2026-11-01): Name | Players | Ping | Locked/Open with JOIN per public Realm, a password box for a
+    locked one, and the owner's switch to put a Realm on the list."""
+    L = journal_runtime()
+    L.execute('''MODEL.servers_at = os.time() - 5
+        MODEL.servers = {
+            { id = "AAAAAAAAAA", live = true, locked = false, players = 2, max = 4, ping = 38, mine = false, name = "Open World" },
+            { id = "BBBBBBBBBB", live = true, locked = true, players = 1, max = 4, mine = false, name = "Locked World" },
+            { id = "CCCCCCCCCC", live = false, locked = false, players = 0, max = 0, mine = false, name = "Quiet World" },
+            { id = "DDDDDDDDDD", live = true, locked = false, players = 4, max = 4, ping = 90, mine = false, name = "Full World" },
+            { id = "EEEEEEEEEE", live = true, locked = false, players = 1, max = 4, ping = 12, mine = false, name = "Fifth World" } }
+        MODEL.rows[1].owner, MODEL.rows[1].remove, MODEL.rows[1].listed = true, "DELETE", false
+        function IN(box, label, nth)
+            local n = 0
+            for _, o in ipairs(ALL) do
+                if o.cls == "/Script/UMG.Button" and LABEL(o) == label and UNDER(box, o) then
+                    n = n + 1
+                    if n == (nth or 1) then return o end
+                end
+            end
+        end''')
+    L.execute('CLICK(REALMS_TAB); TICK(6); SV = BOX("RealmServers")')
+    check(jerrors(L) == [], "the handbook builds without warnings: %s" % jerrors(L))
+    check(L.eval('SV ~= nil and SHOWN(SV)') is False, "SERVERS is closed at first")
+    L.execute('CLICK(BUTTON("SERVERS")); TICK(6)')
+    check(L.eval('SHOWN(SV)') is True and L.eval('SHOWN(BOX("RealmNew"))') is False and L.eval('SHOWN(BOX("RealmBackups"))') is False,
+          "SERVERS opens its page, the others close")
+    # (forced: the tab's own refresh then asks too, unforced, so LAST_ACT is that one)
+    check(L.eval('COUNT("realm_browse", true)') == 1, "opening it asks for the list at once (forced)")
+    L.execute('SV_AT = MODEL.servers_at; MODEL.servers_at = nil; TICK(6)')
+    check(L.eval('TEXT_SHOWN("Getting the list...")') is True, "no list yet: it says it's coming")
+    L.execute('MODEL.servers_failed = "The server list is not on."; TICK(6)')
+    check(L.eval('TEXT_SHOWN("The server list is not on.")') is True and L.eval('TEXT_SHOWN("Getting the list...")') is False,
+          "the browse failed: the tab says why instead of waiting for ever")
+    L.execute('MODEL.servers_failed = nil; MODEL.servers_at = SV_AT; TICK(6)')
+    for s in ("Open World", "2/4", "38 ms", "LOCKED", "Quiet World", "Full World"):
+        check(L.eval('TEXT_SHOWN("%s")' % s) is True, "the list shows %s" % s)
+    check(L.eval('TEXT_SHOWN("Fifth World")') is False, "4 rows a page: the fifth is on page 2")
+    joins = L.eval('(function() local n = 0 for _, o in ipairs(ALL) do if o.cls == "/Script/UMG.Button" and LABEL(o) == "JOIN" '
+                   'and UNDER(SV, o) and SHOWN(o) then n = n + 1 end end return n end)()')
+    check(joins == 2, "JOIN only on the played, not-full Realms (open + locked): %s" % joins)
+    L.execute('CLICK(IN(SV, "JOIN", 1)); TICK(2)')
+    a = L.eval('LAST_ACT("realm_join_public")')
+    check(a is not None and a[2] == "AAAAAAAAAA" and a[3] == "" and a[4] == "Open World", "JOIN on an open one: no password")
+    L.execute('BOX("RealmJoinPassword").typed = "let me in"; CLICK(IN(SV, "JOIN", 2)); TICK(2)')
+    a = L.eval('LAST_ACT("realm_join_public")')
+    check(a is not None and a[2] == "BBBBBBBBBB" and a[3] == "let me in", "JOIN on a locked one sends the password box's text")
+    L.execute('CLICK(IN(SV, "NEXT >")); TICK(6)')
+    check(L.eval('TEXT_SHOWN("Fifth World")') is True, "NEXT shows page 2")
+    # the owner's switch: Our Farm (owner) is the only Realm of mine it offers
+    check(L.eval('TEXT_SHOWN("Our Farm")') is True and L.eval('SHOWN(IN(SV, "TAKE OFF"))') is False, "my Realm, not on the list: no TAKE OFF")
+    L.execute('BOX("RealmListPassword").typed = "secret"; CLICK(IN(SV, "PUT ON LIST")); TICK(2)')
+    a = L.eval('LAST_ACT("realm_set_public")')
+    check(a is not None and a[2] == "4R5BJRNGWF" and a[3] is True and a[4] == "secret", "PUT ON LIST with a password locks it")
+    L.execute('MODEL.rows[1].listed = true; TICK(6)')
+    check(L.eval('IN(SV, "CHANGE") ~= nil and SHOWN(IN(SV, "TAKE OFF"))') is True, "listed: CHANGE and TAKE OFF")
+    L.execute('CLICK(IN(SV, "TAKE OFF")); TICK(2)')
+    a = L.eval('LAST_ACT("realm_set_public")')
+    check(a is not None and a[3] is False and a[4] == "", "TAKE OFF sends no password")
+    # (back to page 1: the stand-in SHOWN doesn't look at the row, and page 2 hides rows, not their buttons)
+    L.execute('CLICK(IN(SV, "< PREV")); MODEL.free = false; TICK(6)')
+    joins = L.eval('(function() local n = 0 for _, o in ipairs(ALL) do if o.cls == "/Script/UMG.Button" and LABEL(o) == "JOIN" '
+                   'and UNDER(SV, o) and SHOWN(o) then n = n + 1 end end return n end)()')
+    check(joins == 0, "no JOIN while a Realm or co-op game is open: %s" % joins)
+    check(jerrors(L) == [], "no warnings while using it: %s" % jerrors(L))
+
+
+@test
+def realm_backup_tab_lists_and_acts(L, tmp):
+    L = journal_runtime()
+    L.execute('CLICK(REALMS_TAB); TICK(6)')
+    L.execute('RB = BOX("RealmBackups")')
+    check(L.eval('SHOWN(RB)') is False and L.eval('SHOWN(BOX("RealmNew"))') is True, "the first tab is open at first")
+    L.execute('CLICK(RCHEST()); TICK(6)')
+    check(L.eval('SHOWN(RB)') is True and L.eval('SHOWN(BOX("RealmNew"))') is False, "the chest opens the backups, closes the first tab's page")
+    check(L.eval('COUNT("realm_backups", "4R5BJRNGWF")') >= 1, "it lists the first Realm's copies")
+    check(L.eval('TEXT_SHOWN("10-31 14:02   after leaving   212 KB")') is True and L.eval('TEXT_SHOWN("10-31 13:00   before opening   2 KB")') is True,
+          "each copy shows its time, reason and size")
+    check(L.eval('TEXT_SHOWN("Our Farm")') is True, "...under the Realm's name")
+    L.execute('CLICK(BUTTON("BACK UP NOW")); TICK(2)')
+    check(L.eval('LAST_ACT("realm_backup_now") and LAST_ACT("realm_backup_now")[2]') == "4R5BJRNGWF", "BACK UP NOW backs up the shown Realm")
+    L.execute('CLICK(BUTTON("RESTORE", 2)); TICK(2)')
+    a = L.eval('LAST_ACT("realm_restore")')
+    check(a is not None and a[2] == "4R5BJRNGWF" and a[3] == "2026-10-31 13.00.00 before opening" and a[4] == "2026-10-31 13:00:00",
+          "RESTORE on the second row restores that copy of that Realm")
+    L.execute('CLICK(BUTTON("NEXT REALM")); TICK(6)')
+    check(L.eval('COUNT("realm_backups", "7K2M9P4Q1Z")') >= 1 and L.eval('TEXT_SHOWN("10-30 09:00   before joining   5 KB")') is True,
+          "NEXT REALM shows the other Realm's copies")
+    L.execute('CLICK(BUTTON("RESTORE", 1)); TICK(2)')
+    check(L.eval('LAST_ACT("realm_restore")[2]') == "7K2M9P4Q1Z", "and RESTORE there is for that Realm")
+    L.execute('CLICK(BUTTON("NEW REALM")); TICK(6)')
+    check(L.eval('SHOWN(RB)') is False and L.eval('SHOWN(BOX("RealmNew"))') is True, "the first tab brings its page back")
+    L.execute('CLICK(RCHEST()); TICK(6); CLICK(RCHEST()); TICK(6)')
+    check(L.eval('SHOWN(RB)') is False and L.eval('SHOWN(BOX("RealmNew"))') is True, "a second press of the chest closes the backups")
+    L.execute('CLICK(RCHEST()); TICK(6)')
+    L.execute('MODEL.current = { id = "4R5BJRNGWF", name = "Our Farm" }; TICK(6)')
+    check(L.eval('SHOWN(RCHEST())') is False and L.eval('SHOWN(RB)') is False, "in a Realm: no chest, the backups close")
+    check(L.eval('COUNT("realm_open")') == 0 and L.eval('COUNT("realm_remove")') == 0, "nothing else was triggered")
+    check(jerrors(L) == [], "no warnings: %s" % jerrors(L))
+
+
+@test
+def realm_backup_tab_restore_guard(L, tmp):
+    """Same restriction as the CO-OP tab (ctx.can_restore) plus no Realm session: no RESTORE, no BACK UP NOW then."""
+    for why, setup in (("co-op open / session log (can_restore false)", "CAN_RESTORE = false"),
+                       ("a Realm session is open (model not free)", "MODEL.free = false")):
+        L = journal_runtime()
+        L.execute('CLICK(REALMS_TAB); TICK(6); CLICK(RCHEST()); TICK(6)')
+        L.execute(setup + '; TICK(6)')
+        check(L.eval('SHOWN(BUTTON("RESTORE", 1))') is False and L.eval('SHOWN(BUTTON("BACK UP NOW"))') is False, "%s: the buttons are hidden" % why)
+        L.execute('CLICK(BUTTON("RESTORE", 1)); CLICK(BUTTON("BACK UP NOW")); TICK(2)')
+        check(L.eval('COUNT("realm_restore")') == 0 and L.eval('COUNT("realm_backup_now")') == 0, "%s: pressing them does nothing" % why)
+    L = journal_runtime()
+    L.execute('CLICK(REALMS_TAB); TICK(6); CLICK(RCHEST()); TICK(6)')
+    check(L.eval('SHOWN(BUTTON("RESTORE", 1))') is True, "(control) with nothing open they show")
+
+
+@test
+def realm_backup_code_stays_apart(L, tmp):
+    """backups.lua never writes the Realm's folder (realm.lua owns it); the co-op page and journal code have no savefs."""
+    src = open(os.path.join(SCRIPTS, "mirror", "backups.lua"), encoding="utf-8").read()
+    check("SurrounSyncRealms" not in src, "backups.lua doesn't name the Realms folder: restore goes through realm.store_character")
 
 
 def main():

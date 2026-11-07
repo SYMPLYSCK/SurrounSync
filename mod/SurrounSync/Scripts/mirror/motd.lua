@@ -3,7 +3,7 @@
 -- tools/motd.ps1 sets it on the Realms server; the bridge asks for it every minute and writes mirror_motd.txt
 -- ("motd <id> <expires, unix s, 0 = never> <text>" or "motd none", then END). In a world each message shows once as
 -- a card (and stays in the message history, Ctrl+F9); at the main menu, where no player ticks, a banner at the top
--- shows the current one for as long as the menu is up (polled with LoopAsync + the game thread, as realmplay
+-- shows the current one for as long as the menu is up (polled on the game thread, util.game_loop, as realmplay
 -- presses NEW GAME): hidden while the menu is off the screen (New Game, Load), gone when the message changes or a
 -- world loads.
 
@@ -165,21 +165,15 @@ local function menu_step(st)
 end
 
 local function poll_menu()
-    if polling or type(LoopAsync) ~= "function" or type(ExecuteInGameThread) ~= "function" then return end
+    if polling then return end
     polling = true
     local st = { polls = 0, up_since = nil, at_ticks = ticks }
-    LoopAsync(MENU_POLL_MS, function()
-        -- (a world's player ticking: stop at once - Lua in this thread while a world runs crashed kit games,
-        -- C-20261027-097; the world tick takes the banner away)
+    local stop = util.game_loop(MENU_POLL_MS, function()
+        -- (a world's player ticking: stop, the world tick takes the banner away)
         if ticks > st.at_ticks + 1 then polling = false; return true end
-        ExecuteInGameThread(function()
-            util.safe(function()
-                if ticks > st.at_ticks + 1 then return end
-                menu_step(st)
-            end, "motd.menu")
-        end)
-        return false
-    end)
+        menu_step(st)
+    end, "motd.menu")
+    if not stop then polling = false end
 end
 
 local function on_level(_, LevelName)
@@ -200,6 +194,8 @@ function motd.init()
         in_world()
     end)
     game.on_world_reset(function() read_in = FIRST_READ end)
+    -- every widget off the screen: the banner goes too, before the GC can free it under us
+    game.on_widgets_cleared(drop_banner)
     util.ensure_hook(LOAD_LEVEL, on_level, nil, true)
     poll_menu()   -- (the game starts at its main menu)
 end

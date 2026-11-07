@@ -282,6 +282,8 @@ function sleep.init(r, connected)
     role = r or "off"
     peer_live = connected or peer_live
     sent, got, seen_go, was_live = nil, nil, nil, false
+    -- every widget off the screen (a death): the sleeping screen isn't put back, nor touched once the GC may free it
+    if game.on_widgets_cleared then game.on_widgets_cleared(function() sh.scr = nil end) end
 end
 
 -- a new world: whoever was asleep is in a new one now

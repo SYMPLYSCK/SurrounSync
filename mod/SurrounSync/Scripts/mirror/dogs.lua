@@ -4,6 +4,7 @@
 -- A hound that first comes within NEAR of the player barks once; one chasing the player (closing in, or right on
 -- them) barks on and on, one bark after the other; the moment it dies its bark stops. Every game does this for its
 -- own player and the hounds it shows (a guest's are the host's copies), so audio.lua doesn't pass these sounds on.
+-- A hound only barks with a clear line to a player (user 2026-11-03: dogs barked from a different room).
 
 local log = require("mirror.log")
 local util = require("mirror.util")
@@ -25,10 +26,14 @@ local CHASE_HOLD = 1.5                        -- s a chase lasts after it stops 
 local POLL, FORGET = 0.2, 10.0                -- s
 -- EObjectTypeQuery 2 = WorldDynamic, 3 = Pawn (an animal dog's capsule is WorldDynamic - kit: Pawn alone missed it)
 local OBJ_TYPES = { 1, 2 }
+local PAWN = "/Script/Engine.Pawn"            -- zombies, other players and cars (WheeledVehiclePawn): never a wall
+local HOUND_EYES, PLAYER_HEAD = 20, 60        -- cm above each one's middle
+local SEE_TRIES = 4                           -- traces per line, each one past a pawn standing in it
+local SIGHT_FOR = 0.35                        -- s one look counts for
 
-local hounds = {}                             -- address -> { z, d, near_done, chase_until, next_at, snd, seen, dead }
-local clock, poll_in, missing_told = 0.0, 0.0, false
-local stats = { seen = 0, near = 0, chase = 0, stopped = 0 }
+local hounds = {}                             -- address -> { z, d, near_done, chase_until, next_at, snd, seen, dead, sees, sees_until }
+local clock, poll_in, missing_told, trace_told = 0.0, 0.0, false, false
+local stats = { seen = 0, near = 0, chase = 0, stopped = 0, unseen = 0 }
 local cfg
 
 local function sound(k)
@@ -98,6 +103,52 @@ local function nearest(spots, l)
     return best, bi
 end
 
+-- Nothing solid on the line a-b? Visibility trace, as the game's own sight lines use. People and cars in the way are
+-- looked past (a dog chases at them, and the target's own body or car ends the line). A trace that can't run says
+-- clear: a game update breaking it must not silence every hound.
+local function line_clear(k, p, z, a, b)
+    local skip, pawn = { z }, util.find(PAWN)
+    for _ = 1, SEE_TRIES do
+        local out, hit = {}, false
+        local ok, err = pcall(function()
+            hit = k:LineTraceSingle(p, a, b, 0, false, { table.unpack(skip) }, 0, out, true,
+                { R = 1, G = 0, B = 0, A = 1 }, { R = 0, G = 1, B = 0, A = 1 }, 0) == true
+        end)
+        if not ok then
+            if not trace_told then
+                trace_told = true
+                log.info("dogs: line of sight trace failed, hounds bark without it: " .. tostring(err))
+            end
+            return true
+        end
+        if not hit then return true end
+        local h, who, person = out.OutHit or out, nil, false
+        pcall(function() who = h.HitObjectHandle.Actor:Get() end)
+        if not util.valid(who) then pcall(function() who = h.Actor:Get() end) end
+        if util.valid(who) and util.valid(pawn) then pcall(function() person = who:IsA(pawn) == true end) end
+        if not person then return false end
+        skip[#skip + 1] = who
+    end
+    return true
+end
+
+-- Does this hound have a clear line to any player here (their middle or their head: low cover hides only one)?
+-- Asked only when it would bark, so a hound out of range or between barks costs no trace.
+local function in_sight(h, k, p, l, spots)
+    if clock < (h.sees_until or 0) then return h.sees end
+    local eyes, sees = { X = l.X, Y = l.Y, Z = l.Z + HOUND_EYES }, false
+    for _, s in ipairs(spots) do
+        if util.dist(s, l) <= RANGE and (line_clear(k, p, h.z, eyes, s)
+            or line_clear(k, p, h.z, eyes, { X = s.X, Y = s.Y, Z = s.Z + PLAYER_HEAD })) then
+            sees = true
+            break
+        end
+    end
+    h.sees, h.sees_until = sees, clock + SIGHT_FOR
+    if not sees then stats.unseen = stats.unseen + 1 end
+    return sees
+end
+
 local function poll(dt)
     if not util.valid(sound("bark1")) then
         if not missing_told then
@@ -140,13 +191,14 @@ local function poll(dt)
             local closing = (h.d and h.who == who) and (h.d - d) / dt or 0
             h.d, h.who = d, who
             if not h.dead then
-                if not h.near_done and d <= NEAR then
+                -- (the first bark waits for sight: a hound that came near behind a wall still barks on rounding the corner)
+                if not h.near_done and d <= NEAR and in_sight(h, k, p, l, spots) then
                     h.near_done = true
                     if not playing(h) and play(h, math.random() < 0.5 and "bark1" or "bark2") then stats.near = stats.near + 1 end
                     h.next_at = clock + 1.0
                 end
                 if closing >= CLOSING or d <= ON_YOU then h.chase_until = clock + CHASE_HOLD end
-                if clock < h.chase_until and clock >= h.next_at and not playing(h) then
+                if clock < h.chase_until and clock >= h.next_at and not playing(h) and in_sight(h, k, p, l, spots) then
                     if play(h, chase_kind()) then stats.chase = stats.chase + 1 end
                     h.next_at = clock + 0.3 + math.random() * 0.7   -- (after this one ends)
                 end
@@ -166,8 +218,9 @@ end
 
 function dogs.status()
     -- (seen: hounds within RANGE so far - none seen and no barks = no hound came close, not a broken bark)
-    return string.format("hounds: %d seen, %d near bark(s), %d chase bark(s), %d stopped at death", stats.seen, stats.near,
-        stats.chase, stats.stopped)
+    -- (no line: looks that found no clear line to a player, so a bark was held back)
+    return string.format("hounds: %d seen, %d near bark(s), %d chase bark(s), %d stopped at death, %d no line", stats.seen,
+        stats.near, stats.chase, stats.stopped, stats.unseen)
 end
 
 function dogs.init(c)

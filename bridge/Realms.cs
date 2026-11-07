@@ -53,6 +53,16 @@ class Realms
     public static int HostingStaleMs = 150000;      // --hosting-stale <ms> (tests)
     readonly Dictionary<string, int> hostingAt = new Dictionary<string, int>();   // id -> TickCount of the last one
     readonly HashSet<string> staleLogged = new HashSet<string>();
+    // The public server list (REALMS page, SERVERS): "server ..." lines from the last browse. The host's heartbeat
+    // tells the server its player count and Steam ping location; browsing estimates each live host's ping from it.
+    const int MAX_SERVERS = 100;
+    readonly List<string> servers = new List<string>();
+    long serversAt;
+    volatile int playersNow = -1, playersMax = -1;
+    public Func<string> PingLocation;            // this PC's Steam ping location (null = not known yet)
+    public Func<string, int> PingTo;             // estimated ms to a ping location (-1 = unknown)
+    bool beatBodyRefused;
+    public void SetPlayers(int now, int max) { playersNow = now; playersMax = max; }
 
     class Job { public string seq, verb; public string[] args; public string rest; public ulong steam; public string name; }
 
@@ -221,6 +231,11 @@ class Realms
             case "forget": return Forget(Id(j, 0));
             case "copykey": return CopyKey(Id(j, 0));
             case "usekey": return UseKey(j.rest);
+            case "browse": return Browse();
+            case "public":
+                if (j.args.Length < 2 || (j.args[1] != "on" && j.args[1] != "off")) throw new Api("bad_input", "public <id> on [password] | off");
+                return SetPublic(Id(j, 0), j.args[1] == "on", After(j.rest, 2));
+            case "joinpublic": return JoinPublic(Id(j, 0), After(j.rest, 1), j);
         }
         throw new Api("bad_command", "unknown Realm command " + j.verb);
     }
@@ -231,6 +246,17 @@ class Realms
         if (s.StartsWith("R") && s.Length == 11) s = s.Substring(1);
         if (!ID.IsMatch(s)) throw new Api("bad_input", "not a Realm id");
         return s;
+    }
+    // the text after the first n words (a password may hold spaces)
+    static string After(string rest, int n)
+    {
+        string s = (rest ?? "").TrimStart();
+        for (int i = 0; i < n && s != ""; i++)
+        {
+            int sp = s.IndexOf(' ');
+            s = sp < 0 ? "" : s.Substring(sp + 1).TrimStart();
+        }
+        return s.Trim();
     }
     static int Gen(Job j, int i)
     {
@@ -290,7 +316,92 @@ class Realms
                     .Append(' ').Append(ms == "" ? "-" : ms).Append(' ').Append(seen == "" ? "0" : seen)
                     .Append(' ').Append(mn == "" ? "?" : mn);
             }
+        // "pub <id> <listed 0|1> <locked 0|1> <invited|public>": on the server list, and how I joined it
+        line.Append("\npub ").Append(id).Append(' ').Append(Str(s, "public") == "True" ? "1" : "0").Append(' ')
+            .Append(Str(s, "locked") == "True" ? "1" : "0").Append(' ').Append(you != null && Str(you, "via") == "public" ? "public" : "invited");
         return line.ToString();
+    }
+
+    // ---- the public server list ----
+
+    // "server <id> <live 0|1> <locked 0|1> <players> <max> <ping ms|-> <mine 0|1> <name>" per listed Realm
+    string Browse()
+    {
+        var r = Call("GET", "/realms/public", null, null, null);
+        var list = r.ContainsKey("realms") ? r["realms"] as object[] : null;
+        if (list == null) throw new Api("bad_reply", "the server sent no list");
+        var lines = new List<string>();
+        foreach (var o in list)
+        {
+            var x = o as Dictionary<string, object>;
+            string id = x == null ? "" : Str(x, "realm_id");
+            if (!ID.IsMatch(id) || lines.Count >= MAX_SERVERS) continue;
+            int players, max;
+            if (!int.TryParse(Str(x, "players"), out players) || players < 0 || players > 64) players = 0;
+            if (!int.TryParse(Str(x, "max_players"), out max) || max < 0 || max > 64) max = 0;
+            bool live = Str(x, "live") == "True", locked = Str(x, "locked") == "True";
+            int ping = -1;
+            string loc = Str(x, "ping_loc");
+            if (live && loc != "" && loc.Length <= 1024 && PingTo != null)
+                try { ping = PingTo(loc); } catch { ping = -1; }
+            string name = Clean(Str(x, "name")).Trim();
+            if (name.Length > 40) name = name.Substring(0, 40);
+            lines.Add("server " + id + " " + (live ? 1 : 0) + " " + (locked ? 1 : 0) + " " + players + " " + max + " "
+                + (ping >= 0 && ping < 100000 ? ping.ToString() : "-") + " " + (File.Exists(KeyFile(id)) ? 1 : 0) + " " + (name == "" ? id : name));
+        }
+        lock (state) { servers.Clear(); servers.AddRange(lines); serversAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); }
+        return "ok " + lines.Count;
+    }
+
+    // the owner lists the Realm (open, or locked with a password) or takes it off; the password only goes to the server
+    string SetPublic(string id, bool on, string password)
+    {
+        var b = new Dictionary<string, object> { { "public", on } };
+        if (on && password != "")
+        {
+            if (password.Length > 64 || Clean(password) != password) throw new Api("bad_input", "a password is 1-64 plain characters");
+            b["password"] = password;
+        }
+        var r = Call("PUT", "/realms/" + id + "/public", id, b, null);
+        bool locked = Str(r, "locked") == "True";
+        try { var s = Call("GET", "/realms/" + id, id, null, null); lock (state) listed[id] = RealmLine(id, s); }
+        catch (Api e) { log("realms: list after public " + id + ": " + e.Code); }
+        log("realms: " + id + (on ? " listed publicly" + (locked ? " (locked)" : "") : " taken off the public list"));
+        return on ? "ok on " + (locked ? "locked" : "open") : "ok off";
+    }
+
+    // JOIN from the server list: a membership of my own (a key like an invite gives), then the mod plays it as usual
+    string JoinPublic(string id, string password, Job j)
+    {
+        if (File.Exists(KeyFile(id)))
+        {
+            // a key the server no longer knows (the owner locked or unlisted it, a newer list join with my Steam id,
+            // the never-seen prune) is set aside and a fresh membership made: JOIN used to answer ok with the dead key,
+            // so the player stayed out until the 3-day refusal rule forgot it (Sentinel review 2026-11-01)
+            try { Call("GET", "/realms/" + id, id, null, null); return "ok " + id + " " + Clean(ReadInfo(id) ?? id); }
+            catch (Api e) { if (!Gone(e, id, "join")) throw; Forget(id); }
+        }
+        var b = new Dictionary<string, object> { { "steam_id", j.steam.ToString() }, { "player_name", Name(j.name, 32) } };
+        if (password != "")
+        {
+            if (password.Length > 64 || Clean(password) != password) throw new Api("bad_password", "wrong password");
+            b["password"] = password;
+        }
+        return Joined(Call("POST", "/realms/" + id + "/join", null, b, null));
+    }
+
+    // what the host's heartbeat tells the server list (null: nothing known, or the server refused it once)
+    Dictionary<string, object> BeatBody()
+    {
+        if (beatBodyRefused) return null;
+        var b = new Dictionary<string, object>();
+        int n = playersNow, max = playersMax;
+        if (n >= 0 && n <= 64) b["players"] = n;
+        if (max >= 1 && max <= 64) b["max_players"] = max;
+        string loc = null;
+        if (PingLocation != null) try { loc = PingLocation(); } catch { loc = null; }
+        if (!string.IsNullOrEmpty(loc) && loc.Length <= 1024 && Clean(loc) == loc) b["ping_loc"] = loc;
+        return b.Count > 0 ? b : null;
     }
 
     string Create(Job j)
@@ -362,6 +473,13 @@ class Realms
         return "ok";
     }
 
+    // a Realm is hosted from this PC right now (its lease held)
+    public bool HoldsLease()
+    {
+        lock (state) { foreach (var kv in leases) if (kv.Value == "held") return true; }
+        return false;
+    }
+
     void DropLease(string id, string why)
     {
         try { File.Delete(LeaseFile(id)); } catch { }
@@ -398,7 +516,21 @@ class Realms
                 continue;
             }
             // (the answer carries the owner's rules: a change reaches the host's game within a minute)
-            try { if (TakeRules(id, Call("POST", "/realms/" + id + "/lease/heartbeat", id, null, Lease(token)))) Write(); }
+            try
+            {
+                Dictionary<string, object> answer = null;
+                var body = BeatBody();
+                try { answer = Call("POST", "/realms/" + id + "/lease/heartbeat", id, body, Lease(token)); }
+                catch (Api e)
+                {
+                    if (body == null || (e.Code != "bad_input" && e.Code != "bad_json")) throw;
+                    // the server list's numbers must never cost the lease: the plain heartbeat goes at once, and from now on
+                    beatBodyRefused = true;
+                    log("realms: heartbeat details refused (" + Clean(e.Message) + ") - plain heartbeats from now on");
+                }
+                if (answer == null) answer = Call("POST", "/realms/" + id + "/lease/heartbeat", id, null, Lease(token));
+                if (TakeRules(id, answer)) Write();
+            }
             catch (Api e)
             {
                 log("realms: heartbeat for " + id + ": " + e.Code);
@@ -710,6 +842,12 @@ class Realms
             foreach (var kv in leases) sb.Append("lease ").Append(kv.Key).Append(' ').Append(kv.Value).Append('\n');
             // "rules <id> <key> <value> ..." (older mods skip the unknown key)
             foreach (var kv in rulesOf) sb.Append("rules ").Append(kv.Key).Append(' ').Append(kv.Value).Append('\n');
+            // "servers <unix s of the last browse> <count>", then its "server ..." lines (older mods skip both)
+            if (serversAt > 0)
+            {
+                sb.Append("servers ").Append(serversAt).Append(' ').Append(servers.Count).Append('\n');
+                foreach (var l in servers) sb.Append(l).Append('\n');
+            }
             foreach (var o in ops) sb.Append(o).Append('\n');
         }
         sb.Append("END\n");

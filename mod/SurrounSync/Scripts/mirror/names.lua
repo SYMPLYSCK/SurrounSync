@@ -210,6 +210,8 @@ local function clicked(b)
     local pressed, hov = false, false
     pcall(function() pressed = b:IsPressed() end)
     pcall(function() hov = b:IsHovered() end)
+    -- (pad A on the button Slate's pad navigation focused: no hover from focus; journal_tab.lua)
+    if not hov and clicks[b] and not pressed then pcall(function() hov = b:HasKeyboardFocus() == true end) end
     local was = clicks[b]
     clicks[b] = pressed
     return was and not pressed and hov
@@ -468,5 +470,7 @@ end
 names._open = function(uid) open_popup(uid) end  -- devtest
 function names.forget() clicks, where = {}, {}; forget_hover(); close_popup() end
 game.on_world_reset(names.forget)
+-- every widget off the screen (a death): the box goes too, before the GC can free it under us
+game.on_widgets_cleared(function() clicks = {}; close_popup() end)
 
 return names

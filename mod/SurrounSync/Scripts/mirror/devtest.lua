@@ -325,7 +325,7 @@ function devtest.watch(cfg)
     -- a job queued just before a leave/join (open's "holds" 2.5 s later) ran on the first tick of the new world and
     -- read the old world's freed container: kit guest crashes 2026-10-27 09:07-09:28 (DBG-20261027-008)
     game.on_world_reset(function() later = {} end)
-    if type(LoopAsync) ~= "function" or type(ExecuteInGameThread) ~= "function" then return end
+    if type(ExecuteInGameThread) ~= "function" then return end
     local name = (cfg.phase2 and cfg.phase2.saved_override) or "Saved"
     local path = (os.getenv("LOCALAPPDATA") or ".") .. "\\SurrounDead\\mirror_dev_" .. name .. ".txt"
     local EMS = "/Script/EasyMultiSave.Default__EMSFunctionLibrary"
@@ -403,6 +403,7 @@ function devtest.watch(cfg)
         elseif cmd:find("^power toggle") then require("mirror.power").dev_toggle(arg and arg:match("^toggle (%a+)$"))
         elseif cmd:find("^act ") then require("mirror.menu").dev_act(arg)
         elseif cmd == "pw" or cmd:find("^pw ") then require("mirror.menu").dev_password(arg or "")
+        elseif cmd == "bike" then require("mirror.hoverbike").make(); log.info("devtest: bike asked")
         elseif cmd == "save" then pcall(function() game.controller():SaveGameToSlot() end)
         elseif cmd == "savetest" then
             cfg.save.destroy_ghost_on_save = false
@@ -506,6 +507,10 @@ function devtest.watch(cfg)
             local l = game.player():K2_GetActorLocation()
             beds.apply(string.format("1 %.1f %.1f %.1f 0 0 0 1", l.X, l.Y, l.Z))
             log.info("devtest: bedhere -> " .. tostring(beds.read()))
+        elseif cmd == "giant here" or cmd == "giant clear" or cmd == "giant status" then
+            local g = require("mirror.giant")
+            if cmd == "giant here" then g.place_here() elseif cmd == "giant clear" then g.clear_here() end
+            log.info("devtest: " .. cmd .. " -> " .. g.status())
         elseif cmd:find("^buildtest ") then
             local p = game.player()
             local comp, ok, err
@@ -879,38 +884,38 @@ function devtest.watch(cfg)
     end
     -- In a world the file is read on the game thread: Lua running in LoopAsync's thread while the game thread runs
     -- the mod crashed the kit games 4x in 51 car cycles 2026-10-27, each at a command pickup (UE4SS hook dispatch,
-    -- freed-object vtable reads). LoopAsync only covers the main menu (no player ticks) and stops at the first tick.
-    -- (ExecuteInGameThread from here: commands still run outside the player's tick, as before)
+    -- freed-object vtable reads). The menu poll only covers the main menu (no player ticks) and stops at the first
+    -- tick. (ExecuteInGameThread from the tick: commands still run outside the player's tick, as before)
     local ticking, poll_in = false, 0.0
     local god_in = 0.0
     -- UE4SS 3.0.1 runs every mod's ExecuteInGameThread actions from one shared queue; if it stops draining, the
     -- commands below go unanswered while the hooks keep ticking (DBG-20261029-004): a no-op every 2 s says when
     local probe_in, probe_posted, probe_said = 2.0, nil, nil
-    -- at the main menu no player ticks: commands are read by LoopAsync until a world's player ticks steadily. Armed
-    -- at the start and again whenever the game goes to the main menu (its MAIN MENU button destroys every player).
+    -- at the main menu no player ticks: commands are read by a game-thread loop (util.game_loop; posting from
+    -- LoopAsync crashed the host there, DBG-20261101-008) until a world's player ticks steadily. Armed at the start
+    -- and again whenever the game goes to the main menu (its MAIN MENU button destroys every player).
     local menu_poll, armed_at = false, 0
     local function poll_menu()
         if menu_poll then return end
         menu_poll, armed_at = true, ticks
-        LoopAsync(250, function()
-            -- (a world's player ticking: stop at once - this thread reading while a world runs crashed kit games,
-            -- C-20261027-097; one tick may still come from the old world's last frame)
+        local stop = util.game_loop(250, function()
+            -- (a world's player ticking: its tick reads them; one tick may still come from the old world's last frame)
             if ticks > armed_at + 1 then
                 menu_poll = false
                 log.info("devtest: commands now read on the game thread")
                 return true
             end
             local cmd = take()
-            if cmd then ExecuteInGameThread(function() util.safe(run, "devtest.watch", cmd) end) end
-            return false
-        end)
+            if cmd then util.safe(run, "devtest.watch", cmd) end
+        end, "devtest.menu_poll")
+        if not stop then menu_poll = false end
     end
     local function on_level(_, LevelName)
         local lv
         pcall(function() lv = LevelName:get():ToString() end)
         if lv == "MainMenu" then
             ticking = false
-            log.info("devtest: main menu - commands read by LoopAsync again")
+            log.info("devtest: main menu - commands read by the menu poll again")
             poll_menu()
         end
     end

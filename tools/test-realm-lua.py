@@ -150,13 +150,16 @@ def t_download(L, tmp):
     rdir = os.path.join(tmp, "Saved", "SurrounSyncRealms", RID)
     down = os.path.join(rdir, "down")
     w = world()
-    side = {"mirror_coop_bed_names.txt": b"1 2 3|Base\n", "mirror_host_settings.txt": b"pvp=on\n"}
+    side = {"mirror_coop_bed_names.txt": b"1 2 3|Base\n", "mirror_host_settings.txt": b"pvp=on\n",
+            "mirror_coop_vehicle_locks.txt": b"V Vehicle_SUV_C_2 7656002 L Vehicle_SUV_C 5000 0 0\n"}
     write_dir(down, dict(w, **side, **{"unknown.bin": b"x", "Player.sav": b"EMSH" + b"p" * 50}))
     g, why = two(L, 'realm.accept_download("%s", 4)' % RID)
     check(g == 4, "a good world is accepted: %s %s" % (g, why))
     got = files_in(os.path.join(rdir, "world"))
     check(all(got.get(n) == d for n, d in w.items()), "world files copied")
     check(got.get("mirror_coop_bed_names.txt") == side["mirror_coop_bed_names.txt"], "sidecar copied")
+    check(got.get("mirror_coop_vehicle_locks.txt") == side["mirror_coop_vehicle_locks.txt"],
+          "the vehicle claims travel with the Realm's world")
     check(got.get("mirror_coop_bags.txt") == b"", "a missing sidecar becomes empty (no stale one)")
     check("unknown.bin" not in got and "Player.sav" not in got, "unknown files and characters are not taken")
     check(lua('realm.head("%s")' % RID) == 4, "head generation 4")
@@ -258,8 +261,96 @@ def t_invite(L, tmp):
     check(blob == "%s MMMMNNNNPPPPQQQQ My World" % RID, "the link carries the bare code: " + blob)
 
 
+def t_public(L, tmp):
+    """The REALMS page's SERVERS tab (user 2026-11-01): the bridge's pub / servers / server lines, and the browse,
+    JOIN and owner's list switch commands."""
+    print("public server list")
+    lua = L.eval
+    other = "0123456789"
+    state_file(tmp, "realms on 1\nrealm %s owner - 3 2 - My World\npub %s 1 1 invited\npub bad\n"
+               "servers 1793590000 3\nserver %s 1 0 2 4 38 1 My  World\nserver %s 0 1 0 0 - 0 Locked One\n"
+               "server notanid 1 0 1 4 10 0 X\nserver %s 1 0 x 4 10 0 Bad numbers\nEND\n" % (RID, RID, RID, other, other))
+    lua("realm.tick(5)")
+    p = lua("realm.pub('%s')" % RID)
+    check(p is not None and p.listed is True and p.locked is True and p.from_list is False, "pub line: listed, locked, invited")
+    check(lua("realm.pub('bad')") is None, "a broken pub line is skipped")
+    rows, at = two(L, "realm.servers()")
+    check(at == 1793590000 and len(rows) == 2, "servers header + 2 good rows (bad id, bad numbers skipped): %s %s" % (at, len(rows)))
+    a, b = rows[1], rows[2]
+    check(a.id == RID and a.live is True and a.locked is False and a.players == 2 and a.max == 4 and a.ping == 38
+          and a.mine is True and a.name == "My  World", "a live row: players, max, ping, mine, name with spaces")
+    check(b.live is False and b.locked is True and b.ping is None and b.mine is False and b.name == "Locked One",
+          "an offline locked row: no ping")
+    state_file(tmp, "realms on 1\nrealm %s member - 3 2 - My World\npub %s 1 0 public\nEND\n" % (RID, RID))
+    lua("realm.tick(5)")
+    check(lua("realm.pub('%s').from_list" % RID) is True, "joined from the list: from_list")
+    rows, at = two(L, "realm.servers()")
+    check(at is None and len(rows) == 0, "no browse yet: no rows, no time")
+
+    L.execute('NOTES = {}; package.preload["mirror.notify"] = function() return { show = function(m, k) NOTES[#NOTES + 1] = m end } end;'
+              'package.preload["mirror.peers"] = function() return { each = function() end } end;'
+              'OPENED = nil; package.preload["mirror.realmplay"] = function() return { open = function(id) OPENED = id end } end;'
+              'members = require("mirror.realmmembers"); SENT = {}')
+    L.execute("members.browse(true)")
+    check((lua("SENT[1]") or "").endswith(" browse"), "browse asks the bridge: %s" % lua("SENT[1]"))
+    L.execute("members.browse(true); members.browse(false)")
+    check(lua("#SENT") == 1, "browse again at once: not sent (10 s / 60 s apart)")
+    # (what the deployed server answered on 2026-11-04: it reads "public" as a Realm code)
+    seq = int(lua("SENT[1]").split()[1])
+    state_file(tmp, "realms on 1\nop %d browse fail bad_input not a Realm code\nEND\n" % seq)
+    lua("realm.tick(1)")
+    check("isn't switched on" in (lua("members.browse_failed") or ""), "a server older than the list: the tab can say so: %s" % lua("members.browse_failed"))
+    check("isn't switched on" in (lua("NOTES[#NOTES]") or ""), "...and a forced browse says it too, in words: %s" % lua("NOTES[#NOTES]"))
+    L.execute("members.browse_failed = nil")
+
+    L.execute('members.join_public("%s", "", "Big World")' % other)
+    sent = lua("SENT[#SENT]")
+    check(sent.endswith("joinpublic %s" % other), "JOIN of an open one: no password: " + sent)
+    seq = int(sent.split()[1])
+    state_file(tmp, "realms on 1\nop %d joinpublic fail bad_password wrong password\nEND\n" % seq)
+    lua("realm.tick(1)")
+    note = lua("NOTES[#NOTES]") or ""
+    check("Big World" in note and "needs the owner's password" in note, "no password for a locked one: said so: " + note)
+    L.execute('members.join_public("%s", "my pass\\n", "Big World")' % other)
+    sent = lua("SENT[#SENT]")
+    check(sent.endswith("joinpublic %s my pass" % other), "the password goes after the id, control characters out: %r" % sent)
+    seq = int(sent.split()[1])
+    state_file(tmp, "realms on 1\nop %d joinpublic ok %s Big World\nEND\n" % (seq, other))
+    lua("realm.tick(1)")
+    sent = lua("SENT[#SENT]")
+    check(sent.split()[2] == "list" and lua("OPENED") is None, "joined: the list is asked first: " + sent)
+    seq = int(sent.split()[1])
+    state_file(tmp, "realms on 1\nop %d list ok 1\nEND\n" % seq)
+    lua("realm.tick(1)")
+    check(lua("OPENED") == other, "...then the Realm opens (joins its host)")
+    check(not any("my pass" in str(lua("LOG[%d]" % i)) for i in range(1, lua("#LOG") + 1)), "the password is never logged")
+
+    L.execute('members.set_public("%s", true, "")' % RID)
+    check(lua("SENT[#SENT]").endswith("public %s on" % RID), "PUT ON LIST, open: " + lua("SENT[#SENT]"))
+    L.execute('members.set_public("%s", true, "lock it")' % RID)
+    check(lua("SENT[#SENT]").endswith("public %s on lock it" % RID), "PUT ON LIST with a password: locked")
+    seq = int(lua("SENT[#SENT]").split()[1])
+    state_file(tmp, "realms on 1\nop %d public ok on locked\nEND\n" % seq)
+    lua("realm.tick(1)")
+    check("locked" in (lua("NOTES[#NOTES]") or ""), "the owner is told it's locked: " + str(lua("NOTES[#NOTES]")))
+    L.execute('members.set_public("%s", false, "ignored")' % RID)
+    check(lua("SENT[#SENT]").endswith("public %s off" % RID), "TAKE OFF sends no password: " + lua("SENT[#SENT]"))
+    n = lua("#SENT")
+    L.execute('members.set_public("%s", true, "short")' % RID)
+    check(lua("#SENT") == n and "at least 6 characters" in (lua("NOTES[#NOTES]") or ""),
+          "a list password under 6 characters: not sent, said so: " + str(lua("NOTES[#NOTES]")))
+    for code, words in (("too_many_listed", "already has 3 Realms"), ("delisted", "taken off the server list for good"),
+                        ("bad_input", "a password needs")):
+        L.execute('members.set_public("%s", true, "")' % RID)
+        seq = int(lua("SENT[#SENT]").split()[1])
+        state_file(tmp, "realms on 1\nop %d public fail %s a password needs at least 6 characters\nEND\n" % (seq, code))
+        lua("realm.tick(1)")
+        note = lua("NOTES[#NOTES]") or ""
+        check(words in note and code not in note, "server refuses the list (%s): plain words: %s" % (code, note))
+
+
 def main():
-    for t in (t_commands, t_download, t_upload, t_chained, t_invite):
+    for t in (t_commands, t_download, t_upload, t_chained, t_invite, t_public):
         tmp = tempfile.mkdtemp(prefix="realmlua_")
         try:
             t(make(tmp), tmp)

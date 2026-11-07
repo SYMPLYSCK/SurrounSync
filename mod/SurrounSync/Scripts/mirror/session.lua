@@ -84,6 +84,30 @@ local function tp_target()
     end
     return tp.home.loc
 end
+-- K2_TeleportTo refuses a spot the capsule would overlap: it returns false and the player stays where the load put
+-- them (kit 2026-11-01 16:50: the host's spot 1 m lower than in the run before, every try "undone" 2363 m off,
+-- DBG-20261101-006). The spot itself first, then 1 m higher, then rings around it. Returns where, or nil + why.
+local PLACE_RINGS, PLACE_STEP = { 150, 250, 400 }, 8
+local function place(p, target, rot)
+    local function try(x, y, z)
+        local ok, moved = pcall(function() return p:K2_TeleportTo({ X = x, Y = y, Z = z }, rot) end)
+        if not ok then return false, tostring(moved) end
+        return moved ~= false
+    end
+    local ok, err = try(target.X, target.Y, target.Z)
+    if ok then return "the spot" end
+    if err then return nil, err end
+    if try(target.X, target.Y, target.Z + 100) then return "1 m higher" end
+    for _, r in ipairs(PLACE_RINGS) do
+        for i = 0, PLACE_STEP - 1 do
+            local a = (i / PLACE_STEP) * 2 * math.pi
+            if try(target.X + math.cos(a) * r, target.Y + math.sin(a) * r, target.Z + 100) then
+                return string.format("%d cm off", r)
+            end
+        end
+    end
+    return nil, "refused at the spot and " .. (1 + #PLACE_RINGS * PLACE_STEP) .. " spots around it"
+end
 local inv_fix = nil
 local realm_fresh = false   -- the Realm join's character had no inventory file (build_coop_slot)
 local realm_had = false     -- ...and it was my own stored Realm character (not the starter): build_coop_slot
@@ -390,7 +414,7 @@ end
 -- everything taken in co-op was lost and everything put away came back (DBG-20261027-007). EMS's own
 -- ResetCustomSave(ClearMemory) drops the cached object, so the load reads the file, like after a game restart.
 local CLEAR_MEMORY = 1 -- EResetCustomSaveType::ClearMemory
-local function ems_forget_player(own)
+local function ems_forget_player(own, ctx)
     local ems
     for _, o in ipairs(FindAllOf("EMSObject") or {}) do
         if util.class_name(o) == "EMSObject" then ems = o end
@@ -407,7 +431,7 @@ local function ems_forget_player(own)
     if #objs == 0 then log.info("session: EMS has no cached PlayerInfo for " .. own .. " - it reads the file"); return end
     for _, obj in ipairs(objs) do
         local ok, err = false, "invalid object"
-        if util.valid(obj) then ok, err = pcall(function() lib():ResetCustomSave(game.world(), obj, CLEAR_MEMORY) end) end
+        if util.valid(obj) then ok, err = pcall(function() lib():ResetCustomSave(ctx or game.world(), obj, CLEAR_MEMORY) end) end
         log.info(string.format("session: EMS cached %s of %s cleared: %s", tostring(util.fname(obj)), own, ok and "ok" or tostring(err)))
         if ok and obj == shared_save then shared_save = nil end
     end
@@ -756,6 +780,7 @@ local function build_coop_slot(own, files)
         -- my Realm character (none yet = the game makes a fresh one), never the own save's
         local rm = require("mirror.realm")
         rm.hold_character(realm_id, nil)   -- (a held character comes back with its items now)
+        backups.take_realm(realm_id, rm.char_dir(realm_id), "before joining")   -- (leaving stores the session's over it)
         local mine = rm.character(realm_id)
         realm_had = mine ~= nil
         local character = mine or rm.starter(realm_id)
@@ -795,9 +820,11 @@ local function character_home(t)
         log.error("session: left the Realm from the Shooting Range - the stored Realm character is kept")
         return "copied"
     end
-    local ok, err = require("mirror.realm").store_character(t.realm, character)
+    local rm = require("mirror.realm")
+    local ok, err = rm.store_character(t.realm, character)
     if not ok then return nil, err end
     log.info("session: Realm character stored in Realm " .. t.realm)
+    backups.take_realm(t.realm, rm.char_dir(t.realm), "after leaving")
     return "copied"
 end
 
@@ -927,22 +954,14 @@ local function menu_exit_due()
 end
 -- The game's MAIN MENU button destroys every player before the load, so nothing ticks at the menu (kit 2026-10-30
 -- 11:58 + 12:05: the guest stayed joined there, Continue on the co-op save). Polled like realmplay's NEW GAME
--- press - LoopAsync only posts, the work runs on the game thread - from 1 s on, once no save runs.
+-- press, on the game thread (util.game_loop), from 1 s on, once no save runs.
 local function poll_menu_exit()
-    if type(LoopAsync) ~= "function" or type(ExecuteInGameThread) ~= "function" then return end
-    local polls, done = 0, false
-    LoopAsync(250, function()
-        if done then return true end
-        ExecuteInGameThread(function()
-            util.safe(function()
-                if done then return end
-                polls = polls + 1
-                -- (a save busy for 2 min: give up here; the tick takes over once a world's player exists)
-                if not menu_exit or (polls >= 4 and menu_exit_due()) or polls >= 480 then done = true end
-            end, "session.menu_exit")
-        end)
-        return false
-    end)
+    local polls = 0
+    util.game_loop(250, function()
+        polls = polls + 1
+        -- (a save busy for 2 min: give up here; the tick takes over once a world's player exists)
+        if not menu_exit or (polls >= 4 and menu_exit_due()) or polls >= 480 then return true end
+    end, "session.menu_exit")
 end
 -- The game's save system may not exist yet when the mod starts: the main menu's load is the second chance,
 -- still before the player can press Continue.
@@ -1210,6 +1229,9 @@ end
 function session.realm_host_left(follow)
     if state ~= "joined" then return end
     gone = nil
+    -- a member from the public server list can't host the Realm (the server refuses its claim): it always follows
+    local pub = realm_id and require("mirror.realm").pub(realm_id)
+    if pub and pub.from_list then follow = true end
     if follow then arm_takeover(true); want_toggle = true; return end
     if take_over_here() then return end
     arm_takeover()
@@ -1300,7 +1322,7 @@ end
 
 -- The pause menu stops every game tick, and the host-gone countdown ran on ticks only: a guest in that menu when the
 -- host's game crashed stayed in its world for good, the menu having no LEAVE CO-OP (user 2026-10-31). phase1's menu
--- watch (LoopAsync, game thread, about once a second) runs the countdown from there; session.tick restarts its clock.
+-- watch (a game-thread loop, about once a second) runs the countdown from there; session.tick restarts its clock.
 local menu_at = nil
 function session.menu_tick()
     local t = os.clock()
@@ -1715,7 +1737,8 @@ local function guest_tick(dt)
                         end
                         tp = nil
                     else
-                        log.info(string.format("session: teleport undone (%.0f m off); retrying", d / 100))
+                        log.info(string.format("session: teleport %s (%.0f m off); retrying",
+                            tp.moved and "undone" or "refused", d / 100))
                         tp.sent_at = nil
                     end
                 end
@@ -1725,10 +1748,14 @@ local function guest_tick(dt)
                 local rot
                 pcall(function() rot = p:K2_GetActorRotation() end)
                 if rot and tp.goal == "home" then rot = { Pitch = 0, Yaw = tp.home.yaw, Roll = 0 } end
-                pcall(function() p:K2_TeleportTo(target, rot) end)
-                tp.tries = tp.tries + 1
+                local where, why = place(p, target, rot)
+                tp.tries, tp.moved = tp.tries + 1, where ~= nil
                 tp.sent_at = tp.settle
-                log.info(string.format("session: teleport #%d %s (%.0f, %.0f, %.0f)", tp.tries, what, target.X, target.Y, target.Z))
+                local now
+                pcall(function() now = util.vec(p:K2_GetActorLocation()) end)
+                log.info(string.format("session: teleport #%d %s (%.0f, %.0f, %.0f): %s, now at %s", tp.tries, what,
+                    target.X, target.Y, target.Z, where and ("moved, " .. where) or tostring(why),
+                    now and string.format("(%.0f, %.0f, %.0f)", now.X, now.Y, now.Z) or "?"))
             end
         end
     end
@@ -1806,9 +1833,10 @@ local function on_actor_loaded(self)
     if not target then return end
     local rot = { Pitch = 0, Yaw = tp.goal == "home" and tp.home.yaw or 0, Roll = 0 }
     if tp.goal == "host" then pcall(function() rot.Yaw = p:K2_GetActorRotation().Yaw end) end
-    local ok = pcall(function() p:K2_TeleportTo(target, rot) end)
+    local where, why = place(p, target, rot)
     log.info(string.format("session: ActorLoaded - snapped %s to (%.0f, %.0f, %.0f): %s",
-        tp.goal == "host" and "next to the host" or "back home", target.X, target.Y, target.Z, tostring(ok)))
+        tp.goal == "host" and "next to the host" or "back home", target.X, target.Y, target.Z,
+        where and ("moved, " .. where) or tostring(why)))
 end
 
 local on_main_menu = function() end
@@ -1891,9 +1919,10 @@ function session.init(c, r, connected)
             hook_main_menu()
             game.player_hook("ActorLoaded", function(self) util.safe(on_actor_loaded, "session.actor_loaded", self) end)
         end
-        game.keybind("F10", { ModifierKey.CONTROL }, function()
+        session.key_leave = function()   -- (also /leave, chatcmd.lua)
             if state == "idle" then key_join_refused = true else want_toggle = true end
-        end)
+        end
+        game.keybind("F10", { ModifierKey.CONTROL }, session.key_leave)
         game.on_new_player(function() util.safe(check_exit, "session.check_exit") end)
         util.hook("/Game/Blueprints/SD_GameInstance.SD_GameInstance_C:Event_LoadLevel",
             function() util.safe(session.on_load_level, "session.on_load_level") end)
@@ -1956,7 +1985,7 @@ end
 function session.state() return state end
 function session.save_now() return save_now() end
 -- before loading a slot whose PlayerInfo file was just written (a Realm's co-op save): EMS must read the file
-function session.forget_cached_player(slot) return ems_forget_player(slot) end
+function session.forget_cached_player(slot, ctx) return ems_forget_player(slot, ctx) end
 -- for Realms (realmplay.lua): the same slot tools the join uses
 function session.saving() return saving() end
 function session.load_slot(slot) return load_slot(slot) end
@@ -1972,6 +2001,15 @@ function session.loading() return level_loading end
 function session.world_save() return (not level_loading) and world_slot or nil end
 function session.saves_dir() return saves_dir() end
 function session.point_at(slot) return point_at(slot) end
+-- The Save_Player EMS holds for the current save name, the object the game's character looks live in, or nil
+function session.player_save(ctx)
+    local cls = StaticFindObject("/Game/Blueprints/Saves/Save_Player.Save_Player_C")
+    if not (ctx and util.valid(cls)) then return nil end
+    local ok, o = pcall(function() return lib():GetCustomSave(ctx, cls, "", "") end)
+    if ok and util.valid(o) then return o end
+    log.warn("session: couldn't get the current Save_Player: " .. tostring(ok and "invalid object" or o))
+    return nil
+end
 function session.playing_slot()
     local cur = ems_current_name()
     if not cur or cur == "" or is_coop(cur) then return nil end

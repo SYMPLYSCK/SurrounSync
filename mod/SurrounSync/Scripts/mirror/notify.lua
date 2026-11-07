@@ -282,7 +282,7 @@ function view.build()
     end
     pcall(function() canvas:SetVisibility(HIT_INVISIBLE) end)   -- (never in the way of a click)
     pcall(function() w:AddToViewport(40) end)
-    view.w, view.slots, view.built_for = w, slots, util.addr(pc)
+    view.w, view.slots, view.built_for, view.stack_slot, view.top = w, slots, util.addr(pc), cs, TOP
     return true
 end
 
@@ -306,6 +306,13 @@ local function fill(s, c)
 end
 
 function view.render()
+    -- the cards stack under the minimap while it's up (minimap.lua: the same top right corner)
+    local top = TOP
+    pcall(function() top = require("mirror.minimap").bottom() or TOP end)
+    if top ~= view.top and view.stack_slot then
+        view.top = top
+        pcall(function() view.stack_slot:SetPosition({ X = -RIGHT, Y = top }) end)
+    end
     local filled = false
     for i, s in ipairs(view.slots) do
         local c = cards[i]
@@ -403,6 +410,8 @@ function notify.init()
     game.keybind("F9", { ModifierKey.CONTROL }, function() util.safe(notify.open_history, "notify.history") end)
     -- (the next message builds the cards again, in the new world)
     game.on_world_reset(drop_view)
+    -- a death takes every widget off the screen with the same controller: the cards would be freed under us
+    game.on_widgets_cleared(drop_view)
 end
 
 -- tests: the logic without the engine

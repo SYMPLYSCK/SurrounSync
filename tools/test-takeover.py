@@ -39,6 +39,7 @@ package.preload["mirror.util"] = function()
     -- (players: { a = address, name = full name }; mark/marked as util.lua's)
     return { safe = function(fn, _, ...) return pcall(fn, ...) end, valid = function(o) return o ~= nil end,
              addr = function(o) return type(o) == "table" and o.a or 1 end, ensure_hook = function() return true end,
+             game_loop = function() return nil end,   -- (no UE4SS loops here, as before: no LoopAsync)
              mark = function(t, o) if o then t[o.a or 1] = o.name or true end end,
              marked = function(t, o) local n = o and t[o.a or 1]; return n ~= nil and (n == true or n == o.name) end }
 end

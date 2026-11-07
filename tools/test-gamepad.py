@@ -210,8 +210,10 @@ package.preload["mirror.game"] = function()
     }
 end
 SETTING = {}
+PADSTYLE = "xbox"   -- MY SETTINGS -> CONTROLLER: "xbox" / "playstation"; "boom" makes pad_style() throw
 package.preload["mirror.mysettings"] = function()
-    return { on = function(k) return SETTING[k] ~= false end }
+    return { on = function(k) return SETTING[k] ~= false end,
+             pad_style = function() if PADSTYLE == "boom" then error("boom") end; return PADSTYLE end }
 end
 
 GP = require("mirror.gamepad")
@@ -697,7 +699,9 @@ def bindings():
     L.execute("""PLAYER.BP_JigHelperComp.CurrentTracActor = BED; RUN(0.5)
                  PLAYER.BP_JigHelperComp.CycleOptions = function() error('boom') end
                  DOWN.Gamepad_DPad_Up = true; RUN(0.25); DOWN.Gamepad_DPad_Up = false; RUN(0.25)""")
-    check(any("option step failed" in l for l in L.eval("LOG").values()), "a failing CycleOptions is logged")
+    check(any("option step failed" in l and "boom" in l for l in L.eval("LOG").values()),
+          "a failing CycleOptions is logged with its error")
+    check(not any("option step failed - nil" in l for l in L.eval("LOG").values()), "a working one is not logged as failed")
     check(warnings(L) == [], "no warnings: %s" % warnings(L))
 
     # assign: a swap, never one button on two actions
@@ -706,7 +710,8 @@ def bindings():
     pads = {a.id: a.pad for a in L.eval("GP.ACTIONS").values()}
     check(pads["jump"] == "Gamepad_RightShoulder" and pads["hotbar_next"] == "Gamepad_FaceButton_Bottom",
           "the action on RB (hotbar next) takes jump's old button (A)")
-    check(len(set(pads.values())) == len(pads), "no button on two actions")
+    bound = [p for p in pads.values() if p]
+    check(len(set(bound)) == len(bound), "no button on two actions")
     check(L.eval('GP.assign("jump", "Gamepad_RightShoulder")') is False, "the same button again: no change")
     check(L.eval('GP.assign("nope", "Gamepad_RightShoulder")') is False and
           L.eval('GP.assign("jump", "Gamepad_LeftStick_Up")') is False, "unknown action or a stick direction: refused")
@@ -742,8 +747,9 @@ def bindings():
         f.write("jump Gamepad_DPad_Up\nthrowable Gamepad_DPad_Up\n")
     L3 = make(pre)
     pads = {a.id: a.pad for a in L3.eval("GP.ACTIONS").values()}
-    check(pads["jump"] == "Gamepad_DPad_Up" and pads["throwable"] != "Gamepad_DPad_Up" and len(set(pads.values())) == len(pads),
-          "a hand-edited file with one button twice: the first keeps it, no doubles")
+    bound = [p for p in pads.values() if p]
+    check(pads["jump"] == "Gamepad_DPad_Up" and pads["throwable"] not in (None, "Gamepad_DPad_Up") and len(set(bound)) == len(bound),
+          "a hand-edited file with one button twice: the first keeps it, the other gets a free button, no doubles")
     L.execute("GP.reset()")
     check(L.eval("MIRRORSTR()") == ";".join("%s=%s" % s for s in SPEC), "RESET: defaults, live")
 
@@ -782,7 +788,431 @@ def bindings():
     check(m["jump"] == "A" and m["hotbar_next"] == "RB" and m["shove"] == "Y", "binds_model names the buttons")
     C.execute('GP.capture("aim")')
     check({r.id: r.button for r in C.eval("GP.binds_model()").values()}["aim"] == "PRESS A BUTTON", "the waiting row says so")
+    # audit 2026-11-02: the handbook closed while SET waited - its pad rows stayed out and the next press bound
+    C.execute("RUN(0.25); PC.bShowMouseCursor = false; RUN(0.25)")
+    check(C.eval("GP.capturing()") is None and C.eval("PADKEYS_IN_IMC()") == n,
+          "the menu closed while SET waits: no more waiting, all %d pad rows back (%r)" % (n, C.eval("GP.capturing()")))
+    C.execute("DOWN.Gamepad_FaceButton_Top = true; RUN(0.25); DOWN.Gamepad_FaceButton_Top = false; RUN(0.25)")
+    m2 = {r.id: r.button for r in C.eval("GP.binds_model()").values()}
+    check(m2["aim"] == m["aim"] and m2["shove"] == "Y", "...and the next press binds nothing (aim %r)" % m2["aim"])
+    C.execute('GP.capture("jump"); RUN(0.5)')
+    check(C.eval("GP.capturing()") == "jump", "a SET with no cursor seen (none to close) still waits")
+    C.execute("RUN(7.0)")
+    # audit 2026-11-03: the controller off - its tick never counted SET's 6 s down, the row said "..." for good and
+    # the first press after switching it back on was bound, wherever that was
+    C.execute("SETTING.gamepad = false; RUN(1.5)")
+    check(C.eval('GP.capture("jump")') is False and C.eval("GP.capturing()") is None, "the controller off: SET doesn't start")
+    C.execute('SETTING.gamepad = true; RUN(3.0); GP.capture("jump"); SETTING.gamepad = false; RUN(1.5)')
+    check(C.eval("GP.capturing()") is None, "switched off while SET waits: it ends")
+    C.execute("SETTING.gamepad = true; RUN(3.0)")
     check(warnings(C) == [], "no warnings: %s" % warnings(C))
+
+
+def full_bindings():
+    print("full bindings")
+    import tempfile
+    # every game action a button can sensibly do is on the list; the new ones start on no button
+    L = make(init=False)
+    acts = {a.id: a for a in L.eval("GP.ACTIONS").values()}
+    names = set()
+    for a in acts.values():
+        if a.ia:
+            names |= set(a.ia.values())
+    want = {"IA_Roll", "IA_ChangeFireMode", "IA_EquipPrimary", "IA_EquipSecondary", "IA_EquipSidearm", "IA_EquipMelee",
+            "IA_Unequip", "IA_Hotbar6", "IA_Hotbar7", "IA_Hotbar8", "IA_FishingRod", "IA_RadialMenu", "IA_LootAll",
+            "IA_Flashlight", "IA_ToggleTactical", "IA_NightVision", "IA_Binoculars", "IA_Distract", "IA_HoldBreath",
+            "IA_QuickSearch", "IA_ScopeZoom", "IA_ChangePerspective", "IA_SwitchCameraLeft", "IA_SwitchCameraRight",
+            "IA_ResetCameraPosition", "IA_FreeLook", "IA_AutoRun", "IA_SitDown", "IA_Journal", "IA_Map",
+            "IA_VehicleHorn", "IA_VehicleRadio", "IA_VehicleFlip", "IA_HideUI", "IA_PhotoMode", "IA_QuickSave"}
+    check(want <= names and names <= set(IMC_ROWS), "the by-name actions are real IMC_General actions, all %d listed" % len(want))
+    check(all(not a.pad for a in acts.values() if a.ia), "the by-name actions start on no button")
+    check(L.eval("PLANSTR(ROWS)") == ";".join(sorted(EXP_STR)), "defaults: the plan is the same as before the full list")
+    m = {r.id: r.button for r in L.eval("GP.binds_model()").values()}
+    check(m["roll"] == "NONE" and m["jump"] == "A", "binds_model: NONE for an unbound action")
+
+    # by name: E's two actions split, the free D-pad right takes loot all only
+    check(L.eval('GP.assign("loot_all", "Gamepad_DPad_Right")') is True, "loot all onto D-pad right")
+    plan = set(split(L.eval("PLANSTR(ROWS)")))
+    check("IA_LootAll|Gamepad_DPad_Right" in plan and "IA_SwitchCameraRight|Gamepad_DPad_Right" not in plan,
+          "D-pad right does loot all, not E's shoulder swap")
+    # onto a taken button: the action there had none to swap, so it goes to none
+    check(L.eval('GP.assign("roll", "Gamepad_FaceButton_Bottom")') is True, "roll onto A")
+    pads = {a.id: a.pad for a in L.eval("GP.ACTIONS").values()}
+    check(pads["roll"] == "Gamepad_FaceButton_Bottom" and pads["jump"] is None, "jump (on A) goes to none")
+    plan = set(split(L.eval("PLANSTR(ROWS)")))
+    check("IA_Roll|Gamepad_FaceButton_Bottom" in plan and not any(e.startswith("IA_Jump|") for e in plan),
+          "the plan: roll on A, jump on nothing")
+    check(L.eval('GP.unassign("roll")') is True and L.eval('GP.unassign("roll")') is False, "unassign: once, then nothing to take")
+    check(dict(L.eval('GP.parse_binds("roll none\\njump Gamepad_DPad_Down\\nnope none")').items()) ==
+          {"roll": False, "jump": "Gamepad_DPad_Down"}, "parse_binds: none for a known action, unknown ids skipped")
+
+    # saved and loaded: none survives a restart, an old file (no new ids) leaves the new ones on none
+    d = tempfile.mkdtemp(prefix="gp-full-")
+    pre = "LINKDIR = [[%s]]" % d
+    L = booted(pre)
+    L.execute("MAPKEYS, UNMAPS = {}, {}")
+    check(L.eval('GP.clear("jump")') is True and L.eval('GP.clear("jump")') is False, "CLEAR jump, then nothing to clear")
+    with open(os.path.join(d, "mirror_pad_binds.txt"), encoding="utf-8") as f:
+        saved = f.read()
+    check("jump none" in saved and "roll none" in saved, "saved as none")
+    check("IA_Jump|Gamepad_FaceButton_Bottom" in split(L.eval("JOIN(UNMAPS)")), "cleared live: A no longer jumps")
+    L.execute('GP.set("map", "Gamepad_FaceButton_Bottom")')
+    pads = {a.id: a.pad for a in make(pre).eval("GP.ACTIONS").values()}
+    check(pads["jump"] is None and pads["map"] == "Gamepad_FaceButton_Bottom", "a new start keeps jump on none and the map on A")
+    # map is a menu action: it stays in the context with a menu up, so it can close the map
+    L.execute("PC.bShowMouseCursor = true; RUN(0.5)")
+    rows = {(m.Action.__name, m.Key.KeyName.s) for m in L.eval("IMC.Mappings").values()}
+    check(("IA_Map", "Gamepad_FaceButton_Bottom") in rows, "menu up: the map's button stays live")
+    # a menu action on a menu direction is out with a menu up: one press moved the focus and shut the handbook
+    L.execute('PC.bShowMouseCursor = false; RUN(0.5); GP.set("journal", "Gamepad_DPad_Down")')
+    L.execute("RUN(0.5)")
+    rows = {(m.Action.__name, m.Key.KeyName.s) for m in L.eval("IMC.Mappings").values()}
+    check(("IA_Journal", "Gamepad_DPad_Down") in rows, "no menu: the handbook on D-pad down is live")
+    L.execute("PC.bShowMouseCursor = true; RUN(0.5)")
+    rows = {(m.Action.__name, m.Key.KeyName.s) for m in L.eval("IMC.Mappings").values()}
+    check(("IA_Journal", "Gamepad_DPad_Down") not in rows and ("IA_Map", "Gamepad_FaceButton_Bottom") in rows,
+          "menu up: the handbook's D-pad down is out (the menu's), the map's A stays")
+    with open(os.path.join(d, "mirror_pad_binds.txt"), "w", encoding="utf-8") as f:
+        f.write("jump Gamepad_DPad_Down\n")
+    pads = {a.id: a.pad for a in make(pre).eval("GP.ACTIONS").values()}
+    check(pads["jump"] == "Gamepad_DPad_Down" and pads["roll"] is None and pads["crouch"] == "Gamepad_FaceButton_Right",
+          "an old file: its binds, defaults for the rest, the new actions on none (not handed a free button)")
+    check(warnings(L) == [], "no warnings: %s" % warnings(L))
+
+
+PS_NAMES = {
+    "Gamepad_FaceButton_Bottom": "CROSS", "Gamepad_FaceButton_Right": "CIRCLE", "Gamepad_FaceButton_Left": "SQUARE",
+    "Gamepad_FaceButton_Top": "TRIANGLE", "Gamepad_LeftShoulder": "L1", "Gamepad_RightShoulder": "R1",
+    "Gamepad_LeftTrigger": "L2", "Gamepad_RightTrigger": "R2", "Gamepad_LeftThumbstick": "L3",
+    "Gamepad_RightThumbstick": "R3", "Gamepad_DPad_Up": "D-PAD UP", "Gamepad_DPad_Down": "D-PAD DOWN",
+    "Gamepad_DPad_Left": "D-PAD LEFT", "Gamepad_DPad_Right": "D-PAD RIGHT", "Gamepad_Special_Left": "CREATE",
+    "Gamepad_Special_Right": "OPTIONS",
+}
+
+
+def playstation():
+    print("playstation")
+    import tempfile
+    L = make(init=False)
+    pads = [(p[1], p[2], p[3]) for p in L.eval("GP.PADS").values()]
+    check(len(pads) == 16 and {p[0] for p in pads} == set(PS_NAMES), "16 pad buttons, the same keys as before")
+    check(all(PS_NAMES[k] == ps for k, _, ps in pads), "each has its PlayStation name (CROSS, L1, CREATE, OPTIONS...)")
+    check(len({ps for _, _, ps in pads}) == 16 and len({x for _, x, _ in pads}) == 16, "no name twice on either pad")
+    check(L.eval('GP.pad_name("Gamepad_FaceButton_Bottom", "playstation")') == "CROSS" and
+          L.eval('GP.pad_name("Gamepad_FaceButton_Bottom", "xbox")') == "A" and
+          L.eval('GP.pad_name("Gamepad_FaceButton_Bottom")') == "A", "pad_name: CROSS / A, xbox when no style given")
+    check(L.eval('GP.pad_name(nil, "playstation")') is None and L.eval('GP.pad_name("Gamepad_LeftStick_Up", "playstation")') is None,
+          "pad_name: nil for no key or a stick direction")
+    plan_x = L.eval("PLANSTR(ROWS)")
+    L.execute('PADSTYLE = "playstation"')
+    m = {r.id: r.button for r in L.eval("GP.binds_model()").values()}
+    check(m["jump"] == "CROSS" and m["crouch"] == "CIRCLE" and m["interact"] == "SQUARE" and m["lights"] == "TRIANGLE",
+          "PLAYSTATION: the face buttons are CROSS / CIRCLE / SQUARE / TRIANGLE")
+    check(m["hotbar_back"] == "L1" and m["hotbar_next"] == "R1" and m["aim"] == "L2" and m["shoot"] == "R2",
+          "PLAYSTATION: shoulders L1 / R1, triggers L2 / R2")
+    check(m["inventory"] == "CREATE" and m["pause"] == "OPTIONS" and m["roll"] == "NONE", "CREATE / OPTIONS, NONE for unbound")
+    check(L.eval("PLANSTR(ROWS)") == plan_x, "the pad type changes names only: the same keys go into the context")
+    L.execute('PADSTYLE = "boom"')
+    check({r.id: r.button for r in L.eval("GP.binds_model()").values()}["jump"] == "A", "pad type unreadable: Xbox names, no error")
+    # SET on a PS pad: the same key comes back (Cross is Gamepad_FaceButton_Bottom), the row names it CROSS
+    C = booted('PADSTYLE = "playstation"')
+    C.execute('PC.bShowMouseCursor = true; RUN(0.25); GP.capture("shove"); RUN(0.25); DOWN.Gamepad_FaceButton_Top = true; RUN(0.25)')
+    m = {r.id: r.button for r in C.eval("GP.binds_model()").values()}
+    check(m["shove"] == "TRIANGLE" and m["lights"] == "R3", "PS pad SET: Triangle binds shove, lights swap to R3")
+    check(warnings(C) == [], "no warnings: %s" % warnings(C))
+
+    # each pad button is read once a frame however many parts ask (menu focus + inventory both read the D-pad)
+    K = booted()
+    K.execute("""KEYREADS = {}
+                 local f = PC.IsInputKeyDown
+                 PC.IsInputKeyDown = function(self, k) KEYREADS[k.KeyName.s] = (KEYREADS[k.KeyName.s] or 0) + 1; return f(self, k) end""")
+    K.execute("KEYREADS = {}; RUN(1.0, 0.25)")
+    reads = dict(K.eval("KEYREADS").items())
+    check(not reads.get("Gamepad_DPad_Up") and not reads.get("Gamepad_DPad_Down"),
+          "in the world with nothing looked at: D-pad up/down are not read (%s)" % reads)
+    check(reads.get("Gamepad_RightShoulder") == 4, "the hotbar buttons are read once a tick (4 ticks: %s)" % reads.get("Gamepad_RightShoulder"))
+    K.execute("PC.bShowMouseCursor = true; RUN(0.5); KEYREADS = {}; RUN(1.0, 0.25)")
+    reads = dict(K.eval("KEYREADS").items())
+    check(reads and max(reads.values()) == 4, "menu up: no button read twice in a tick (%s)" % reads)
+    K.execute("PC.bShowMouseCursor = false; RUN(0.5); PLAYER.BP_JigHelperComp.CurrentTracActor = BED; RUN(0.25)")
+    K.execute("DOWN.Gamepad_DPad_Up = true; RUN(0.25); DOWN.Gamepad_DPad_Up = false; RUN(0.25)")
+    check(K.eval("JOIN(OPTS)") == "true", "looking at a bed: D-pad up still steps the options once")
+    # a D-pad held while the target comes into view is not a fresh press
+    K.execute("PLAYER.BP_JigHelperComp.CurrentTracActor = NOTHING; RUN(1.0); DOWN.Gamepad_DPad_Down = true; RUN(0.25); "
+              "PLAYER.BP_JigHelperComp.CurrentTracActor = BED; RUN(0.5)")
+    check(K.eval("JOIN(OPTS)") == "true", "D-pad down held as a target appears: no option step")
+    K.execute("DOWN.Gamepad_DPad_Down = false; RUN(0.25); DOWN.Gamepad_DPad_Down = true; RUN(0.25); DOWN.Gamepad_DPad_Down = false")
+    check(K.eval("JOIN(OPTS)") == "true;false", "released and pressed again: it steps")
+    check(warnings(K) == [], "no warnings: %s" % warnings(K))
+
+    # a bindings file that can't be written: said in the log, the binding still live, no error raised
+    W = booted("LINKDIR = [[%s]]" % os.path.join(tempfile.mkdtemp(prefix="gp-ro-"), "missing", "dir"))
+    W.execute("MAPKEYS = {}")
+    check(W.eval('GP.set("reload", "Gamepad_FaceButton_Right")') is True, "SET with no writable folder still binds")
+    check("IA_Reload|Gamepad_FaceButton_Right" in split(W.eval("JOIN(MAPKEYS)")), "and it is live at once")
+    check(any("bindings not saved" in w for w in warnings(W)) and
+          not any("safe() caught" in w for w in warnings(W)), "the failed save is logged as a warning, nothing thrown")
+    d = tempfile.mkdtemp(prefix="gp-save-")
+    S = booted("LINKDIR = [[%s]]" % d)
+    S.execute('GP.set("reload", "Gamepad_FaceButton_Right"); GP.step_sens("look_x", 1)')
+    with open(os.path.join(d, "mirror_pad_binds.txt"), encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    n_act = S.eval("#GP.ACTIONS + #GP.CONTROLS")
+    check(len(lines) == n_act + 1 and lines[-1] == "look_x 230" and all(len(l.split()) == 2 for l in lines),
+          "saved whole: one line per action and control plus the changed speed (%d lines)" % len(lines))
+    # the file opens but the write fails (a full disk): a warning, not a quiet success
+    F = booted("LINKDIR = [[%s]]" % d)
+    F.execute("""io.open = function() return { write = function() return nil, 'disk full' end,
+                                              close = function() return true end } end""")
+    F.execute('GP.set("reload", "Gamepad_DPad_Left")')
+    check(any("bindings not saved" in w for w in warnings(F)), "a failed write is logged as not saved")
+
+    # IsInputKeyDown throwing (a controller going away): every button counts as up, nothing fires
+    T = booted()
+    T.execute("PC.IsInputKeyDown = function() error('gone') end; DOWN.Gamepad_RightShoulder = true; RUN(0.5)")
+    check(T.eval("#CYCLES") == 0 and not any("safe() caught" in w for w in warnings(T)),
+          "a key read that throws: no hotbar step, nothing raised")
+
+
+CONTROL_DEFAULTS = {
+    "menu_up": "Gamepad_DPad_Up", "menu_down": "Gamepad_DPad_Down", "menu_left": "Gamepad_DPad_Left",
+    "menu_right": "Gamepad_DPad_Right", "inv_grab": "Gamepad_FaceButton_Bottom", "inv_back": "Gamepad_FaceButton_Right",
+    "inv_take": "Gamepad_FaceButton_Left", "inv_tab_left": "Gamepad_LeftShoulder", "inv_tab_right": "Gamepad_RightShoulder",
+    "option_up": "Gamepad_DPad_Up", "option_down": "Gamepad_DPad_Down",
+}
+INV_NAMES = {"menu_up": "up", "menu_down": "down", "menu_left": "left", "menu_right": "right", "inv_grab": "a",
+             "inv_back": "b", "inv_take": "x", "inv_tab_left": "lb", "inv_tab_right": "rb"}
+
+
+def controls():
+    print("menu / inventory / option controls, switches")
+    import tempfile
+
+    def ctl(L):
+        return {a.id: a.pad for a in L.eval("GP.CONTROLS").values()}
+
+    def acts(L):
+        return {a.id: a.pad for a in L.eval("GP.ACTIONS").values()}
+
+    def btns(L):
+        return dict(L.eval('require("mirror.padinv").BUTTONS').items())
+
+    L = make()
+    check(ctl(L) == CONTROL_DEFAULTS, "11 controls on the buttons they had when hard-coded")
+    check(btns(L) == {INV_NAMES[k]: v for k, v in CONTROL_DEFAULTS.items() if k in INV_NAMES},
+          "padinv's buttons are the bindings")
+    check(L.eval("PLANSTR(ROWS)") == ";".join(sorted(EXP_STR)), "the controls add no context rows (same plan)")
+    rows = [r.id for r in L.eval("GP.binds_model()").values()]
+    check(len(rows) == L.eval("#GP.ACTIONS + #GP.CONTROLS") and len(set(rows)) == len(rows),
+          "binds_model: every action and control once (%d rows)" % len(rows))
+    check(rows[14] == "menu_up" and rows[24] == "option_down" and rows[25] == "roll" and rows[13] == "pause",
+          "the order: the 14 bound actions, the controls, then the unbound actions")
+    check(L.eval("math.ceil(#GP.binds_model() / 11)") == 6, "6 pages of 11 on the BUTTONS tab")
+    labels = [r.label for r in L.eval("GP.binds_model()").values()]
+    check(max(len(x) for x in labels) <= 21, "no label longer than 21 characters (%d)" % max(len(x) for x in labels))
+
+    # swaps stay inside a kind: a control onto a game action's button leaves the action alone
+    check(L.eval('GP.assign("inv_grab", "Gamepad_FaceButton_Top")') is True, "INV: GRAB onto Y")
+    c, a = ctl(L), acts(L)
+    check(c["inv_grab"] == "Gamepad_FaceButton_Top" and a["lights"] == "Gamepad_FaceButton_Top" and
+          a["jump"] == "Gamepad_FaceButton_Bottom", "Y grabs in the inventory and still does lights in the world; A still jumps")
+    check(btns(L)["a"] == "Gamepad_FaceButton_Top", "padinv grabs on Y")
+    check(L.eval('GP.assign("inv_back", "Gamepad_FaceButton_Top")') is True and
+          ctl(L)["inv_grab"] == "Gamepad_FaceButton_Right" and btns(L)["a"] == "Gamepad_FaceButton_Right" and
+          btns(L)["b"] == "Gamepad_FaceButton_Top", "BACK onto Y: GRAB swaps to BACK's old B")
+    check(L.eval('GP.assign("option_up", "Gamepad_DPad_Left")') is True and ctl(L)["menu_left"] == "Gamepad_DPad_Left" and
+          ctl(L)["option_down"] == "Gamepad_DPad_Down", "an option step onto D-pad left: the menu's D-pad left untouched")
+    check(L.eval('GP.assign("option_up", "Gamepad_DPad_Down")') is True and ctl(L)["option_down"] == "Gamepad_DPad_Left",
+          "onto the other option step's button: they swap")
+    check(L.eval('GP.unassign("inv_take")') is True and btns(L).get("x") is None, "QUICK TAKE cleared: padinv has no X")
+    check(L.eval('GP.assign("jump", "Gamepad_FaceButton_Right")') is True and ctl(L)["inv_grab"] == "Gamepad_FaceButton_Right",
+          "and a game action swapping leaves the controls alone")
+    L.execute("GP.reset_binds()")
+    check(ctl(L) == CONTROL_DEFAULTS and btns(L)["x"] == "Gamepad_FaceButton_Left", "reset_binds: the controls back too")
+
+    # live: the inventory takes a moved button (padinv's own stand-ins)
+    P = make()
+    P.execute(INV)
+    P.execute('GP.set("inv_take", "Gamepad_FaceButton_Top"); PADS.y = "Gamepad_FaceButton_Top"')
+    P.execute("P('right'); P('right', 'right', 'right'); CALLS = {}; P('x')")
+    check("quick" not in P.eval("JOIN(CALLS)"), "QUICK TAKE moved to Y: X takes nothing")
+    P.execute("CALLS = {}; P('y')")
+    check("LootComp quick BoxItem" in P.eval("JOIN(CALLS)"), "Y quick-takes the loot box")
+    P.execute('GP.clear("menu_right"); PADS.y = nil')
+    P.execute("CALLS = {}; local c = CUR(); P('right'); MOVED = CUR() ~= c")
+    check(P.eval("MOVED") is False, "MENU RIGHT cleared: D-pad right moves nothing")
+
+    # live: the menu focus and the option step follow theirs
+    K = booted()
+    K.execute("""MENUS = { WIDGET('Journal', { kids = { WIDGET('First', { button = true }), WIDGET('Second', { button = true }) } }) }""")
+    K.execute('GP.set("menu_up", "Gamepad_FaceButton_Top"); PC.bShowMouseCursor = true; RUN(0.5)')
+    K.execute("DOWN.Gamepad_DPad_Up = true; RUN(0.25); DOWN.Gamepad_DPad_Up = false; RUN(0.25)")
+    check(K.eval("#FOCUSED") == 0, "MENU UP on Y: D-pad up (on nothing in the menu now) focuses nothing")
+    K.execute("DOWN.Gamepad_FaceButton_Top = true; RUN(0.25); DOWN.Gamepad_FaceButton_Top = false; RUN(0.25)")
+    check(K.eval("JOIN(FOCUSED)") == "First", "Y focuses the menu's first button")
+    K.execute("MENUS[1].kids[2].HasKeyboardFocus = function() return true end")
+    K.execute("DOWN.Gamepad_FaceButton_Top = true; RUN(0.25); DOWN.Gamepad_FaceButton_Top = false; RUN(0.25)")
+    check(K.eval("#FOCUSED") == 1, "a button already focused keeps it (no jump back to the first)")
+    K.execute("MENUS = { WIDGET('Small', { kids = { WIDGET('Only', { button = true }) } }) }; FOCUSED = {}")
+    K.execute("DOWN.Gamepad_FaceButton_Top = true; RUN(0.25); DOWN.Gamepad_FaceButton_Top = false; RUN(0.25)")
+    check(K.eval("JOIN(FOCUSED)") == "Only", "a menu with one button: it gets focus")
+    O = booted()
+    O.execute('GP.set("option_up", "Gamepad_FaceButton_Top"); RUN(0.25); PLAYER.BP_JigHelperComp.CurrentTracActor = BED; RUN(0.5)')
+    rows = {(m.Action.__name, m.Key.KeyName.s) for m in O.eval("IMC.Mappings").values()}
+    check(("IA_Throwable", "Gamepad_DPad_Up") in rows and not any(k == "Gamepad_FaceButton_Top" for _, k in rows),
+          "looking at a bed with PROMPT OPTION UP on Y: Y's rows out, D-pad up throws again")
+    O.execute("OPTS = {}; DOWN.Gamepad_FaceButton_Top = true; RUN(0.25); DOWN.Gamepad_FaceButton_Top = false; RUN(0.25)")
+    O.execute("DOWN.Gamepad_DPad_Up = true; RUN(0.25); DOWN.Gamepad_DPad_Up = false; RUN(0.25)")
+    check(O.eval("JOIN(OPTS)") == "true", "Y steps the options up once, D-pad up no longer does")
+    # SET captures a control like an action
+    O.execute('PLAYER.BP_JigHelperComp.CurrentTracActor = NOTHING; PC.bShowMouseCursor = true; RUN(0.5); GP.capture("inv_back"); RUN(0.25)')
+    O.execute("DOWN.Gamepad_LeftThumbstick = true; RUN(0.25); DOWN.Gamepad_LeftThumbstick = false; RUN(0.25)")
+    check(ctl(O)["inv_back"] == "Gamepad_LeftThumbstick" and acts(O)["sprint"] == "Gamepad_LeftThumbstick",
+          "SET on INV: BACK takes L3; sprint keeps L3")
+    m = {r.id: r.button for r in O.eval("GP.binds_model()").values()}
+    check(m["inv_back"] == "L3" and m["option_up"] == "Y" and m["menu_up"] == "D-PAD UP", "binds_model names them")
+    check(warnings(K) == [] and warnings(O) == [] and warnings(P) == [], "no warnings")
+
+    # saved and loaded; an old file leaves the defaults; a hand-edited one never doubles a kind
+    d = tempfile.mkdtemp(prefix="gp-ctl-")
+    pre = "LINKDIR = [[%s]]" % d
+    path = os.path.join(d, "mirror_pad_binds.txt")
+    S = booted(pre)
+    S.execute('GP.set("inv_back", "Gamepad_FaceButton_Top"); GP.clear("option_down")')
+    saved = open(path, encoding="utf-8").read()
+    check("inv_back Gamepad_FaceButton_Top" in saved and "option_down none" in saved and "menu_up Gamepad_DPad_Up" in saved,
+          "saved: each control's button, none when cleared")
+    S2 = make(pre)
+    check(ctl(S2)["inv_back"] == "Gamepad_FaceButton_Top" and ctl(S2)["option_down"] is None and
+          btns(S2)["b"] == "Gamepad_FaceButton_Top", "a new start loads them, into padinv too")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("jump Gamepad_DPad_Down\nreload Gamepad_FaceButton_Right\n")
+    S3 = make(pre)
+    check(ctl(S3) == CONTROL_DEFAULTS, "a file from before the controls: their defaults")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("inv_grab Gamepad_DPad_Up\nmenu_up Gamepad_DPad_Up\noption_up Gamepad_DPad_Up\njump Gamepad_DPad_Up\ninv_take none\n")
+    S4 = make(pre)
+    c, a = ctl(S4), acts(S4)
+    menu = [v for k, v in c.items() if k in INV_NAMES and v]
+    check(c["menu_up"] == "Gamepad_DPad_Up" and c["inv_grab"] == "Gamepad_FaceButton_Bottom" and len(set(menu)) == len(menu),
+          "one button twice among the menu controls: the first in the list keeps it, the other its default, no doubles")
+    check(c["option_up"] == "Gamepad_DPad_Up" and a["jump"] == "Gamepad_DPad_Up" and c["inv_take"] is None,
+          "the same button across kinds is kept; none stays none")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("menu_up Gamepad_DPad_Down\n")
+    check(ctl(make(pre))["menu_down"] == "Gamepad_FaceButton_Top",
+          "a control whose default is taken: the first free pad key of its kind (Y; A/B/X are the inventory's)")
+    check(warnings(S) == [], "no warnings: %s" % warnings(S))
+
+    # aim's slow look follows AIM's button
+    A = booted()
+    full = A.eval("GP.LOOK.yaw") * 0.1 / A.eval("GP.LOOK.scale")
+    A.execute('GP.set("aim", "Gamepad_LeftShoulder"); RUN(0.25); LOOKTICK(1, 0, 1)')
+    check(abs(A.eval("SUM(YAW)") - full) < 1e-9, "AIM on LB: LT pulled is full speed")
+    A.execute("DOWN.Gamepad_LeftShoulder = true; LOOKTICK(1, 0, 0); DOWN.Gamepad_LeftShoulder = false")
+    check(abs(A.eval("SUM(YAW)") - full * 0.5) < 1e-9, "LB held: half speed")
+    A.execute('GP.set("aim", "Gamepad_RightTrigger"); RUN(0.25); AXES.Gamepad_RightTriggerAxis = 1; LOOKTICK(1, 0, 0)')
+    check(abs(A.eval("SUM(YAW)") - full * 0.5) < 1e-9, "AIM on RT: the right trigger's axis slows it")
+    A.execute("AXES.Gamepad_RightTriggerAxis = 0.2; LOOKTICK(1, 0, 0)")
+    check(abs(A.eval("SUM(YAW)") - full) < 1e-9, "RT barely touched: full speed")
+    A.execute('AXES.Gamepad_RightTriggerAxis = 0; GP.clear("aim"); RUN(0.25); LOOKTICK(1, 0, 1)')
+    check(abs(A.eval("SUM(YAW)") - full) < 1e-9, "AIM on no button: never slowed")
+
+    # switches: INVERT LOOK, SWAP STICKS
+    W = booted(pre)
+    o = {r.id: r for r in W.eval("GP.opts_model()").values()}
+    check(set(o) == {"invert_look", "swap_sticks"} and o["invert_look"].text == "OFF" and o["swap_sticks"].on is False,
+          "two switches, both OFF")
+    pitch = W.eval("GP.LOOK.pitch") * 0.1 / W.eval("GP.LOOK.scale")
+    check(W.eval('GP.toggle_opt("invert_look")') is True, "INVERT LOOK on")
+    W.execute("LOOKTICK(0, 1, 0)")
+    check(abs(W.eval("SUM(PITCH)") + pitch) < 1e-9, "inverted: stick up looks down")
+    W.execute("PLAYER.InvertValue = -1; LOOKTICK(0, 1, 0); PLAYER.InvertValue = 1")
+    check(abs(W.eval("SUM(PITCH)") - pitch) < 1e-9, "inverted on top of the game's own invert: up again")
+    W.execute("LOOKTICK(1, 0, 0)")
+    check(W.eval("SUM(YAW)") > 0, "left / right not inverted")
+    W.execute("MAPKEYS, UNMAPS = {}, {}")
+    check(W.eval('GP.toggle_opt("swap_sticks")') is True, "SWAP STICKS on")
+    mk, um = split(W.eval("JOIN(MAPKEYS)")), split(W.eval("JOIN(UNMAPS)"))
+    check("IA_MoveForward|Gamepad_RightStick_Up" in mk and "IA_MoveForward|Gamepad_LeftStick_Up" in um,
+          "live: walking moves to the right stick")
+    check("Gamepad_RightStick_Up=W" in W.eval("MIRRORSTR()") and "Gamepad_LeftStick_Up" not in W.eval("MIRRORSTR()"),
+          "MIRROR: the right stick walks, the left one doesn't")
+    W.execute("AXES.Gamepad_RightX = 1; YAW = {}; RUN(0.25)")
+    check(W.eval("#YAW") == 0, "swapped: the right stick no longer turns")
+    W.execute("AXES.Gamepad_RightX = 0; AXES.Gamepad_LeftX = 1; YAW = {}; RUN(0.25); AXES.Gamepad_LeftX = 0")
+    check(W.eval("#YAW") == 1 and W.eval("SUM(YAW)") > 0, "swapped: the left stick turns")
+    W.execute("PC.bShowMouseCursor = true; RUN(0.5)")
+    rows = {(m.Action.__name, m.Key.KeyName.s) for m in W.eval("IMC.Mappings").values()}
+    check(("IA_MoveForward", "Gamepad_RightStick_Up") in rows, "menu up: the walk stick's rows stay, as before")
+    W.execute("PC.bShowMouseCursor = false; RUN(0.5)")
+    saved = open(path, encoding="utf-8").read()
+    check("invert_look on" in saved and "swap_sticks on" in saved, "saved as on")
+    W2 = make(pre)
+    check(W2.eval("GP.OPT.invert") is True and W2.eval("GP.OPT.swap") is True and
+          "Gamepad_RightStick_Up=W" in W2.eval("MIRRORSTR()"), "a new start loads both, the right stick walking")
+    W.execute("GP.reset()")
+    saved = open(path, encoding="utf-8").read()
+    check(W.eval("GP.OPT.invert") is False and W.eval("GP.OPT.swap") is False and "Gamepad_LeftStick_Up=W" in W.eval("MIRRORSTR()")
+          and "invert_look" not in saved and "swap_sticks" not in saved, "RESET: both off, the left stick walks, nothing saved")
+    check(W.eval('GP.toggle_opt("bogus")') is None, "an unknown switch: nil")
+    check(dict(W.eval('GP.parse_opts("look_x 230\\ninvert_look on\\nswap_sticks maybe\\nswap_sticks off extra\\n")').items())
+          == {"invert_look": True}, "parse_opts: line by line (not paired with the line before), junk skipped")
+    check(dict(W.eval('GP.parse_opts("invert_look off\\r\\n")').items()) == {"invert_look": False}, "off and CRLF read")
+    check(warnings(W) == [], "no warnings: %s" % warnings(W))
+
+
+def sensitivity():
+    print("sensitivity")
+    import tempfile
+    d = tempfile.mkdtemp(prefix="gp-sens-")
+    pre = "LINKDIR = [[%s]]" % d
+    path = os.path.join(d, "mirror_pad_binds.txt")
+    L = booted(pre)
+    s = {r.id: r for r in L.eval("GP.sens_model()").values()}
+    check(set(s) == {"look_x", "look_y", "aim_look", "dead_zone"}, "four sliders")
+    check(s["look_x"].text == "100%" and s["aim_look"].text == "50%" and s["dead_zone"].text == "12%",
+          "defaults: speeds at 100%, aim 50%, dead zone 12%")
+    check(abs(s["look_x"].value - (220 - 40) / (600 - 40)) < 1e-9, "slider position of the default yaw")
+    check(L.eval('GP.set_sens("look_x", 1.0)') is True and L.eval("GP.LOOK.yaw") == 600, "slider full right: yaw 600")
+    check(L.eval('GP.set_sens("look_x", 1.0)') is False, "the same place again: no change, no save")
+    check(L.eval('GP.set_sens("look_x", 7)') is False and L.eval('GP.set_sens("look_x", "x")') is False and
+          L.eval('GP.set_sens("bogus", 0.5)') is False, "out of range clamps (already max), junk and unknown refused")
+    L.execute('GP.set_sens("dead_zone", 0.0)')
+    check(abs(L.eval("GP.LOOK.dz") - 0.02) < 1e-9, "dead zone slider full left: 0.02")
+    check(L.eval('GP.step_sens("aim_look", 1)') is True and abs(L.eval("GP.LOOK.aim") - 0.55) < 1e-9, "+ on aim: 0.55")
+    L.execute('GP.step_sens("aim_look", -1); GP.step_sens("aim_look", -1)')
+    check(abs(L.eval("GP.LOOK.aim") - 0.45) < 1e-9, "- twice: 0.45")
+    with open(path, encoding="utf-8") as f:
+        saved = f.read()
+    check("look_x 600" in saved and "dead_zone 2" in saved and "aim_look 45" in saved and "look_y" not in saved,
+          "saved: the moved ones as whole numbers, the untouched one left out")
+    # the look uses it
+    L.execute("LOOKTICK(1, 0, 0)")
+    check(abs(L.eval("SUM(YAW)") - 600 * 0.1 / 2.5) < 1e-9, "the right stick turns at the new speed")
+    # a restart loads them; the bindings in the same file still load
+    L.execute('GP.set("reload", "Gamepad_FaceButton_Right")')
+    L2 = make(pre)
+    check(L2.eval("GP.LOOK.yaw") == 600 and abs(L2.eval("GP.LOOK.aim") - 0.45) < 1e-9 and abs(L2.eval("GP.LOOK.dz") - 0.02) < 1e-9,
+          "a new start loads the speeds")
+    check({a.id: a.pad for a in L2.eval("GP.ACTIONS").values()}["reload"] == "Gamepad_FaceButton_Right", "and the bindings")
+    # a hand-edited value out of range is clamped onto the slider
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("look_x 99999\ndead_zone 0\njump Gamepad_FaceButton_Bottom\n")
+    L3 = make(pre)
+    check(L3.eval("GP.LOOK.yaw") == 600 and abs(L3.eval("GP.LOOK.dz") - 0.02) < 1e-9, "out-of-range saved values are clamped")
+    # RESET: the default speeds back, nothing about speed left in the file
+    L.execute("GP.reset()")
+    check(L.eval("GP.LOOK.yaw") == 220 and L.eval("GP.LOOK.aim") == 0.5 and L.eval("GP.LOOK.dz") == 0.12, "RESET: default speeds")
+    with open(path, encoding="utf-8") as f:
+        saved = f.read()
+    check(not any(k in saved for k in ("look_x", "look_y", "aim_look", "dead_zone")), "RESET: no speed lines saved")
+    # a config's look speed is the default the slider shows as 100% and RESET returns to
+    C = make(pre, cfg="{ gamepad = { look = { yaw = 100 } } }")
+    check({r.id: r.text for r in C.eval("GP.sens_model()").values()}["look_x"] == "100%", "a config's yaw shows as 100%")
+    C.execute('GP.set_sens("look_x", 1.0); GP.reset()')
+    check(C.eval("GP.LOOK.yaw") == 100, "RESET goes back to the config's yaw")
+    check(warnings(L) == [] and warnings(C) == [], "no warnings")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1369,7 +1799,13 @@ def padinv():
     L.execute("PC.bShowMouseCursor = true; RUN(0.5); MENUS = { WIDGET('Inv', { kids = { WIDGET('Btn', { button = true }) } }) }")
     L.execute("DOWN.Gamepad_DPad_Right = true; RUN(0.25); DOWN.Gamepad_DPad_Right = false; RUN(0.25)")
     check(L.eval("#FOCUSED") == 0 and L.eval("CUR()") == "0,0", "gamepad tick: an inventory up takes the D-pad (no menu focus)")
+    # in the inventory its buttons only drive the inventory: MAP on A would grab and open the map in one press
+    L.execute('GP.set("map", "Gamepad_FaceButton_Bottom"); RUN(0.25)')
+    rows = {(m.Action.__name, m.Key.KeyName.s) for m in L.eval("IMC.Mappings").values()}
+    check(("IA_Map", "Gamepad_FaceButton_Bottom") not in rows, "inventory up: the map's A is out (padinv's grab)")
     L.execute("PC.bShowMouseCursor = false; RUN(0.25)")
+    rows = {(m.Action.__name, m.Key.KeyName.s) for m in L.eval("IMC.Mappings").values()}
+    check(("IA_Map", "Gamepad_FaceButton_Bottom") in rows, "inventory closed: the map's A is back")
     check(L.eval("PI.status()").startswith("on=false") and L.eval("TINT(CELL(BAG,0,0))") == "0.10,0.10,0.10",
           "cursor hidden (inventory closed): padinv lets go and restores the tint")
     check(warnings(L) == [], "no warnings: %s" % warnings(L))
@@ -1400,28 +1836,48 @@ def settings():
     row = L.eval('(function() for _, o in ipairs(MS.LIST) do if o.key == "gamepad" then return o end end end)()')
     check(row is not None, "LIST has a gamepad row")
     if row is not None:
-        check(row.default == "on", "gamepad defaults to on")
+        check(row.default == "xbox", "gamepad defaults to XBOX (on, as before)")
         check(row.label == "CONTROLLER", "labelled CONTROLLER")
         vals = [v[1] for v in row["values"].values()]
-        check(vals == ["off", "on"], "plain on/off values")
+        check(vals == ["off", "xbox", "playstation"], "values OFF / XBOX / PLAYSTATION")
         check(row.extra == "BINDINGS", "the row has a second button: BINDINGS")
     n = L.eval("#MS.LIST")
     L.execute("MS.init()")
-    check(L.eval('MS.on("gamepad")') is True and L.eval('MS.value("gamepad")') == "on", "on by default")
+
+    def hint():
+        return L.eval('(function() for _, r in ipairs(MS.rows()) do if r.key == "gamepad" then return r.text .. "|" .. r.hint end end end)()')
+    check(L.eval('MS.on("gamepad")') is True and L.eval('MS.value("gamepad")') == "xbox" and L.eval("MS.pad_style()") == "xbox",
+          "on by default, Xbox names")
+    check(hint().startswith("XBOX|") and "Steam Input off" in hint(), "XBOX: the Steam Input off hint")
     L.execute('MS.toggle("gamepad")')
-    check(L.eval('MS.on("gamepad")') is False, "toggle turns it off")
+    check(L.eval('MS.on("gamepad")') is True and L.eval("MS.pad_style()") == "playstation", "toggle: PLAYSTATION, still on")
+    check(hint().startswith("PLAYSTATION|") and "Steam Input on" in hint() and "Gamepad" in hint(),
+          "PLAYSTATION: the Steam Input on + Gamepad template hint")
     L.execute('MS.toggle("gamepad")')
-    check(L.eval('MS.on("gamepad")') is True, "and back on")
-    keys = [k for k in L.eval("ROWKEYS()").split(";") if k != "syncfx"]
-    check("gamepad" in keys and len(keys) == n, "the settings page lists the gamepad row (%d rows without SyncFX)" % len(keys))
+    check(L.eval('MS.on("gamepad")') is False and L.eval("MS.pad_style()") == "xbox", "toggle: off (Xbox names kept)")
+    L.execute('MS.toggle("gamepad")')
+    check(L.eval('MS.on("gamepad")') is True and L.eval('MS.value("gamepad")') == "xbox", "and round to XBOX")
+    # a settings file from before: "gamepad on" is XBOX, "gamepad off" stays off
+    import tempfile
+    for saved, want in (("gamepad on\n", "xbox"), ("gamepad off\n", "off"), ("gamepad playstation\n", "playstation"),
+                        ("gamepad maybe\n", "xbox")):
+        d = tempfile.mkdtemp(prefix="ms-")
+        with open(os.path.join(d, "mirror_my_settings.txt"), "w", encoding="utf-8") as f:
+            f.write(saved)
+        M = lua54.LuaRuntime()
+        M.execute(MYSET.replace('return {} end\nMS', 'return { dir = function() return [[%s]] end } end\nMS' % d), SCRIPTS)
+        check(M.eval('MS.value("gamepad")') == want, "a saved %r loads as %s" % (saved.strip(), want))
+    keys = [k for k in L.eval("ROWKEYS()").split(";") if k not in ("syncfx", "gore")]
+    check("gamepad" in keys and len(keys) == n, "the settings page lists the gamepad row (%d rows without SyncFX and GORE)" % len(keys))
     with open(os.path.join(SCRIPTS, "mirror", "journal_tab.lua"), encoding="utf-8") as f:
         m = re.search(r"^local SETTING_ROWS = (\d+)", f.read(), re.M)
-    check(m is not None and int(m.group(1)) == n + 1,
-          "journal_tab SETTING_ROWS (%s) holds SyncFX plus all %d rows" % (m and m.group(1), n))
+    check(m is not None and int(m.group(1)) == n + 2,
+          "journal_tab SETTING_ROWS (%s) holds SyncFX, GORE and all %d rows" % (m and m.group(1), n))
     check([w for w in L.eval("LOG").values() if w.startswith("WARN") or w.startswith("ERROR")] == [], "no warnings")
 
 
-for t in (plan, stick, lifecycle, missing, look, init_cfg, bindings, padinv, settings):
+for t in (plan, stick, lifecycle, missing, look, init_cfg, bindings, full_bindings, playstation, controls, sensitivity, padinv,
+          settings):
     t()
 print()
 print("%d checks, %d failure(s)" % (count, len(fails)))

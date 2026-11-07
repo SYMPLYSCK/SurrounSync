@@ -3,7 +3,7 @@
 
     python tools/test-bridge.py      (build the bridge first: tools/build-bridge.ps1)
 """
-import os, random, re, shutil, socket, string, subprocess, sys, tempfile, time
+import os, random, re, shutil, socket, string, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.environ.get("SURROUNSYNC_BRIDGE") or os.path.join(ROOT, "mod", "SurrounSync", "bridge", "SurrounSyncBridge.exe")
@@ -56,6 +56,21 @@ def wait_for(fn, secs=10.0):
     return fn()
 
 
+def watch_gone(path, secs=10.0):
+    # a file that is cleared and then resent can be gone for only ~20 ms (measured 16-46 ms after a switch),
+    # less than wait_for's 50 ms poll: watch it from a thread started before the action, ~1 ms apart
+    gone = threading.Event()
+
+    def run():
+        t = time.time()
+        while time.time() - t < secs and not gone.is_set():
+            if not os.path.exists(path):
+                gone.set()
+            time.sleep(0.0005)
+    threading.Thread(target=run, daemon=True).start()
+    return gone
+
+
 def start(role, d, extra=(), env=None):
     args = [EXE, "--role", role, "--dir", d, "--test-net", str(PORT), "--no-game-check"] + list(extra)
     return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
@@ -75,6 +90,9 @@ def bridge_logs(d):
 
 
 def hammer(path, stop):
+    # open half the time, far more than the game's one short read a frame. Open all the time but for a few microseconds,
+    # as this was, starved the writer (File.Replace can't win): 2 of 5 suite runs missed the 10 s limit; repeated 2026-11-04,
+    # 3 of 80 rounds, each landing 11 ms after the reader stopped, none lost; a read every 16 ms: worst 50 ms in 40 rounds
     while not stop[0]:
         try:
             with open(path, "rb") as f:
@@ -82,6 +100,7 @@ def hammer(path, stop):
                 time.sleep(0.002)
         except OSError:
             pass
+        time.sleep(0.002)
 
 
 def main():
@@ -213,8 +232,9 @@ def main():
         print("4. the guest joins again in the same run: the host's earlier state arrives again")
         put_blob(A, "look", "host", "host look")
         check(wait_for(lambda: get_blob(B, "look", "host"), 15) == "host look", "(setup) host look arrived")
+        gone = watch_gone(os.path.join(B, "mirror_look_host.txt"))
         lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
-        check(wait_for(lambda: get_blob(B, "look", "host") is None, 10), "the switch cleared the host's files on the guest")
+        check(gone.wait(10), "the switch cleared the host's files on the guest")
         check(wait_for(lambda: get_blob(B, "look", "host"), 15) == "host look", "...and the host resent its look")
         check(wait_for(lambda: get_blob(B, "hello", "host"), 15) == "host hello", "...and its hello")
         # a world file at a join: bigger than one piece, sent deflated in one message
@@ -284,10 +304,14 @@ def main():
         check(wait_for(lambda: get_blob(A, "pw", "guest"), 15) == "in", "...accepted: data flows")
         lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
         time.sleep(0.6)
-        for _ in range(3):
+        # each try waits for the host's answer: a fixed 4 s sleep let a slow try overlap the next join
+        def wrongs():
+            return log_of(A, "mirror_bridge.log").count("password wrong from 1002")
+        before = wrongs()
+        for i in range(1, 4):
             lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0 nope")
-            time.sleep(4)
-        check("joinerror blocked" in log_of(B, "mirror_lobby.txt"), "three wrong passwords (three tries): blocked")
+            check(wait_for(lambda i=i: wrongs() >= before + i, 20), "(setup) wrong password try %d answered" % i)
+        check(wait_for(lambda: "joinerror blocked" in log_of(B, "mirror_lobby.txt"), 10), "three wrong passwords (three tries): blocked")
         lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0 open sesame")
         time.sleep(5)
         check("request 1002" not in log_of(A, "mirror_lobby.txt"), "...even the right one is refused until hosting again")

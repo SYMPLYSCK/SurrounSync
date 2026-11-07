@@ -117,11 +117,23 @@ local function set_mode(p, mode)
     end)
 end
 
+-- Where the other player is: the newest pose they sent (phase1.lua sets this for its link), else their ghost here.
+-- The ghost can lag or be a dead actor for a while - report 2026-10-30, Realm: after a bed respawn both goto's went
+-- to the world's origin (DBG-20261030-007) - their own pose never does.
+local locate = function() return nil end
+function teleport.set_locator(fn) locate = fn end
+local function peer_at()
+    local at
+    pcall(function() at = locate() end)
+    if at and math.abs(at.X) < 1 and math.abs(at.Y) < 1 and math.abs(at.Z) < 1 then at = nil end
+    return at or ghost.location()
+end
+
 -- Move the local player next to the other player. Returns nil on success or a reason.
 local function go_to_peer()
     local why = blocked()
     if why then return why end
-    local p, at = game.player(), ghost.location()
+    local p, at = game.player(), peer_at()
     local from = util.vec(p:K2_GetActorLocation())
     if not at then return "the other player's position isn't known yet" end
     local dx, dy = at.X - from.X, at.Y - from.Y
@@ -240,6 +252,15 @@ local COMMANDS = {
 }
 local LIST = "Commands: /goto <player>, /bring <player>, /accept, /deny, /messages"
 local SHORT = "Commands: /goto, /bring, /accept, /deny, /messages"
+
+-- chatcmd.lua: is this word one of the commands here?
+function teleport.known(word)
+    for _, c in ipairs(COMMANDS) do
+        if c.name == word then return true end
+        for _, a in ipairs(c.also) do if a == word then return true end end
+    end
+    return false
+end
 
 -- the tip for what's typed so far: nil when it isn't a command
 function teleport.tip(text)

@@ -8,7 +8,8 @@
 --
 -- The military trader too: BP_MilitaryTraderSpawner puts it at a random one of its 5 spawn points in each game
 -- (kit 2026-10-27: host at -1937,239448, guest 3.7 km away). The host sends where its trader stands; a joined
--- guest moves its own trader there.
+-- guest moves its own trader there. The ice cream van the same way (BP_ShakesConesSpawner: one of its 5 spawn
+-- points at random, BeginPlay; the van never drives).
 
 local log = require("mirror.log")
 local util = require("mirror.util")
@@ -32,11 +33,14 @@ local last_sent, host_want = nil, nil
 local pending = nil          -- the mismatch seen last check (acted on only when it is seen twice)
 local stats = { removed = 0, spawned = 0 }
 
-local MIL = "BP_MilitaryTrader_C"
--- no BeginPlay of its own: new ones are caught by the parent's (looking for its own kept backing off: moved 75 s late)
+-- traders placed at a random spawn point in each game: its class, its blob, its name in the log
+local TRADERS = {
+    { cls = "BP_MilitaryTrader_C", blob = "miltrader", name = "military trader" },
+    { cls = "BP_ShakesConesTrader_C", blob = "icetrader", name = "ice cream trader" },
+}
+-- no BeginPlay of their own: new ones are caught by the parent's (looking for its own kept backing off: moved 75 s late)
 local MIL_PARENT = "/Game/Inventory/Traders/BP_TraderMaster.BP_TraderMaster_C"
 local MIL_NEAR = 100.0       -- cm: closer than this to the host's spot counts as the same place
-local mil_sent, mil_want, mil_pending = nil, nil, nil
 stats.moved = 0
 
 local destroyed = {}         -- actors already destroyed here, still listed until the engine lets go (util.mark)
@@ -126,8 +130,8 @@ local function fix(have, want)
     end
 end
 
-local function mil_trader()
-    for _, a in ipairs(util.instances(MIL, { MIL_PARENT })) do
+local function mil_trader(t)
+    for _, a in ipairs(util.instances(t.cls, { MIL_PARENT })) do
         if real(a) then return a end
     end
     return nil
@@ -140,40 +144,40 @@ local function mil_spot(a)
     return { X = l.X, Y = l.Y, Z = l.Z, yaw = r and r.Yaw or 0 }
 end
 
--- host: where its military trader stands ("-" = none); sent again only when it is somewhere else
-local function mil_host()
-    local a = mil_trader()
+-- host: where its trader stands ("-" = none); sent again only when it is somewhere else
+local function mil_host(t)
+    local a = mil_trader(t)
     local s = a and mil_spot(a)
-    if s and mil_sent and util.dist(s, mil_sent) < MIL_NEAR then return end
-    if not s and mil_sent == false then return end
-    mil_sent = s or false
+    if s and t.sent and util.dist(s, t.sent) < MIL_NEAR then return end
+    if not s and t.sent == false then return end
+    t.sent = s or false
     -- (exact to the cm: its shared stock is found by position on a 10 cm grid - a rounded spot could land in the next cell)
-    link.put_blob("miltrader", s and string.format("%.2f %.2f %.2f %.1f", s.X, s.Y, s.Z, s.yaw) or "-")
-    log.info("camps: the host's military trader: " .. (s and string.format("%.0f, %.0f, %.0f", s.X, s.Y, s.Z) or "none"))
+    link.put_blob(t.blob, s and string.format("%.2f %.2f %.2f %.1f", s.X, s.Y, s.Z, s.yaw) or "-")
+    log.info("camps: the host's " .. t.name .. ": " .. (s and string.format("%.0f, %.0f, %.0f", s.X, s.Y, s.Z) or "none"))
 end
 
--- guest: its own military trader goes where the host's stands (seen twice, like a camp mismatch)
-local function mil_guest()
-    local body = link.get_blob("miltrader")
+-- guest: its own trader goes where the host's stands (seen twice, like a camp mismatch)
+local function mil_guest(t)
+    local body = link.get_blob(t.blob)
     if body then
         local x, y, z, yaw = body:match("^(%S+) (%S+) (%S+) (%S+)$")
-        mil_want = x and { X = tonumber(x), Y = tonumber(y), Z = tonumber(z), yaw = tonumber(yaw) or 0 } or false
+        t.want = x and { X = tonumber(x), Y = tonumber(y), Z = tonumber(z), yaw = tonumber(yaw) or 0 } or false
     end
-    if not mil_want then mil_pending = nil; return end
-    local a = mil_trader()
+    if not t.want then t.pending = nil; return end
+    local a = mil_trader(t)
     local s = a and mil_spot(a)
-    if not s or util.dist(s, mil_want) < MIL_NEAR then mil_pending = nil; return end
-    if not mil_pending then mil_pending = true; return end
-    mil_pending = nil
-    local w = mil_want
+    if not s or util.dist(s, t.want) < MIL_NEAR then t.pending = nil; return end
+    if not t.pending then t.pending = true; return end
+    t.pending = nil
+    local w = t.want
     local ok = pcall(function()
         a:K2_SetActorLocationAndRotation({ X = w.X, Y = w.Y, Z = w.Z }, util.rot(0, w.yaw, 0), false, {}, true)
     end)
     local now = ok and mil_spot(a)
     ok = now ~= nil and util.dist(now, w) < MIL_NEAR
     if ok then stats.moved = stats.moved + 1 end
-    log.info(string.format("camps: military trader moved to the host's spot (%.0f, %.0f, %.0f, %.0f m away): %s",
-        w.X, w.Y, w.Z, util.dist(s, w) / 100, ok and "ok" or "FAILED"))
+    log.info(string.format("camps: %s moved to the host's spot (%.0f, %.0f, %.0f, %.0f m away): %s",
+        t.name, w.X, w.Y, w.Z, util.dist(s, w) / 100, ok and "ok" or "FAILED"))
 end
 
 local function host_tick()
@@ -183,13 +187,15 @@ local function host_tick()
         link.put_blob("camps", w == "" and "-" or w)
         log.info("camps: the host's settlement camps: " .. (w == "" and "none" or w))
     end
-    util.safe(mil_host, "camps.mil_host")
+    for _, t in ipairs(TRADERS) do util.safe(mil_host, "camps.mil_host", t) end
 end
 
 local function guest_tick()
     local body = peer_live() and link.get_blob("camps") or nil
     if body then host_want = parse(body) end
-    if session and session.in_world() and joined_for >= SETTLE and peer_live() then util.safe(mil_guest, "camps.mil_guest") end
+    if session and session.in_world() and joined_for >= SETTLE and peer_live() then
+        for _, t in ipairs(TRADERS) do util.safe(mil_guest, "camps.mil_guest", t) end
+    end
     if not (host_want and session and session.in_world()) then joined_for, pending = 0.0, nil; return end
     if joined_for < SETTLE then return end
     local have = present()
@@ -212,7 +218,7 @@ end
 
 function camps.status()
     if role == "host" then return "camps: sending " .. ((last_sent and last_sent ~= "") and last_sent or "none") end
-    return string.format("camps: removed %d, spawned %d, military trader moved %d", stats.removed, stats.spawned, stats.moved)
+    return string.format("camps: removed %d, spawned %d, traders moved %d", stats.removed, stats.spawned, stats.moved)
 end
 
 function camps.init(c, r, s, connected)
@@ -224,6 +230,9 @@ function camps.init(c, r, s, connected)
 end
 
 -- a new world: its objects are new (an old address may come back as another actor)
-function camps.forget() destroyed, spawned_here, pending, mil_pending = {}, {}, nil, nil end
+function camps.forget()
+    destroyed, spawned_here, pending = {}, {}, nil
+    for _, t in ipairs(TRADERS) do t.pending = nil end
+end
 
 return camps

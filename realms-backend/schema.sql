@@ -18,14 +18,24 @@ CREATE TABLE IF NOT EXISTS realms (
     lease_name    TEXT,
     lease_token   TEXT,
     lease_expires INTEGER,
-    rules         TEXT                        -- the owner's game rules, "<key> <value> ..." (NULL = not set yet)
+    rules         TEXT,                       -- the owner's game rules, "<key> <value> ..." (NULL = not set yet)
+    public        INTEGER NOT NULL DEFAULT 0, -- 1 = on the public server list
+    pass_salt     TEXT,                       -- a locked public Realm: hex salt + PBKDF2-SHA256 of its password
+    pass_hash     TEXT,
+    players       INTEGER,                    -- the host's heartbeat: players in its game, its cap, its Steam ping location
+    max_players   INTEGER,
+    ping_loc      TEXT,
+    listed_ip     TEXT,                       -- the address (IPv6: its /64) that put it on the list, for the per-address cap
+    listed_at     INTEGER,                    -- when it went on the list; with hosted_at, a Realm unhosted for 14 days drops off
+    hosted_at     INTEGER,                    -- the last claim or heartbeat
+    list_banned   INTEGER NOT NULL DEFAULT 0  -- 1 = an admin took it off the list for good
 );
 
 CREATE TABLE IF NOT EXISTS members (
     realm_id   TEXT NOT NULL,
     member_id  TEXT NOT NULL,
     key_hash   TEXT NOT NULL,                 -- sha256 of the member key; the key itself is never stored
-    steam_id   TEXT NOT NULL,                 -- as claimed by the client (display only, not proof)
+    steam_id   TEXT NOT NULL,                 -- as claimed by the client (not proof: a list join never blocks the real one)
     name       TEXT NOT NULL,
     role       TEXT NOT NULL CHECK (role IN ('owner', 'member')),
     created_at INTEGER NOT NULL,
@@ -33,6 +43,7 @@ CREATE TABLE IF NOT EXISTS members (
     char_gen   INTEGER NOT NULL DEFAULT 0,
     char_hash  TEXT,
     char_size  INTEGER,
+    via        TEXT,                          -- NULL = owner or invited, 'public' = joined from the server list
     PRIMARY KEY (realm_id, member_id)
 );
 

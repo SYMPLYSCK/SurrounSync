@@ -85,6 +85,15 @@ static class Steam
     [DllImport(DLL)] [return: MarshalAs(UnmanagedType.I1)]
     public static extern bool SteamAPI_ISteamFriends_HasFriend(IntPtr self, ulong id, int flags);
 
+    // ping estimates for the Realms server list (SteamNetworkPingLocation_t is 512 opaque bytes)
+    [DllImport(DLL)] public static extern IntPtr SteamAPI_SteamNetworkingUtils_SteamAPI_v004();
+    [DllImport(DLL)] public static extern void SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess(IntPtr self);
+    [DllImport(DLL)] public static extern float SteamAPI_ISteamNetworkingUtils_GetLocalPingLocation(IntPtr self, byte[] loc);
+    [DllImport(DLL)] public static extern void SteamAPI_ISteamNetworkingUtils_ConvertPingLocationToString(IntPtr self, byte[] loc, byte[] buf, int size);
+    [DllImport(DLL)] [return: MarshalAs(UnmanagedType.I1)]
+    public static extern bool SteamAPI_ISteamNetworkingUtils_ParsePingLocationString(IntPtr self, byte[] text, byte[] loc);
+    [DllImport(DLL)] public static extern int SteamAPI_ISteamNetworkingUtils_EstimatePingTimeFromLocalHost(IntPtr self, byte[] loc);
+
     [StructLayout(LayoutKind.Sequential, Pack = 8)]
     public struct CallbackMsg { public int User; public int Callback; public IntPtr Param; public int ParamSize; }
 
@@ -120,6 +129,8 @@ interface INet
     // the session's state in one line, for the log when its reliable lane dies (DBG-20261030-005: cause still unknown)
     string Session(ulong id);
     void SetPresence(string role);
+    // hosting a Realm (a held lease): friends must not see it as a co-op game to join
+    void SetRealm(bool realm);
     List<KeyValuePair<ulong, string>> FriendsWithPresence(string role);
     int FriendCount();
     void SetPublic(bool on, bool listed, Dictionary<string, string> data);
@@ -127,6 +138,10 @@ interface INet
     IntPtr SteamUser { get; }
     void RequestServers();
     List<Dictionary<string, string>> Servers { get; }
+    // Realms server list: this PC's Steam ping location (null = not measured yet) and the estimated ms to another
+    // one (-1 = unknown). Called from the Realms worker thread.
+    string PingLocation();
+    int PingTo(string location);
     void Shutdown();
 }
 
@@ -326,7 +341,68 @@ class SteamNet : INet
         }
         finally { Marshal.FreeHGlobal(res); }
     }
-    public void SetPresence(string role) { Steam.SteamAPI_ISteamFriends_SetRichPresence(friends, Steam.Z("surrounsync"), Steam.Z(role)); }
+    // Friends' CO-OP tabs list everyone whose "surrounsync" presence is "host" (FriendsWithPresence, older bridges
+    // too). A Realm runs on a co-op host underneath, so its host showed up there as a co-op game (user 2026-11-01:
+    // "only coop worlds show up in coop, and realms only show up in realms"): while it hosts a Realm it says "realm".
+    string presRole = "idle"; bool presRealm;
+    public void SetPresence(string role) { presRole = role; ApplyPresence(); }
+    public void SetRealm(bool realm) { if (realm == presRealm) return; presRealm = realm; ApplyPresence(); }
+
+    // The relay network is started on the first ask (it measures the data centre pings in the background, so the
+    // first answers are null/-1). A steam_api64.dll without these exports gives null/-1 for good.
+    IntPtr utils;
+    bool pingDead;
+    readonly object pingLock = new object();
+    IntPtr Utils()
+    {
+        lock (pingLock)
+        {
+            if (pingDead) return IntPtr.Zero;
+            if (utils == IntPtr.Zero)
+                try
+                {
+                    utils = Steam.SteamAPI_SteamNetworkingUtils_SteamAPI_v004();
+                    if (utils != IntPtr.Zero) Steam.SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess(utils);
+                    else pingDead = true;
+                }
+                catch (Exception) { pingDead = true; utils = IntPtr.Zero; }
+            return utils;
+        }
+    }
+    public string PingLocation()
+    {
+        var u = Utils();
+        if (u == IntPtr.Zero) return null;
+        try
+        {
+            var loc = new byte[512];
+            if (Steam.SteamAPI_ISteamNetworkingUtils_GetLocalPingLocation(u, loc) < 0) return null;
+            var buf = new byte[1024];
+            Steam.SteamAPI_ISteamNetworkingUtils_ConvertPingLocationToString(u, loc, buf, buf.Length);
+            int n = Array.IndexOf(buf, (byte)0);
+            string s = Encoding.ASCII.GetString(buf, 0, n < 0 ? buf.Length : n);
+            return s == "" ? null : s;
+        }
+        catch (Exception) { return null; }
+    }
+    public int PingTo(string location)
+    {
+        var u = Utils();
+        if (u == IntPtr.Zero || string.IsNullOrEmpty(location)) return -1;
+        try
+        {
+            var loc = new byte[512];
+            if (!Steam.SteamAPI_ISteamNetworkingUtils_ParsePingLocationString(u, Steam.Z(location), loc)) return -1;
+            int ms = Steam.SteamAPI_ISteamNetworkingUtils_EstimatePingTimeFromLocalHost(u, loc);
+            return ms < 0 ? -1 : ms;
+        }
+        catch (Exception) { return -1; }
+    }
+    void ApplyPresence()
+    {
+        string v = presRealm && presRole == "host" ? "realm" : presRole;
+        Steam.SteamAPI_ISteamFriends_SetRichPresence(friends, Steam.Z("surrounsync"), Steam.Z(v));
+    }
     public int FriendCount() { return Steam.SteamAPI_ISteamFriends_GetFriendCount(friends, FRIEND_IMMEDIATE); }
     public bool IsFriend(ulong id) { return Steam.SteamAPI_ISteamFriends_HasFriend(friends, id, FRIEND_IMMEDIATE); }
 
@@ -467,6 +543,10 @@ class TestNet : INet
         role = r;
         TryListen();
     }
+    public void SetRealm(bool realm) { }   // (no friends on the test network)
+    // (the test network's stand-in: every PC is "test=<id>", 40 ms apart)
+    public string PingLocation() { return "test=" + Me; }
+    public int PingTo(string location) { return location != null && location.StartsWith("test=") ? 40 : -1; }
 
     void TryListen()
     {
@@ -724,6 +804,7 @@ static class Win
     public struct WAVEFORMATEX { public ushort tag, channels; public uint rate, bytesPerSec; public ushort blockAlign, bits, cbSize; }
     [StructLayout(LayoutKind.Sequential)]
     public struct WAVEHDR { public IntPtr data; public uint length, recorded; public IntPtr user; public uint flags, loops; public IntPtr next, reserved; }
+    [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint ms);
     [DllImport("winmm.dll")] public static extern int waveOutOpen(out IntPtr h, int device, ref WAVEFORMATEX fmt, IntPtr cb, IntPtr inst, int flags);
     [DllImport("winmm.dll")] public static extern int waveOutPrepareHeader(IntPtr h, IntPtr hdr, int size);
     [DllImport("winmm.dll")] public static extern int waveOutUnprepareHeader(IntPtr h, IntPtr hdr, int size);
@@ -735,6 +816,9 @@ static class Win
 class VoiceOut
 {
     public double Distance = 0;
+    public bool Walkie;              // both of us carry a handheld radio (mirror_voice.txt "walkie", voice.lua)
+    public double hpIn, hpOut, lpOut; // the radio sound's filters, carried from one packet to the next
+    public uint hiss = 2463534242;
     public long HeardAt = -100000;   // when their last voice packet arrived (TickCount)
     public bool Talking { get { return Environment.TickCount - HeardAt < 400; } }
     IntPtr wave = IntPtr.Zero;
@@ -834,19 +918,51 @@ class Voice
         return pkt;
     }
 
-    double Gain(double d) { double g = d <= 5 ? 1.0 : d >= 50 ? 0.0 : 1.0 - (d - 5) / 45.0; return g * Volume; }
+    // Near: full to 5 m, nothing from 50 m. A walkie (a handheld radio at both ends) carries 3x as far, to 150 m, at a
+    // steady radio level; where that is louder than the near voice, the voice comes through the radio.
+    public const double WalkieRange = 150, WalkieLevel = 0.7;
+    public static double Near(double d) { return d <= 5 ? 1.0 : d >= 50 ? 0.0 : 1.0 - (d - 5) / 45.0; }
+    public static double Level(double d, bool walkie, out bool radio)
+    {
+        double near = Near(d), r = walkie && d <= WalkieRange ? WalkieLevel : 0.0;
+        radio = r > near;
+        return radio ? r : near;
+    }
+
+    // The radio sound: only 300-3000 Hz (a one-pole high-pass then low-pass, state kept per player), a faint hiss,
+    // and the peaks squashed like a small speaker's.
+    public static void RadioFx(VoiceOut who, byte[] buf, int n, uint rate, double g)
+    {
+        double dt = 1.0 / rate, rch = 1.0 / (2 * Math.PI * 300), rcl = 1.0 / (2 * Math.PI * 3000);
+        double a = rch / (rch + dt), b = dt / (rcl + dt);
+        for (int i = 0; i + 1 < n; i += 2)
+        {
+            double x = (short)(buf[i] | (buf[i + 1] << 8));
+            who.hpOut = a * (who.hpOut + x - who.hpIn); who.hpIn = x;
+            who.lpOut += b * (who.hpOut - who.lpOut);
+            who.hiss ^= who.hiss << 13; who.hiss ^= who.hiss >> 17; who.hiss ^= who.hiss << 5;
+            double v = who.lpOut * 1.6 * g + ((who.hiss / (double)uint.MaxValue) - 0.5) * 500 * g;
+            double m = Math.Abs(v);
+            if (m > 20000) v = Math.Sign(v) * (20000 + (m - 20000) * 0.25);
+            int o = (int)v;
+            if (o > 32767) o = 32767; else if (o < -32768) o = -32768;
+            buf[i] = (byte)(o & 0xff); buf[i + 1] = (byte)((o >> 8) & 0xff);
+        }
+    }
 
     public void Play(VoiceOut who, byte[] data, int offset)
     {
         who.HeardAt = Environment.TickCount;
         if (!Available || !On) return;
-        double g = Gain(who.Distance);
+        bool radio;
+        double g = Level(who.Distance, who.Walkie, out radio) * Volume;
         if (g <= 0.001) return;
         var src = new byte[data.Length - offset];
         Buffer.BlockCopy(data, offset, src, 0, src.Length);
         uint got;
         if (Steam.SteamAPI_ISteamUser_DecompressVoice(user, src, (uint)src.Length, pcm, (uint)pcm.Length, out got, rate) != 0 || got == 0) return;
-        for (int i = 0; i + 1 < got; i += 2)
+        if (radio) RadioFx(who, pcm, (int)got, rate, g);
+        else for (int i = 0; i + 1 < got; i += 2)
         {
             int v = (short)(pcm[i] | (pcm[i + 1] << 8));
             v = (int)(v * g);
@@ -1028,8 +1144,12 @@ class Bridge
         }
     }
 
+    static string timerNote = "default";
     static int Main(string[] args)
     {
+        // Windows wakes a Thread.Sleep on its timer tick, 15.6 ms by default: the loop's Sleep(4) slept ~16 ms, on
+        // both bridges, for every message (DBG-20261027-003). 1 ms for this process while it runs.
+        try { timerNote = Win.timeBeginPeriod(1) == 0 ? "1 ms" : "refused"; } catch (Exception e) { timerNote = "failed: " + e.Message; }
         var b = new Bridge();
         try { return b.Run(args); }
         catch (Exception e) { b.Log("FATAL " + e); return 1; }
@@ -1183,7 +1303,8 @@ class Bridge
             voice.Init(net.SteamUser, Log);
             net.SetPresence(role); me = net.Me;
             Log("bridge " + role + " up" + (testPort > 0 ? " (TEST NET on 127.0.0.1:" + testPort + ")" : "") + " - my id " + me
-                + ", folder " + dir + (configuredPeer != 0 ? ", peer from config " + configuredPeer : ", looking for a Steam friend"));
+                + ", folder " + dir + (configuredPeer != 0 ? ", peer from config " + configuredPeer : ", looking for a Steam friend")
+                + ", timer " + timerNote);
             if (localAliasNote != null) Log(localAliasNote);
             if (selftest)
             {
@@ -1196,6 +1317,8 @@ class Bridge
             {
                 StartUpdateCheck();
                 realms = new Realms(dir, Realms.ResolveUrl(realmsUrl), ModDir(), SurrounSyncShared.Game.EngineOf(Win64Dir()), Log);
+                realms.PingLocation = net.PingLocation;
+                realms.PingTo = net.PingTo;
             }
             StartWriter();
             StartWatchdog();
@@ -1358,7 +1481,7 @@ class Bridge
         long t = Now();
         if (t - last <= 2000) return missing >= 5;
         last = t;
-        if (Process.GetProcessesByName("SurrounDead-Win64-Shipping").Length == 0) missing++; else missing = 0;
+        if (!SurrounSyncShared.Game.RunningFrom("SurrounDead-Win64-Shipping", Win64Dir())) missing++; else missing = 0;
         return missing >= 5;
     }
 
@@ -1631,12 +1754,42 @@ class Bridge
                 catch (Exception e) { Console.Error.WriteLine("clip: " + e.Message); }
             });
         }
+        else if (c == "openradio")
+        {
+            // SONGS FOLDER on a radio screen: Explorer opens <game folder>\Radio from here, off the game thread (the mod's
+            // os.execute start froze the game 5 s, 2026-11-03). A fixed folder: the command carries no path
+            string dir = Path.GetFullPath(Path.Combine(Win64Dir(), "..", "..", "..", "Radio"));
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    Directory.CreateDirectory(dir);
+                    using (System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe", "\"" + dir + "\"") { UseShellExecute = false })) { }
+                }
+                catch (Exception e) { Console.Error.WriteLine("openradio: " + e.Message); }
+            });
+        }
         else if (c == "clearallow") { try { File.Delete(AllowFile()); } catch { } Log("always-allowed list cleared"); WriteLobby(); }
         else Log("unknown command '" + c + "'");
     }
 
+    // hosting a Realm, not a co-op game: not in friends' CO-OP lists (presence "realm") nor in the public games
+    bool realmHosting;
+    void CheckRealmHosting()
+    {
+        bool now = role == "host" && realms != null && realms.HoldsLease();
+        if (now == realmHosting) return;
+        realmHosting = now;
+        net.SetRealm(now);
+        Log(now ? "presence: hosting a Realm - not listed as a co-op game" : "presence: " + role);
+        UpdatePublic();
+    }
+
     void WriteLobby()
     {
+        CheckRealmHosting();
+        // (what a hosted Realm's heartbeat tells the public server list)
+        if (realms != null) realms.SetPlayers(1 + Guests(), 1 + maxGuests);
         hosting.Clear();
         hosting.AddRange(net.FriendsWithPresence("host"));
         var sb = new StringBuilder();
@@ -1799,12 +1952,21 @@ class Bridge
             else if (f[i] == "volume") voice.Volume = Math.Max(0, Math.Min(1, v / 100.0));
             else if (f[i] == "dist") { var p = Primary(); if (p != null) p.voice.Distance = v; }
             else if (f[i].StartsWith("dist_")) { string tag = f[i].Substring(5); foreach (var l in links) if (l.outTag == tag) l.voice.Distance = v; }
+            else if (f[i] == "walkie") { var p = Primary(); if (p != null) SetWalkie(p, v != 0); }
+            else if (f[i].StartsWith("walkie_")) { string tag = f[i].Substring(7); foreach (var l in links) if (l.outTag == tag) SetWalkie(l, v != 0); }
         }
+    }
+
+    void SetWalkie(PeerLink l, bool on)
+    {
+        if (l.voice.Walkie == on) return;
+        l.voice.Walkie = on;
+        Log("voice: walkie " + (on ? "on" : "off") + " with " + l.outTag);
     }
 
     void UpdatePublic()
     {
-        if (!(publicOn && role == "host")) { net.SetPublic(false, false, null); return; }
+        if (!(publicOn && role == "host") || realmHosting) { net.SetPublic(false, false, null); return; }
         var d = new Dictionary<string, string>();
         d["surrounsync"] = "1"; d["name"] = publicName; d["proto"] = publicProto;
         d["locked"] = passKey != null ? "1" : "0"; d["players"] = (1 + Guests()) + "/" + (1 + maxGuests); d["host"] = net.Me.ToString();

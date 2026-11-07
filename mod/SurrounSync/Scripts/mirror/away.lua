@@ -1,6 +1,6 @@
 -- "I'm in the game menu": the pause/settings menu stops the player's tick, so poses stop and after 10 s the other
 -- game said "X's game isn't responding (paused, loading or frozen)" (player review 2026-10-31), and a file link
--- went "gone" after 45 s. While no tick runs, phase1's LoopAsync watch puts "away menu <n>", n bumped every
+-- went "gone" after 45 s. While no tick runs, phase1's game-thread menu watch puts "away menu <n>", n bumped every
 -- SEND_EVERY s; the next tick puts "away -". The other game takes "paused"/"gone" as "menu" while the last bump
 -- is under FRESH_S old: a game frozen in its menu stops bumping and the normal paused/gone path takes over.
 -- One per link (peers.lua PRESENCE): each guest's copy tells its own link.
@@ -35,7 +35,7 @@ function away.tick()
     end
 end
 
--- from the LoopAsync watch (game thread): can = the player exists and no load/leave is under way
+-- from phase1's menu watch (game thread): can = the player exists and no load/leave is under way
 function away.idle(can)
     local t = os.clock()
     if not (can and last_tick and t - last_tick > IDLE_S) then return end

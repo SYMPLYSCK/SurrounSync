@@ -23,21 +23,50 @@ local stats = { sent = 0, played = 0 }
 local fix_lasers
 local lasers_follow_aim
 
+-- (sounds and emitters are long-lived assets: their paths are cached by address, as audio.lua's - a GetFullName
+-- each, twice a shot)
+local paths, paths_n = {}, 0
 local function path_of(obj)
     if not util.valid(obj) then return nil end
-    local p
+    local a = util.addr(obj)
+    local p = a and paths[a]
+    if p then return p end
     pcall(function() p = obj:GetFullName():match("^%S+ (.+)$") end)
+    if p and a then
+        if paths_n > 256 then paths, paths_n = {}, 0 end
+        paths[a], paths_n = p, paths_n + 1
+    end
     return p
 end
 
 local find = util.find
 
-local function on_weapon_effects(self, EmitterTemplate)
-    local w = self:get()
-    local p, owner, parent = game.player(), nil, nil
+-- Is this gun the player's? Each of the three shot hooks asked (owner + attach parent: two calls each, three times a
+-- shot, and for every raider's gun too); a gun's holder is kept for OWNER_S (a pick-up or drop takes longer than that).
+local OWNER_S = 1.0
+local owned, owned_n = {}, 0  -- weapon addr -> { yes = bool, p = player addr, t = until }
+local function mine(w)
+    local p = game.player()
+    local k, pk, t = util.addr(w), util.addr(p), os.clock()
+    local c = k and owned[k]
+    if c and c.p == pk and t < c.t then return c.yes end
+    local owner, parent
     pcall(function() owner = w:GetOwner() end)
     pcall(function() parent = w:GetAttachParentActor() end)
-    if not (util.same(owner, p) or util.same(parent, p)) then return end
+    local yes = util.same(owner, p) or util.same(parent, p)
+    if k then
+        if not c then
+            if owned_n >= 64 then owned, owned_n = {}, 0 end
+            owned_n = owned_n + 1
+        end
+        owned[k] = { yes = yes, p = pk, t = t + OWNER_S }
+    end
+    return yes
+end
+
+local function on_weapon_effects(self, EmitterTemplate)
+    local w = self:get()
+    if not mine(w) then return end
     fire.last_shot = os.clock()
     local comp, emitter
     pcall(function() comp = w.BP_WeaponsPickupComponent end)
@@ -54,7 +83,7 @@ local function on_weapon_effects(self, EmitterTemplate)
 end
 
 local function capture_hook(self, EmitterTemplate)
-    util.safe(on_weapon_effects, "fire.capture", self, EmitterTemplate)
+    perf.hook("hook fire.shot", util.safe, on_weapon_effects, "fire.capture", self, EmitterTemplate)
 end
 
 local impacts = events.new("impact", 64, 2)
@@ -74,11 +103,7 @@ local impact_stats = { sent = 0, played = 0 }
 local warned_fx = false
 
 local function on_surface_hit(self, ImpactPoint, HitActor, Rotation, Surface)
-    local w = self:get()
-    local p, owner, parent = game.player(), nil, nil
-    pcall(function() owner = w:GetOwner() end)
-    pcall(function() parent = w:GetAttachParentActor() end)
-    if not (util.same(owner, p) or util.same(parent, p)) then return end
+    if not mine(self:get()) then return end
     fire.last_shot = os.clock()
     local l, r, s
     pcall(function() l = ImpactPoint:get() end)
@@ -90,7 +115,7 @@ local function on_surface_hit(self, ImpactPoint, HitActor, Rotation, Surface)
 end
 
 local function surface_hook(self, ImpactPoint, HitActor, Rotation, Surface)
-    util.safe(on_surface_hit, "fire.impact_capture", self, ImpactPoint, HitActor, Rotation, Surface)
+    perf.hook("hook fire.impact", util.safe, on_surface_hit, "fire.impact_capture", self, ImpactPoint, HitActor, Rotation, Surface)
 end
 
 local function play_impact(payload)
@@ -129,7 +154,11 @@ end
 
 -- The held gun's muzzle: holstered guns are visible and have a Muzzle socket too (after a weapon switch the old
 -- gun came first and the tracers/flashes started at it) - a piece hanging from a hand socket wins.
-local function ghost_muzzle()
+-- (each shot and each tracer of the other player asked every visible ghost piece twice; the answer is kept MUZZLE_S -
+-- a weapon switch shows at the next shot after that)
+local MUZZLE_S = 0.25
+local muzzle_at, muzzle_c, muzzle_g = -100, nil, nil
+local function find_muzzle()
     local any
     for i, c in ipairs(look.components()) do
         local ok = false
@@ -140,6 +169,12 @@ local function ghost_muzzle()
         end
     end
     return any
+end
+local function ghost_muzzle()
+    local t, g = os.clock(), util.addr(ghost.get())
+    if t - muzzle_at < MUZZLE_S and g == muzzle_g and (muzzle_c == nil or util.valid(muzzle_c)) then return muzzle_c end
+    muzzle_at, muzzle_g, muzzle_c = t, g, find_muzzle()
+    return muzzle_c
 end
 
 local function play(payload)
@@ -184,11 +219,7 @@ local trail_stats = { sent = 0, played = 0 }
 local trail_warned = false
 
 local function on_trail(self, MuzzleLocation, EndPointLocation)
-    local w = self:get()
-    local p, owner, parent = game.player(), nil, nil
-    pcall(function() owner = w:GetOwner() end)
-    pcall(function() parent = w:GetAttachParentActor() end)
-    if not (util.same(owner, p) or util.same(parent, p)) then return end
+    if not mine(self:get()) then return end
     local m, e
     pcall(function() local v = MuzzleLocation:get(); m = { X = v.X, Y = v.Y, Z = v.Z } end)
     pcall(function() local v = EndPointLocation:get(); e = { X = v.X, Y = v.Y, Z = v.Z } end)
@@ -197,7 +228,7 @@ local function on_trail(self, MuzzleLocation, EndPointLocation)
     trail_stats.sent = trail_stats.sent + 1
 end
 local function trail_hook(self, MuzzleLocation, EndPointLocation)
-    util.safe(on_trail, "fire.trail_capture", self, MuzzleLocation, EndPointLocation)
+    perf.hook("hook fire.trail", util.safe, on_trail, "fire.trail_capture", self, MuzzleLocation, EndPointLocation)
 end
 
 local trail_setting, trail_setting_at = true, -100
@@ -474,6 +505,10 @@ end
 
 forget_world = function()
     laser_list, list_idx, driven, in_hand = {}, 0, {}, {}
+    owned, owned_n, muzzle_at, muzzle_c, muzzle_g = {}, 0, -100, nil, nil
+    -- (a new world can unload the old one's sounds: a freed address that came back as another asset kept its path;
+    -- audit 2026-11-03)
+    paths, paths_n = {}, 0
 end
 
 return fire

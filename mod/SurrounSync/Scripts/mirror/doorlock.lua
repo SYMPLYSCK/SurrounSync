@@ -891,5 +891,7 @@ function doorlock.forget()
     local_s, local_of = nil, nil
 end
 game.on_world_reset(doorlock.forget)
+-- every widget off the screen (a death): the keypad goes too, before the GC can free it under us
+game.on_widgets_cleared(close_pad)
 
 return doorlock

@@ -8,7 +8,9 @@
 -- takes with its Character.WeaponScroll setting on). In a menu (cursor shown) the buttons are for the menu: their
 -- rows come out of the context (set_level), the inventory grids go to padinv.lua, and elsewhere a D-pad press with
 -- nothing focused puts focus on the menu's first button, so Slate's own navigation moves it and A presses it.
--- Each action's button can be changed (CONTROLLER -> BINDINGS, saved in mirror_pad_binds.txt).
+-- Each action's button can be changed, or cleared, and every other game action can be put on a button
+-- (CONTROLLER -> BINDINGS), and so can the mod's own menu, inventory and option-step buttons; the look speeds and
+-- dead zone have sliders, INVERT LOOK and SWAP STICKS are switches. All saved in mirror_pad_binds.txt.
 
 local log = require("mirror.log")
 local util = require("mirror.util")
@@ -21,25 +23,32 @@ local gamepad = {}
 local IMC = "/Game/Input/IMC_General.IMC_General"
 local BINDS_FILE = "\\mirror_pad_binds.txt"
 
--- The buttons an action can sit on, in the bindings screen's words.
+-- The buttons an action can sit on, in the bindings screen's words: { key, Xbox name, PlayStation name }. A PS5
+-- pad is the same buttons in the same places: the game reads XInput only, so a DualSense reaches it as a virtual
+-- Xbox pad (Steam Input's Gamepad template, DS4Windows) and Cross is Gamepad_FaceButton_Bottom like A. Words, not
+-- the ✕○□△ glyphs, which the game's font may not have. (Touchpad, PS button: no XInput key, so not bindable.)
 gamepad.PADS = {
-    { "Gamepad_FaceButton_Bottom", "A" }, { "Gamepad_FaceButton_Right", "B" },
-    { "Gamepad_FaceButton_Left", "X" }, { "Gamepad_FaceButton_Top", "Y" },
-    { "Gamepad_LeftShoulder", "LB" }, { "Gamepad_RightShoulder", "RB" },
-    { "Gamepad_LeftTrigger", "LT" }, { "Gamepad_RightTrigger", "RT" },
-    { "Gamepad_LeftThumbstick", "L3" }, { "Gamepad_RightThumbstick", "R3" },
-    { "Gamepad_DPad_Up", "D-PAD UP" }, { "Gamepad_DPad_Down", "D-PAD DOWN" },
-    { "Gamepad_DPad_Left", "D-PAD LEFT" }, { "Gamepad_DPad_Right", "D-PAD RIGHT" },
-    { "Gamepad_Special_Left", "VIEW" }, { "Gamepad_Special_Right", "MENU" },
+    { "Gamepad_FaceButton_Bottom", "A", "CROSS" }, { "Gamepad_FaceButton_Right", "B", "CIRCLE" },
+    { "Gamepad_FaceButton_Left", "X", "SQUARE" }, { "Gamepad_FaceButton_Top", "Y", "TRIANGLE" },
+    { "Gamepad_LeftShoulder", "LB", "L1" }, { "Gamepad_RightShoulder", "RB", "R1" },
+    { "Gamepad_LeftTrigger", "LT", "L2" }, { "Gamepad_RightTrigger", "RT", "R2" },
+    { "Gamepad_LeftThumbstick", "L3", "L3" }, { "Gamepad_RightThumbstick", "R3", "R3" },
+    { "Gamepad_DPad_Up", "D-PAD UP", "D-PAD UP" }, { "Gamepad_DPad_Down", "D-PAD DOWN", "D-PAD DOWN" },
+    { "Gamepad_DPad_Left", "D-PAD LEFT", "D-PAD LEFT" }, { "Gamepad_DPad_Right", "D-PAD RIGHT", "D-PAD RIGHT" },
+    { "Gamepad_Special_Left", "VIEW", "CREATE" }, { "Gamepad_Special_Right", "MENU", "OPTIONS" },
 }
-local PAD_NAME = {}
-for _, p in ipairs(gamepad.PADS) do PAD_NAME[p[1]] = p[2] end
-local DPAD = { Gamepad_DPad_Up = true, Gamepad_DPad_Down = true, Gamepad_DPad_Left = true, Gamepad_DPad_Right = true }
--- D-pad up/down while looking at something you can use (a bed, a crate): the mouse wheel's option step. The game
--- has it on plain key events (BP_PlayerCharacter MouseScrollUp/Down -> BP_JigHelperComp.CycleOptions(true = up,
--- false = down)), not on an Enhanced Input action, so no context row can copy it. User 2026-10-31: "when hovering
--- over a bed or a crate you cant use those controlls so make d pad work".
-local OPTION_PAD = { Gamepad_DPad_Up = true, Gamepad_DPad_Down = true }
+local PAD_NAME, PAD_NAME_PS = {}, {}
+for _, p in ipairs(gamepad.PADS) do PAD_NAME[p[1]] = p[2]; PAD_NAME_PS[p[1]] = p[3] end
+-- a pad key's name for the pad in use (style "playstation" or "xbox"); nil for no key or an unknown one
+function gamepad.pad_name(pad, style)
+    if pad == nil then return nil end
+    return style == "playstation" and PAD_NAME_PS[pad] or PAD_NAME[pad]
+end
+-- MY SETTINGS -> CONTROLLER: XBOX or PLAYSTATION (xbox when it can't be read)
+local function pad_style()
+    local ok, s = pcall(function() return require("mirror.mysettings").pad_style() end)
+    return ok and s == "playstation" and "playstation" or "xbox"
+end
 local LOOK_HOLD_S = 0.3   -- the look level stays this long after the target goes (no flapping on a flickering trace)
 
 -- The actions, each on one pad button (pad = the default). keys: the keyboard/mouse keys it copies, so it gets
@@ -63,92 +72,254 @@ gamepad.ACTIONS = {
     { id = "shove", label = "SHOVE", pad = "Gamepad_RightThumbstick", keys = { "V" } },
     { id = "reload", label = "RELOAD", pad = "Gamepad_DPad_Left", keys = { "R" }, skip = { IA_VehicleRadio = true } },
     { id = "throwable", label = "THROWABLE", pad = "Gamepad_DPad_Up", keys = { "Five" } },
-    { id = "inventory", label = "INVENTORY", pad = "Gamepad_Special_Left", keys = { "Tab" } },
-    { id = "pause", label = "PAUSE MENU", pad = "Gamepad_Special_Right", keys = { "Escape" } },
+    { id = "inventory", label = "INVENTORY", pad = "Gamepad_Special_Left", keys = { "Tab" }, menu = true },
+    { id = "pause", label = "PAUSE MENU", pad = "Gamepad_Special_Right", keys = { "Escape" }, menu = true },
+    -- The rest of the game's actions, on no button until one is picked (16 buttons, the ones above take 14). ia:
+    -- the context actions it goes on, by name, so a key with several actions (E: shoulder swap and loot all,
+    -- Hyphen: sit and camera reset) can be split. menu: stays live with a menu up, so it can close its own menu.
+    { id = "roll", label = "ROLL", ia = { "IA_Roll" } },
+    { id = "fire_mode", label = "FIRE MODE", ia = { "IA_ChangeFireMode" } },
+    { id = "primary", label = "PRIMARY WEAPON", ia = { "IA_EquipPrimary" } },
+    { id = "secondary", label = "SECONDARY WEAPON", ia = { "IA_EquipSecondary" } },
+    { id = "sidearm", label = "SIDEARM", ia = { "IA_EquipSidearm" } },
+    { id = "melee", label = "MELEE", ia = { "IA_EquipMelee" } },
+    { id = "unequip", label = "PUT AWAY", ia = { "IA_Unequip" } },
+    { id = "hotbar6", label = "HOTBAR 6", ia = { "IA_Hotbar6" } },
+    { id = "hotbar7", label = "HOTBAR 7", ia = { "IA_Hotbar7" } },
+    { id = "hotbar8", label = "HOTBAR 8", ia = { "IA_Hotbar8" } },
+    { id = "fishing", label = "FISHING ROD", ia = { "IA_FishingRod" } },
+    { id = "radial", label = "RADIAL MENU", ia = { "IA_RadialMenu" } },
+    { id = "loot_all", label = "LOOT ALL", ia = { "IA_LootAll" } },
+    { id = "flashlight", label = "FLASHLIGHT", ia = { "IA_Flashlight" } },
+    { id = "tactical", label = "TACTICAL ATTACHMENT", ia = { "IA_ToggleTactical" } },
+    { id = "night_vision", label = "NIGHT VISION", ia = { "IA_NightVision" } },
+    { id = "binoculars", label = "BINOCULARS", ia = { "IA_Binoculars" } },
+    { id = "distract", label = "DISTRACT", ia = { "IA_Distract" } },
+    { id = "hold_breath", label = "HOLD BREATH", ia = { "IA_HoldBreath" } },
+    { id = "quick_search", label = "QUICK SEARCH", ia = { "IA_QuickSearch" } },
+    { id = "scope_zoom", label = "SCOPE ZOOM", ia = { "IA_ScopeZoom" } },
+    { id = "perspective", label = "CAMERA VIEW", ia = { "IA_ChangePerspective" } },
+    { id = "camera_left", label = "SHOULDER LEFT", ia = { "IA_SwitchCameraLeft" } },
+    { id = "camera_right", label = "SHOULDER RIGHT", ia = { "IA_SwitchCameraRight" } },
+    { id = "reset_camera", label = "RESET CAMERA", ia = { "IA_ResetCameraPosition" } },
+    { id = "free_look", label = "FREE LOOK", ia = { "IA_FreeLook" } },
+    { id = "auto_run", label = "AUTO RUN", ia = { "IA_AutoRun" } },
+    { id = "sit", label = "SIT DOWN", ia = { "IA_SitDown" } },
+    { id = "journal", label = "HANDBOOK", ia = { "IA_Journal" }, menu = true },
+    { id = "map", label = "MAP", ia = { "IA_Map" }, menu = true },
+    { id = "horn", label = "CAR HORN", ia = { "IA_VehicleHorn" } },
+    { id = "car_radio", label = "CAR RADIO", ia = { "IA_VehicleRadio" } },
+    { id = "car_flip", label = "FLIP CAR", ia = { "IA_VehicleFlip" } },
+    { id = "hide_ui", label = "HIDE HUD", ia = { "IA_HideUI" } },
+    { id = "photo", label = "PHOTO MODE", ia = { "IA_PhotoMode" } },
+    { id = "quick_save", label = "QUICK SAVE", ia = { "IA_QuickSave" } },
 }
 local by_id = {}
 for _, a in ipairs(gamepad.ACTIONS) do a.default = a.pad; by_id[a.id] = a end
 
--- the left stick walks (not rebindable)
-local STICK = {
-    { "Gamepad_LeftStick_Up", "W" }, { "Gamepad_LeftStick_Down", "S" },
-    { "Gamepad_LeftStick_Left", "A" }, { "Gamepad_LeftStick_Right", "D" },
+-- The buttons the mod reads itself, each only in its own place, so they swap only with their own kind and can
+-- share a button with a game action (A jumps in the world and grabs in the inventory). ctx "menu" (cursor shown):
+-- padinv's inventory buttons (inv: its name for one) and the menu cursor (dir: also the menu focus below).
+-- ctx "look" (in the world, looking at something you can use, a bed, a crate): the mouse wheel's option step. The
+-- game has that on plain key events (BP_PlayerCharacter MouseScrollUp/Down -> BP_JigHelperComp.CycleOptions(up)),
+-- not on an Enhanced Input action, so no context row can copy it. User 2026-10-31: "when hovering over a bed or a
+-- crate you cant use those controlls so make d pad work".
+gamepad.CONTROLS = {
+    { id = "menu_up", label = "MENU UP", pad = "Gamepad_DPad_Up", ctx = "menu", inv = "up", dir = true },
+    { id = "menu_down", label = "MENU DOWN", pad = "Gamepad_DPad_Down", ctx = "menu", inv = "down", dir = true },
+    { id = "menu_left", label = "MENU LEFT", pad = "Gamepad_DPad_Left", ctx = "menu", inv = "left", dir = true },
+    { id = "menu_right", label = "MENU RIGHT", pad = "Gamepad_DPad_Right", ctx = "menu", inv = "right", dir = true },
+    { id = "inv_grab", label = "INV: GRAB / PUT DOWN", pad = "Gamepad_FaceButton_Bottom", ctx = "menu", inv = "a" },
+    { id = "inv_back", label = "INV: BACK / LEAVE", pad = "Gamepad_FaceButton_Right", ctx = "menu", inv = "b" },
+    { id = "inv_take", label = "INV: QUICK TAKE", pad = "Gamepad_FaceButton_Left", ctx = "menu", inv = "x" },
+    { id = "inv_tab_left", label = "INV: TAB / TURN LEFT", pad = "Gamepad_LeftShoulder", ctx = "menu", inv = "lb" },
+    { id = "inv_tab_right", label = "INV: TAB / TURN RIGHT", pad = "Gamepad_RightShoulder", ctx = "menu", inv = "rb" },
+    { id = "option_up", label = "PROMPT OPTION UP", pad = "Gamepad_DPad_Up", ctx = "look", up = true },
+    { id = "option_down", label = "PROMPT OPTION DOWN", pad = "Gamepad_DPad_Down", ctx = "look", up = false },
+}
+for _, a in ipairs(gamepad.CONTROLS) do a.default = a.pad; by_id[a.id] = a end
+-- the list an action or control swaps buttons within (with its own ctx)
+local function kind(a) return a.ctx and gamepad.CONTROLS or gamepad.ACTIONS end
+
+-- On/off switches (BINDINGS -> SENSITIVITY), saved as "<id> on" while on. key: the gamepad.OPT field.
+gamepad.OPTIONS = {
+    { id = "invert_look", label = "INVERT LOOK", key = "invert" },   -- stick up looks down
+    { id = "swap_sticks", label = "SWAP STICKS", key = "swap" },      -- walk on the right stick, look with the left
+}
+gamepad.OPT = { invert = false, swap = false }
+local opt_by_id = {}
+for _, o in ipairs(gamepad.OPTIONS) do opt_by_id[o.id] = o end
+
+-- the stick that walks (W/A/S/D): the left one, the right one with SWAP STICKS
+local STICKS = {
+    left = { { "Gamepad_LeftStick_Up", "W" }, { "Gamepad_LeftStick_Down", "S" },
+             { "Gamepad_LeftStick_Left", "A" }, { "Gamepad_LeftStick_Right", "D" } },
+    right = { { "Gamepad_RightStick_Up", "W" }, { "Gamepad_RightStick_Down", "S" },
+              { "Gamepad_RightStick_Left", "A" }, { "Gamepad_RightStick_Right", "D" } },
 }
 
 -- { pad key, the keyboard/mouse key it copies, skip = { action name = true } }: the stick plus each action's keys
--- on its current button
+-- on its current button. DIRECT: { pad key, action name } for the actions bound by name (ia). The controls go to
+-- padinv (its buttons) and option_pads (the rows the option step takes out while looking at something).
 gamepad.MIRROR = {}
+gamepad.DIRECT = {}
+local option_pads = {}
 function gamepad.rebuild()
-    local m = {}
-    for _, p in ipairs(STICK) do m[#m + 1] = p end
+    local m, d, o = {}, {}, {}
+    for _, p in ipairs(STICKS[gamepad.OPT.swap and "right" or "left"]) do m[#m + 1] = p end
     for _, a in ipairs(gamepad.ACTIONS) do
-        for _, k in ipairs(a.keys or {}) do m[#m + 1] = { a.pad, k, skip = a.skip } end
+        if a.pad then
+            for _, k in ipairs(a.keys or {}) do m[#m + 1] = { a.pad, k, skip = a.skip } end
+            for _, n in ipairs(a.ia or {}) do d[#d + 1] = { a.pad, n } end
+        end
     end
-    gamepad.MIRROR = m
+    for _, a in ipairs(gamepad.CONTROLS) do
+        if a.inv then padinv.BUTTONS[a.inv] = a.pad end
+        if a.ctx == "look" and a.pad then o[a.pad] = true end
+    end
+    gamepad.MIRROR, gamepad.DIRECT, option_pads = m, d, o
 end
 gamepad.rebuild()
 
--- Saved bindings: "<id> <pad key>" lines; unknown ids/buttons are skipped.
+-- Saved bindings: "<id> <pad key>" lines, "<id> none" for an action taken off its button; unknown ids/buttons
+-- are skipped. Returns id -> pad key, or false for none.
 function gamepad.parse_binds(s)
     local out = {}
     for id, pad in tostring(s or ""):gmatch("([%w_]+)%s+([%w_]+)") do
-        if by_id[id] and PAD_NAME[pad] then out[id] = pad end
+        if by_id[id] and PAD_NAME[pad] then out[id] = pad elseif by_id[id] and pad == "none" then out[id] = false end
     end
     return out
 end
+
+-- Right stick sensitivity (CONTROLLER -> BINDINGS -> SENSITIVITY sliders), saved in the bindings file as
+-- "<id> <whole number>". key: the LOOK field; pct: the file and the screen show it as a percentage (0.5 -> 50);
+-- speeds show as a percentage of their default. min/max/step in LOOK units.
+gamepad.SENS = {
+    { id = "look_x", label = "LOOK SPEED LEFT / RIGHT", key = "yaw", min = 40, max = 600, step = 10 },
+    { id = "look_y", label = "LOOK SPEED UP / DOWN", key = "pitch", min = 30, max = 450, step = 10 },
+    { id = "aim_look", label = "LOOK SPEED WHILE AIMING", key = "aim", min = 0.1, max = 1.0, step = 0.05, pct = true },
+    { id = "dead_zone", label = "STICK DEAD ZONE", key = "dz", min = 0.02, max = 0.4, step = 0.01, pct = true },
+}
+local sens_by_id = {}
+for _, s in ipairs(gamepad.SENS) do sens_by_id[s.id] = s end
+local LOOK_DEFAULT = {}   -- the LOOK values before any slider (defaults + cfg), what RESET goes back to
+
+local function snap(s, v)
+    v = math.max(s.min, math.min(s.max, v))
+    return s.min + math.floor((v - s.min) / s.step + 0.5) * s.step
+end
+-- "<id> <number>" lines -> id -> LOOK value (clamped, snapped); other lines skipped
+function gamepad.parse_sens(str)
+    local out = {}
+    for id, n in tostring(str or ""):gmatch("([%w_]+)%s+(%d+)") do
+        local s = sens_by_id[id]
+        if s then out[id] = snap(s, s.pct and tonumber(n) / 100 or tonumber(n)) end
+    end
+    return out
+end
+-- "<id> on|off" lines -> id -> true / false; other lines skipped. Line by line: a loose pattern over the whole
+-- file pairs one line's number with the next line's name.
+function gamepad.parse_opts(str)
+    local out = {}
+    for line in tostring(str or ""):gmatch("[^\r\n]+") do
+        local id, v = line:match("^%s*([%w_]+)%s+(%a+)%s*$")
+        if opt_by_id[id] and (v == "on" or v == "off") then out[id] = v == "on" end
+    end
+    return out
+end
+local function sens_number(s) local v = gamepad.LOOK[s.key]; return math.floor((s.pct and v * 100 or v) + 0.5) end
 local function binds_path()
     local d = link.dir and link.dir()
     return d and (d .. BINDS_FILE)
 end
+-- Saved choices first (the first claim on a button wins; none stays none), then defaults, then any free button
+-- for one that has a default: never one button on two of one kind (list + ctx), even from a hand-edited file.
+local function settle(list, want)
+    local used, left, rest = {}, {}, {}
+    local function free(a, p) return not used[(a.ctx or "game") .. "|" .. p] end
+    local function take(a, p) a.pad = p; used[(a.ctx or "game") .. "|" .. p] = true end
+    for _, a in ipairs(list) do
+        local p = want[a.id]
+        if p == false then a.pad = nil
+        elseif p and free(a, p) then take(a, p)
+        else left[#left + 1] = a end
+    end
+    for _, a in ipairs(left) do
+        if a.default == nil then a.pad = nil
+        elseif free(a, a.default) then take(a, a.default)
+        else rest[#rest + 1] = a end
+    end
+    for _, a in ipairs(rest) do
+        a.pad = nil
+        for _, p in ipairs(gamepad.PADS) do
+            if free(a, p[1]) then take(a, p[1]); break end
+        end
+    end
+end
 local function load_binds()
     for _, a in ipairs(gamepad.ACTIONS) do a.pad = a.default end
+    for _, a in ipairs(gamepad.CONTROLS) do a.pad = a.default end
     local path = binds_path()
     local f = path and io.open(path, "rb")
     if not f then gamepad.rebuild(); return end
     local s = f:read("*a") or ""
     f:close()
-    -- saved choices first (the first claim on a button wins), then defaults, then any free button: never one
-    -- button on two actions, even from a hand-edited file
-    local want, used, left = gamepad.parse_binds(s), {}, {}
-    for _, a in ipairs(gamepad.ACTIONS) do
-        local p = want[a.id]
-        if p and not used[p] then a.pad = p; used[p] = true else left[#left + 1] = a end
-    end
-    local rest = {}
-    for _, a in ipairs(left) do
-        if not used[a.default] then a.pad = a.default; used[a.default] = true else rest[#rest + 1] = a end
-    end
-    for _, a in ipairs(rest) do
-        for _, p in ipairs(gamepad.PADS) do
-            if not used[p[1]] then a.pad = p[1]; used[p[1]] = true; break end
-        end
-    end
+    local want = gamepad.parse_binds(s)
+    settle(gamepad.ACTIONS, want)
+    settle(gamepad.CONTROLS, want)   -- (a file from before the controls were listed: their defaults)
+    for id, on in pairs(gamepad.parse_opts(s)) do gamepad.OPT[opt_by_id[id].key] = on end
     gamepad.rebuild()
+    for id, v in pairs(gamepad.parse_sens(s)) do gamepad.LOOK[sens_by_id[id].key] = v end
 end
 local function save_binds()
     local path = binds_path()
-    local f = path and io.open(path, "wb")
-    if not f then return false end
-    for _, a in ipairs(gamepad.ACTIONS) do f:write(a.id, " ", a.pad, "\n") end
-    f:close()
-    return true
+    if not path then return false end
+    -- the whole file built first, then one write: nothing half-built reaches the disk, and a failed write is said
+    local lines = {}
+    for _, a in ipairs(gamepad.ACTIONS) do lines[#lines + 1] = a.id .. " " .. (a.pad or "none") .. "\n" end
+    for _, a in ipairs(gamepad.CONTROLS) do lines[#lines + 1] = a.id .. " " .. (a.pad or "none") .. "\n" end
+    -- (only the ones moved off their default: a later default change still reaches everyone else)
+    for _, s in ipairs(gamepad.SENS) do
+        local d = LOOK_DEFAULT[s.key]
+        if not d or math.abs(gamepad.LOOK[s.key] - d) >= s.step / 2 then lines[#lines + 1] = s.id .. " " .. sens_number(s) .. "\n" end
+    end
+    for _, o in ipairs(gamepad.OPTIONS) do
+        if gamepad.OPT[o.key] then lines[#lines + 1] = o.id .. " on\n" end
+    end
+    local f, err = io.open(path, "wb")
+    local ok = f and f:write(table.concat(lines)) and true
+    if f then ok = f:close() and ok end
+    if not ok then log.warn("gamepad: bindings not saved - " .. tostring(err or path)) end
+    return ok == true
 end
 
--- Puts an action on a button. The action already there takes this one's old button (a swap), so no button
--- does two things. Returns true when something changed.
+-- Puts an action (or control) on a button. The one of its kind already there takes this one's old button (a
+-- swap; none when this one had none), so no button does two things at once. Returns true when something changed.
 function gamepad.assign(id, pad)
     local a = by_id[id]
     if not a or not PAD_NAME[pad] or a.pad == pad then return false end
-    for _, o in ipairs(gamepad.ACTIONS) do
-        if o ~= a and o.pad == pad then o.pad = a.pad end
+    for _, o in ipairs(kind(a)) do
+        if o ~= a and o.ctx == a.ctx and o.pad == pad then o.pad = a.pad end
     end
     a.pad = pad
     gamepad.rebuild()
     return true
 end
+-- Takes an action off its button. Returns true when it had one.
+function gamepad.unassign(id)
+    local a = by_id[id]
+    if not a or not a.pad then return false end
+    a.pad = nil
+    gamepad.rebuild()
+    return true
+end
 function gamepad.reset_binds()
     for _, a in ipairs(gamepad.ACTIONS) do a.pad = a.default end
+    for _, a in ipairs(gamepad.CONTROLS) do a.pad = a.default end
     gamepad.rebuild()
+end
+function gamepad.reset_sens()
+    for _, s in ipairs(gamepad.SENS) do gamepad.LOOK[s.key] = LOOK_DEFAULT[s.key] or gamepad.LOOK[s.key] end
 end
 -- { pad key, action }: analog throttle and brake in a car (both actions are Axis1D; Backwards negates itself)
 gamepad.EXTRA = {
@@ -193,6 +364,9 @@ function gamepad.plan(mappings)
             if not (p.skip and m.name and p.skip[m.name]) then add(m, p[1]) end
         end
     end
+    for _, p in ipairs(gamepad.DIRECT) do
+        if by_name[p[2]] then add(by_name[p[2]], p[1]) end
+    end
     for _, p in ipairs(gamepad.EXTRA) do
         if by_name[p[2]] then add(by_name[p[2]], p[1]) end
     end
@@ -228,7 +402,7 @@ local function read(imc)
 end
 
 local added = {}   -- { action, name, pad, out } this module put in (out: taken out of the context for now)
-local level = "game"   -- which rows of `added` are in the context: "game" all, "menu" some, "none" none
+local level = "game"   -- which rows of `added` are in the context: "game" all, "menu"/"inv" some, "none" none
 
 -- The pad keys go live: the context off and back on at its old priority.
 local function refresh(imc)
@@ -298,38 +472,56 @@ local function keys()
     if KEY.rx then return KEY end
     KEY.rx = { KeyName = FName("Gamepad_RightX") }
     KEY.ry = { KeyName = FName("Gamepad_RightY") }
+    KEY.lx = { KeyName = FName("Gamepad_LeftX") }
+    KEY.ly = { KeyName = FName("Gamepad_LeftY") }
     KEY.lt = { KeyName = FName("Gamepad_LeftTriggerAxis") }
+    KEY.rt = { KeyName = FName("Gamepad_RightTriggerAxis") }
     KEY.pad = {}
     for _, p in ipairs(gamepad.PADS) do KEY.pad[p[1]] = { KeyName = FName(p[1]) } end
     return KEY
 end
 
+-- Is a pad button down. Read once per tick (padinv, the menu focus and the D-pad all ask; tick() clears it).
+local frame_down = {}
 local function down(pc, pad)
-    local d = false
-    pcall(function() d = pc:IsInputKeyDown(keys().pad[pad]) end)
-    return d == true
+    local d = frame_down[pad]
+    if d ~= nil then return d end
+    d = false
+    pcall(function() d = pc:IsInputKeyDown(keys().pad[pad]) == true end)
+    if pad ~= nil then frame_down[pad] = d end
+    return d
 end
 
--- Which pad rows are in the context. "game": all. "menu" (cursor shown): only the left stick and the buttons
--- that close menus (inventory, pause), so A/B/X/Y, the D-pad and the shoulders drive the menu and the inventory
+-- Which pad rows are in the context. "game": all. "menu" (cursor shown): only the walk stick and the buttons
+-- that close menus (the menu = true actions: inventory, pause, handbook, map), so A/B/X/Y, the D-pad and the
+-- shoulders drive the menu and the inventory
 -- without also jumping, crouching or interacting behind it. "look" (in the world, looking at something you can
--- use): all but D-pad up/down, which step its options instead (no throwable behind it). "none" (SET waiting for a
--- button on the bindings screen): no rows, so the press only binds. Rows move only when their state changes; one
--- refresh per change.
+-- use): all but the option step's buttons (D-pad up/down unless rebound), which step its options instead (no
+-- throwable behind it). "none" (SET waiting for a button on the bindings screen): no rows, so the press only binds.
+-- Rows move only when their state changes; one refresh per change.
 local STICK_PAD = {}
-for _, p in ipairs(STICK) do STICK_PAD[p[1]] = true end
+for _, set in pairs(STICKS) do
+    for _, p in ipairs(set) do STICK_PAD[p[1]] = true end
+end
 local function set_level(want)
     level = want
     local imc = StaticFindObject(IMC)
     if not util.valid(imc) then return end
-    local keep = {}
-    for _, a in ipairs(gamepad.ACTIONS) do
-        if a.id == "inventory" or a.id == "pause" then keep[a.pad] = true end
+    -- (a menu action on a button the menu itself uses stays out, or one press did both: HANDBOOK on D-pad down
+    -- moved the menu's focus and shut the handbook. The MENU directions work in every menu, the INV buttons only in
+    -- the inventory ("inv"), so MAP on A still closes the map; audit 2026-11-03)
+    local busy, keep = {}, {}
+    for _, c in ipairs(gamepad.CONTROLS) do
+        if c.ctx == "menu" and c.pad and (c.dir or want == "inv") then busy[c.pad] = true end
     end
+    for _, a in ipairs(gamepad.ACTIONS) do
+        if a.menu and a.pad and not busy[a.pad] then keep[a.pad] = true end
+    end
+    local in_menu = want == "menu" or want == "inv"
     local n = 0
     for _, p in ipairs(added) do
-        local out = want == "none" or (want == "menu" and not keep[p.pad] and not STICK_PAD[p.pad])
-            or (want == "look" and OPTION_PAD[p.pad] == true)
+        local out = want == "none" or (in_menu and not keep[p.pad] and not STICK_PAD[p.pad])
+            or (want == "look" and option_pads[p.pad] == true)
         if out ~= (p.out == true) and util.valid(p.action) then
             n = n + 1
             p.out = out
@@ -372,17 +564,30 @@ local function menu_buttons()
 end
 
 local menu = { open = false, buttons = nil, held = {} }
--- A D-pad press in a menu that reached the game (so no button has focus - Slate's navigation eats it when one
--- has): focus the menu's first button.
+-- A MENU UP/DOWN/LEFT/RIGHT press in a menu that reached the game with no button focused (on the D-pad, Slate's
+-- navigation eats it when one has): focus the menu's first button. Slate's own navigation stays on the D-pad and
+-- left stick, A pressing: that is the engine's, not the mod's. A button that has focus keeps it (a rebound one
+-- reaches the game every press).
+local function focused(b)
+    for _, w in ipairs(b) do
+        local f = false
+        pcall(function() f = w:HasKeyboardFocus() end)
+        if f == true then return true end
+    end
+    return false
+end
 local function menu_tick(pc)
     local pressed = false
-    for pad in pairs(DPAD) do
-        local d = down(pc, pad)
-        if d and not menu.held[pad] then pressed = true end
-        menu.held[pad] = d
+    for _, a in ipairs(gamepad.CONTROLS) do
+        if a.dir then
+            local d = a.pad ~= nil and down(pc, a.pad)
+            if d and not menu.held[a.id] then pressed = true end
+            menu.held[a.id] = d
+        end
     end
     if not pressed then return end
     local b = menu_buttons()
+    if focused(b) then return end
     local ok = b[1] and pcall(function() b[1]:SetKeyboardFocus() end)
     log.info(string.format("gamepad: menu focus -> %s (%d button(s))", ok and (util.fname(b[1]) or "?") or "none", #b))
 end
@@ -392,7 +597,7 @@ local cycle_held = {}
 local function hotbar_tick(pc)
     for _, a in ipairs(gamepad.ACTIONS) do
         if a.cycle ~= nil then
-            local d = down(pc, a.pad)
+            local d = a.pad ~= nil and down(pc, a.pad)
             if d and not cycle_held[a.id] then
                 local p = game.player()
                 local ok, e = pcall(function() p:Event_WeaponCycle(a.cycle) end)
@@ -411,16 +616,22 @@ local function looked_at()
     pcall(function() a = h.CurrentTracActor end)
     return util.valid(a) and h or nil
 end
--- Option step on D-pad up/down: a fresh press while there is a target calls CycleOptions, as one wheel notch does.
+-- Option step (PROMPT OPTION UP/DOWN): a fresh press while there is a target calls CycleOptions, as one wheel
+-- notch does.
 local option_held = {}
 local function options_tick(pc, helper)
-    for pad in pairs(OPTION_PAD) do
-        local d = down(pc, pad)
-        if d and not option_held[pad] and helper then
-            local ok, e = pcall(function() helper:CycleOptions(pad == "Gamepad_DPad_Up") end)
-            if not ok then log.every("gamepad.options", 60, "gamepad: option step failed - " .. tostring(e)) end
+    for _, a in ipairs(gamepad.CONTROLS) do
+        if a.ctx == "look" and a.pad then
+            -- nothing looked at: not read (2 calls a frame saved); counted as held, so a press already down when a
+            -- target comes into view isn't taken as a fresh one
+            local d = true
+            if helper then d = down(pc, a.pad) end
+            if d and not option_held[a.id] and helper then
+                local ok, e = pcall(function() helper:CycleOptions(a.up) end)
+                if not ok then log.every("gamepad.options", 60, "gamepad: option step failed - " .. tostring(e)) end
+            end
+            option_held[a.id] = d
         end
-        option_held[pad] = d
     end
 end
 
@@ -428,8 +639,11 @@ end
 -- pressed SET doesn't bind itself. The game viewport takes focus so the press reaches the game, not the menu.
 local capture = nil
 local CAPTURE_SECS = 6.0
+local ticking = false   -- init ran (gamepad.enabled = false in the config: no tick, so nothing would end a SET)
 function gamepad.capture(id)
-    if not by_id[id] then return false end
+    -- (the controller off: its tick never counts the 6 s down, SET would wait forever and bind the first press
+    -- after it's switched back on, wherever that is)
+    if not by_id[id] or not ticking or not setting_on() then return false end
     capture = { id = id, left = CAPTURE_SECS, armed = false }
     pcall(function() StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary"):SetFocusToGameViewport() end)
     return true
@@ -465,20 +679,27 @@ function gamepad.scales(pc)
     return scale_cache.yaw, scale_cache.pitch
 end
 
-local function look(dt)
-    local pc = game.controller()
-    if not util.valid(pc) then return end
-    local cursor = false
-    pcall(function() cursor = pc.bShowMouseCursor end)
-    if cursor then return end   -- a menu is up
-    local k, L = keys(), gamepad.LOOK
-    local x, y = pc:GetInputAnalogKeyState(k.rx), pc:GetInputAnalogKeyState(k.ry)
+-- The look slows while AIM's button is held: a trigger past 0.3 of its travel (read as its axis), any other
+-- button while down. AIM on no button: never.
+local TRIGGER_AXIS = { Gamepad_LeftTrigger = "lt", Gamepad_RightTrigger = "rt" }
+local function aiming(pc)
+    local pad = by_id.aim.pad
+    if pad == nil then return false end
+    local axis = TRIGGER_AXIS[pad]
+    if axis then return (tonumber(pc:GetInputAnalogKeyState(keys()[axis])) or 0) > 0.3 end
+    return down(pc, pad)
+end
+
+-- pc: the valid controller, with no menu up (tick checks both)
+local function look(pc, dt)
+    local k, L, O = keys(), gamepad.LOOK, gamepad.OPT
+    local x, y = pc:GetInputAnalogKeyState(O.swap and k.lx or k.rx), pc:GetInputAnalogKeyState(O.swap and k.ly or k.ry)
     local dx, dy = gamepad.stick(x, y, L.dz, L.expo)
     if dx == 0 and dy == 0 then return end
-    local speed = (tonumber(pc:GetInputAnalogKeyState(k.lt)) or 0) > 0.3 and L.aim or 1
-    -- the game's own setting: its mouse look multiplies pitch by the player's InvertValue too
-    local inv = 1
-    pcall(function() local v = tonumber(game.player().InvertValue); if v and v ~= 0 then inv = v end end)
+    local speed = aiming(pc) and L.aim or 1
+    -- the game's own setting: its mouse look multiplies pitch by the player's InvertValue too; INVERT LOOK on top
+    local inv = O.invert and -1 or 1
+    pcall(function() local v = tonumber(game.player().InvertValue); if v and v ~= 0 then inv = inv * v end end)
     local ys, ps = gamepad.scales(pc)
     pc:AddYawInput(dx * L.yaw * speed * dt / ys)
     -- stick up looks up (kit 2026-10-31: the mouse path's sign looked down - user: "look up and look down are inverted")
@@ -502,7 +723,7 @@ local function tick(dt)
         local w = util.addr(game.world())
         if on and w and w ~= state.world then state.world, state.wait = w, 1.0 end
     end
-    if not state.on then return end
+    if not state.on then capture = nil; return end   -- (switched off during a SET: it ends)
     if state.wait > 0 then
         state.wait = state.wait - dt
         if state.wait <= 0 then
@@ -514,14 +735,22 @@ local function tick(dt)
         end
         return
     end
+    frame_down = {}
     local pc = game.controller()
     if util.valid(pc) then
         local cursor = false
         pcall(function() cursor = pc.bShowMouseCursor end)
         cursor = cursor == true
+        -- the handbook closed while SET waited: stop waiting (the pad rows stayed out and the next press bound
+        -- silently, up to 6 s; audit 2026-11-02). Only once its cursor was seen during this capture.
+        if capture then
+            if cursor then capture.menu = true
+            elseif capture.menu then log.info("gamepad: menu closed - no button set for " .. capture.id); capture = nil end
+        end
         local helper = not capture and not cursor and looked_at() or nil
         if helper then state.look_left = LOOK_HOLD_S else state.look_left = math.max(0, state.look_left - dt) end
-        local want = capture and "none" or (cursor and "menu" or (state.look_left > 0 and "look" or "game"))
+        local want = capture and "none"
+            or (cursor and (padinv.on() and "inv" or "menu") or (state.look_left > 0 and "look" or "game"))
         if want ~= level then set_level(want) end
         if capture then
             padinv.leave()
@@ -534,31 +763,107 @@ local function tick(dt)
             hotbar_tick(pc)
             options_tick(pc, helper)
         end
+        if not cursor then look(pc, dt) end   -- (a menu up: the stick is the menu's)
     end
-    look(dt)
 end
 
+-- the context rows follow a changed binding at once (when bound)
+local function rebind_live()
+    if state.on and #added > 0 then util.safe(function() unbind(); bind() end, "gamepad.rebind") end
+end
 -- Bindings screen: an action onto a button (swap), saved and live at once when bound.
 function gamepad.set(id, pad)
     if not gamepad.assign(id, pad) then return false end
     save_binds()
     log.info("gamepad: " .. id .. " -> " .. pad)
-    if state.on and #added > 0 then util.safe(function() unbind(); bind() end, "gamepad.rebind") end
+    rebind_live()
     return true
 end
-function gamepad.reset()
-    gamepad.reset_binds()
+-- Bindings screen CLEAR: the action off its button, saved and live.
+function gamepad.clear(id)
+    if not gamepad.unassign(id) then return false end
     save_binds()
-    log.info("gamepad: bindings reset")
-    if state.on and #added > 0 then util.safe(function() unbind(); bind() end, "gamepad.rebind") end
+    log.info("gamepad: " .. id .. " -> none")
+    rebind_live()
+    return true
 end
--- rows for the bindings screen: { id, label, button ("..." while SET waits for it) }
+-- RESET TO DEFAULT: the default buttons, look speeds and switches
+function gamepad.reset()
+    for _, o in ipairs(gamepad.OPTIONS) do gamepad.OPT[o.key] = false end
+    gamepad.reset_binds()
+    gamepad.reset_sens()
+    save_binds()
+    log.info("gamepad: bindings, sensitivity and switches reset")
+    rebind_live()
+end
+-- rows for the bindings screen: { id, label, button ("PRESS A BUTTON" while SET waits for it, "NONE" unbound) },
+-- the buttons named for the pad picked in MY SETTINGS (XBOX: A, LB; PLAYSTATION: CROSS, L1). The actions that
+-- start on a button, then the menu / inventory / option controls, then the rest of the game's actions.
 function gamepad.binds_model()
+    local out, style = {}, pad_style()
+    local function row(a)
+        out[#out + 1] = { id = a.id, label = a.label,
+                          button = capture and capture.id == a.id and "PRESS A BUTTON" or gamepad.pad_name(a.pad, style) or "NONE" }
+    end
+    for _, a in ipairs(gamepad.ACTIONS) do if a.default then row(a) end end
+    for _, a in ipairs(gamepad.CONTROLS) do row(a) end
+    for _, a in ipairs(gamepad.ACTIONS) do if not a.default then row(a) end end
+    return out
+end
+
+-- Switches: each as { id, label, on, text ("ON" / "OFF") }
+function gamepad.opts_model()
     local out = {}
-    for _, a in ipairs(gamepad.ACTIONS) do
-        out[#out + 1] = { id = a.id, label = a.label, button = capture and capture.id == a.id and "PRESS A BUTTON" or PAD_NAME[a.pad] }
+    for _, o in ipairs(gamepad.OPTIONS) do
+        local on = gamepad.OPT[o.key] == true
+        out[#out + 1] = { id = o.id, label = o.label, on = on, text = on and "ON" or "OFF" }
     end
     return out
+end
+-- A switch's button: flipped, saved and live (SWAP STICKS moves the walk rows to the other stick). Returns the
+-- new value, nil for an unknown id.
+function gamepad.toggle_opt(id)
+    local o = opt_by_id[id]
+    if not o then return nil end
+    gamepad.OPT[o.key] = not gamepad.OPT[o.key]
+    gamepad.rebuild()
+    save_binds()
+    log.info("gamepad: " .. id .. " " .. (gamepad.OPT[o.key] and "on" or "off"))
+    if o.key == "swap" then rebind_live() end
+    return gamepad.OPT[o.key]
+end
+
+-- Sliders: each sensitivity as { id, label, value (0..1 along the slider), text }
+function gamepad.sens_model()
+    local out = {}
+    for _, s in ipairs(gamepad.SENS) do
+        local v = gamepad.LOOK[s.key]
+        local base = LOOK_DEFAULT[s.key] or v
+        local shown = s.pct and math.floor(v * 100 + 0.5) or math.floor(v / base * 100 + 0.5)
+        out[#out + 1] = { id = s.id, label = s.label, value = (v - s.min) / (s.max - s.min), text = shown .. "%" }
+    end
+    return out
+end
+-- A slider moved to f (0..1): LOOK takes the nearest step; saved when that changed it. Returns true then.
+function gamepad.set_sens(id, f)
+    local s = sens_by_id[id]
+    f = tonumber(f)
+    if not s or not f or f ~= f then return false end
+    local v = snap(s, s.min + math.max(0, math.min(1, f)) * (s.max - s.min))
+    if math.abs(v - gamepad.LOOK[s.key]) < s.step / 2 then return false end
+    gamepad.LOOK[s.key] = v
+    save_binds()
+    return true
+end
+-- The - / + beside a slider: one step down (dir < 0) or up. Returns true when it moved.
+function gamepad.step_sens(id, dir)
+    local s = sens_by_id[id]
+    if not s then return false end
+    local v = snap(s, gamepad.LOOK[s.key] + (dir < 0 and -s.step or s.step))
+    if math.abs(v - gamepad.LOOK[s.key]) < s.step / 2 then return false end
+    gamepad.LOOK[s.key] = v
+    save_binds()
+    return true
 end
 
 function gamepad.init(cfg)
@@ -567,8 +872,10 @@ function gamepad.init(cfg)
         if c.enabled == false then return end
         for k, v in pairs(c.look or {}) do if gamepad.LOOK[k] ~= nil and type(v) == "number" then gamepad.LOOK[k] = v end end
     end
+    for k, v in pairs(gamepad.LOOK) do LOOK_DEFAULT[k] = v end
     util.safe(load_binds, "gamepad.binds")
     game.on_tick(function(dt) util.safe(tick, "gamepad.tick", dt) end)
+    ticking = true
 end
 
 -- dev checks (devtest eval): what's bound, and a fresh bind

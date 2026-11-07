@@ -18,6 +18,11 @@ local TURRET = "/Game/Blueprints/BuildingSystem/Actors/Turret/Buildable_Turret.B
 local MINE = "/Game/Blueprints/BuildingSystem/Actors/Traps/Buildable_LandMine.Buildable_LandMine_C"
 -- A horde beacon K2_DestroyActor's itself right after its final-wave SpawnRewards (no MC_Destroy).
 local BEACON = "/Game/Blueprints/HordeSystem/Beacon/Buildable_HordeBeacon.Buildable_HordeBeacon_C"
+-- A storage container's name (the game's Rename: BuildableRenameObject Confirm -> OverrideBuildName, which sets its
+-- ContainerName, a SaveGame text shown on its hover and its inventory panel). The other game sets the same
+-- ContainerName on its copy; the host's save keeps it, and a joining guest gets it in that save.
+local CONTAINER = "/Game/Blueprints/BuildingSystem/Actors/Containers/BuildableMaster_Container.BuildableMaster_Container_C"
+local MAX_NAME = 64
 local BOOM_FX = "/Game/PolygonFiles/PolygonMilitary/FX/FX_Explosion_New.FX_Explosion_New"
 local BOOM_CUE = "/Game/Audio/WARFARE_SOUNDS/Explosion_Fire_Gas/Cues/explosion_large_06_Cue.explosion_large_06_Cue"
 
@@ -28,11 +33,13 @@ local hook_in = 0.0
 local hooked_logged = nil
 local last_moving_id = nil
 local last_moving = nil
+local move_from = nil   -- { actor, id }: the piece the game's Move option (Buildable_MASTER ReplacingObject) last picked up
 local last_obj = nil
 local last_da = nil
 local applying = false
 local expect_gone = {}
-local stats = { placed = 0, moved = 0, removed = 0, made = 0, applied_moves = 0, applied_removes = 0, missing = 0 }
+local stats = { placed = 0, moved = 0, removed = 0, renamed = 0, made = 0, applied_moves = 0, applied_removes = 0,
+                applied_renames = 0, missing = 0 }
 
 local function shared() return role == "host" or (session and session.in_world()) end
 local function traded() if session and session.checkpoint and shared() then session.checkpoint("builds") end end
@@ -93,6 +100,20 @@ local function on_spawn_build(self, SpawnTransform)
     pcall(function() actor = comp.ReplacingActor end)
     local moving_id = last_moving_id
     if not replacing and last_moving and util.valid(last_moving) then replacing, actor = true, last_moving end
+    -- The hook runs after SpawnBuild, whose StopBuildMode has cleared ReplacingObject? and ReplacingActor: a move is
+    -- known from the tick's sample above, or from the game's Move option (ReplacingObject, move_from) when the
+    -- piece now stands on the spot just built. Missed, the move went out as a new place: the other game built a
+    -- second piece there and kept its own where it was (user 2026-11-03: duplicate containers, moves not shown).
+    local from = move_from
+    move_from = nil
+    if not replacing and from and util.valid(from.actor) then
+        local at
+        pcall(function() at = util.vec(from.actor:K2_GetActorLocation()) end)
+        if at and util.dist(at, l) < 1.0 then
+            replacing, actor, moving_id = true, from.actor, from.id
+            log.info("builds: the move was seen by the Move option, not the build mode")
+        end
+    end
     last_moving, last_moving_id = nil, nil
     if replacing then
         if util.valid(actor) then
@@ -237,15 +258,66 @@ local function move(payload)
     util.safe(function()
         doorlock.moved(util.vec(b:K2_GetActorLocation()), { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) })
     end, "builds.doorlock")
-    pcall(function()
-        b:K2_SetActorLocationAndRotation({ X = tonumber(x), Y = tonumber(y), Z = tonumber(z) },
-            { Pitch = tonumber(pi), Yaw = tonumber(ya), Roll = tonumber(ro) }, false, {}, true)
+    local to = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
+    local ok, err = pcall(function()
+        b:K2_SetActorLocationAndRotation(to, { Pitch = tonumber(pi), Yaw = tonumber(ya), Roll = tonumber(ro) }, false, {}, true)
     end)
+    local at
+    pcall(function() at = util.vec(b:K2_GetActorLocation()) end)
+    if not ok or not at or util.dist(at, to) > 5.0 then
+        log.warn(string.format("builds: the other player moved %s - it didn't move here (%s)", id,
+            not ok and tostring(err) or (at and string.format("%.0f cm off", util.dist(at, to)) or "no place")))
+        return
+    end
     stats.applied_moves = stats.applied_moves + 1
     log.info("builds: the other player moved " .. id)
 end
 
 local interact_fn = function(self) util.safe(function() remember_id(self:get()) end, "builds.interact") end
+
+-- the game's Move option on a piece: it opens build mode with that piece to put down again (still where it was)
+local function on_move_option(self)
+    if applying or not shared() then return end
+    local b = self:get()
+    local ok, id = pcall(id_of, b)
+    if ok and not id:find("@0,0,0$") then move_from = { actor = b, id = id } end
+end
+local move_option_fn = function(self) util.safe(on_move_option, "builds.move_option", self) end
+
+local function clean_name(s)
+    s = tostring(s or ""):gsub("%c", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    return util.utf8_cut(s, MAX_NAME)
+end
+
+-- the player renamed a container here (any container: the game lets anyone rename one)
+local function on_rename(self, Name)
+    if applying or not shared() then return end
+    local b = self:get()
+    local name
+    pcall(function() name = Name:get():ToString() end)
+    name = clean_name(name)
+    if name == "" then return end
+    local ok, id = pcall(id_of, b)
+    if not ok or id:find("@0,0,0$") then log.warn("builds: renamed a container - its place unknown, not sent"); return end
+    channel:send("C " .. id .. " " .. require("mirror.names").encode(name))
+    stats.renamed = stats.renamed + 1
+    log.info("builds: renamed " .. id .. " - telling the other game")
+end
+
+local function rename(payload)
+    local id, enc = payload:match("^C (%S+) (%S+)$")
+    if not id then return end
+    local name = clean_name(require("mirror.names").decode(enc))
+    if name == "" then return end
+    local b = find(id, 100)
+    if not b then stats.missing = stats.missing + 1; log.info("builds: " .. id .. " renamed - not here"); return end
+    -- (the property, not OverrideBuildName: that also opens the hover menu on this screen)
+    local ok, err = pcall(function() b.ContainerName = FText(name) end)
+    if not ok then log.warn("builds: couldn't rename " .. id .. ": " .. tostring(err)); return end
+    stats.applied_renames = stats.applied_renames + 1
+    log.info("builds: the other player renamed " .. id)
+end
+local rename_fn = function(self, Name) util.safe(on_rename, "builds.rename", self, Name) end
 
 local function remove(payload)
     local id = payload:match("^R (%S+)$")
@@ -310,6 +382,8 @@ function builds.tick(dt)
         util.ensure_hook(BEACON .. ":SpawnRewards", horde_done_fn)
         util.ensure_hook(BM .. ":OnBeginInteract", interact_fn)
         util.ensure_hook(BM .. ":OnExecuteInteract", interact_fn)
+        util.ensure_hook(BM .. ":ReplacingObject", move_option_fn)
+        util.ensure_hook(CONTAINER .. ":OverrideBuildName", rename_fn)
         if not shared() then expect_gone = {} end
     end
     channel:pump(function(p)
@@ -320,6 +394,7 @@ function builds.tick(dt)
         elseif k == "M" then util.safe(move, "builds.move", p)
         elseif k == "R" then util.safe(remove, "builds.remove", p)
         elseif k == "X" then util.safe(exploded, "builds.exploded", p)
+        elseif k == "C" then util.safe(rename, "builds.rename", p)
         elseif k == "N" then util.safe(bedtags.apply, "builds.bedname", p) end
         -- more than two players: the host built / moved / removed it with plain actor calls no hook sees,
         -- so the other guests hear it from here (ids are places, the same in every world)
@@ -330,13 +405,14 @@ end
 function builds.relay_send(p) channel:send(p) end
 
 function builds.status()
-    return string.format("builds: placed %d, moved %d, removed %d | made %d, moves %d, removes %d%s",
-        stats.placed, stats.moved, stats.removed, stats.made, stats.applied_moves, stats.applied_removes,
+    return string.format("builds: placed %d, moved %d, removed %d, renamed %d | made %d, moves %d, removes %d, renames %d%s",
+        stats.placed, stats.moved, stats.removed, stats.renamed, stats.made, stats.applied_moves, stats.applied_removes,
+        stats.applied_renames,
         stats.missing > 0 and (", not here " .. stats.missing) or "")
 end
 
 -- Respawn/reload: the old world's objects are freed - drop them without touching them.
-local function forget_world() last_moving, last_obj, last_moving_id = nil, nil, nil end
+local function forget_world() last_moving, last_obj, last_moving_id, move_from = nil, nil, nil, nil end
 function builds.init(c, r, s)
     game.on_world_reset(forget_world)
     cfg, role, session = c, r, s

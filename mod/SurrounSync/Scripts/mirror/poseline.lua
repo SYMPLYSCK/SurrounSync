@@ -56,4 +56,25 @@ function poseline.parse(payload)
     return pose
 end
 
+-- "B <car> <forward> <right> <up> <yaw>" after the pose (vehicles.base_line): standing on that car, at that spot of it.
+function poseline.parse_base(seg)
+    local n, x, y, z, yaw = seg:match("^B (%S+) (%S+) (%S+) (%S+) (%S+)$")
+    x, y, z, yaw = tonumber(x), tonumber(y), tonumber(z), tonumber(yaw)
+    if not (n and x and y and z and yaw) then return nil end
+    return { name = n, X = x, Y = y, Z = z, yaw = yaw }
+end
+
+-- What follows the pose, each after its own "|": the car I stand on ("B ..."), the FPV quad I fly ("Q ...",
+-- drone.lua) and the car I drive (the rest: "D ..."). Returns the base (parsed), the quad's segment, the car's.
+function poseline.segments(rest)
+    local base, quad, car = nil, nil, nil
+    for seg in (rest or ""):gmatch("[^|]+") do
+        local k = seg:sub(1, 2)
+        if k == "B " then base = poseline.parse_base(seg)
+        elseif k == "Q " then quad = seg
+        else car = seg end
+    end
+    return base, quad, car
+end
+
 return poseline

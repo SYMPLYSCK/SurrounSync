@@ -429,6 +429,9 @@ function link.peer_state_now(rx_age)
     local s = link.status()
     local hb, game = tonumber(s:match("peer_hb (%-?[%d.]+)") or ""), s:match("peer_game (%S+)")
     if game == "gone" then return "gone" end
+    -- (no hello on this link yet: the bridge starts a new link as heard "now", so a re-made link to a host whose
+    -- game closed read "ok" every 20 s and its host-gone countdown never ran out, kit 2026-11-01, DBG-20261101-010)
+    if game == "?" then return "unknown" end
     if not hb or hb < 0 then return "unknown" end
     if hb > (c.peer_gone_after or 15) then return "gone" end
     if rx_age and rx_age > 10 then return "paused" end

@@ -11,8 +11,32 @@ local KINDS = {
     BP_WarehouseDoors_C        = { flag = "IsClosed", closed_when = true, toggle = "Event_Door" },
     BP_ContainerDoors_C        = { flag = "Open?", closed_when = false, toggle = "Event_Door" },
     BP_BarrierGate_C           = { flag = "Open?", closed_when = false, toggle = "Event_Door" },
-    -- Lab and keycard doors: only the lock state is copied. Their open events use up the keycard.
-    BP_LaboratorySlidingDoor_C = { lock = "Locked" },
+    -- Lab sliding doors (decompiled, player report 2026-11-01: "the doors will only open for the player that has
+    -- opened them, meaning two key cards are needed"): a keycard sets Unlocked (whose OnRep turns the frame green and
+    -- clears Locked) and slides the door with TL_DoorsKeycard; pressing an unlocked one plays that timeline back and
+    -- forth. Copying only Locked, without the OnRep or the slide, left it shut and red on the other screen. Now the
+    -- unlock is copied with its OnRep, and the door's slide (TL_DoorsKeycard forward = open) follows. The lab's
+    -- circuit box unlocks its doors the same way (Unlocked + OnRep_Unlocked, no slide).
+    BP_LaboratorySlidingDoor_C = {
+        unlock = "Unlocked", after_unlock = function(o) o:OnRep_Unlocked() end,
+        is_open = function(o)
+            local t = o.TL_DoorsKeycard
+            return t:GetPlaybackPosition() > 0.001 and not t:IsReversing()
+        end,
+        open = function(o) o.TL_DoorsKeycard:Play() end,
+        close = function(o) o.TL_DoorsKeycard:Reverse() end,
+    },
+    -- The lab's light switches (decompiled): the circuit box's lever runs Event_LightSwitch on each of its LightSwitches
+    -- (a toggle, which also flips the switch's own Switches); On? and Off? are each other's opposite, and OnRep_On? /
+    -- OnRep_Off? set the switch's lamp and every light in its Lights (LightOn? + OnRep_LightOn?). Only the game whose
+    -- player pulled the lever ever ran it. Copied as a state with its OnRep, not the toggle (a repeat can't flip it back).
+    BP_LaboratoryLightSwitch_C = {
+        flag = "On?", closed_when = false,
+        open = function(o) o["On?"] = true; o["OnRep_On?"](o) end,
+        close = function(o) o["Off?"] = true; o["OnRep_Off?"](o) end,
+    },
+    -- the lab's double entrance doors: a plain door (IsClosed, Event_Door), no keycard
+    BP_LaboratoryEntranceDoors_C = { flag = "IsClosed", closed_when = true, toggle = "Event_Door" },
     Buildable_WoodenDoor_C     = { flag = "IsClosed", closed_when = true, toggle = "Event_OpenDoor", dot = true },
     Buildable_WoodenDoor2_C    = { flag = "IsClosed", closed_when = true, toggle = "Event_OpenDoor", dot = true },
     Buildable_WoodenGate_C     = { flag = "IsClosed", closed_when = true, toggle = "Event_OpenDoor", dot = true },
@@ -27,12 +51,28 @@ local KINDS = {
     -- Keycard doors (player report 2026-10-27: one area's doors took a keycard on each game). BP_KeycardDoor uses
     -- up a keycard on every opening and closes itself 30 min later; MC_OpenDoor(actor) only plays the opening
     -- (decompiled): the other game opens its copy with that, facing the other player, and never shuts it (each
-    -- closes on its own timer). The keypad door works the same way. The lab's secure doors keep an Unlocked flag
-    -- that the keycard sets: copied, the other player opens them for free.
+    -- closes on its own timer). The keypad door works the same way.
     BP_KeycardDoor_C               = { flag = "Open?", closed_when = false, toggle = "MC_OpenDoor", open_only = true, by_actor = true },
     BP_KeycardDoor_Child_C         = { flag = "Open?", closed_when = false, toggle = "MC_OpenDoor", open_only = true, by_actor = true },
     BP_KeypadDoor_C                = { flag = "Open?", closed_when = false, toggle = "MC_OpenDoor", open_only = true, by_actor = true },
-    BP_LaboratorySecureDoors_C     = { unlock = "Unlocked" },
+    -- The lab's secure doors (decompiled): Event_Door on a closed one always wants a keycard (Unlocked is set but never
+    -- read there), so copying Unlocked alone opened nothing (report 2026-11-01). Re-traced 2026-11-01 (a9719e5 had the
+    -- two timelines the wrong way round): the keycard opening is IsClosed = false + TL_Mechanism (its end plays TL_Doors,
+    -- the slide); pressing an open one is TL_MechanismReverse, whose every update reverses TL_Doors, and TL_Doors back at
+    -- its start sets IsClosed. Event_Close only runs TL_MechanismReverse backwards (moves no door). Opened from behind
+    -- (Event_AutoDoor) the doors slide on another timeline, Timeline_0 then Timeline, which TL_Doors' reverse never
+    -- undoes: a copy opened that way is closed by reversing Timeline too. From the start each time (a timeline left at
+    -- its end by the last open or close would not run again).
+    BP_LaboratorySecureDoors_C     = {
+        flag = "IsClosed", closed_when = true, unlock = "Unlocked",
+        open = function(o) o.IsClosed = false; o.TL_Mechanism:PlayFromStart() end,
+        close = function(o)
+            o.TL_MechanismReverse:PlayFromStart()
+            if o.Timeline:GetPlaybackPosition() > 0.001 then o.Timeline:Reverse() end
+            -- (TL_Doors never ran here: its end, which sets the flag, won't come)
+            if o.TL_Doors:GetPlaybackPosition() <= 0.001 then o.IsClosed = true end
+        end,
+    },
 }
 
 local POLL = 0.25
@@ -54,8 +94,11 @@ local active = false
 local now, poll_in, scan_in = 0.0, 0.0, 0.0
 local stats = { sent = 0, applied = 0, unlocked = 0, missing = 0 }
 local doorlock = require("mirror.doorlock")
+local vehlock = require("mirror.vehlock")
 local lock_role, lock_session = nil, nil
-local lock_blob, lock_sent, lock_ops_sent, lock_ack, lock_seen = nil, nil, nil, 0, {}
+-- each lock store on this link: its module, the host's blob, the guest's blob, and what was sent and taken
+local function lock_link(m, out, back) return { m = m, out = out, back = back, blob = nil, sent = nil, ops_sent = nil, ack = 0, seen = {} } end
+local LOCKS = { lock_link(doorlock, "locks", "lock_g"), lock_link(vehlock, "vlocks", "vlock_g") }
 
 local function key(obj, cls)
     local l = obj:K2_GetActorLocation()
@@ -106,7 +149,8 @@ end
 local function read(d)
     local open, unlocked
     pcall(function()
-        if d.kind.flag then open = (d.obj[d.kind.flag] == true) ~= d.kind.closed_when end
+        if d.kind.is_open then open = d.kind.is_open(d.obj) == true
+        elseif d.kind.flag then open = (d.obj[d.kind.flag] == true) ~= d.kind.closed_when end
         if d.kind.lock then unlocked = d.obj[d.kind.lock] ~= true end
         if d.kind.unlock then unlocked = d.obj[d.kind.unlock] == true end
     end)
@@ -157,15 +201,19 @@ local function apply(id, e)
         local ok = pcall(function()
             if d.kind.lock then d.obj[d.kind.lock] = false else d.obj[d.kind.unlock] = true end
         end)
+        if ok and d.kind.after_unlock then ok = pcall(d.kind.after_unlock, d.obj) end
         want.unlocked = true
         stats.unlocked = stats.unlocked + 1
         log.info("doors: unlocked " .. id .. " (the other player opened it)" .. (ok and "" or " - FAILED"))
     end
-    if d.kind.toggle and e.open ~= nil and open ~= nil and e.open ~= open and (e.open or not d.kind.open_only) then
+    if (d.kind.toggle or d.kind.open) and e.open ~= nil and open ~= nil and e.open ~= open and (e.open or not d.kind.open_only) then
         local ex = expect[id]
         if not (ex and ex.open == e.open and now < ex["until"]) then
             local by = d.kind.by_actor and require("mirror.ghost").get() or nil
-            local ok, err = pcall(function() local f = d.obj[d.kind.toggle]; if by then f(d.obj, by) else f(d.obj) end end)
+            local ok, err = pcall(function()
+                if d.kind.open then (e.open and d.kind.open or d.kind.close)(d.obj); return end
+                local f = d.obj[d.kind.toggle]; if by then f(d.obj, by) else f(d.obj) end
+            end)
             if ok and e.open and d.kind.dot and e.dot then pcall(function() d.obj.DotProduct = e.dot end) end
             want.open = e.open
             stats.applied = stats.applied + 1
@@ -208,40 +256,44 @@ local function set_active(on)
     end
 end
 
--- Door code locks (doorlock.lua): the host sends its locks plus the last of this guest's changes it took ("locks"),
--- a guest sends its changes ("lock_g"). Not tied to door_sync: a lock holds whichever way doors sync.
-local function sync_locks()
+-- Door code locks (doorlock.lua) and vehicle locks (vehlock.lua), each its own store and blobs: the host sends its
+-- locks plus the last of this guest's changes it took ("locks" / "vlocks"), a guest sends its changes ("lock_g" /
+-- "vlock_g"). Not tied to door_sync: a lock holds whichever way doors sync.
+local function sync_locks(L)
+    local m = L.m
     if not peer_live() then
         -- (whoever joins next is a new guest game: nothing of theirs taken yet)
-        lock_blob, lock_sent, lock_ops_sent = nil, nil, nil
-        lock_ack, lock_seen = 0, {}
-        if lock_role ~= "host" then doorlock.take(nil); doorlock.left() end
+        L.blob, L.sent, L.ops_sent = nil, nil, nil
+        L.ack, L.seen = 0, {}
+        if lock_role ~= "host" then m.take(nil); m.left() end
         return
     end
     if lock_role == "host" then
-        local g = link.get_blob("lock_g")
-        if g then lock_ack = doorlock.take_ops(g, lock_seen) end
-        local k = doorlock.gen() .. ":" .. lock_ack .. ":" .. tostring(lock_seen.run)
-        if k ~= lock_sent then lock_sent = k; link.put_blob("locks", doorlock.dump(lock_ack, lock_seen.run)) end
+        local g = link.get_blob(L.back)
+        -- (this link's own vehicles module: the guest whose changes these are, so vehlock knows whose seat is whose)
+        if g then L.ack = m.take_ops(g, L.seen, require("mirror.vehicles")) end
+        local k = m.gen() .. ":" .. L.ack .. ":" .. tostring(L.seen.run)
+        if k ~= L.sent then L.sent = k; link.put_blob(L.out, m.dump(L.ack, L.seen.run)) end
         return
     end
-    local b = link.get_blob("locks")
-    if b then lock_blob = b end
+    local b = link.get_blob(L.out)
+    if b then L.blob = b end
     if not lock_session.in_world() then
         -- home: my own world's locks again, but changes made in the host's world (the last frame there too) still go
         -- to it until it took them (menu.lua keeps the link that long)
-        doorlock.take(nil)
-        doorlock.take_ack(lock_blob)
+        m.take(nil)
+        m.take_ack(L.blob)
     else
-        doorlock.take(lock_blob or "ack 0")   -- (before the host's first: nobody's doors yet, my changes still queue)
+        m.take(L.blob or "ack 0")   -- (before the host's first: nobody's locks yet, my changes still queue)
     end
-    local og = doorlock.ops_gen()
-    if og ~= lock_ops_sent then lock_ops_sent = og; link.put_blob("lock_g", doorlock.ops_text()) end
+    local og = m.ops_gen()
+    if og ~= L.ops_sent then L.ops_sent = og; link.put_blob(L.back, m.ops_text()) end
 end
 
 function doors.tick(dt)
     now = now + dt
-    util.safe(sync_locks, "doors.locks")
+    for _, L in ipairs(LOCKS) do util.safe(sync_locks, "doors.locks", L) end
+    util.safe(vehlock.tick, "vehlock.tick", dt)
     local b = peer_live() and link.get_blob("doors") or nil
     if b then peer_blob = b; if active then take_peer() end end
     set_active(role == "host" or session.in_world())
@@ -302,6 +354,7 @@ end
 function doors.init(c, r, s, connected)
     cfg, role, session = c, r, s
     lock_role, lock_session = r, s
+    vehlock.init(s)
     peer_live = connected or peer_live
     require("mirror.game").on_world_reset(doors.forget)
     if cfg.door_sync == false then role = "off"; session = { in_world = function() return false end } end

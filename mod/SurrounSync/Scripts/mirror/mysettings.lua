@@ -22,8 +22,16 @@ mysettings.LIST = {
     { key = "dmgnumbers", label = "DAMAGE NUMBERS", hint = "The numbers that pop up when you hit something.", default = "on" },
     { key = "perf", label = "GUEST PERFORMANCE", hint = "As a guest: zombies are copied to you within 150 / 100 / 60 m.",
       values = { { "full", "FULL" }, { "balanced", "BALANCED" }, { "low", "LOW" } }, default = "full" },
-    { key = "gamepad", label = "CONTROLLER", hint = "Xbox-style pad. Turn Steam Input off for SurrounDead in Steam.", default = "on",
-      extra = "BINDINGS" },   -- a second button on the row: the pad's bindings screen   -- (Steam Input on turns the pad into keys: doubled hotbar, no aim - kit 2026-10-31)
+    -- The pad type: the same buttons either way (the game reads XInput only: a DualSense reaches it as a virtual
+    -- Xbox pad through Steam Input's Gamepad template or DS4Windows), only the names on screen and the setup hint
+    -- differ. Xbox: Steam Input off (its default SurrounDead layout turns the pad into keys: doubled hotbar, no aim
+    -- - kit 2026-10-31). hints: one per value, in place of hint.
+    { key = "gamepad", label = "CONTROLLER", default = "xbox", extra = "BINDINGS",   -- extra: the bindings screen button
+      values = { { "off", "OFF" }, { "xbox", "XBOX" }, { "playstation", "PLAYSTATION" } },
+      hints = { off = "Pick XBOX or PLAYSTATION to play with a pad.",
+                xbox = "Xbox pad. Turn Steam Input off for SurrounDead in Steam.",
+                playstation = "PS5 pad. In Steam: Steam Input on, layout template Gamepad." },
+      legacy = { on = "xbox" } },   -- legacy: values older versions saved
 }
 -- the zombie copy range each GUEST PERFORMANCE value asks the host for (share of config zombies.radius)
 mysettings.PERF_SHARE = { full = 1.0, balanced = 100 / 150, low = 60 / 150 }
@@ -48,7 +56,9 @@ local function load()
     local s = f and f:read("*a") or ""
     if f then f:close() end
     for k, v in s:gmatch("(%w+)%s+(%w+)") do
-        if by_key[k] and valid(by_key[k], v) then mine[k] = v end
+        local o = by_key[k]
+        if o and o.legacy and o.legacy[v] then v = o.legacy[v] end
+        if o and valid(o, v) then mine[k] = v end
     end
 end
 
@@ -64,6 +74,8 @@ function mysettings.value(key)
     return mine[key]
 end
 function mysettings.on(key) local v = mysettings.value(key); return v ~= nil and v ~= "off" end
+-- The pad's button names: "playstation" or "xbox" (also while the pad is off, so the bindings screen has names).
+function mysettings.pad_style() return mysettings.value("gamepad") == "playstation" and "playstation" or "xbox" end
 
 -- The settings page's button: the next value.
 function mysettings.toggle(key)
@@ -84,10 +96,15 @@ mysettings.SYNCFX = "SyncFX"
 mysettings.SYNCFX_ROW = { key = "syncfx", tag = "Optimizes Performance", tag_color = { R = 0.06, G = 0.30, B = 0.08, A = 1.0 },
     label = "SYNCFX GRAPHICS", hint = "F8 in game turns it on, F6 menu." }   -- one line on the page
 
-local function syncfx_row()
-    local ok, installed, on, pending = pcall(function() return require("mirror.modlist").state(mysettings.SYNCFX) end)
+-- The gore mod (SurrounDeadGore: its Lua mod and blood asset pak), under SyncFX the same way: switched in mods.txt
+-- and the pak's name (modlist.set_gore), from the next game start. Only this PC's screen, so never matched with the
+-- host. MY SETTINGS is the CO-OP gear's page and, in a Realm, the REALMS page's RULES -> MY SETTINGS.
+mysettings.GORE = "SurrounDeadGore"
+mysettings.GORE_ROW = { key = "gore", label = "GORE", hint = "Blood sprays, splatter, pools, headshot kills." }
+
+local function mod_row(id, r)
+    local ok, installed, on, pending = pcall(function() return require("mirror.modlist").state(id) end)
     if not ok or not installed then return nil end
-    local r = mysettings.SYNCFX_ROW
     return { key = r.key, tag = r.tag, tag_color = r.tag_color, label = r.label, text = on and "ON" or "OFF",
              hint = pending and ((on and "On" or "Off") .. " from your next game start.") or r.hint }
 end
@@ -95,12 +112,13 @@ end
 function mysettings.rows()
     if not loaded then load() end
     local out = {}
-    local fx = syncfx_row()
-    if fx then out[1] = fx end
+    out[#out + 1] = mod_row(mysettings.SYNCFX, mysettings.SYNCFX_ROW)
+    out[#out + 1] = mod_row(mysettings.GORE, mysettings.GORE_ROW)
     for _, o in ipairs(mysettings.LIST) do
         local text = mine[o.key]
         for _, x in ipairs(o.values) do if x[1] == mine[o.key] then text = x[2] end end
-        out[#out + 1] = { key = o.key, label = o.label, hint = o.hint, text = text, extra = o.extra }
+        out[#out + 1] = { key = o.key, label = o.label, hint = o.hints and o.hints[mine[o.key]] or o.hint, text = text,
+                          extra = o.extra }
     end
     return out
 end

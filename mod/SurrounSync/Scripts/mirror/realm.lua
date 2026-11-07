@@ -20,7 +20,7 @@ local L = backups.LAYOUT
 realm.WORLD = { "Level.sav", "General.sav", "Difficulties.sav", "Slot.sav", "Thumb.sav" }
 -- the mod's own files that belong to a world, not to a PC (bed names, death bag owners, the host rules)
 realm.SIDECARS = { "mirror_coop_bed_names.txt", "mirror_coop_bags.txt", "mirror_host_settings.txt",
-                   "mirror_coop_door_locks.txt" }
+                   "mirror_coop_door_locks.txt", "mirror_coop_vehicle_locks.txt" }
 local MAX_SIDECAR = 256 * 1024
 local MAX_STARTER_FILE = 16 * 1024 * 1024
 local TIMEOUT = { download = 150, upload = 150 }
@@ -52,7 +52,7 @@ end
 
 local seq = (os.time() % 100000) * 1000
 local pending = {}     -- seq -> { verb, cb, t }
-local state = { realms = nil, list = {}, leases = {}, rules = {} }
+local state = { realms = nil, list = {}, leases = {}, rules = {}, pub = {}, servers = {}, servers_at = nil }
 local read_in = 0.0
 
 -- cb(ok, words, text): words = the answer after "ok"/"fail" split on spaces; text = the same unsplit
@@ -86,7 +86,7 @@ end
 local function read_state()
     local s = fs.read(link.dir() .. "\\mirror_realms.txt")
     if not s or s:sub(-4) ~= "END\n" then return nil end
-    local t = { list = {}, leases = {}, ops = {}, rules = {} }
+    local t = { list = {}, leases = {}, ops = {}, rules = {}, pub = {}, servers = {} }
     for line in s:gmatch("[^\n]+") do
         local k, rest = line:match("^(%a+) (.*)$")
         if k == "realms" then
@@ -110,6 +110,19 @@ local function read_state()
             -- "rules <id> <key> <value> ...": the owner's game rules (hostrules.lua)
             local id, r = rest:match("^(%S+) (.+)$")
             if id then t.rules[id] = r end
+        elseif k == "pub" then
+            -- "pub <id> <listed 0|1> <locked 0|1> <invited|public>": on the server list, and how I joined it
+            local id, listed, locked, via = rest:match("^(%S+) ([01]) ([01]) (%a+)$")
+            if id then t.pub[id] = { listed = listed == "1", locked = locked == "1", from_list = via == "public" } end
+        elseif k == "servers" then
+            t.servers_at = tonumber(rest:match("^(%d+)") or "")
+        elseif k == "server" then
+            -- "server <id> <live 0|1> <locked 0|1> <players> <max> <ping ms|-> <mine 0|1> <name...>" (the last browse)
+            local id, live, locked, n, max, ping, mine, name = rest:match("^(%S+) ([01]) ([01]) (%d+) (%d+) (%S+) ([01]) ?(.*)$")
+            if id and realm.valid_id(id) and #t.servers < 100 then
+                t.servers[#t.servers + 1] = { id = id, live = live == "1", locked = locked == "1", players = tonumber(n),
+                    max = tonumber(max), ping = tonumber(ping), mine = mine == "1", name = name ~= "" and name or id }
+            end
         elseif k == "op" then
             local n, verb, res, more = rest:match("^(%d+) (%S+) (%a+) ?(.*)$")
             if n then t.ops[tonumber(n)] = { verb = verb, ok = res == "ok", text = more } end
@@ -133,7 +146,10 @@ function realm.tick(dt)
     if read_in > 0 then return end
     read_in = any and 0.25 or 2.0
     local t = read_state()
-    if t then state.realms, state.realms_at, state.list, state.leases, state.rules = t.realms, t.realms_at, t.list, t.leases, t.rules end
+    if t then
+        state.realms, state.realms_at, state.list, state.leases, state.rules = t.realms, t.realms_at, t.list, t.leases, t.rules
+        state.pub, state.servers, state.servers_at = t.pub, t.servers, t.servers_at
+    end
     -- answers are handed out after the walk: a handler that sends the next request adds to `pending`, and a
     -- table that grows during pairs() fails ("invalid key to 'next'" in-game: claim_new -> upload)
     local ready = {}
@@ -158,6 +174,10 @@ function realm.lease(id) return state.leases[id] end
 -- the owner's game rules as the server has them ("pvp off players 4 ..."; nil = not set yet or an older bridge)
 function realm.rules(id) return state.rules[id] end
 function realm.busy() return next(pending) ~= nil end
+-- the public server list: { listed, locked, from_list } for my Realm id (nil: an older bridge)
+function realm.pub(id) return state.pub[id] end
+-- the last browse's rows ({ id, live, locked, players, max, ping (ms or nil), mine, name }) and when it ran (unix s)
+function realm.servers() return state.servers, state.servers_at end
 
 -- ---- the local copy of the newest world ----
 

@@ -14,6 +14,7 @@ import argparse, math, os, re, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SD = os.path.join(os.environ.get("LOCALAPPDATA", ""), "SurrounDead")
+SPIN = 0.3   # radians per second around the host (--spin; 0 = each bot stands still at its own angle)
 
 
 def protocol():
@@ -57,8 +58,8 @@ def roster(d):
 
 
 class Bot:
-    def __init__(self, bid, exe, port, base, phase, radius):
-        self.id, self.phase, self.radius = bid, phase, radius
+    def __init__(self, bid, exe, port, base, phase, radius, spin=SPIN):
+        self.id, self.phase, self.radius, self.spin = bid, phase, radius, spin
         self.dir = os.path.join(base, str(bid))
         os.makedirs(self.dir, exist_ok=True)
         self.proc = subprocess.Popen([exe, "--role", "guest", "--peer", "1001", "--test-net", str(port),
@@ -101,7 +102,7 @@ class Bot:
         f = self.host_sample()
         if not f or len(f) < 5:
             return
-        a = self.phase + (time.time() - self.t0) * 0.3
+        a = self.phase + (time.time() - self.t0) * self.spin
         if not self.ride:   # riding: stay on the host (the driver) - the ghost sits in its seat anyway
             f[0] = "%.1f" % (float(f[0]) + math.cos(a) * self.radius)
             f[1] = "%.1f" % (float(f[1]) + math.sin(a) * self.radius)
@@ -173,11 +174,12 @@ def main():
     ap.add_argument("--no-accept", action="store_true")
     ap.add_argument("--crash", action="store_true", help="vanish at the end (no goodbye), like a crashed game")
     ap.add_argument("--host-dir", help="accept through this host bridge dir (self-test without the game)")
+    ap.add_argument("--spin", type=float, default=SPIN, help="radians per second around the host (0 = stand still)")
     a = ap.parse_args()
     base = tempfile.mkdtemp(prefix="mirror_bots_")
     print("bots in " + base, flush=True)
     ids = [int(x) for x in a.ids.split(",") if x]
-    bots = [Bot(b, a.bridge, a.port, base, i * 2.1, a.radius) for i, b in enumerate(ids)]
+    bots = [Bot(b, a.bridge, a.port, base, i * 2.1, a.radius, a.spin) for i, b in enumerate(ids)]
     accepted, end = set(), time.time() + a.secs
     try:
         while time.time() < end and all(b.proc.poll() is None for b in bots):

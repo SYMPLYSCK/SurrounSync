@@ -1,4 +1,6 @@
 -- Backup copies of a save, taken before co-op touches it. Kept in Saved\SurrounSyncBackups.
+-- Realm characters have their own scope (take_realm / list_realm / restore_realm): the same folders, manifests and
+-- retention, under SurrounSyncBackups\SurrounSync Realms\<Realm id>. Co-op's lists and requests never see them.
 
 local log = require("mirror.log")
 local savefs = require("mirror.savefs")
@@ -21,6 +23,8 @@ before co-op touched it ("before joining", "before going home", ...). The oldest
 one from before you first used co-op - it is never deleted automatically.
 
 The easy way back: open the co-op menu in the game -> Backups -> Restore (it applies when you restart).
+The folder "SurrounSync Realms" holds your character of each Realm (one folder per Realm id). Bring one back in the
+game: handbook (J) -> REALMS -> BACKUPS -> Restore (it applies the next time you open that Realm).
 
 By hand (game closed):
   1. Copy every .sav / .jpg file of the dated folder, EXCEPT the ones whose name starts with the save's name,
@@ -130,9 +134,15 @@ function backups.take(o)
     local src = saves_dir .. "\\" .. from
     local files = {}
     local function add(path, name, sidecar) if savefs.exists(path) then files[#files + 1] = { path, name, sidecar } end end
-    if kind == "full" then for _, f in ipairs(backups.LAYOUT.world) do add(src .. "\\" .. f, f) end end
-    for _, f in ipairs(backups.LAYOUT.player) do add(src .. "\\" .. f, f) end
-    for _, x in ipairs(backups.LAYOUT.sidecars) do add(saves_dir .. "\\" .. from .. x, slot .. x, true) end
+    if o.dir then
+        -- a Realm character: kept by plain file name in its own folder, no world
+        for _, f in ipairs(backups.LAYOUT.player) do add(o.dir .. "\\" .. f, f) end
+        for _, x in ipairs(backups.LAYOUT.sidecars) do add(o.dir .. "\\" .. x, x, true) end
+    else
+        if kind == "full" then for _, f in ipairs(backups.LAYOUT.world) do add(src .. "\\" .. f, f) end end
+        for _, f in ipairs(backups.LAYOUT.player) do add(src .. "\\" .. f, f) end
+        for _, x in ipairs(backups.LAYOUT.sidecars) do add(saves_dir .. "\\" .. from .. x, slot .. x, true) end
+    end
     if #files == 0 then return nil, "nothing to back up in " .. from end
     local sig = {}
     for _, f in ipairs(files) do
@@ -183,7 +193,7 @@ function backups.take(o)
         if data ~= f[4] then return fail("read-back of " .. dst .. " differs from the source") end
         lines[#lines + 1] = string.format("file %s %d %s%s", f[2], #data, f[5], f[3] and " sidecar" or "")
     end
-    local pinned = #entries == 0
+    local pinned = #entries == 0 and not o.dir   -- (a Realm keeps its newest copies only)
     local time = os.date("%Y-%m-%d %H:%M:%S")
     local manifest = table.concat({ "mirrorcoop-backup 1", "slot=" .. slot, "time=" .. time, "reason=" .. reason,
         "kind=" .. kind, "pinned=" .. (pinned and "1" or "0"), "version=" .. version }, "\n") .. "\n"
@@ -240,5 +250,68 @@ function backups.pending_restore()
 end
 
 function backups.cancel_restore() savefs.remove(request_path()) end
+
+-- ---- Realm characters ----
+-- The character a Realm keeps for me (realm.lua's character folder: Player.sav, PlayerInfo.sav and the sidecars by plain
+-- name). The key is a folder no save is called, so co-op's listing, pruning and orphan cleanup never reach it.
+
+local REALM_DIR = "SurrounSync Realms"
+local is_character_file = {}
+for _, f in ipairs(backups.LAYOUT.player) do is_character_file[f] = true end
+for _, f in ipairs(backups.LAYOUT.sidecars) do is_character_file[f] = true end
+
+function backups.realm_key(id)
+    if type(id) ~= "string" or not id:match("^%w+$") then return nil end
+    return REALM_DIR .. "\\" .. id
+end
+
+-- dir = the Realm's character folder. nil, nil = no character yet (nothing to keep); nil, why = it failed
+function backups.take_realm(id, dir, reason)
+    local key = backups.realm_key(id)
+    if not (key and root and dir) then return nil, "no backup folder for this Realm" end
+    if not savefs.exists(dir .. "\\Player.sav") then return nil end
+    local name, err = backups.take{ slot = key, dir = dir, kind = "realm", reason = reason }
+    if not name then log.warn("backups: Realm " .. id .. " character not backed up: " .. tostring(err)) end
+    return name, err
+end
+
+-- newest first, each with the size of all its files
+function backups.list_realm(id)
+    local key = backups.realm_key(id)
+    if not (key and root) then return {} end
+    local out = backups.list(key)
+    for _, e in ipairs(out) do
+        local m, bytes = backups.manifest(key, e.folder), 0
+        for _, f in ipairs(m and m.files or {}) do bytes = bytes + f.size end
+        e.size = bytes
+    end
+    return out
+end
+
+-- Puts a backup back as the Realm's character. `store` is realm.store_character: that file owns the Realm's folder and
+-- its atomic set write, this one never writes there. The character as it is now is backed up first.
+function backups.restore_realm(id, folder, dir, store)
+    local key = backups.realm_key(id)
+    if not (key and root) then return nil, "no backup folder for this Realm" end
+    local ok, why = backups.verify(key, folder)
+    if not ok then return nil, why end
+    local files = {}
+    for _, f in ipairs(backups.manifest(key, folder).files) do
+        if not is_character_file[f.name] then return nil, "unexpected file " .. f.name .. " in the backup" end
+        files[f.name] = savefs.read(slot_dir(key) .. "\\" .. folder .. "\\" .. f.name)
+        if not files[f.name] then return nil, "can't read " .. f.name end
+    end
+    if not files["Player.sav"] then return nil, "the backup has no Player.sav" end
+    if savefs.exists(dir .. "\\Player.sav") then
+        local kept, err = backups.take_realm(id, dir, "before restore")
+        if not kept then return nil, "couldn't back up the current character first: " .. tostring(err) end
+    end
+    local stored, err = store(id, files)
+    if not stored then return nil, err end
+    -- (a held character reports done without writing: that is not a restore)
+    if savefs.read(dir .. "\\Player.sav") ~= files["Player.sav"] then return nil, "the Realm kept its current character (held?)" end
+    log.info("backups: Realm " .. id .. " character restored from " .. folder)
+    return true
+end
 
 return backups

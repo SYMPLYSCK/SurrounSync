@@ -3,7 +3,8 @@
 -- returns Unhandled), so this drives the grids itself. User 2026-10-31: "x will quick take a will allow you too grab
 -- and then move with d pad too where you want and then lb rb rotate and when ur hovering over an item and the
 -- dropdown menu pops up you can move up and down with d pad too interact with the items and then when u dpad left or
--- right it just moves too the next slot in the inventory".
+-- right it just moves too the next slot in the inventory". The buttons below are the defaults (padinv.BUTTONS:
+-- each can be moved in CONTROLLER -> BINDINGS).
 --   D-pad   the next cell (out of the item under the cursor; at a grid's edge the nearest grid that way, never the
 --           hotbar; left/right with nothing that way go on to the next row). The mouse follows, so the game's own
 --           hover shows.
@@ -22,11 +23,14 @@ local game = require("mirror.game")
 
 local padinv = {}
 
-local B = {
+-- name -> pad key; the defaults, which gamepad.lua replaces with the bindings (CONTROLLER -> BINDINGS: MENU
+-- UP..RIGHT, INV: ...). A name on no button (nil) is never pressed.
+padinv.BUTTONS = {
     up = "Gamepad_DPad_Up", down = "Gamepad_DPad_Down", left = "Gamepad_DPad_Left", right = "Gamepad_DPad_Right",
     a = "Gamepad_FaceButton_Bottom", b = "Gamepad_FaceButton_Right", x = "Gamepad_FaceButton_Left",
     lb = "Gamepad_LeftShoulder", rb = "Gamepad_RightShoulder",
 }
+local NAMES = { "up", "down", "left", "right", "a", "b", "x", "lb", "rb" }
 local DIRS = { up = { 0, -1 }, down = { 0, 1 }, left = { -1, 0 }, right = { 1, 0 } }
 padinv.REPEAT_FIRST, padinv.REPEAT_EVERY, padinv.SCAN_EVERY, padinv.MENU_PLACE = 0.35, 0.12, 0.5, 0.3
 padinv.LAYOUT_EVERY, padinv.HOVER_MISSES = 2.0, 3
@@ -749,8 +753,9 @@ end
 -- presses this frame: fresh ones, plus D-pad repeats while held
 local function presses(pc, dt, down)
     local out = {}
-    for name, pad in pairs(B) do
-        local d = down(pc, pad)
+    for _, name in ipairs(NAMES) do
+        local pad = padinv.BUTTONS[name]
+        local d = pad ~= nil and down(pc, pad) == true
         if d and not S.held_keys[name] then
             out[name] = true
             S.rep[name] = padinv.REPEAT_FIRST
@@ -875,6 +880,9 @@ function padinv.leave()
     if S.on then log.info("padinv: inventory off the pad") end
     reset()
 end
+
+-- true while the pad drives the inventory (gamepad.lua takes the INV buttons out of the menu actions then)
+function padinv.on() return S.on == true end
 
 function padinv.status()
     local c = S.cur

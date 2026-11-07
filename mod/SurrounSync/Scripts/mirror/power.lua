@@ -10,7 +10,10 @@ local power = {}
 
 local CLASSES = {
     g = { "Buildable_SmallGenerator_C", "Buildable_LargeGenerator_C", "Buildable_IndustrialGenerator_C" },
-    w = { "BP_PowerGenerator_C" },
+    -- the lab's generator works like the world one (decompiled: TurnedOn? + Event_TurnOn, which flips it and powers
+    -- its Actors: lights, lab doors' warning state) - player report 2026-11-01: "the generator inside needs to be
+    -- switched on by both players"
+    w = { "BP_PowerGenerator_C", "BP_LaboratoryGenerator_C" },
     l = { "Buildable_Lamp_C", "Buildable_CampingLamp_C", "Buildable_CeilingLight_C", "Buildable_CeilingLight2_C",
           "Buildable_ConstructionLight_C", "Buildable_WallLight_C" },
     -- auto turrets: switched on and off through Buildable_MASTER's power (PoweredOn?), each game its own copy -
@@ -45,7 +48,7 @@ local cfg, role, session
 local channel = events.reliable("power")
 local known = {}
 local by_class = {}
-local scan_at, scan_in, poll_in, blob_in = 0, 0.0, 0.0, 0.0
+local scan_at, scan_retry, scan_in, poll_in, blob_in = 0, 0, 0.0, 0.0, 0.0
 local mine_at = {}
 local applied_at = {}
 local missing = {}
@@ -79,7 +82,12 @@ local function scan_step()
     scan_at = scan_at % #SCAN + 1
     local kind, cls = SCAN[scan_at][1], SCAN[scan_at][2]
     local objs, walked = util.instances(cls, hooks_of(kind, cls), GROUP[kind])
-    if not walked then return end
+    -- not walked yet (its hook lookups took this frame): the same class again next second, not 12 s later
+    if not walked then
+        if scan_retry < 3 then scan_retry, scan_at = scan_retry + 1, scan_at - 1 else scan_retry = 0 end
+        return
+    end
+    scan_retry = 0
     local seen = {}
     for _, a in ipairs(objs) do
         -- (a group walk's list can be a few frames old: an actor freed since then must not be read)
@@ -157,7 +165,15 @@ local function apply(id, kind, on, fuel, why)
     elseif kind == "w" then
         if on ~= cur_on then
             pcall(function() a["GasAdded?"] = true; a["ItemUsed?"] = true end)
-            pcall(function() a:Event_TurnOn(game.player()) end)
+            -- (the lab's Event_TurnOn also pops the "generator on/off" notice and completes the PowerOnGenerator
+            -- quest task on this game, for a switch the other player pulled; its TestTurnOnOff is the same flip and
+            -- Actors power without either, decompiled - its hum is Event_TurnOn's own Audio step, done here)
+            local quiet = id:find("^BP_LaboratoryGenerator_C@") and pcall(function() a:TestTurnOnOff() end)
+            if quiet then
+                pcall(function() if on then a.Audio:Activate(false) else a.Audio:Deactivate() end end)
+            else
+                pcall(function() a:Event_TurnOn(game.player()) end)
+            end
             changed = true
         end
     elseif kind == "l" then
@@ -272,7 +288,7 @@ function power.status()
 end
 
 -- Respawn/reload: the old world's objects are freed - drop them without touching them.
-local function forget_world() known, by_class, scan_at, scan_in = {}, {}, 0, 0.0 end
+local function forget_world() known, by_class, scan_at, scan_retry, scan_in = {}, {}, 0, 0, 0.0 end
 function power.init(c, r, s)
     game.on_world_reset(forget_world)
     cfg, role, session = c, r, s

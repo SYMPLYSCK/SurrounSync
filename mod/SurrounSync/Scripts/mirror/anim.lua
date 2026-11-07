@@ -110,6 +110,30 @@ end
 
 local find_montage = util.find
 
+-- The item's eat / drink / open sound comes from the montage on the character that uses it (BP_PlayerCharacter
+-- PlayUsingItemMontage: "Use" / "Open" notify -> MC_PlaySoundAtLocation, no attenuation passed). Some of those cues
+-- have none of their own either (human_eating_v3_Cue, Drinking_6_Cue; S_Eat_Cue and S_Drink_Cue have FootSteps
+-- Attenuation): played by the other player's character here they were heard at full volume anywhere on the map
+-- (player report 2026-11-01: the host hears the guest eat and drink). Such a cue gets one of the game's own
+-- attenuations (audio.lua's pick for 2D cues) - on the cue itself, so the player's own use of it has it too, as the
+-- game's attenuated eat cues do; at the player's own spot it sounds as loud as before.
+local USE_SOUNDS = { "ConsumeSound", "OpenItemSound" }
+local function attenuate(asset)
+    for _, k in ipairs(USE_SOUNDS) do
+        local s, own
+        pcall(function() s = asset[k] end)
+        if util.valid(s) then
+            pcall(function() own = util.valid(s.AttenuationSettings) or s.bOverrideAttenuation == true end)
+            local att = not own and require("mirror.audio").attenuation_for(s) or nil
+            if att then
+                local ok = pcall(function() s.AttenuationSettings = att end)
+                log.info("anim: " .. (path_of(s) or k):match("[^%./]+$") .. " had no attenuation - given "
+                    .. (path_of(att) or "?"):match("[^%./]+$") .. (ok and "" or " - FAILED"))
+            end
+        end
+    end
+end
+
 local function apply_use(g, asset_p, extra)
     local mp, op = (extra or ""):match("^(%S+) (%S+)$")
     local asset, m = find_montage(asset_p), mp and find_montage(mp)
@@ -118,6 +142,7 @@ local function apply_use(g, asset_p, extra)
         return
     end
     local o = op ~= "-" and find_montage(op) or nil
+    util.safe(attenuate, "anim.attenuate", asset)
     local ok, err = pcall(function() g:PlayUsingItemMontage(asset, m, o) end)
     -- (every swing, loot and hit is one: debug only, ~1000 lines in 75 min of play, live 2026-10-30)
     if ok then log.debug("anim: ghost uses " .. (asset_p:match("[^%.]+$") or asset_p))

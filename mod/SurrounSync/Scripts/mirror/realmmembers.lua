@@ -75,6 +75,71 @@ function members.use_key(text)
     end)
 end
 
+-- ---- the public server list (REALMS page, SERVERS) ----
+
+local browsed_at = -100
+-- A Realm server older than the list: it reads "public" as a Realm code (bad_input), or has no such route (not_found).
+local NOT_ON_SERVER = { bad_input = true, not_found = true }
+-- what the SERVERS tab says when the last browse failed (nil: it worked), or it would wait on "Getting the list..."
+members.browse_failed = nil
+-- the list from the server, at most every 10 s (force) or 60 s (the open tab's own refresh)
+function members.browse(force)
+    if not realm.enabled() then return end
+    if os.time() - browsed_at < (force and 10 or 60) then return end
+    browsed_at = os.time()
+    realm.send("browse", "", function(ok, w, text)
+        if ok then members.browse_failed = nil; return end
+        members.browse_failed = NOT_ON_SERVER[w[1]] and "The server list isn't switched on yet."
+            or "Couldn't get the server list. Trying again in a minute."
+        if force then say(NOT_ON_SERVER[w[1]] and members.browse_failed or ("Couldn't get the server list (" .. text .. ")."), "bad") end
+    end)
+end
+
+-- JOIN from the list: a membership of my own (locked Realms need the owner's password), then open it like any of
+-- mine - a hosted one joins its host. The password goes to the bridge and the server only, never to the log.
+function members.join_public(id, password, name)
+    if not (realm.enabled() and realm.valid_id(id)) then return end
+    password = tostring(password or ""):gsub("[%c]", "")
+    realm.send("joinpublic", id .. (password ~= "" and (" " .. password) or ""), function(ok, w, text)
+        if not ok then
+            local why = w[1] == "bad_password" and (password == "" and "it needs the owner's password" or "wrong password")
+                or w[1] == "full" and "it has no free places" or w[1] == "no_realm" and "it isn't on the list any more"
+                or w[1] == "slow_down" and "too many tries, wait a while" or text
+            say("Couldn't join " .. (name or realm.code(id)) .. " (" .. why .. ").", "bad")
+            return
+        end
+        say("You're in " .. (name or realm.code(id)) .. " - opening it...", "good")
+        realm.send("list", "", function() require("mirror.realmplay").open(id) end)
+    end)
+end
+
+-- the owner's PUBLIC switch: on (open, or locked with a password) or off. Locking or taking it off removes the
+-- players who joined from the list; invited members stay.
+members.MIN_LIST_PASSWORD = 6   -- the server's MIN_PASSWORD
+function members.set_public(id, on, password)
+    if not (realm.enabled() and realm.valid_id(id)) then return end
+    password = tostring(password or ""):gsub("[%c]", "")
+    if on and password ~= "" and #password < members.MIN_LIST_PASSWORD then
+        say("A server list password needs at least " .. members.MIN_LIST_PASSWORD .. " characters.", "bad")
+        return
+    end
+    realm.send("public", id .. (on and (" on" .. (password ~= "" and (" " .. password) or "")) or " off"), function(ok, w, text)
+        if not ok then
+            local why = w[1] == "too_many_listed" and "this connection already has 3 Realms on the list"
+                or w[1] == "delisted" and "it was taken off the server list for good"
+                or w[1] == "slow_down" and "too many changes, wait a while"
+                or w[1] == "not_found" and "it isn't switched on yet"
+                or w[1] == "bad_input" and (text:gsub("^bad_input%s*", "")) or text
+            say("Couldn't change the server list (" .. why .. ").", "bad")
+            return
+        end
+        say(not on and "Your Realm is off the server list." or w[2] == "locked"
+            and "Your Realm is on the server list, locked: players need your password to join."
+            or "Your Realm is on the server list: anyone can join while you host it.", "good")
+        browsed_at = -100
+    end)
+end
+
 -- ADD TO REALM (host, in a Realm session): the friend named `who` (nil = every friend here) becomes a member
 function members.add(id, name, who)
     if not (realm.enabled() and realm.valid_id(id)) then return 0 end

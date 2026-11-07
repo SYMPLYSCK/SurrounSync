@@ -36,6 +36,86 @@ function util.job_running(name) return false end
 function util.pause() end
 function util.jobs_tick() end
 
+-- fn() on the game thread every ms until it returns true or the returned stop() runs; nil when UE4SS has no way.
+-- Never LoopAsync + ExecuteInGameThread: ExecuteInGameThread from LoopAsync's thread moves the callback onto the
+-- mod's one hook Lua thread while the game thread may be running Lua on it (UE4SS 3.0.1 LuaMod.cpp), so a UFunction
+-- wrapper being built there read a wrong stack slot: host crashes at the main menu, 2x in 3 kit starts 2026-11-01
+-- (DBG-20261101-008). UE4SS's action lock doesn't help: the game thread runs hook Lua without it. What does is that
+-- a LoopInGameThreadWithDelay loop is registered once, from the game thread, and runs there. Registering moves the
+-- callback onto the hook thread too, so loops asked for off the game thread (main.lua runs on the mod's own thread
+-- at mod start) wait for one bootstrap loop that starts them from the game thread.
+local loop_fallback_said = false
+local boot = nil   -- { q = starts waiting, h = its handle (nil until it came back, false once its pass ran) }
+local function in_game_thread()
+    if type(IsInGameThread) ~= "function" then return true end
+    local ok, yes = pcall(IsInGameThread)
+    return not ok or yes ~= false
+end
+local function boot_start(start)
+    if boot then boot.q[#boot.q + 1] = start; return true end
+    local b = { q = { start } }
+    boot = b   -- (before the call: its first pass can run on the game thread before the handle comes back)
+    local ok, h = pcall(LoopInGameThreadWithDelay, 0, function()
+        if b.h then pcall(CancelDelayedAction, b.h) end
+        b.h = false
+        if boot == b then boot = nil end
+        local q = b.q
+        b.q = {}
+        for _, s in ipairs(q) do s() end
+    end)
+    if not (ok and h ~= nil) then
+        if boot == b then boot = nil end
+        return false
+    end
+    if b.h == false then pcall(CancelDelayedAction, h) else b.h = h end   -- (its pass already ran)
+    return true
+end
+function util.game_loop(ms, fn, context)
+    local stopped, handle = false, nil
+    local function stop()
+        stopped = true
+        if handle then
+            local h = handle
+            handle = nil
+            pcall(CancelDelayedAction, h)
+        end
+    end
+    local function step()
+        if stopped then stop(); return end   -- (stopped before the handle came back)
+        local ok, done = util.safe(fn, context or "util.game_loop")
+        if ok and done then stop() end
+    end
+    local function fallback()
+        if type(LoopAsync) ~= "function" or type(ExecuteInGameThread) ~= "function" then return false end
+        if not loop_fallback_said then
+            loop_fallback_said = true
+            log.warn("util.game_loop: this UE4SS has no LoopInGameThreadWithDelay - polling from LoopAsync (DBG-20261101-008 crash risk)")
+        end
+        LoopAsync(ms, function()
+            if stopped then return true end
+            ExecuteInGameThread(step)
+            return stopped
+        end)
+        return true
+    end
+    local function start()
+        if stopped then return true end
+        local ok, h = pcall(LoopInGameThreadWithDelay, math.floor(ms), step)
+        if ok and h ~= nil then
+            handle = h
+            if stopped then stop() end
+            return true
+        end
+        log.warn("util.game_loop: LoopInGameThreadWithDelay refused for " .. tostring(context) .. ": " .. tostring(h))
+        return fallback()
+    end
+    if type(LoopInGameThreadWithDelay) == "function" and type(CancelDelayedAction) == "function" then
+        if in_game_thread() then return start() and stop or nil end
+        if boot_start(start) then return stop end
+    end
+    return fallback() and stop or nil
+end
+
 -- UE4SS hands out non-nil wrappers for null objects; any method on one but
 -- IsValid reads through a null pointer and kills the game (pcall can't catch it).
 function util.valid(obj)
@@ -143,41 +223,52 @@ function util.all_of(cls, max_age)
     return list, 0
 end
 
+-- the object on that 10 cm spot, else the nearest within near; the second result says it was on the spot
 local function nearest_of(list, gx, gy, gz, near)
-    local best, best_d = nil, near or -1
+    local best, best_d, exact = nil, near or -1, false
     pcall(function()
         for _, o in ipairs(list) do
             if util.valid(o) and not o:GetFullName():find("Default__", 1, true) then
                 local ok, l = pcall(function() return o:K2_GetActorLocation() end)
                 if ok and l then
                     local x, y, z = math.floor(l.X / 10 + 0.5) * 10, math.floor(l.Y / 10 + 0.5) * 10, math.floor(l.Z / 10 + 0.5) * 10
-                    if x == gx and y == gy and z == gz then best = o; return end
+                    if x == gx and y == gy and z == gz then best, exact = o, true; return end
                     local d = math.sqrt((l.X - gx) ^ 2 + (l.Y - gy) ^ 2 + (l.Z - gz) ^ 2)
                     if d < best_d then best, best_d = o, d end
                 end
             end
         end
     end)
-    return best
+    return best, exact
 end
 
 -- id -> the object found for it last time (a walk is 30-40 ms; events for one container come in runs)
 local by_id, id_of_addr = {}, {}
-local function forget_ids() by_id, id_of_addr = {}, {} end
+local function forget_ids() by_id, id_of_addr, all_cache = {}, {}, {} end   -- (world reset: the old lists hold freed objects)
 function util.find_by_id(id, near)
     local cls, gx, gy, gz = id:match("^([^@]+)@(%-?%d+),(%-?%d+),(%-?%d+)$")
     if not cls then return nil end
     gx, gy, gz = tonumber(gx) * 10, tonumber(gy) * 10, tonumber(gz) * 10
+    local t = os.clock()
     local c = by_id[id]
     if c then
-        if util.addr(c.o) == c.a and util.class_name(c.o) == cls and nearest_of({ c.o }, gx, gy, gz, near) then return c.o end
+        local ok, exact
+        if util.addr(c.o) == c.a and util.class_name(c.o) == cls then ok, exact = nearest_of({ c.o }, gx, gy, gz, near) end
+        -- (a neighbour taken for it is asked again after a while: it was the nearest, maybe not the one)
+        if ok and (exact or t - c.at < ALL_TTL) then return c.o end
         by_id[id], id_of_addr[c.a] = nil, nil
     end
+    -- Only a hit on the spot is sure: a near one may be a neighbour of the same class while the one meant isn't
+    -- in an older list (T18: a storage box built next to another one - the other player's put-ins went into the
+    -- old box for good, through the cache above). Not on the spot in an older list: walk again.
     local list, age = util.all_of(cls)
-    local best = nearest_of(list, gx, gy, gz, near)
-    if not best and age > 0.5 then best = nearest_of(util.all_of(cls, 0), gx, gy, gz, near) end
+    local best, exact = nearest_of(list, gx, gy, gz, near)
+    if not exact and age > 0.5 then
+        local fresh, fexact = nearest_of(util.all_of(cls, 0), gx, gy, gz, near)
+        if fresh then best, exact = fresh, fexact end
+    end
     local a = best and util.addr(best)
-    if a then by_id[id], id_of_addr[a] = { o = best, a = a }, id end
+    if a then by_id[id], id_of_addr[a] = { o = best, a = a, at = t }, id end
     return best
 end
 
@@ -257,6 +348,14 @@ local class_miss, class_hit = {}, {}
 -- instead; each frame looks up the first one (after a load ~200 wait: all hooked in ~3 s, one lookup a frame -
 -- letting them all go at once was 300-600 ms).
 local starved_q, starved_in, starved_n = {}, {}, 0
+-- hk -> { pre, post, tpre, tpost }: the newest handlers written at that spot; the hook calls them through tpre/tpost
+local ens = {}
+local function def_key(f)
+    if not f then return "-" end
+    local i = debug.getinfo(f, "S")
+    if not i or i.what == "C" then return tostring(f) end
+    return tostring(i.source) .. ":" .. tostring(i.linedefined)
+end
 function util.starved_lookups() return starved_n, #starved_q end
 function util.recheck_hooks() next_check, backoff, class_miss, class_hit = {}, {}, {}, {}; starved_q, starved_in = {}, {} end
 function util.frame() return frame_no end
@@ -265,14 +364,28 @@ function util.new_frame()
     local e = table.remove(starved_q, 1)
     if e then
         starved_in[e.hk], starved_n = nil, starved_n + 1
-        util.ensure_hook(e.path, e.pre, e.post, "budget")
+        local h = ens[e.hk]   -- (the newest handlers: a co-op start while it waited made new ones)
+        util.ensure_hook(e.path, h.pre, h.post, "budget")
     end
 end
 -- urgent: look it up now, outside the budget (a hook that must stand before the next level load);
 -- "budget" = outside the budget only
 function util.ensure_hook(path, pre, post, urgent)
     local t = os.clock()
-    local hk = path .. "|" .. tostring(pre)
+    -- Keyed by where the handler is written (its chunk names the copy: peers loads a link's copy as "path#tag"),
+    -- not by the closure: a module that makes its handlers again on each co-op start (zombies.init) used to add
+    -- another hook every time, and the old ones kept firing - each hit sent once more per restart. Now the new
+    -- handler takes the old one's place.
+    local hk = path .. "|" .. def_key(pre) .. "|" .. def_key(post)
+    local e = ens[hk]
+    if not e then
+        e = { pre = pre, post = post }
+        e.tpre = function(...) return e.pre(...) end
+        e.tpost = post and function(...) return e.post(...) end or nil
+        ens[hk] = e
+    else
+        e.pre, e.post = pre, post
+    end
     if next_check[hk] and t < next_check[hk] then return hooked_fn[hk] ~= nil end
     -- StaticFindObject costs ~1.7 ms (a miss ~15 ms, measured in-game): while the function we hooked
     -- is still the live object of that name the hook stands - only a gone/replaced one needs a lookup
@@ -290,7 +403,7 @@ function util.ensure_hook(path, pre, post, urgent)
     if lookup_ms >= LOOKUP_MS and not urgent then
         if not starved_in[hk] then
             starved_in[hk] = true
-            starved_q[#starved_q + 1] = { hk = hk, path = path, pre = pre, post = post }
+            starved_q[#starved_q + 1] = { hk = hk, path = path }
         end
         return hooked_fn[hk] ~= nil
     end
@@ -308,7 +421,7 @@ function util.ensure_hook(path, pre, post, urgent)
     next_check[hk] = t + RECHECK
     local a = util.addr(fn)
     if hooked_fn[hk] == a then hooked_obj[hk] = fn; return true end
-    if util.hook(path, pre, post, true) then hooked_fn[hk], hooked_obj[hk] = a, fn; return true end
+    if util.hook(path, e.tpre, e.tpost, true) then hooked_fn[hk], hooked_obj[hk] = a, fn; return true end
     return false
 end
 
@@ -340,7 +453,7 @@ local function on_end_play(self)
     for _, t in pairs(tracked) do
         if t.set[a] then t.set[a], t.gone = nil, true; ended_n = ended_n + 1 end
     end
-    for _, fn in ipairs(end_fns) do pcall(fn, a) end
+    for _, fn in ipairs(end_fns) do pcall(fn, a, o) end
 end
 local function hook_end_play()
     if end_hooked then return end
@@ -349,19 +462,28 @@ local function hook_end_play()
     util.hook("/Script/Engine.Actor:ReceiveEndPlay", on_end_play, nil, true)
     util.hook("/Script/Engine.ActorComponent:ReceiveEndPlay", on_end_play, nil, true)
 end
+-- (on_end callbacks get the ended object's address and the object; this hooks EndPlay now, before the first walk)
+util.watch_ends = hook_end_play
 local function track_add(t, o)
     local a = util.addr(o)
     if a and not t.set[a] then t.set[a] = util.class_name(o) or true; t.list[#t.list + 1] = o end
 end
-local function on_begin(self)
+-- (a parent's BeginPlay runs for its children: a child also goes into the list kept under the hooked class itself -
+-- prefabs.lua lists "PrefabMaster_C", and every site that came after the first walk was missing from it for the
+-- 30 min until the next walk: a site the guest spawned was never removed when the host's went, DBG-20261101-007)
+local function on_begin(self, path)
     local o
     pcall(function() o = self:get() end)
     if not util.valid(o) then return end
-    local t = tracked[util.class_name(o) or ""]
-    if t then
-        track_add(t, o)
-        local a = util.addr(o)
-        if a then t.born = t.born or {}; t.born[a] = os.clock() end
+    local own = util.class_name(o) or ""
+    local hooked = path and path:match("%.([^%.]+)$")
+    for _, k in ipairs({ own, hooked ~= own and hooked or nil }) do
+        local t = tracked[k]
+        if t then
+            track_add(t, o)
+            local a = util.addr(o)
+            if a then t.born = t.born or {}; t.born[a] = os.clock() end
+        end
     end
 end
 -- Hooked, whether the first class is loaded at all, and a count of (re)hooks.
@@ -377,6 +499,15 @@ local function track_hooked(paths, clock)
         end
         -- lookups share ensure_hook's per-frame budget (a miss ~15 ms; ~20 classes are often not loaded)
         if lookup_frame ~= frame_no then lookup_frame, lookup_ms = frame_no, 0 end
+        -- the class's own ReceiveEndPlay, looked up in a later round than its BeginPlay hook (a miss ~15 ms: with the
+        -- hook and the first walk in one frame it was "perf: power took 37-46 ms" once a second after a load)
+        if h.end_due and h.on and lookup_ms < LOOKUP_MS then
+            h.end_due = nil
+            local t0 = os.clock()
+            local ef = StaticFindObject(p .. ":ReceiveEndPlay")
+            if util.valid(ef) then util.hook(p .. ":ReceiveEndPlay", on_end_play, nil, true) end
+            lookup_ms = lookup_ms + (os.clock() - t0) * 1000
+        end
         -- (the first check of a path runs at once: until then "not loaded" would hand out an empty list)
         if clock >= h.check and (lookup_ms < LOOKUP_MS or not h.seen) then
             h.seen = true
@@ -396,20 +527,16 @@ local function track_hooked(paths, clock)
                 h.check = clock + h.wait
             end
             h.fn = a and fn or nil
-            lookup_ms = lookup_ms + (os.clock() - t0) * 1000
             -- loaded without a BeginPlay of its own: it won't get one, and each miss costs ~15 ms
             if not a and h.loaded then h.check = clock + 30.0 end
             if not a then h.on, h.addr = false, nil
             elseif a ~= h.addr then
-                h.on = util.hook(p .. ":ReceiveBeginPlay", on_begin, nil, true) == true
+                h.on = util.hook(p .. ":ReceiveBeginPlay", function(self) on_begin(self, p) end, nil, true) == true
                 h.addr = h.on and a or nil
-                if h.on then
-                    h.gen = (h.gen or 0) + 1
-                    -- (looked up once per class load: a miss costs ~15 ms)
-                    local ef = StaticFindObject(p .. ":ReceiveEndPlay")
-                    if util.valid(ef) then util.hook(p .. ":ReceiveEndPlay", on_end_play, nil, true) end
-                end
+                -- (EndPlay: looked up once per class load, next round)
+                if h.on then h.gen, h.end_due = (h.gen or 0) + 1, true end
             end
+            lookup_ms = lookup_ms + (os.clock() - t0) * 1000
         end
         on, gen = on or h.on, gen + (h.gen or 0)
         if i == 1 then loaded = h.loaded end
@@ -489,12 +616,18 @@ function util.instances(cls, hooks, group)
     if group and groups[group] and (groups[group][cls] or cls == group) then t.group = group end
     local clock = os.clock()
     hook_end_play()
-    local loaded, gen = true, 0
-    if #t.hooks > 0 then t.hooked, loaded, gen = track_hooked(t.hooks, clock) end
+    local loaded, gen, spent = true, 0, 0
+    if #t.hooks > 0 then
+        local before = lookup_frame == frame_no and lookup_ms or 0
+        t.hooked, loaded, gen = track_hooked(t.hooks, clock)
+        spent = lookup_ms - before
+    end
     if t.hooked and gen ~= t.walked_gen then t.due = 0 end   -- a hook just went in: catch what came before it
     if clock >= t.due and #t.hooks > 0 and not t.hooked and not loaded then
         t.list, t.set, t.walked, t.due = {}, {}, true, clock + 2.0
-    elseif clock >= t.due and track_frame ~= frame_no and (not t.walked or clock - track_rewalk_at >= TRACK_GAP) then
+    -- (not in a frame where this class's own lookups ran: the walk is the next call's)
+    elseif clock >= t.due and spent < LOOKUP_MS and track_frame ~= frame_no
+        and (not t.walked or clock - track_rewalk_at >= TRACK_GAP) then
         track_frame = frame_no
         if t.walked then track_rewalk_at = clock end
         local function fill(u, name, src)

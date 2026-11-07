@@ -1,6 +1,7 @@
--- Quick chat: in a co-op or Realm session, "/" with the handbook closed opens a chat box in the bottom left.
--- Enter sends it like the CO-OP tab's SEND ("/goto ..." and the other commands run), Esc closes it. The last chat
--- lines show above the box, and the command tip while a "/" line is typed.
+-- Quick chat: "/" with the handbook closed opens a chat box in the bottom left. Enter sends it like the CO-OP tab's SEND
+-- ("/goto ..." and the other commands run), Esc closes it. The last chat lines show above the box, and the command tip
+-- while a "/" line is typed. With nobody to talk to (no co-op or Realm session) it opens too, for the commands: every
+-- hotkey is one (chatcmd.lua), and those keys work alone.
 
 local log = require("mirror.log")
 local util = require("mirror.util")
@@ -16,11 +17,15 @@ local GREY = { R = 0.75, G = 0.75, B = 0.75, A = 1 }
 local BLACK = { R = 0, G = 0, B = 0, A = 1 }
 local LINES = 5
 local HINT = "Say something - / for commands - Esc closes"
+local HINT_ALONE = "Type / for commands - Esc closes"
 
--- configure{ active() = in a co-op or Realm session, send(text) -> true when sent, recent(n), tip(text) }
+-- configure{ active() = in a co-op or Realm session, send(text) -> true when sent, recent(n), tip(text), say(text) }
 local ctx = nil
-local box = nil          -- { w, input, lines = { TextBlock }, tip, shown = { text per line }, tip_text }
+local box = nil          -- { w, input, lines = { TextBlock }, tip, shown = { text per line }, tip_text, alone = opened with nobody to talk to }
 local want_open, bound = false, false
+
+-- FPVDrone's plain letter keys (G, H) ask this: they reach their keybinds while they're typed here too
+local function typing(on) pcall(function() ModRef:SetSharedVariable("SurrounSync.typing", on) end) end
 
 local function new(cls, outer)
     local o
@@ -72,7 +77,8 @@ local function build(w)
     pcall(function() input.WidgetStyle.FocusedForegroundColor = ink end)
     pcall(function() input.WidgetStyle.TextStyle.ColorAndOpacity = ink end)
     pcall(function() input:SetForegroundColor(BLACK) end)
-    pcall(function() input:SetHintText(FText(HINT)) end)
+    b.alone = not ctx.active()
+    pcall(function() input:SetHintText(FText(b.alone and HINT_ALONE or HINT)) end)
     pcall(function() input.MinimumDesiredWidth = 440 end)
     local is
     pcall(function() is = vb:AddChildToVerticalBox(input) end)
@@ -106,6 +112,7 @@ local function close()
     if not box then return end
     local b = box
     box = nil
+    typing(false)
     pcall(function() b.w:RemoveFromParent() end)
     local pc = game.controller()
     pcall(function() util.cdo(WBL):SetInputMode_GameOnly(pc, false) end)
@@ -113,7 +120,7 @@ end
 
 -- not over the handbook, the rename box, or anything that shows the mouse (inventory, pause menu, a trader)
 local function can_open()
-    if box or not (ctx and ctx.active()) then return false end
+    if box or not ctx then return false end
     local pl, pc = game.player(), game.controller()
     if not (util.valid(pl) and util.valid(pc)) then return false end
     local busy = false
@@ -133,6 +140,7 @@ local function open()
     local ok, b = pcall(build, w)
     if not ok then log.warn("quickchat: couldn't build the chat box (" .. tostring(b) .. ")"); return end
     box = b
+    typing(true)
     refresh()
     pcall(function() w:AddToViewport(45) end)
     -- the keys go to the box (no walking while typing), no mouse
@@ -144,6 +152,14 @@ local function enter()
     if not box then return end
     local s = typed()
     if not s:find("%S") then close(); return end
+    -- (a command: the box goes first, or closing it takes the keys and the mouse from a window the command opened)
+    if s:match("^%s*[/\\]") then close(); ctx.send(s); return end
+    if not ctx.active() then
+        -- (the line stays: it's only one "/" away from a command)
+        if ctx.say then ctx.say("Nobody else is here to read that. Commands start with /.") end
+        pcall(function() box.input:SetKeyboardFocus() end)
+        return
+    end
     if ctx.send(s) then close(); return end
     -- (not sent, e.g. "one message a second": the text stays to send again)
     pcall(function() box.input:SetKeyboardFocus() end)
@@ -165,11 +181,13 @@ function quickchat.tick(dt)
         if can_open() then open() end
     end
     if not box then return end
-    if not ctx.active() or not util.valid(box.w) then close(); return end
+    if (not box.alone and not ctx.active()) or not util.valid(box.w) then close(); return end
     refresh()
 end
 
 -- a load tears the viewport down: the box went with the old world
-game.on_world_reset(function() box = nil; want_open = false end)
+game.on_world_reset(function() box = nil; want_open = false; typing(false) end)
+-- every widget off the screen (a death): the box goes too, before the GC can free it under us
+game.on_widgets_cleared(function() want_open = false; close() end)
 
 return quickchat

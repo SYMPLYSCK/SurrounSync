@@ -2,7 +2,7 @@
 
     pip install --target <dir> lupa, set PYTHONPATH=<dir>, then: python tools/test-sync.py
 """
-import os, random, shutil, sys, tempfile
+import math, os, random, shutil, sys, tempfile
 
 try:
     from lupa.lua54 import LuaRuntime   # the game's Lua (plain `lupa` is the newest, 5.5 - other semantics)
@@ -101,7 +101,7 @@ def link_blob_comes_back_after_reset():
 def a_player_in_the_game_menu_is_not_a_frozen_game():
     """Player review 2026-10-31: the host opened the pause/settings menu and 10 s later the guest read "Host's game
     isn't responding (paused, loading or frozen)" (a file link went "gone" at 45 s: countdown home). The menu stops
-    the game's tick; away.lua puts "away menu <n>" from the LoopAsync watch and the other game reads paused/gone
+    the game's tick; away.lua puts "away menu <n>" from phase1's game-thread menu watch and the other game reads paused/gone
     as "menu" while it keeps coming."""
     print("a_player_in_the_game_menu_is_not_a_frozen_game")
     L = lua()
@@ -273,6 +273,91 @@ def clockmap_quiet_places_without_stats():
     check(t3 is None, "an update older than one already placed is dropped")
 
 
+def util_game_loop_runs_on_the_game_thread_loop():
+    """DBG-20261101-008: ExecuteInGameThread posted from LoopAsync's thread changed the mod's hook Lua thread while
+    the game thread ran Lua on it (host crashes at the main menu). Polls go through util.game_loop: UE4SS's
+    LoopInGameThreadWithDelay, stopped with CancelDelayedAction; LoopAsync only on a UE4SS without that."""
+    print("util_game_loop_runs_on_the_game_thread_loop")
+    L = lua()
+    L.execute('''
+        WARNS = {}
+        package.loaded["mirror.log"] = setmetatable({ warn = function(s) WARNS[#WARNS + 1] = s end },
+            { __index = function() return function() end end })
+        util = require("mirror.util")
+        function fakes()
+            LOOPS, CANCELLED, ASYNCS, POSTS = {}, {}, {}, 0
+            LoopInGameThreadWithDelay = function(ms, fn) LOOPS[#LOOPS + 1] = { ms = ms, fn = fn }; return 100 + #LOOPS end
+            CancelDelayedAction = function(h) CANCELLED[#CANCELLED + 1] = h; return true end
+            LoopAsync = function(ms, fn) ASYNCS[#ASYNCS + 1] = fn end
+            ExecuteInGameThread = function(fn) POSTS = POSTS + 1; fn() end
+        end
+        -- runs loop i the way UE4SS does until it's cancelled (CancelDelayedAction drops it)
+        function run(i) local h = 100 + i; for _, c in ipairs(CANCELLED) do if c == h then return false end end; LOOPS[i].fn(); return true end
+    ''')
+    L.execute('fakes(); N = 0; STOP = util.game_loop(250, function() N = N + 1; return N >= 3 end, "t")')
+    check(L.eval('#LOOPS') == 1 and L.eval('LOOPS[1].ms') == 250 and L.eval('#ASYNCS') == 0,
+          "a game-thread loop every 250 ms, nothing from LoopAsync")
+    L.execute('run(1); run(1)')
+    check(L.eval('N') == 2 and L.eval('#CANCELLED') == 0, "fn runs on each pass and the loop goes on")
+    L.execute('run(1); run(1); run(1)')
+    check(L.eval('N') == 3 and L.eval('#CANCELLED') == 1 and L.eval('CANCELLED[1]') == 101,
+          "fn returning true cancels its own handle; no pass after that (%s)" % L.eval('N'))
+    check(L.eval('POSTS') == 0, "nothing posted with ExecuteInGameThread")
+    L.execute('fakes(); N = 0; STOP = util.game_loop(1000, function() N = N + 1 end, "t"); run(1); STOP(); run(1)')
+    check(L.eval('N') == 1 and L.eval('CANCELLED[1]') == 101, "stop() cancels it from outside")
+    L.execute('fakes(); N = 0; util.game_loop(1000, function() N = N + 1; error("boom") end, "t.err"); run(1); run(1)')
+    check(L.eval('N') == 2 and L.eval('#CANCELLED') == 0, "an error in fn is caught and the loop keeps going")
+    # stopped before LoopInGameThreadWithDelay handed the handle back (a start from the mod's own thread)
+    L.execute('''fakes(); N = 0
+        LoopInGameThreadWithDelay = function(ms, fn) LOOPS[1] = { ms = ms, fn = fn }; fn(); return 101 end
+        util.game_loop(250, function() N = N + 1; return true end, "t.early"); run(1); run(1)''')
+    check(L.eval('N') == 1 and L.eval('CANCELLED[1]') == 101, "stopped before the handle came back: cancelled once it's back, fn not run again")
+    # a UE4SS without game-thread loops: LoopAsync posts, the warning comes once
+    L.execute('fakes(); WARNS = {}; LoopInGameThreadWithDelay = nil; N = 0; STOP = util.game_loop(250, function() N = N + 1; return N >= 2 end, "t.old")')
+    check(L.eval('#ASYNCS') == 1, "no LoopInGameThreadWithDelay: LoopAsync is the fallback")
+    check(L.eval('ASYNCS[1]()') is False and L.eval('ASYNCS[1]()') is True and L.eval('N') == 2 and L.eval('POSTS') == 2,
+          "...each pass posted to the game thread, stopping when fn says so")
+    check(L.eval('ASYNCS[1]()') is True and L.eval('N') == 2, "...and it stays stopped")
+    L.execute('fakes(); LoopInGameThreadWithDelay = function() error("AOB scans failed") end; util.game_loop(250, function() end, "t.refused")')
+    check(L.eval('#ASYNCS') == 1, "LoopInGameThreadWithDelay refusing: the fallback too")
+    check(L.eval('#WARNS') == 2 and "no LoopInGameThreadWithDelay" in L.eval('WARNS[1]')
+          and "refused for t.refused" in L.eval('WARNS[2]'),
+          "the fallback warns once, a refusal each time (%s)" % L.eval('table.concat(WARNS, " | ")'))
+    L.execute('fakes(); LoopInGameThreadWithDelay, LoopAsync = nil, nil')
+    check(L.eval('util.game_loop(250, function() end, "t.none")') is None, "no way to loop: nil")
+    # asked for off the game thread (main.lua at mod start): one bootstrap loop starts them all from the game thread
+    L.execute('''fakes(); GAME = false; IsInGameThread = function() return GAME end; A, B = 0, 0
+        STOP_A = util.game_loop(250, function() A = A + 1 end, "t.a")
+        STOP_B = util.game_loop(1000, function() B = B + 1 end, "t.b")''')
+    check(L.eval('#LOOPS') == 1 and L.eval('LOOPS[1].ms') == 0 and L.eval('STOP_A ~= nil and STOP_B ~= nil'),
+          "off the game thread: one bootstrap loop registered for both")
+    L.execute('GAME = true; run(1); run(1)')
+    check(L.eval('CANCELLED[1]') == 101 and L.eval('#LOOPS') == 3 and L.eval('LOOPS[2].ms') == 250 and L.eval('LOOPS[3].ms') == 1000,
+          "its first pass starts both from the game thread and cancels itself (%s loops)" % L.eval('#LOOPS'))
+    L.execute('run(2); run(3); STOP_B(); run(3)')
+    check(L.eval('A') == 1 and L.eval('B') == 1 and L.eval('CANCELLED[2]') == 103, "the started loops run and stop as usual")
+    L.execute('fakes(); GAME = false; util.game_loop(250, function() end, "t.c")')
+    check(L.eval('#LOOPS') == 1, "a later start off the game thread gets a new bootstrap")
+    L.execute('GAME = true; N = 0; util.game_loop(250, function() N = N + 1 end, "t.d")')
+    check(L.eval('#LOOPS') == 2 and L.eval('LOOPS[2].ms') == 250, "on the game thread: started at once, no bootstrap")
+    L.execute('run(1)')
+    check(L.eval('#LOOPS') == 3, "...and the waiting one still starts on the bootstrap's pass")
+    # stopped while waiting for the bootstrap: never started
+    L.execute('fakes(); GAME = false; S = util.game_loop(250, function() end, "t.e"); S(); GAME = true; run(1)')
+    check(L.eval('#LOOPS') == 1 and L.eval('CANCELLED[1]') == 101, "stopped before the bootstrap ran: never started")
+    # the bootstrap's pass ran on the game thread before its handle came back
+    L.execute('''fakes(); GAME = false; E = 0
+        LoopInGameThreadWithDelay = function(ms, fn)
+            LOOPS[#LOOPS + 1] = { ms = ms, fn = fn }
+            local h = 100 + #LOOPS
+            if h == 101 then fn() end
+            return h
+        end
+        util.game_loop(250, function() E = E + 1 end, "t.f")''')
+    check(L.eval('#LOOPS') == 2 and L.eval('CANCELLED[1]') == 101, "bootstrap ran before its handle came back: loop started, bootstrap cancelled")
+    L.execute('IsInGameThread = nil')
+
+
 def util_null_objects_are_invalid():
     print("util_null_objects_are_invalid")
     L = lua()
@@ -358,7 +443,55 @@ def jig_stats_copy_the_asset_defaults():
                                 Stats_8_78B6E3C14C0578F96B7C9FBBA7820A46 = { ForEach = function(self, fn)
                                     for i, r in ipairs(rows) do fn(i, { get = function() return r end }) end end } } }
         G = jig.base_stats(GUN)
+        -- 1 damage on 1.0.0: nearly every gun has 5 rows at 100% and MaxStats 4, which caps nothing in the game's
+        -- bytecode. Stopping at 4 lost DamageFallOff: FindStat gives 1 for it and a hit loses 7 damage per metre.
+        local five = { rs("Jig.Stat.FirearmDamage", 50, 60, 100, false, false), rs("Jig.Stat.CriticalHitMultiplier", 25, 35, 100, false, false),
+                       rs("Jig.Stat.CriticalHitChance", 10, 20, 100, false, false), rs("Jig.Stat.FirearmRPM", 750, 850, 100, false, false),
+                       rs("Jig.Stat.DamageFallOff", 100, 105, 100, false, false), rs("Jig.Stat.Rare", 1, 2, 0, false, false) }
+        local flat = { STAT_NAME_13_8D9D8D5D48A145FB1BAD6E98C69D0A10 = { TagName = nm("Jig.Stat.Flat") }, Prefix_16_994B3BFF49FB68BE6A485DB9498EB954 = nm("None"),
+                       MinValue_6_4B4822A7420F784740B6A58155973EE6 = 7, MaxValue_8_04A5809A498E900862BCCA9A6E412BD7 = 7, Txt_12_F1BE8023414240AC50F4B09BF1B79D58 = nm("None") }
+        VAL = { IsValid = function() return true end, GetAddress = function() return 44 end,
+                ItemStats = { ForEach = function(self, fn) fn(1, { get = function() return flat end }) end },
+                RandomStats = { MaxStats_7_971BC4334FEFC6C1B39175A3D0721033 = 4,
+                                Stats_8_78B6E3C14C0578F96B7C9FBBA7820A46 = { ForEach = function(self, fn)
+                                    for i, r in ipairs(five) do fn(i, { get = function() return r end }) end end } } }
+        V = jig.base_stats(VAL)
+        function TAGS(list)
+            local out = {}
+            for i, s in ipairs(list) do out[i] = s.STAT_NAME_13_8D9D8D5D48A145FB1BAD6E98C69D0A10.TagName.name end
+            return table.concat(out, ",")
+        end
+        -- a gun made short by an older version: rows kept as they are, only what the game always gives is added
+        local function stats_arr(rows)
+            local list = {}
+            for i, s in ipairs(rows) do list[i] = s end
+            return setmetatable({ list = list }, { __index = {
+                GetArrayNum = function() return #list end,
+                ForEach = function(_, fn) for i, s in ipairs(list) do fn(i, { get = function() return s end }) end end },
+                __newindex = function(_, k, v) list[k] = v end })
+        end
+        local function row(tag, lo, hi)
+            return { STAT_NAME_13_8D9D8D5D48A145FB1BAD6E98C69D0A10 = { TagName = FName(tag) }, MinValue_6_4B4822A7420F784740B6A58155973EE6 = lo,
+                     MaxValue_8_04A5809A498E900862BCCA9A6E412BD7 = hi }
+        end
+        SHORT = { [jig.STATS] = stats_arr({ row("Jig.Stat.FirearmDamage", 51, 58), row("Jig.Stat.CriticalHitMultiplier", 33, 33),
+                                            row("Jig.Stat.CriticalHitChance", 15, 15), row("Jig.Stat.FirearmRPM", 800, 800) }) }
+        NADDED = jig.add_missing_stats and jig.add_missing_stats(SHORT, VAL)
+        NAGAIN = jig.add_missing_stats and jig.add_missing_stats(SHORT, VAL)
+        SHORTROWS = SHORT[jig.STATS].list
+        NEMPTY = jig.add_missing_stats and jig.add_missing_stats({ [jig.STATS] = stats_arr({}) }, VAL)
+        NOTCUT = jig.add_missing_stats and jig.add_missing_stats({ [jig.STATS] = stats_arr({ row("Jig.Stat.FirearmDamage", 51, 58) }) }, VAL)
     ''')
+    check(L.eval('TAGS(V)') == "Jig.Stat.FirearmDamage,Jig.Stat.CriticalHitMultiplier,Jig.Stat.CriticalHitChance,Jig.Stat.FirearmRPM,Jig.Stat.DamageFallOff,Jig.Stat.Flat",
+          "every row that passes its chance, past MaxStats, then the fixed stats, like the game's roll")
+    check(100 <= L.eval('V[5].MinValue_6_4B4822A7420F784740B6A58155973EE6') <= 105, "the falloff is rolled inside the asset's range")
+    check(L.eval('NADDED') == 1 and L.eval('TAGS(SHORTROWS)').endswith("Jig.Stat.FirearmRPM,Jig.Stat.DamageFallOff"),
+          "a gun made short gets the falloff; the 0% row and the fixed stat stay out")
+    check(L.eval('SHORTROWS[1].MaxValue_8_04A5809A498E900862BCCA9A6E412BD7') == 58 and L.eval('SHORTROWS[2].MinValue_6_4B4822A7420F784740B6A58155973EE6') == 33,
+          "and keeps the rolls it had")
+    check(L.eval('NAGAIN') == 0, "a second repair adds nothing")
+    check(L.eval('NEMPTY') == 0, "a stat-less item is not this repair's: write_stats gives it the whole roll")
+    check(L.eval('NOTCUT') == 0, "an item without exactly MaxStats stats was not cut by the old roll and is left alone")
     check(L.eval('#G') == 2, "a weapon gets its rolled stats (a 0% stat is skipped)")
     check(L.eval('G[1].STAT_NAME_13_8D9D8D5D48A145FB1BAD6E98C69D0A10.TagName.name') == "Jig.Stat.FirearmDamage"
           and 30 <= L.eval('G[1].MinValue_6_4B4822A7420F784740B6A58155973EE6') <= L.eval('G[1].MaxValue_8_04A5809A498E900862BCCA9A6E412BD7') <= 40,
@@ -515,6 +648,15 @@ def instances_walk_once_then_follow_beginplay():
               'local l, w = util.instances("Door_C"); R5, R6 = #l, w')
     check(L.eval('TOUCHED') == 0, "a world reset drops the old objects without touching them")
     check(L.eval('WALKS') == L.eval('W0') + 1 and L.eval('R5') == 2 and L.eval('R6'), "and walks the class again in the new world")
+    # DBG-20261101-007: a list kept under the parent class (prefabs.lua "PrefabMaster_C") gets the children whose
+    # BeginPlay runs the parent's after the first walk - a site the guest spawned was missing from it
+    L.execute('WORLD.Master_C = { actor("Prefab_A_C") }; frame(); util.instances("Master_C", { "/Game/D.Master_C" }); '
+              'frame(); R9 = #util.instances("Master_C", { "/Game/D.Master_C" }); W0 = WALKS; '
+              'KID = actor("Prefab_B_C"); HOOKS["/Game/D.Master_C:ReceiveBeginPlay"]({ get = function() return KID end }); '
+              'frame(2.0); R10 = #util.instances("Master_C", { "/Game/D.Master_C" })')
+    check(L.eval('R9') == 1 and L.eval('R10') == 2 and L.eval('WALKS') == L.eval('W0'),
+          "a child started after the walk joins the parent's list through the parent's BeginPlay, no walk (%s, %s)"
+          % (L.eval('R9'), L.eval('R10')))
 
 
 def grouped_classes_share_one_walk():
@@ -645,6 +787,68 @@ def unloaded_tracked_classes_cost_few_lookups():
     check(L.eval("H120") == 0, "a standing hook needs no lookups (%d)" % L.eval("H120"))
 
 
+def a_new_class_spreads_its_lookups_and_walk():
+    # kit 2026-11-01 08:05:59-08:06:05: "perf: power took 36-46 ms" once a second after a load, each time a lamp
+    # type's first visit: class + BeginPlay lookups, the hook, the EndPlay lookup (a miss ~15 ms) and the walk in one frame
+    print("a_new_class_spreads_its_lookups_and_walk")
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        util = require("mirror.util")
+        HOOKS = {}
+        util.hook = function(p, fn) HOOKS[p] = fn; return true end
+        HAS_END = { ["/Game/L.Gate_C"] = true }
+        StaticFindObject = function(p)
+            local c, f = p:match("^(.-):(.+)$")
+            if f == "ReceiveEndPlay" and not HAS_END[c] then NOW = NOW + 0.015; return nil end
+            NOW = NOW + 0.0017
+            return obj({ GetFName = function() return { ToString = function() return f or p end } end })
+        end
+        FindAllOf = function(c) NOW = NOW + 0.008; return { obj({ GetFullName = function() return c .. " /Game/L.L:P." .. c .. "_1" end }) } end
+        function frame() NOW = NOW + 1.0; util.new_frame() end
+        function visit(c, p)
+            frame(); local t0 = NOW
+            local l, w = util.instances(c, p)
+            return (NOW - t0) * 1000, w, #l
+        end
+        MS, W, N = {}, {}, {}
+        for i = 1, 4 do MS[i], W[i], N[i] = visit("Lamp_C", "/Game/L.Lamp_C") end
+        GMS = {}
+        for i = 1, 4 do GMS[i] = visit("Gate_C", "/Game/L.Gate_C") end
+    """)
+    ms = [L.eval("MS[%d]" % i) for i in range(1, 5)]
+    check(max(ms) < 16, "no visit pays more than one slow part (ms per visit %s; all in one was ~26)" % ["%.1f" % m for m in ms])
+    check(not L.eval("W[1]") and L.eval('HOOKS["/Game/L.Lamp_C:ReceiveBeginPlay"] ~= nil'),
+          "first visit: BeginPlay hooked, no walk yet")
+    check(L.eval("W[3]") and L.eval("N[3]") == 1, "the walk follows within two more visits and finds it")
+    check(L.eval('HOOKS["/Game/L.Lamp_C:ReceiveEndPlay"] == nil') and L.eval('HOOKS["/Game/L.Gate_C:ReceiveEndPlay"] ~= nil'),
+          "the EndPlay hook still goes in where the class has its own")
+    gms = [L.eval("GMS[%d]" % i) for i in range(1, 5)]
+    check(max(gms) < 16, "a class with its own EndPlay spreads the same way (%s)" % ["%.1f" % m for m in gms])
+
+
+def power_scans_a_class_again_until_it_is_walked():
+    print("power_scans_a_class_again_until_it_is_walked")
+    L = lua()
+    L.execute(FAKES + POWER_FAKES + r"""
+        ORDER, LEFT = {}, { Buildable_Lamp_C = 2, Buildable_WallLight_C = 100 }
+        util.instances = function(cls)
+            ORDER[#ORDER + 1] = cls
+            if (LEFT[cls] or 0) > 0 then LEFT[cls] = LEFT[cls] - 1; return {}, false end
+            return LIST[cls] or {}, true
+        end
+        power.init({}, "host", { in_world = function() return true end })
+        run(40)
+        function runs(c) local best, n = 0, 0
+            for _, x in ipairs(ORDER) do if x == c then n = n + 1; best = math.max(best, n) else n = 0 end end
+            return best end
+        function count(c) local n = 0; for _, x in ipairs(ORDER) do if x == c then n = n + 1 end end; return n end
+    """)
+    check(L.eval('runs("Buildable_Lamp_C")') == 3, "a class its hook lookups held back is asked again the next second (%d in a row)" % L.eval('runs("Buildable_Lamp_C")'))
+    check(L.eval('runs("Buildable_WallLight_C")') == 4 and L.eval('count("Buildable_Lamp_C")') >= 4,
+          "one that never walks holds the scan at most 4 s, the others still come round")
+
+
 def hook_lookups_share_one_budget():
     print("hook_lookups_share_one_budget")
     L = lua()
@@ -725,13 +929,98 @@ def find_remembers_misses():
     check(L.eval('R4') and L.eval('R6'), "a world reset forgets misses; a hit is cached")
 
 
+def find_by_id_never_keeps_a_neighbour_for_the_one_meant():
+    """T18: find_by_id took the nearest of a class within `near` from a list up to 5 s old and kept it for good. A
+    storage box built next to another (60 cm) and filled at once: the other player's put-ins went into the old box,
+    every time after. A world reset also kept the old world's lists for up to 5 s."""
+    print("find_by_id_never_keeps_a_neighbour_for_the_one_meant")
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        util = require("mirror.util")
+        function box(x)
+            local a = obj({ GetFullName = function() return "Box_C /Game/L.L:P.Box_C_" .. x end,
+                            K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end })
+            a.GetClass = function() return cls("Box_C") end
+            return a
+        end
+        A = box(0); WORLD = { A }; WALKS = 0
+        FindAllOf = function() WALKS = WALKS + 1; local t = {}; for i, o in ipairs(WORLD) do t[i] = o end; return t end
+        R1 = util.find_by_id("Box_C@0,0,0", 100) == A
+        NOW = 1; B = box(60); WORLD[2] = B
+        R2 = util.find_by_id("Box_C@6,0,0", 100) == B
+        W2 = WALKS; R3 = util.find_by_id("Box_C@6,0,0", 100) == B and WALKS == W2
+        NOW = 2; R4 = util.find_by_id("Box_C@-6,0,0", 100) == A   -- not built here yet: the nearest for now
+        NOW = 3; D = box(-60); WORLD[3] = D
+        NOW = 4; R5 = util.find_by_id("Box_C@-6,0,0", 100) == A
+        NOW = 8; R6 = util.find_by_id("Box_C@-6,0,0", 100) == D
+        NOW = 8.1; util.all_of("Box_C", 0)                              -- a list walked just before the reset
+        NOW = 8.2; NEWA = box(0); WORLD = { NEWA }; util.find_reset()
+        R7 = util.find_by_id("Box_C@0,0,0", 100) == NEWA
+    """)
+    check(L.eval('R1'), "the box on the spot is found")
+    check(L.eval('R2'), "a box built next to it a moment ago is found, not its neighbour 60 cm away")
+    check(L.eval('R3'), "and kept without another walk")
+    check(L.eval('R4') and L.eval('R5'), "one not here yet gets the nearest for a few seconds")
+    check(L.eval('R6'), "then is asked again and finds the one meant")
+    check(L.eval('R7'), "a world reset forgets the old world's lists")
+
+
+def a_handler_made_again_replaces_its_hook_instead_of_adding_one():
+    """T18 long sessions: zombies.init makes its damage handlers again on every co-op start and ensure_hook keyed a
+    hook by the closure, so each start added another DamageTaken / ReceiveAnyDamage hook and the old ones kept
+    sending - after N starts every hit went N times."""
+    print("a_handler_made_again_replaces_its_hook_instead_of_adding_one")
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        util = require("mirror.util")
+        HOOKED = {}
+        util.hook = function(p, pre) HOOKED[#HOOKED + 1] = { p = p, pre = pre }; return true end
+        FNS = {}
+        StaticFindObject = function(p)
+            NOW = NOW + 0.001
+            FNS[p] = FNS[p] or obj({ GetFName = function() return { ToString = function() return p:match("([^:]+)$") end } end })
+            return FNS[p]
+        end
+        function make(n) return function() CALLED = n end end
+        P = "/Game/A.A_C:DamageTaken"
+        for start = 1, 5 do util.new_frame(); NOW = NOW + 20; util.ensure_hook(P, make(start)) end
+        R1 = #HOOKED
+        HOOKED[1].pre(); R2 = CALLED
+        -- another copy of the same file (peers loads a link's copy as "path#tag"): its own hook
+        SRC = "return function(n) return function() CALLED = 'copy' .. n end end"
+        A = load(SRC, "@mirror/zombies.lua")(); B = load(SRC, "@mirror/zombies.lua#2")()
+        util.new_frame(); NOW = NOW + 20; util.ensure_hook(P, A(1)); util.ensure_hook(P, B(1))
+        util.new_frame(); NOW = NOW + 20; util.ensure_hook(P, A(2)); util.ensure_hook(P, B(2))
+        R3 = #HOOKED
+        -- a different handler on the same function: its own hook
+        util.new_frame(); NOW = NOW + 20; util.ensure_hook(P, function() CALLED = "other" end)
+        R4 = #HOOKED
+        -- a hook that waited in the lookup queue while a new start made new handlers: the newest one runs
+        Q = "/Game/Q.Q_C:Hit"
+        util.new_frame(); NOW = NOW + 20
+        for i = 1, 4 do util.ensure_hook("/Game/Q.Q_C:Hog" .. i, function() end) end
+        N0 = #HOOKED; util.ensure_hook(Q, make("old")); util.ensure_hook(Q, make("new")); WAITED = #HOOKED == N0
+        for i = 1, 60 do util.new_frame() end
+        for _, h in ipairs(HOOKED) do if h.p == Q then QN = (QN or 0) + 1; h.pre() end end
+        R5 = CALLED
+    """)
+    check(L.eval('R1') == 1, "five starts that make the handler again hook the function once (%d)" % L.eval('R1'))
+    check(L.eval('R2') == 5, "and the hook runs the newest handler (%s)" % L.eval('R2'))
+    check(L.eval('R3') == 3, "two copies of one file keep a hook each (%d hooks in all)" % L.eval('R3'))
+    check(L.eval('R4') == 4, "a handler written elsewhere gets its own hook")
+    check(L.eval('WAITED') and L.eval('QN') == 1 and L.eval('R5') == "new",
+          "a hook that waited for its lookup runs the newest handler, once (%s, %s)" % (L.eval('QN'), L.eval('R5')))
+
+
 def tactical_reads_only_lights_the_class_has():
     print("tactical_reads_only_lights_the_class_has")
     L = lua()
     L.execute(FAKES + r"""
         PLAYER = obj({})
         GHOST = obj({})
-        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end }
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end }
         package.loaded["mirror.ghost"] = { get = function() return GHOST_ON and GHOST or nil end, generation = function() return 1 end,
                                            on_destroy = function() end }
         package.loaded["mirror.look"] = { components = function() return {} end }
@@ -855,7 +1144,7 @@ def vehicles_seat_four_players_by_slot():
             GHOST = obj({ K2_SetActorLocationAndRotation = function(self, l) GHOST_AT = l end, PlayAnimMontage = function() end,
                           CharacterMovement = { SetMovementMode = function() end } })
             package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return nil end,
-                                              on_world_reset = function() end }
+                                              on_widgets_cleared = function() end, on_world_reset = function() end }
             package.loaded["mirror.ghost"] = { get = function() return GHOST end, set_seated = function() end, generation = function() return 1 end }
             package.loaded["mirror.link"].tags = function() return nil end
             package.loaded["mirror.link"].peer_name = function() return "Peer" end
@@ -1017,6 +1306,133 @@ def vehicles_seat_four_players_by_slot():
     L.execute('vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 3.000"); vehicles.tick(0.1)')
     check(L.eval('A["LightsOn?"]') is False and L.eval('TOGGLES') == 2 and L.eval('VIS') is True,
           "lights off the same way (still not hidden: the game's own switch must keep working here)")
+    # the host drives, the guest gets in as a passenger, then the host switches the lights on (user 2026-11-03: off on
+    # the passenger's screen)
+    # The game's switch as decompiled: lit -> every light 0, flag off; unlit -> only above 0 health, every light 50000,
+    # flag on. The guest's copy keeps its own health while the host drives: at 0 here the switch refused.
+    def passenger_lights(health):
+        L = setup("guest", 1, 0)
+        L.execute(r'''
+            A["LightsOn?"], TOGGLES = false, 0
+            A.VehicleHealthComponent = { CurrentHealth = %s }
+            LS = { { Intensity = 0 }, { Intensity = 0 }, { Intensity = 0 }, { Intensity = 0 } }
+            for _, l in ipairs(LS) do l.SetIntensity = function(self, v) self.Intensity = v end end
+            A.Lights = { ForEach = function(self, fn) for i, l in ipairs(LS) do fn(i, { get = function() return l end }) end end }
+            A.TurnOnOffLights = function(self)
+                TOGGLES = TOGGLES + 1
+                if self["LightsOn?"] then
+                    for _, l in ipairs(LS) do l:SetIntensity(0) end
+                    self["LightsOn?"] = false
+                elseif self.VehicleHealthComponent.CurrentHealth > 0 then
+                    for _, l in ipairs(LS) do l:SetIntensity(50000.0) end
+                    self["LightsOn?"] = true
+                end
+            end
+            function LIT_ALL(v) for _, l in ipairs(LS) do if l.Intensity ~= v then return false end end return true end
+            vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 1.000"); vehicles.tick(0.1)
+            CAR_PARENT = A
+            for i = 1, 5 do vehicles.tick(0.1) end
+            RIDE_P = blobs_out.ride
+            vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 1 2.000"); vehicles.tick(0.1)
+            vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 1 2.100"); vehicles.tick(0.1)
+        ''' % health)
+        return L
+    L = passenger_lights(100)
+    check((L.eval('RIDE_P') or "").startswith("R Vehicle_Van_C_1"), "(setup) the guest rides in the host's car")
+    check(L.eval('A["LightsOn?"]') is True and L.eval('LIT_ALL(50000.0)') and L.eval('TOGGLES') == 1,
+          "the host switches the lights on: on for the passenger too, by the game's switch (%s, %d toggles)"
+          % (L.eval('A["LightsOn?"]'), L.eval('TOGGLES')))
+    L = passenger_lights(0)
+    check(L.eval('A["LightsOn?"]') is True and L.eval('LIT_ALL(50000.0)'),
+          "the passenger's copy at 0 health (the switch refuses): the lights still go on (%s, %s)"
+          % (L.eval('A["LightsOn?"]'), L.eval('LS[1].Intensity')))
+    L.execute('for _, l in ipairs(LS) do l.Intensity = 0 end; for i = 1, 15 do vehicles.tick(0.1) end')
+    check(L.eval('A["LightsOn?"]') is True and L.eval('LIT_ALL(50000.0)'),
+          "lights darkened here after they were set: back on within a second (%s)" % L.eval('LS[1].Intensity'))
+    L.execute('vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 4.000"); for i = 1, 15 do vehicles.tick(0.1) end')
+    check(L.eval('A["LightsOn?"]') is False and L.eval('LIT_ALL(0)'),
+          "the host switches them off: off on the passenger's copy too (%s, %s)" % (L.eval('A["LightsOn?"]'), L.eval('LS[1].Intensity')))
+
+    # the car the other player drives is put on their spot every frame. K2_TeleportTo refused a car standing on the
+    # ground nearly every frame (kit 2026-11-02: 25k refusals, even onto its own spot), and switching its collision
+    # off and on around the move every frame left the copy shaking while the driver's car stood still; a suspected
+    # part of the car fling, not reproduced (DBG-20261027-002)
+    L = setup("guest", 1, 0)
+    L.execute(r'''
+        COLL, MOVES, SPOT = {}, 0, nil
+        A.K2_TeleportTo = function() return false end
+        A.SetActorEnableCollision = function(self, on) COLL[#COLL + 1] = on end
+        A.K2_SetActorLocationAndRotation = function(self, l, r, sweep, hit, teleport)
+            MOVES = MOVES + 1; SPOT = { X = l.X, sweep = sweep, teleport = teleport } end
+        vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 1.000")
+        vehicles.drive_sample("D Vehicle_Van_C_1 50 0 0 0 0 0 0 0 0 1 0 1.100")
+        for i = 1, 10 do vehicles.tick(0.1) end
+    ''')
+    check(L.eval('#COLL') == 0, "a followed car's collision is never switched off and on (%d switches)" % L.eval('#COLL'))
+    check(L.eval('MOVES') >= 10 and L.eval('SPOT.X') == 50 and L.eval('SPOT.teleport') is True and L.eval('SPOT.sweep') is False,
+          "it is still put on the driver's spot every frame, as a teleport (%d moves, x %s)" % (L.eval('MOVES'), L.eval('SPOT and SPOT.X')))
+
+    # the same in a copy for a third or fourth player (peers.lua mate): one move per frame, not two
+    counts = {}
+    for is_mate in (False, True):
+        L = setup("guest", 1, 0)
+        L.execute(r'''
+            local is_mate = ...
+            vehicles.init({ mirror_vehicles = true }, "guest", { guest_in_world = function() return true end,
+                                                                 in_world = function() return true end }, is_mate)
+            MOVES = 0
+            A.K2_SetActorLocationAndRotation = function() MOVES = MOVES + 1 end
+            vehicles.drive_sample("D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 1.000")
+            vehicles.drive_sample("D Vehicle_Van_C_1 50 0 0 0 0 0 0 0 0 1 0 1.100")
+            vehicles.tick(0.1)
+            MOVES = 0
+            for i = 1, 10 do vehicles.tick(0.1) end
+        ''', is_mate)
+        counts[is_mate] = L.eval('MOVES')
+    check(counts[False] == 10 and counts[True] == 10,
+          "a car another player drives is moved once per frame, in the main copy and in a mate copy (%d and %d moves in 10 frames)"
+          % (counts[False], counts[True]))
+
+    # standing on a car's roof: the pose carries which car and where on it, and the other game pins the ghost to that
+    # spot on its own car - the world spot trailed a moving car on the driver's screen (user 2026-11-02)
+    L = setup("guest", 1, 0)
+    L.execute(r'''
+        vehicles.tick(0.1)
+        CAR_AT, CAR_YAW = { X = 1000, Y = 2000, Z = 0 }, 90
+        A.K2_GetActorLocation = function() return { X = CAR_AT.X, Y = CAR_AT.Y, Z = CAR_AT.Z } end
+        A.K2_GetActorRotation = function() return { Pitch = 0, Yaw = CAR_YAW, Roll = 0 } end
+        A.GetActorForwardVector = function() return { X = 0, Y = 1, Z = 0 } end
+        A.GetActorRightVector = function() return { X = -1, Y = 0, Z = 0 } end
+        A.GetActorUpVector = function() return { X = 0, Y = 0, Z = 1 } end
+        A.GetOwner = function(self) return A end
+        PLAYER.BasedMovement = { MovementBase = nil }
+        PLAYER.K2_GetActorLocation = function() return { X = 950, Y = 2100, Z = 180 } end
+        PLAYER.K2_GetActorRotation = function() return { Pitch = 0, Yaw = 120, Roll = 0 } end
+        OFF_CAR = vehicles.base_line(PLAYER)
+        PLAYER.BasedMovement = { MovementBase = { IsValid = function() return true end, GetOwner = function() return A end } }
+        LINE = vehicles.base_line(PLAYER)
+        P = require("mirror.poseline").parse_base(LINE)
+        local l, y = vehicles.on_base(P, { X = 950, Y = 2100, Z = 180 })
+        SAME = { X = l.X, Y = l.Y, Z = l.Z, yaw = y }
+        CAR_AT = { X = 1000, Y = 3500, Z = 0 }     -- here the car has driven 15 m on; the world spot sent is still behind
+        l, y = vehicles.on_base(P, { X = 950, Y = 2100, Z = 180 })
+        ON = { X = l.X, Y = l.Y, Z = l.Z, yaw = y }
+        CAR_AT = { X = 1000, Y = 6000, Z = 0 }     -- 40 m off: another car under that name, keep the world spot
+        FAR = vehicles.on_base(P, { X = 950, Y = 2100, Z = 180 })
+        GARBLED = require("mirror.poseline").parse_base("B Vehicle_Van_C_1 1 2")
+        MOVES = 0
+        A.K2_SetActorLocationAndRotation = function() MOVES = MOVES + 1 end
+        vehicles.drive_sample(LINE); for i = 1, 3 do vehicles.tick(0.1) end
+    ''')
+    check(L.eval('OFF_CAR') is None, "on the ground: no car spot sent")
+    check(L.eval('LINE') == "B Vehicle_Van_C_1 100.0 50.0 180.0 30.0",
+          "on the roof: the car's name, the spot along its forward, right and up, the yaw against it (%s)" % L.eval('LINE'))
+    check(abs(L.eval('SAME.X') - 950) < 0.01 and abs(L.eval('SAME.Y') - 2100) < 0.01 and abs(L.eval('SAME.Z') - 180) < 0.01
+          and abs(L.eval('SAME.yaw') - 120) < 0.01, "a car in the same place: the ghost stands where the player stands")
+    check(abs(L.eval('ON.X') - 950) < 0.01 and abs(L.eval('ON.Y') - 3600) < 0.01 and abs(L.eval('ON.Z') - 180) < 0.01,
+          "the car here has driven on: the ghost is on its roof, not on the world spot behind it (y %.0f)" % L.eval('ON.Y'))
+    check(L.eval('FAR') is None and L.eval('GARBLED') is None, "a car 40 m off, or a garbled spot: no pin, the world spot stays")
+    check(L.eval('MOVES') == 0, "a game that knows no car spots reads it as a car sample of a kind it skips: no car moved")
 
     # the guest drives a car the host's world doesn't have: the host makes one to show it, but it never goes into the
     # host's saves and is gone when the guest leaves (report 2026-10-29: cars in the host's save it never had)
@@ -1140,7 +1556,7 @@ def vehicles_keep_this_worlds_fuel():
         PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end })
         GHOST = obj({})
         package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return nil end,
-                                          on_world_reset = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end }
         package.loaded["mirror.ghost"] = { get = function() return GHOST end, set_seated = function() end, generation = function() return 1 end }
         StaticFindObject = function() return obj({}) end
         util = require("mirror.util")
@@ -1224,7 +1640,7 @@ def car_horn_reaches_the_other_game():
                            GetAttachParentActor = function() return PARENT end })
             GHOST = obj({})
             package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return nil end,
-                                              on_world_reset = function() end }
+                                              on_widgets_cleared = function() end, on_world_reset = function() end }
             package.loaded["mirror.ghost"] = { get = function() return GHOST end, set_seated = function() end, generation = function() return 1 end }
             StaticFindObject = function() return obj({}) end
             util = require("mirror.util")
@@ -1326,7 +1742,7 @@ def raiders_can_hit_the_guests_ghost():
         PLAYER = obj({ Mesh = mesh({ 3, 9, 10, 23, 25 }) })
         GHOST = obj({ Mesh = mesh({ 3 }) })
         package.loaded["mirror.game"] = { player = function() return PLAYER end, controller = function() return nil end,
-                                          player_hook = function() end, on_world_reset = function() end }
+                                          player_hook = function() end, on_widgets_cleared = function() end, on_world_reset = function() end }
         package.loaded["mirror.ghost"] = { get = function() return GHOST end, is = function(a) return a == GHOST end,
             generation = function() return 1 end,
             restore_mesh = function() RESTORED = RESTORED + 1; GHOST.Mesh.resp = { [3] = 2 } end }
@@ -1363,7 +1779,7 @@ def harvest_uses_up_nodes_once():
         L = lua()
         L.execute(FAKES + r"""
             package.loaded["mirror.link"].peer_age = function() return 0 end
-            package.loaded["mirror.game"] = { on_world_reset = function(fn) RESET = fn end }
+            package.loaded["mirror.game"] = { on_widgets_cleared = function() end, on_world_reset = function(fn) RESET = fn end }
             util = require("mirror.util")
             HOOKS = {}
             util.ensure_hook = function(path, fn) HOOKS[path:match(":(.+)$")] = fn; return true end
@@ -1490,7 +1906,7 @@ def zombie_spawn_pins_hold_or_refuse():
     L = lua()
     L.execute(FAKES + r"""
         package.loaded["mirror.game"] = { player = function() return nil end, world = function() return nil end,
-                                          on_world_reset = function() end, keybind = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
         package.loaded["mirror.loader"] = { want = function() end }
         ASSETS = {}
@@ -1550,7 +1966,7 @@ def hounds_bark_when_they_come_for_you():
         TICKS = {}
         PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end })
         package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return {} end,
-            on_tick = function(f) TICKS[#TICKS + 1] = f end, on_world_reset = function() end }
+            on_tick = function(f) TICKS[#TICKS + 1] = f end, on_widgets_cleared = function() end, on_world_reset = function() end }
         LOADED = true
         -- (UE 5.6 has no SoundBase.Duration to read: the mod can't see a sound's length; each plays for its WAV's length)
         LEN = { DogBark1 = 0.51, DogBark2 = 0.76, DogGrowl = 1.71, DogBarking = 2.9 }
@@ -1565,6 +1981,24 @@ def hounds_bark_when_they_come_for_you():
         local k = obj({})
         k.SphereOverlapActors = function(self, w, loc, r, t, cls, ign, out)
             for _, d in ipairs(IN) do if math.abs(d.x - loc.X) <= r then out[#out + 1] = d end end end
+        -- (the world on the line X: a wall at WALL_X, a pawn at IN_WAY.x that a trace can be told to ignore)
+        WALL = obj({ IsA = function() return false end })
+        function pawn_at(x) return obj({ x = x, IsA = function(self, c) return c.p == "/Script/Engine.Pawn" end }) end
+        TRACES = 0
+        k.LineTraceSingle = function(self, ctx, a, b, ch, cx, ign, dbg, out)
+            if TRACE_BROKEN then error("no such function") end
+            TRACES = TRACES + 1; IGNORED = ign
+            local lo, hi = math.min(a.X, b.X), math.max(a.X, b.X)
+            local who
+            if IN_WAY and IN_WAY.x > lo and IN_WAY.x < hi then
+                who = IN_WAY
+                for _, i in ipairs(ign) do if i == IN_WAY then who = nil end end
+            end
+            if not who and WALL_X and WALL_X > lo and WALL_X < hi then who = WALL end
+            if not who then return false end
+            out.OutHit = { HitObjectHandle = { Actor = { Get = function() return who end } } }
+            return true
+        end
         local gs = obj({})
         -- (a sound plays for its length at its pitch, then the component destroys itself: IsPlaying/Stop on it
         -- afterwards are calls on a dead object - counted as LATE)
@@ -1619,6 +2053,26 @@ def hounds_bark_when_they_come_for_you():
     n = L.eval('#PLAYS - N5')
     # (one at least: a random 2.9 s "fit" can fill the whole run; judged by my player alone it is 0)
     check(n >= 1, "a hound chasing the other player near me barks on my game (%d)" % n)
+    # user 2026-11-03: dogs barked from a different room. Only with a clear line to a player.
+    L.execute('GHOST_AT = { X = 99999, Y = 0, Z = 0 }; WALL_X = 100; H = hound(2000); IN = { H }; N6 = #PLAYS; run(6, -30)')
+    check(L.eval('H.x') == 200 and L.eval('#PLAYS') == L.eval('N6'),
+          "a hound running up behind a wall and standing right behind it: quiet (%d barks)" % (L.eval('#PLAYS - N6')))
+    check(L.eval('IGNORED[1] == H'), "...its line doesn't stop at its own body")
+    check(L.eval('dg.status()').endswith(" no line") and " 0 no line" not in L.eval('dg.status()'),
+          "the held-back barks show in the status (%s)" % L.eval('dg.status()'))
+    L.execute('WALL_X = nil; run(1.5)')
+    check(L.eval('#PLAYS') > L.eval('N6') and L.eval('PLAYS[N6 + 1].p').rstrip("12") .endswith("DogBark"),
+          "the wall out of the way: its first bark was kept for this moment (%s)" % L.eval('PLAYS[N6 + 1] and PLAYS[N6 + 1].p'))
+    # the target's own body, a car or another zombie end the line first: they are looked past, a wall behind them isn't
+    L.execute('IN_WAY = pawn_at(100); H = hound(200); IN = { H }; N7 = #PLAYS; run(2)')
+    check(L.eval('#PLAYS') > L.eval('N7'), "a zombie or car between it and me isn't a wall: it barks")
+    L.execute('WALL_X = 50; H = hound(200); IN = { H }; N8 = #PLAYS; run(4)')
+    check(L.eval('#PLAYS') == L.eval('N8'), "...a wall behind that zombie still hides me")
+    L.execute('IN_WAY = nil; WALL_X = 1000; GHOST_AT = { X = 1500, Y = 0, Z = 0 }; H = hound(1100); IN = { H }; N9 = #PLAYS; run(3)')
+    check(L.eval('#PLAYS') > L.eval('N9'), "a wall hides me but it sees the other player: it barks")
+    L.execute('GHOST_AT = { X = 99999, Y = 0, Z = 0 }; WALL_X = 100; TRACE_BROKEN = true; H = hound(200); IN = { H }; N10 = #PLAYS; run(2)')
+    check(L.eval('#PLAYS') > L.eval('N10'), "a trace that can't run (game update) leaves barks on, not every hound silent")
+    L.execute('TRACE_BROKEN = false; WALL_X = nil')
     L.execute('LOADED = false; util.find = function(p) return StaticFindObject(p) end; H = hound(500); IN = { H }; N2 = #PLAYS; run(5, -20)')
     check(L.eval('#PLAYS') == L.eval('N2'), "no pak: quiet, nothing loaded from Lua")
 
@@ -1630,7 +2084,7 @@ def human_copies_hold_the_hosts_weapon():
     L = lua()
     L.execute(FAKES + r"""
         package.loaded["mirror.game"] = { player = function() return nil end, world = function() return nil end,
-                                          on_world_reset = function() end, keybind = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
         package.loaded["mirror.loader"] = { want = function() end }
         GUN = obj({ GetFullName = function() return "BlueprintGeneratedClass /Game/AI/W/BP_AIWeapon_M4.BP_AIWeapon_M4_C" end })
@@ -1660,14 +2114,16 @@ def zombie_copies_take_the_hosts_look():
     L = lua()
     L.execute(FAKES + r"""
         package.loaded["mirror.game"] = { player = function() return nil end, world = function() return nil end,
-                                          on_world_reset = function() end, keybind = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
         package.loaded["mirror.loader"] = { want = function() end }
         ASSETS = {}
         StaticFindObject = function(p) return ASSETS[p] end
         util = require("mirror.util")
         util.ensure_hook = function() return true end
-        util.cdo = function() return { GetConsoleVariableBoolValue = function() return false end } end
+        CLEARED = {}
+        util.cdo = function() return { GetConsoleVariableBoolValue = function() return false end,
+                                       K2_ClearTimer = function(self, o, n) CLEARED[#CLEARED + 1] = { o = o, n = n } end } end
         zombies = require("mirror.zombies")
         local function asset(kind, p) local a = obj({ GetFullName = function() return kind .. " " .. p end,
                                                       GetClass = function() return cls(kind) end }); ASSETS[p] = a; return a end
@@ -1690,13 +2146,51 @@ def zombie_copies_take_the_hosts_look():
                           local parent = mesh.mat
                           mesh.mat = obj({ Parent = parent, GetClass = function() return cls("MaterialInstanceDynamic") end })
                       end })
-            for _, a in ipairs({ "Sprinter", "UltraRadiated", "Acidic", "Screamer", "Grenadier", "ToughenedCrawler" }) do
+            for _, a in ipairs({ "Sprinter", "UltraRadiated", "Acidic", "Screamer", "Grenadier", "ToughenedCrawler", "Crawler" }) do
                 z["Archetype_" .. a] = function(self) self.called[#self.called + 1] = a end
             end
             return z
         end
         E = { mesh = "/Game/Z/SK_A.SK_A", mat = "/Game/Z/M_A.M_A" }
     """)
+    # Game build 26467602: a crawler is an archetype (Archetype_Crawler: 40 cm capsule), number 7 on the wire.
+    L.execute('W = zombie(); W.CapsuleComponent = { GetUnscaledCapsuleHalfHeight = function() return 40.0 end }; '
+              'S = zombie(); S.CapsuleComponent = { GetUnscaledCapsuleHalfHeight = function() return 88.0 end }')
+    check(L.eval('zombies._look.arch_of(W, "nohook")') == 7, "a crawler is recognised by its 40 cm capsule without the hook")
+    check(L.eval('zombies._look.arch_of(S, "nohook")') == 0, "a standing zombie is no crawler")
+    # Archetype_Crawler calls ToughenedCrawler inside it: whichever hook comes last, the zombie counts as a crawler.
+    L.execute('local T = zombie(); local h = { get = function() return T end }; TNAME = T:GetFName():ToString(); TZ = T; '
+              'zombies._look.arch_hooks[7](h); zombies._look.arch_hooks[6](h)')
+    check(L.eval('zombies._look.arch_of(TZ, TNAME)') == 7, "ToughenedCrawler run inside Crawler leaves it a crawler")
+    # It loads nothing (the class's own references): a copy runs it though this game rolled no crawler itself.
+    L.execute('K = zombie(); KCOPY = { z = K, fam = "zombie" }; zombies._look.sync(4, KCOPY, E, { arch = 7, bones = 0, eyes = 0 })')
+    check(L.eval('K.called[1]') == "Crawler" and L.eval('#K.called') == 1, "a copy of the host's crawler crawls (Archetype_Crawler run once)")
+    # A late crawler: the copy's bones were already matched once, then Archetype_Crawler hides its own random leg
+    # pair (calf_l + Foot_R) while the host's lost the other (calf_r + Foot_L = 96). Only the host's pair stays hidden.
+    L.execute('LC = zombie(); LC.Archetype_Crawler = function(self) self.Mesh.hidden.calf_l = true; self.Mesh.hidden.Foot_R = true end; '
+              'LCOPY = { z = LC, fam = "zombie" }; zombies._look.sync(5, LCOPY, E, { arch = 0, bones = 96, eyes = 0 }); '
+              'zombies._look.sync(5, LCOPY, E, { arch = 7, bones = 96, eyes = 0 })')
+    check(L.eval('LC.Mesh.hidden.calf_r and LC.Mesh.hidden.Foot_L and not LC.Mesh.hidden.calf_l and not LC.Mesh.hidden.Foot_R') is True,
+          "a late crawler copy shows the host's leg pair, not its own random one")
+    # A copy's own swing: the montage's AnimNotify_BeginEvent started its trace timer; it is cleared (the host's
+    # zombie does the hitting). A real zombie's trace and a copy's other events stay.
+    L.execute('''
+        local function notify(owner, ev)
+            local mesh = obj({ GetOwner = function() return owner end })
+            local n = obj({ EventName = { ToString = function() return ev end } })
+            zombies._look.arch_hooks.notify({ get = function() return n end }, { get = function() return mesh end })
+        end
+        COPYZ, REALZ = zombie(), zombie()
+        local was = zombies.is_copy
+        zombies.is_copy = function(o) return o == COPYZ end
+        notify(COPYZ, "RightArmTrace"); notify(COPYZ, "BiteTrace"); notify(REALZ, "AttackTrace"); notify(COPYZ, "Footstep")
+        notify(nil, "AttackTrace")
+        zombies.is_copy = was
+    ''')
+    check(L.eval('#CLEARED') == 2 and L.eval('CLEARED[1].o == COPYZ and CLEARED[1].n == "RightArmTrace"')
+          and L.eval('CLEARED[2].n == "BiteTrace"'), "a copy's arm and bite traces are stopped (%d cleared)" % L.eval('#CLEARED'))
+    check(not L.eval('(function() for _, c in ipairs(CLEARED) do if c.o == REALZ or c.n == "Footstep" then return true end end end)()'),
+          "a real zombie's trace and a copy's other notify events are left alone")
     # Host side: a screamer's hidden jaw and arms and its glowing eyes are read.
     L.execute('H = zombie(); H.Mesh.hidden = { Jaw = true, lowerarm_r = true, lowerarm_l = true }; '
               'H.Mesh.mat = obj({ Parent = MAT, GetClass = function() return cls("MaterialInstanceDynamic") end })')
@@ -1740,7 +2234,7 @@ def copy_deaths_and_removals_wait_for_the_animation_gate():
         WORLD = obj({})
         package.loaded["mirror.game"] = { player = function() return nil end, world = function() return WORLD end,
                                           controller = function() return nil end,
-                                          on_world_reset = function() end, keybind = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
         package.loaded["mirror.loader"] = { want = function() end }
         package.loaded["mirror.invdiag"] = { summary = function() return "-" end }
@@ -1835,7 +2329,7 @@ def animgate_runs_waiting_calls_once_animation_is_on_the_game_thread():
     L.execute(FAKES + r"""
         WORLD = obj({}); TICK, RESET = nil, nil
         package.loaded["mirror.game"] = { world = function() return WORLD end,
-                                          on_tick = function(f) TICK = f end, on_world_reset = function(f) RESET = f end }
+                                          on_tick = function(f) TICK = f end, on_widgets_cleared = function() end, on_world_reset = function(f) RESET = f end }
         CV = { ["a.ParallelAnimUpdate"] = 1, ["a.ParallelAnimEvaluation"] = 1 }
         KSL = obj({ GetConsoleVariableIntValue = function(self, n) return CV[n] end,
                     ExecuteConsoleCommand = function(self, w, cmd) local n, v = cmd:match("^(%S+) (%S+)$"); CV[n] = tonumber(v) end })
@@ -1968,7 +2462,7 @@ def nests_keep_real_health():
             GHOST = obj({})
             package.loaded["mirror.ghost"] = { get = function() return GHOST end, location = function() return nil end }
             PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end })
-            package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end,
                                               on_tick = function() end }
             TEMPLATE = { StandardHealthValue = 2000, MaxHealth = 3000 }
             StaticFindObject = function(p) if p:find(":DamageComponent_GEN_VARIABLE", 1, true) then return obj(TEMPLATE) end return obj({}) end
@@ -2094,7 +2588,7 @@ def horde_beacon_runs_only_on_the_host():
                          pump = function(self, fn) local q = INBOX; INBOX = {}; for _, p in ipairs(q) do fn(p) end end } end }
             package.loaded["mirror.ghost"] = { get = function() return nil end, location = function() return nil end }
             PLAYER = obj({ CreateNotificationUI = function(self, t) NOTES[#NOTES + 1] = t end })
-            package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end }
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end }
             FText = function(s) return s end
             util = require("mirror.util")
             util.ensure_hook = function(p, fn) HOOKS[p:match(":(.+)$")] = fn; return true end
@@ -2157,7 +2651,7 @@ def copy_radiation_is_taken_back():
         RC.DecreaseRadiation = function(self, n) self.refreshed = self.refreshed + 1; self.CurrentRadiation = self.CurrentRadiation - n end
         PLAYER = obj({ GetComponentByClass = function() return RC end })
         package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return nil end,
-                                          on_world_reset = function() end, keybind = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
         package.loaded["mirror.loader"] = { want = function() end }
         StaticFindObject = function() return obj({}) end
@@ -2193,7 +2687,7 @@ def goto_and_bring_move_only_your_own_player():
             P.K2_TeleportTo = function(self, to) self.at = to; return true end
             G = obj({ SwimmingComponent = {} })
             G.K2_GetActorLocation = function() return { X = 10000, Y = 0, Z = 590 } end
-            package.loaded["mirror.game"] = { player = function() return P end, on_world_reset = function() end }
+            package.loaded["mirror.game"] = { player = function() return P end, on_widgets_cleared = function() end, on_world_reset = function() end }
             package.loaded["mirror.ghost"] = { get = function() return G end,
                                                location = function() return G:K2_GetActorLocation() end }
             KSL = { LineTraceSingle = function(self, ctx, from, to, ch, cx, ign, dbg, out)
@@ -2227,6 +2721,19 @@ def goto_and_bring_move_only_your_own_player():
     check(B.eval("P.at.X") > 9000 and B.eval("SENT[3]") == "Y", "accepted: the asked game moves its own player")
     B.execute('INBOX = { "Q G" }; tp.tick(0.1); tp.tick(31)')
     check(B.eval("tp.pending()") is None and B.eval("SENT[4]") == "X", "an unanswered request times out")
+    # DBG-20261030-007: after a bed respawn the ghost here read 0,0,0 (a dead actor) and both goto's went to the
+    # world's origin; the newest pose the other player sent is where they are
+    C = side()
+    C.execute('G.K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end; '
+              'package.loaded["mirror.ghost"].location = function() return nil end; '
+              '(tp.set_locator or function() end)(function() return { X = 30000, Y = 0, Z = 590 } end); '
+              'os.clock = (function(c) return function() return c() + 100 end end)(os.clock); tp.command("/goto fri"); INBOX = { "A" }; tp.tick(0.1)')
+    d = C.eval("math.sqrt((P.at.X - 30000)^2 + P.at.Y^2)")
+    check(140 <= d <= 160 and C.eval("SENT[#SENT]") == "G", "goto lands beside the other player's own newest pose, not their ghost (%.0f cm)" % d)
+    D = side()
+    D.execute('(tp.set_locator or function() end)(function() return { X = 0, Y = 0, Z = 0 } end); INBOX = { "Q B" }; tp.tick(0.1); tp.accept()')
+    d = D.eval("math.sqrt((P.at.X - 10000)^2 + P.at.Y^2)")
+    check(140 <= d <= 160, "a pose at the origin is never a target: bring falls back to the ghost (%.0f cm)" % d)
 
 
 def backpack_tooltip_reads_the_item_once():
@@ -2242,7 +2749,7 @@ def backpack_tooltip_reads_the_item_once():
         KEYS, HOOKS, WALKS, FULLNAMES, REFREADS = {}, {}, 0, 0, 0
         COMP = obj({})
         PLAYER = obj({ BP_JigComponent = COMP })
-        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end,
                                           keybind = function(k, _, fn) KEYS[k] = fn end, on_ready = function() end }
         package.loaded["mirror.jig"] = { contents_of = function(c) WALKS = WALKS + 1; return { { uid = "1_2_3_4" } } end }
         util = require("mirror.util")
@@ -2369,7 +2876,7 @@ def backpack_names_travel_with_the_item():
     d = tempfile.mkdtemp()
     L = lua()
     L.execute(FAKES + r"""
-        package.loaded["mirror.game"] = { player = function() return nil end, on_world_reset = function() end,
+        package.loaded["mirror.game"] = { player = function() return nil end, on_widgets_cleared = function() end, on_world_reset = function() end,
                                           keybind = function() end, on_ready = function() end }
         util = require("mirror.util")
         names = require("mirror.names")
@@ -2542,7 +3049,7 @@ def loot_skips_containers_gone_since_listed():
     L.execute(FAKES + r"""
         package.loaded["mirror.crumb"] = { at = function() end }
         package.loaded["mirror.ghost"] = { get = function() return GH end, location = function() return { X = 0, Y = 0, Z = 0 } end }
-        package.loaded["mirror.game"] = { player = function() return ME end, on_world_reset = function() end }
+        package.loaded["mirror.game"] = { player = function() return ME end, on_widgets_cleared = function() end, on_world_reset = function() end }
         GEN, READ = {}, {}
         package.loaded["mirror.jig"] = {
             generate = function(c) GEN[#GEN + 1] = c.name end,
@@ -2586,7 +3093,7 @@ def loot_guest(near=False):
     L.execute(FAKES + r"""
         package.loaded["mirror.crumb"] = { at = function() end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, location = function() return nil end }
-        package.loaded["mirror.game"] = { player = function() return ME end, on_world_reset = function() end }
+        package.loaded["mirror.game"] = { player = function() return ME end, on_widgets_cleared = function() end, on_world_reset = function() end }
         SENT, INBOX = {}, {}
         package.loaded["mirror.events"] = { send = function(self, p) SENT[#SENT + 1] = p end, reliable = function(name)
             return { send = function(self, p) SENT[#SENT + 1] = p end,
@@ -3227,6 +3734,100 @@ def lights_come_back_on_a_respawned_ghost():
     check(L.eval("AFTER") == 800, "after a ghost respawn with an unchanged blob the light is still on (%s)" % L.eval("AFTER"))
 
 
+def fast_fire_asks_little_per_shot():
+    # player list #6: FPS drop with fast-firing guns. Each shot ran three hooks that each asked the gun's owner and
+    # attach parent (raiders' guns too), read two asset paths by GetFullName, and each shot and tracer heard searched
+    # every ghost piece for its muzzle; none of it was timed (hooks run outside every tick).
+    print("fast_fire_asks_little_per_shot")
+    L = lua()
+    L.execute(FAKES + r"""
+        LINES = {}
+        package.loaded["mirror.log"] = setmetatable({ info = function(s) LINES[#LINES + 1] = s end },
+            { __index = function() return function() end end })
+        package.loaded["mirror.crumb"] = { at = function() end, current = function() return nil end, taken = function() return 0 end,
+                                           leave = function() end }
+        CLOCK = 0; os.clock = function() return CLOCK end
+        PLAYER = obj({})
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, controller = function() return nil end,
+            on_world_reset = function(f) RESET = f end, player_hook = function() end }
+        SOCKETS = 0
+        PIECE = obj({ DoesSocketExist = function() SOCKETS = SOCKETS + 1; return true end, IsVisible = function() return true end,
+                      GetSocketLocation = function() return { X = 1, Y = 2, Z = 3 } end })
+        GHOST = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end })
+        package.loaded["mirror.ghost"] = { get = function() return GHOST end }
+        package.loaded["mirror.look"] = { components = function() return { PIECE } end, in_hand = function() return true end }
+        package.loaded["mirror.audio"] = { attenuation_for = function() return nil end }
+        SENT, INBOX = {}, {}
+        package.loaded["mirror.events"] = evmock { new = function(name) return {
+            send = function(self, m) SENT[#SENT + 1] = name .. " " .. m end,
+            pump = function(self, fn) local q = INBOX[name] or {}; INBOX[name] = nil; for _, m in ipairs(q) do fn(m) end end } end }
+        util = require("mirror.util")
+        HOOKS = {}
+        util.ensure_hook = function(p, fn) HOOKS[p:match(":([^:]+)$")] = fn; return true end
+        util.find = function() return obj({}) end
+        SPAWNED = 0
+        util.cdo = function() return { PlaySoundAtLocation = function() end,
+            SpawnEmitterAttached = function() SPAWNED = SPAWNED + 1 end, ReportNoiseEvent = function() end,
+            SpawnSystemAtLocation = function() return { SetVectorParameter = function() end } end,
+            GetConsoleVariableBoolValue = function() return true end } end
+        ASKED, NAMED = 0, 0
+        SND = obj({ GetFullName = function() NAMED = NAMED + 1; return "SoundCue /Game/Audio/AR.AR" end })
+        FLASH = obj({ GetFullName = function() NAMED = NAMED + 1; return "ParticleSystem /Game/FX/Flash.Flash" end })
+        function gun(holder)
+            local g = { holder = holder, BP_WeaponsPickupComponent = obj({ FirearmSound = SND, DefaultSoundRadius = 3000 }) }
+            g.GetOwner = function() ASKED = ASKED + 1; return g.holder end
+            g.GetAttachParentActor = function() ASKED = ASKED + 1; return g.holder end
+            return obj(g)
+        end
+        MINE, RAIDER = gun(PLAYER), gun(obj({}))
+        perf = require("mirror.perf")
+        fire = require("mirror.fire")
+        fire.init({ ghost = { mirror_fire = true } }, "host")
+        fire.tick(0.1)
+        function P(v) return { get = function() return v end } end
+        function shoot(w)
+            HOOKS.Svr_WeaponEffects(P(w), P(FLASH))
+            HOOKS.FireSurfaceHit(P(w), P({ X = 1, Y = 1, Z = 1 }), P(nil), P({ Pitch = 0, Yaw = 0, Roll = 0 }), P(8))
+            HOOKS.Svr_SpawnTrail(P(w), P({ X = 0, Y = 0, Z = 0 }), P({ X = 9, Y = 9, Z = 9 }))
+        end
+        function count(kind) local n = 0; for _, m in ipairs(SENT) do if m:find("^" .. kind .. " ") then n = n + 1 end end; return n end
+        for i = 1, 10 do shoot(MINE); shoot(RAIDER); CLOCK = CLOCK + 0.05 end
+    """)
+    check(L.eval('count("fire")') == 10 and L.eval('count("impact")') == 10 and L.eval('count("trail")') == 10
+          and L.eval('#SENT') == 30, "10 shots of mine are sent whole, the raider's 10 not (%s)" % L.eval('#SENT'))
+    check(L.eval('ASKED') == 4, "each gun's holder asked once in the second, not three times a shot (%s calls, was 120)" % L.eval('ASKED'))
+    check(L.eval('NAMED') == 2, "the shot's sound and flash paths read once (%s, was 20)" % L.eval('NAMED'))
+    L.execute('SENT = {}; RAIDER.holder = PLAYER; CLOCK = CLOCK + 1.1; shoot(RAIDER)')
+    check(L.eval('#SENT') == 3, "a gun picked up is the player's at its first shot a second later (%s)" % L.eval('#SENT'))
+    L.execute('SENT = {}; PLAYER = obj({}); MINE.holder = PLAYER; shoot(MINE)')
+    check(L.eval('#SENT') == 3, "a new player character (respawn) is asked about at once, not after the second")
+    # a new world: the old sound's address may come back as another sound (audit 2026-11-03)
+    L.execute('RESET(); SND.GetFullName = function() return "SoundCue /Game/Audio/SMG.SMG" end; SENT = {}; shoot(MINE)')
+    fired = [m for m in L.eval('SENT').values() if m.startswith("fire ")]
+    check(len(fired) == 1 and "/Game/Audio/SMG.SMG" in fired[0], "after a world reset a reused address is named again (%s)" % fired)
+    L.execute('SND.GetFullName = function() return "SoundCue /Game/Audio/AR.AR" end; RESET()')
+    L.execute(r"""
+        CLOCK = CLOCK + 5; S0 = SOCKETS
+        INBOX.fire, INBOX.trail = {}, {}
+        for i = 1, 10 do INBOX.fire[i] = "/Game/Audio/AR.AR /Game/FX/Flash.Flash 3000"; INBOX.trail[i] = "0 0 0 9 9 9" end
+        fire.tick(0.016); S1 = SOCKETS
+        CLOCK = CLOCK + 0.3; INBOX.fire = { "/Game/Audio/AR.AR /Game/FX/Flash.Flash 3000" }; fire.tick(0.016); S2 = SOCKETS
+    """)
+    check(L.eval('SPAWNED') == 11, "every shot heard still flashes at the ghost's muzzle (%s)" % L.eval('SPAWNED'))
+    check(L.eval('S1 - S0') == 1, "10 shots + 10 tracers heard at once search the ghost's pieces once (%s, was 20)" % L.eval('S1 - S0'))
+    check(L.eval('S2 - S1') == 1, "...and again after a quarter second (a weapon switch shows)")
+    # the hooks' time is reported (it was in no part), not added to the mod's frame time
+    L.execute(r"""
+        perf.frame_begin(); CLOCK = CLOCK + 0.001; perf.frame_end(0.016)
+        perf.hook("hook fire.shot", function() CLOCK = CLOCK + 0.004 end)
+        perf.frame_begin(); CLOCK = CLOCK + 0.001; perf.frame_end(31)
+        REPORT = LINES[#LINES]
+    """)
+    rep = L.eval('REPORT') or ""
+    check("hook fire.shot 2.00" in rep and "mod 1.00 ms/frame" in rep,
+          "a hook's time is listed per frame and kept out of the mod's own frame time (%s)" % rep[:160])
+
+
 def perf_run_puts_the_outer_step_back():
     # audit N30: after fire.tick's sub-timers the crash step stayed "f.hurts" for the rest of fire.tick
     print("perf_run_puts_the_outer_step_back")
@@ -3234,7 +3835,7 @@ def perf_run_puts_the_outer_step_back():
     L.execute(r"""
         package.loaded["mirror.log"] = setmetatable({}, { __index = function() return function() end end })
         CUR = nil
-        package.loaded["mirror.crumb"] = { at = function(s) CUR = s end, current = function() return CUR end }
+        package.loaded["mirror.crumb"] = { at = function(s) CUR = s end, current = function() return CUR end, taken = function() return 0 end }
         perf = require("mirror.perf")
         perf.frame_begin()
         perf.run("fire", function() perf.run("f.hurts", function() end); IN = CUR end)
@@ -3455,7 +4056,12 @@ def crumb_keeps_the_last_64_steps():
         check(seqs == list(range(7, 71)), "the newest 64 steps are kept (%s..%s)" % (seqs[0], seqs[-1]))
         newest = [r for r in rows if r.split()[0] == b"70"][0]
         check(newest.rstrip().endswith(b"step 70"), "each line ends in its step (%r)" % newest[:60])
-        check(open("mirror_step.txt").read().rstrip().endswith("step 70"), "mirror_step.txt still holds the current step")
+        # 2026-11-01: the one-line mirror_step.txt cost a second write per step (kit: ~0.7 ms/frame for both);
+        # the ring's newest line is the current step, mirror_step.txt only points there
+        check(open("mirror_step.txt").read().startswith("(SurrounSync 1.0.1+"), "mirror_step.txt points at the ring")
+        check(L.eval('require("mirror.crumb").newest(...)', raw.decode()).endswith(" step 70")
+              and L.eval('require("mirror.crumb").newest(...)', raw.decode())[:2].isdigit(),
+              "the ring's newest line is the current step, as '<time> <step>'")
         L.execute(r"""
             -- (a new game run: the last run's files are closed - Windows can't rename an open file)
             package.loaded["mirror.crumb"] = nil
@@ -3476,12 +4082,26 @@ def crumb_keeps_the_last_64_steps():
                 crumb.start()
                 crumb.at("run %d")
             """ % (i + 3))
-        kept = {n: open(n).read().strip() for n in ("mirror_step.1.txt", "mirror_step.2.txt", "mirror_step.3.txt")}
-        check(kept["mirror_step.1.txt"].endswith("run 4") and kept["mirror_step.2.txt"].endswith("run 3")
-              and kept["mirror_step.3.txt"].endswith("next run"),
+        kept = {n: str(L.eval('require("mirror.crumb").newest(...)', open(n, "rb").read().decode()))
+                for n in ("mirror_steps.1.txt", "mirror_steps.2.txt", "mirror_steps.3.txt")}
+        check(kept["mirror_steps.1.txt"].endswith("run 4") and kept["mirror_steps.2.txt"].endswith("run 3")
+              and kept["mirror_steps.3.txt"].endswith("next run"),
               "the last three runs' steps are kept, newest first (%r)" % kept)
-        check(not os.path.exists("mirror_step.4.txt") and os.path.exists("mirror_steps.3.txt"),
-              "...no more than three, for the step ring too")
+        check(not os.path.exists("mirror_steps.4.txt") and not os.path.exists("mirror_step.4.txt"),
+              "...no more than three")
+        # a mod from before 1.0.1 left only its one-line step file: its step is still reported at start
+        L.execute(r"""
+            package.loaded["mirror.crumb"] = nil
+            collectgarbage(); collectgarbage()
+        """)
+        for n in os.listdir("."):
+            if n.startswith("mirror_step"): os.remove(n)
+        with open("mirror_step.txt", "w") as f: f.write("%-72s" % "23:14:02 hook old mod step")
+        L.execute(r"""
+            local crumb = require("mirror.crumb")
+            PREV = crumb.start()
+        """)
+        check(str(L.eval("PREV")).rstrip() == "23:14:02 hook old mod step", "an older mod's step file is still read at start")
     finally:
         os.chdir(old)
         shutil.rmtree(d, ignore_errors=True)
@@ -3732,6 +4352,176 @@ def bag_put_back_after_a_take_reaches_the_host():
     check(H.eval("A3") == 2, "an old put replayed later adds nothing")
 
 
+def loot_tables_stay_small_and_a_recent_echo_survives_the_prune():
+    """T18: the host cleared its whole "emptied" list every 200 emptied containers - a take emptied a second before
+    lost its entry, and its echo (taken for a take of an item not here) made the guest give a real item back. And
+    per-item tables (da_of, the guest's sent_takes) kept an entry for every item of the session."""
+    print("loot_tables_stay_small_and_a_recent_echo_survives_the_prune")
+    H = loot_guest()
+    H.execute(r"""
+        package.loaded["mirror.loot"] = nil
+        loot = require("mirror.loot")
+        loot.init({}, "host", { in_world = function() return true end })
+        PUMP.BP_JigMultiplayer = COMP
+        HCONT, ADDS = {}, 0
+        local J = package.loaded["mirror.jig"]
+        J.contents_of = function() return HCONT end
+        J.add_item = function(c, da, n) ADDS = ADDS + 1; local u = "H" .. ADDS; HCONT[#HCONT + 1] = { uid = u, da = da, count = n }; return u end
+        J.take = function(c, uid) for i, it in ipairs(HCONT) do if it.uid == uid then table.remove(HCONT, i); break end end; return true end
+        J.fill = function() return 0, 0 end
+        COMP.MainJigContainers = { GetArrayNum = function() return 1 end, ForEach = function(self, f)
+            f(1, { get = function() return { ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B = { ForEach = function(_, g)
+                for i, it in ipairs(HCONT) do g(i, { get = function() return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = it.uid,
+                    ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { Count_8_DD79AF2A46126A338C8DCCB4616D91CD = it.count } } end }) end
+            end } } end }) end }
+        ID = "Container_FuelLoot_GasPump_C@10,0,0"
+        SEQ = 0
+        function take_msg(i) return ID .. " H" .. i .. " 0 " .. (2 * i) .. " /Game/X.DA_Rifle" end
+        for i = 1, 202 do
+            INBOX.loot = { "A " .. ID .. " G" .. i .. " /Game/X.DA_Rifle 1 0 0 " .. (2 * i - 1) .. " -1:0:-1" }; loot.tick(0.5)
+            INBOX.loot = { take_msg(i) }; loot.tick(0.5)
+        end
+        SENT = {}
+        INBOX.loot = { take_msg(201) }; loot.tick(0.1)                -- the echo of the take a second ago
+        GAVE = nil
+        for _, p in ipairs(SENT) do if p:sub(1, 2) == "L " then GAVE = p end end
+        SZ = loot._sizes and loot._sizes() or {}
+    """)
+    check(H.eval("GAVE") is None, "the echo of a take emptied a second before the prune asks nothing back (%r)" % H.eval("GAVE"))
+    sz = H.eval("SZ")
+    check(all((sz[k] if sz[k] is not None else 99) <= 1 for k in ("alias", "rev", "added_once", "da_of", "count_seen")),
+          "202 items put in and taken out leave the per-item tables empty (%s)" % dict(sz))
+    check((sz["emptied"] if sz["emptied"] is not None else 999) <= 202, "the emptied list is bounded (%s)" % sz["emptied"])
+    G = loot_guest()
+    G.execute(r"""
+        PUMP.BP_JigMultiplayer = COMP
+        package.loaded["mirror.jig"].contents_of = function(c) if c == COMP then return CONT end return {} end
+        CONT = { { uid = "G1", da = "/Game/X.DA_Bandage", count = 3 } }
+        open(); loot.tick(0.1)
+        ID = SENT[1] and SENT[1]:match("^Q (%S+)$")
+        INBOX.lootc = { "C " .. tostring(ID) .. " 0 one" }
+        loot.tick(0.1)
+        CONT = {}
+        HOOKS["/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C:JigMP_OnItemRemoved"]({ get = function() return PUMP end }, { get = function() return "G1" end })
+        loot.tick(0.01)
+        S1 = loot._sizes and loot._sizes().sent_takes or -1
+        for i = 1, 130 do loot.tick(1.0) end
+        S2 = loot._sizes and loot._sizes().sent_takes or -1
+    """)
+    check(G.eval("S1") == 1 and G.eval("S2") == 0,
+          "a guest's take is remembered for a give-back, then let go after 120 s (%s, %s)" % (G.eval("S1"), G.eval("S2")))
+
+
+def a_put_back_while_the_host_lacks_the_container_is_kept_not_lost():
+    """T18 (players: loot gone after hours of moving it into storage): a guest took an item out of a container the
+    host's game hadn't loaded (the take is kept, so the item still counted as added there) and put it back in: that
+    put was dropped without a word - in neither game's copy once the host's list came."""
+    print("a_put_back_while_the_host_lacks_the_container_is_kept_not_lost")
+    H = loot_guest()
+    H.execute(r"""
+        package.loaded["mirror.loot"] = nil
+        loot = require("mirror.loot")
+        loot.init({}, "host", { in_world = function() return true end })
+        PUMP.BP_JigMultiplayer = COMP
+        HCONT, ADDS = {}, 0
+        local J = package.loaded["mirror.jig"]
+        J.contents_of = function() return HCONT end
+        J.add_item = function(c, da, n) ADDS = ADDS + 1; local u = "H" .. ADDS; HCONT[#HCONT + 1] = { uid = u, da = da, count = n }; return u end
+        J.take = function(c, uid) for i, it in ipairs(HCONT) do if it.uid == uid then table.remove(HCONT, i); break end end; return true end
+        J.fill = function() return 0, 0 end
+        COMP.MainJigContainers = { GetArrayNum = function() return 1 end, ForEach = function(self, f)
+            f(1, { get = function() return { ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B = { ForEach = function(_, g)
+                for i, it in ipairs(HCONT) do g(i, { get = function() return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = it.uid,
+                    ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { Count_8_DD79AF2A46126A338C8DCCB4616D91CD = it.count } } end }) end
+            end } } end }) end }
+        FOUND = true
+        util.find_by_id = function() return FOUND and PUMP or nil end
+        ID = "Container_FuelLoot_GasPump_C@10,0,0"
+        INBOX.loot = { "A " .. ID .. " G1 /Game/X.DA_Rifle 1 0 0 1 -1:0:-1" }; loot.tick(0.1)
+        A1 = ADDS
+        FOUND = false                                                          -- the host walks away
+        INBOX.loot = { ID .. " G1 0 2 /Game/X.DA_Rifle" }; loot.tick(0.1)     -- the guest takes it out
+        INBOX.loot = { "A " .. ID .. " G1 /Game/X.DA_Rifle 1 0 0 3 -1:0:-1" }; loot.tick(0.1)   -- and puts it back
+        FOUND = true
+        for i = 1, 15 do loot.tick(0.1) end
+        A2, N2 = ADDS, #HCONT
+        -- more than LATER_MAX changes waiting: a put-in that falls off the end goes back to the guest (R), not nowhere
+        FOUND, SENT = false, {}
+        INBOX.loot = { "A " .. ID .. " G9 /Game/X.DA_Pills 1 0 0 4 -1:0:-1" }; loot.tick(0.1)
+        for i = 1, 200 do INBOX.loot = { ID .. " T" .. i .. " 0 " .. (4 + i) .. " /Game/X.DA_Nail" }; loot.tick(0.01) end
+        R = nil
+        for _, p in ipairs(SENT) do if p:find("^R " .. ID:gsub("%p", "%%%0") .. " G9 ") then R = p end end
+    """)
+    check(H.eval("A1") == 1, "the first put is added")
+    check(H.eval("A2") == 2 and H.eval("N2") == 1,
+          "the take and the put back wait for the container, then the item is in it (adds %s, here %s)" % (H.eval("A2"), H.eval("N2")))
+    check(H.eval("R") is not None, "a kept put-in pushed out by the cap is handed back to the guest (%r)" % H.eval("R"))
+
+
+def a_put_into_an_item_in_a_container_lands_in_that_item():
+    """User 2026-11-03: an item player 2 put into an ammo tin inside a storage crate vanished. The put carried only
+    the cell and the grid's slot, not the tin: the host added it to the crate's own grids (or found no room) and its
+    next list took the item out of the tin on the guest's screen."""
+    print("a_put_into_an_item_in_a_container_lands_in_that_item")
+    G = loot_guest()
+    G.execute(r"""
+        PUMP.BP_JigMultiplayer = COMP
+        local J = package.loaded["mirror.jig"]
+        J.worth_sending = function() return false end
+        SUB = {}
+        J.subtree = function(c, uid) return SUB[uid] end
+        ID = "Container_FuelLoot_GasPump_C@10,0,0"
+        for k, fn in pairs(HOOKS) do if k:find(":JigMP_OnItemAdded", 1, true) then ADDED = fn end end
+        CONT = {}
+        J.contents_of = function() return CONT end
+        local function put(uid, da)
+            CONT[#CONT + 1] = SUB[uid][1]
+            ADDED({ get = function() return PUMP end }, { get = function() return uid end })
+            loot.tick(0.1); loot.tick(0.1)
+            for _, p in ipairs(SENT) do if p:find("^A [^ ]+ " .. uid .. " ") then return p end end
+        end
+        SUB.T1 = { { uid = "T1", da = "/Game/X.DA_AmmoTin", count = 1, dx = 0, dy = 0, cell = 4, rot = false, slot = 0, holder = "0_0_0_0" } }
+        SUB.G2 = { { uid = "G2", da = "/Game/X.DA_Ammo", count = 1, dx = 0, dy = 0, cell = 3, rot = true, slot = 1, holder = "T1", parent = 1 } }
+        LOOSE = put("T1", "/Game/X.DA_AmmoTin")
+        NESTED = put("G2", "/Game/X.DA_Ammo")
+    """)
+    loose, nested = G.eval("LOOSE"), G.eval("NESTED")
+    check(loose is not None and loose.endswith(" 4:0:0"), "a put into the crate itself keeps the old cell:rot:slot form (%r)" % loose)
+    check(nested is not None and nested.endswith(" 3:1:1:T1"), "a put into the tin names the tin it went into (%r)" % nested)
+    H = loot_guest()
+    H.execute(r"""
+        package.loaded["mirror.loot"] = nil
+        loot = require("mirror.loot")
+        loot.init({}, "host", { in_world = function() return true end })
+        PUMP.BP_JigMultiplayer = COMP
+        HCONT, ADDS, CONTS = {}, 0, {}
+        local J = package.loaded["mirror.jig"]
+        J.contents_of = function() return HCONT end
+        J.add_item = function(c, da, n, dx, dy, conts, place)
+            ADDS = ADDS + 1; CONTS[ADDS] = conts and conts[1] and conts[1].raw or "top"
+            local u = "H" .. ADDS; HCONT[#HCONT + 1] = { uid = u, da = da, count = n }; return u
+        end
+        J.containers_in = function(c, hu)
+            if hu == "H1" then return { { raw = "TIN slot 0", slot = 0 }, { raw = "TIN slot 1", slot = 1 } } end
+            return {}
+        end
+        J.fill = function() return 0, 0 end
+        COMP.MainJigContainers = { GetArrayNum = function() return 1 end, ForEach = function(self, f)
+            f(1, { get = function() return { ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B = { ForEach = function(_, g)
+                for i, it in ipairs(HCONT) do g(i, { get = function() return { UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = it.uid,
+                    ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { Count_8_DD79AF2A46126A338C8DCCB4616D91CD = it.count } } end }) end
+            end } } end }) end }
+        ID = "Container_FuelLoot_GasPump_C@10,0,0"
+        INBOX.loot = { "A " .. ID .. " T1 /Game/X.DA_AmmoTin 1 0 0 1 4:0:0" }; loot.tick(0.1)
+        INBOX.loot = { "A " .. ID .. " G2 /Game/X.DA_Ammo 1 0 0 2 3:1:1:T1" }; loot.tick(0.1)
+        INBOX.loot = { "A " .. ID .. " G3 /Game/X.DA_Ammo 1 0 0 3 5:0:0:T9" }; loot.tick(0.1)
+    """)
+    check(H.eval("ADDS") == 3 and H.eval("CONTS[1]") == "top", "the tin goes into the crate itself (%s)" % H.eval("CONTS[1]"))
+    check(H.eval("CONTS[2]") == "TIN slot 1",
+          "the ammo goes into the tin the guest put it in, its own compartment (%s, was the crate's grids)" % H.eval("CONTS[2]"))
+    check(H.eval("CONTS[3]") == "top", "a tin the host doesn't have: into the crate itself, not lost (%s)" % H.eval("CONTS[3]"))
+
+
 def container_class_checks_are_cached():
     # "perf: loot took 30-90 ms": with some MAIN classes not loaded (tents, stations...) "not a container" was
     # never kept, so every inventory component redid up to 12 IsA, and the missing classes were looked up
@@ -3956,7 +4746,7 @@ def beds_get_a_rename_row_and_shared_names():
         HELPER = obj({ CurrentTracActor = BED, CurrentInteractOptionIndex = 0 })
         PC = obj({ MyHUD = { InteractWidget = W } })
         package.loaded["mirror.game"] = { player = function() return { BP_JigHelperComp = HELPER } end, controller = function() return PC end,
-                                          on_world_reset = function() end, keybind = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end }
         util = require("mirror.util")
         HOOKS = {}
         util.ensure_hook = function(p, fn) HOOKS[p:match(":(%w+)$")] = fn; return true end
@@ -4014,6 +4804,86 @@ def ghost_swims_without_its_own_water_detection():
     check(L.eval('#CLEARED') == 1, "the timer is stopped once per ghost")
     check(L.eval('G.SwimmingComponent["IsSwimming?"]') is False, "leaving the water ends the ghost's swimming")
 
+
+def the_other_players_radiation_and_eating_stay_theirs():
+    # Player report 2026-11-01: the host hears the guests' radiation, eating and drinking. Decompiled: a radiated
+    # zombie's hit on the ghost (GameFunctionLibrary.ApplyRadiationDamage -> RadiationComponent.DecreaseRadiation)
+    # starts the ghost's Geiger with SpawnSound2D; the ghost's replayed use montage plays the item's ConsumeSound
+    # (MC_PlaySoundAtLocation, no attenuation), and human_eating_v3_Cue / Drinking_6_Cue have none of their own.
+    print("the_other_players_radiation_and_eating_stay_theirs")
+    L = lua()
+    L.execute(FAKES + r"""
+        util = require("mirror.util")
+        RADC = obj({})
+        StaticFindObject = function(p) if p:find("RadiationComponent_C", 1, true) then return RADC end end
+        ghost = require("mirror.ghost")
+        ghost.configure({ ghost = {} })
+        STOPS, DESTROYED, CLEARS = 0, 0, 0
+        function geiger()
+            local g
+            g = obj({ Stop = function() STOPS = STOPS + 1 end,
+                      K2_DestroyComponent = function() DESTROYED = DESTROYED + 1; g.IsValid = function() return false end end })
+            return g
+        end
+        COMP = obj({ CurrentRadiation = 100.0, MaxRadiation = 100.0, ClearTimers = function() CLEARS = CLEARS + 1 end })
+        LOOKUPS = 0
+        G = obj({ GetComponentByClass = function(_, c) LOOKUPS = LOOKUPS + 1; if c == RADC then return COMP end end,
+                  K2_GetRootComponent = function() return obj({}) end,
+                  K2_GetActorLocation = function() return { X = 500, Y = 0, Z = 0 } end })
+        ghost._set_for_test(G)
+        ghost.check(0.016)
+    """)
+    check(L.eval('STOPS') == 0 and L.eval('CLEARS') == 0 and L.eval('COMP.CurrentRadiation') == 100,
+          "a ghost with no radiation is left alone")
+    L.execute('COMP.CurrentRadiation = 97.5; COMP.Geiger = geiger(); GEIGER1 = COMP.Geiger; ghost.check(0.016)')
+    check(L.eval('STOPS') == 1 and L.eval('DESTROYED') == 1, "the Geiger a zombie's radiation started on the ghost is stopped")
+    check(L.eval('COMP.CurrentRadiation') == 100 and L.eval('CLEARS') == 1,
+          "the ghost's radiation is put back to full and its timers cleared (%s)" % L.eval('COMP.CurrentRadiation'))
+    L.execute('ghost.check(0.016); ghost.check(0.016)')
+    check(L.eval('STOPS') == 1 and L.eval('CLEARS') == 1, "a stopped Geiger isn't stopped again every frame")
+    L.execute('COMP.Geiger = geiger(); ghost.check(0.016)')
+    check(L.eval('STOPS') == 2 and L.eval('COMP.CurrentRadiation') == 100,
+          "a Geiger alone (radiation already full) is stopped too")
+    check(L.eval('LOOKUPS') == 1, "the component is looked up once per ghost, not every frame (%s)" % L.eval('LOOKUPS'))
+    L.execute('G2 = obj({ GetComponentByClass = function(_, c) LOOKUPS = LOOKUPS + 1; return nil end,'
+              ' K2_GetRootComponent = function() return obj({}) end, K2_GetActorLocation = function() return { X = 1, Y = 2, Z = 3 } end })'
+              '; ghost._set_for_test(G2); ghost.check(0.016)')
+    check(L.eval('LOOKUPS') == 2 and L.eval('STOPS') == 2, "a new ghost has its own component looked up; none, no harm")
+
+    L = lua()
+    L.execute(FAKES + r"""
+        CLOCK = 0; os.clock = function() return CLOCK end
+        ATT = obj({ GetFullName = function() return "SoundAttenuation /Game/Audio/Attenuation/FootSteps.FootSteps" end })
+        ASKED = 0
+        package.loaded["mirror.audio"] = { attenuation_for = function(s) ASKED = ASKED + 1; return ATT end }
+        function cue(name, att)
+            return obj({ AttenuationSettings = att, bOverrideAttenuation = false,
+                         GetFullName = function() return "SoundCue /Game/Audio/" .. name .. "." .. name end })
+        end
+        EAT = cue("human_eating_v3_Cue", nil)
+        OWN = obj({})
+        OPEN = cue("S_Eat_Cue", OWN)
+        USED = {}
+        G = obj({ PlayUsingItemMontage = function(self, a, m, o) USED[#USED + 1] = a end })
+        package.loaded["mirror.game"] = { player = function() return obj({}) end, player_hook = function() end }
+        package.loaded["mirror.ghost"] = { is = function() return false end, get = function() return G end }
+        package.loaded["mirror.link"].peer_age = function() return 0 end
+        util = require("mirror.util")
+        ASSET = obj({ ConsumeSound = EAT, OpenItemSound = OPEN,
+                      GetFullName = function() return "JigsawItem_DataAsset /Game/Inventory/DA_CannedTuna.DA_CannedTuna" end })
+        MONT = obj({ GetFullName = function() return "AnimMontage /Game/Character/Anims/Chr_EatingCannedFood_Montage.Chr_EatingCannedFood_Montage" end })
+        util.find = function(p) if p:find("DA_CannedTuna", 1, true) then return ASSET end return MONT end
+        anim = require("mirror.anim")
+        anim.init({ ghost = { mirror_montages = true } })
+        blobs_in.anim = "9 1 " .. os.time() .. " use /Game/Inventory/DA_CannedTuna.DA_CannedTuna 1 "
+            .. "/Game/Character/Anims/Chr_EatingCannedFood_Montage.Chr_EatingCannedFood_Montage -"
+        anim.tick()
+    """)
+    check(L.eval('#USED') == 1 and L.eval('USED[1] == ASSET'), "the other player's use montage still plays on their character")
+    check(L.eval('EAT.AttenuationSettings == ATT'),
+          "an eat cue with no attenuation gets one of the game's before the ghost's montage plays it")
+    check(L.eval('OPEN.AttenuationSettings == OWN'), "a cue with its own attenuation keeps it")
+    check(L.eval('ASKED') == 1, "only the cue without attenuation is asked about (%s)" % L.eval('ASKED'))
 
 def a_player_sitting_down_sits_on_the_other_screen():
     # User 2026-10-30: "also sitting down isnt synced". The game's sit (BP_PlayerCharacter IA_SitDown) plays
@@ -4130,10 +5000,18 @@ def door_code_locks_keep_other_players_out_until_they_type_it():
             -- (ME_AT: where this player stands; nil = no spot to read)
             package.loaded["mirror.game"] = { player = function() return { BP_JigHelperComp = HELPER,
                                                   K2_GetActorLocation = ME_AT and function() return ME_AT end } end,
-                                              controller = function() return PC end, on_world_reset = function() end }
+                                              controller = function() return PC end, on_widgets_cleared = function() end, on_world_reset = function() end }
             util = require("mirror.util")
-            HOOKS = {}
-            util.ensure_hook = function(p, fn) HOOKS[p:match(":(%w+)$")] = fn; return true end
+            -- (the real ensure_hook keys on path + function and UE4SS runs every hook of a function, so doorlock's and
+            -- vehlock's hooks on the same helper function both run: HOOKS[name] calls them all, in hook order)
+            HOOKS, HOOKFNS = {}, {}
+            util.ensure_hook = function(p, fn)
+                local k = p:match(":(%w+)$"); local l = HOOKFNS[k] or {}; HOOKFNS[k] = l
+                for _, f in ipairs(l) do if f == fn then return true end end
+                l[#l + 1] = fn
+                HOOKS[k] = function(...) local r; for _, f in ipairs(l) do r = f(...) end; return r end
+                return true
+            end
             util.cdo = function() return {
                 Create = function(_, pc, c)
                     if c.path:find("KeypadUI", 1, true) then
@@ -4466,6 +5344,234 @@ def door_code_locks_keep_other_players_out_until_they_type_it():
           "a guest can't remove access in the host's name")
 
 
+def vehicle_claims_keep_other_players_out_of_a_locked_car():
+    # User 2026-11-01: "a player can "Claim" a vehicle and then after claim will have the option too lock and unlock
+    # it, locked means but the owner can get in ... make it seperate from the door lock so they dont messs with
+    # eachother". Host + guest, each its own Lua, the real doors.lua carrying the claims, the door locks running too.
+    print("vehicle_claims_keep_other_players_out_of_a_locked_car")
+    import tempfile
+    def side(role, sid, name):
+        d = tempfile.mkdtemp().replace("\\", "/")
+        L = lua()
+        L.execute(FAKES + r"""
+            DIR, ROLE = "D", "R"
+            package.loaded["mirror.link"].lobby = function() return { id = "SID", name = "NAME" } end
+            CARDS = {}
+            package.loaded["mirror.notify"] = { show = function(t) CARDS[#CARDS + 1] = t end, clear = function() end }
+            function opt(n) return obj({ sel = false, SetSelected = function(self, v) self.sel = v end, OptionName = n,
+                                        UpdateText = function(self, v) self.OptionName = v end,
+                                        RemoveFromParent = function(self) for i, k in ipairs(VB.kids) do if k == self then table.remove(VB.kids, i) end end end }) end
+            function arr(items) return { items = items, GetArrayNum = function(self) return #self.items end,
+                ForEach = function(self, fn) for i, e in ipairs(self.items) do fn(i, { get = function() return e end }) end end } end
+            OPTS = { opt("Get In Vehicle"), opt("Open Storage"), opt("Push Vehicle") }
+            VB = obj({ kids = {} })
+            for _, o in ipairs(OPTS) do VB.kids[#VB.kids + 1] = o end
+            VB.GetChildrenCount = function(self) return #self.kids end
+            VB.GetChildAt = function(self, i) return self.kids[i + 1] end
+            VB.AddChildToVerticalBox = function(self, w) self.kids[#self.kids + 1] = w; return { SetPadding = function() end } end
+            W = obj({ InteractOptions = VB, Options = arr(OPTS), ObjectName = { t = "Pickup Truck", SetText = function(self, v) self.t = v end,
+                                                                          GetText = function(self) local t = self.t; return { ToString = function() return t end } end } })
+            -- a car: KEY = the host's name of it (vehicles.peer_name_of; not "NAME", which the setup replaces)
+            function car(n, x, c) return obj({ KEY = n, GetClass = function() return cls(c) end,
+                                               IsA = function(self, k) return k.path:find("BP_VehicleMaster", 1, true) ~= nil end,
+                                               K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end }) end
+            CAR1 = car("Vehicle_PickupTruck_C_1", 1000, "Vehicle_PickupTruck_C")
+            CAR2 = car("Vehicle_SUV_C_2", 5000, "Vehicle_SUV_C")
+            CAR3 = car("Vehicle_Van_C_3", 9000, "Vehicle_Van_C")
+            DOOR1 = obj({ GetClass = function() return cls("Buildable_WoodenDoor_C") end, IsA = function() return false end,
+                          K2_GetActorLocation = function() return { X = 1200, Y = 0, Z = 0 } end })
+            CARS = { [CAR1.KEY] = CAR1, [CAR2.KEY] = CAR2, [CAR3.KEY] = CAR3 }
+            IN = {}   -- car name -> another player drives it
+            VEH = { peer_name_of = function(c) return c.KEY end, car_named = function(n) return CARS[n] end,
+                    my_car = function() return nil end, peer_drives = function(c) return IN[c.KEY] == true end,
+                    rides_in = function() return nil end }
+            package.loaded["mirror.vehicles"] = VEH
+            package.loaded["mirror.peers"] = { each = function(_, fn) fn(VEH) end }
+            FindAllOf = function(c) local out = {}
+                for _, a in pairs(CARS) do if a:GetClass():GetFName():ToString() == c then out[#out + 1] = a end end
+                return out end
+            HELPER = obj({ CurrentTracActor = nil, CurrentInteractOptionIndex = 0,
+                           TraceToWorld = function(self) if TRACE ~= nil then self.CurrentTracActor = TRACE end end })
+            function opts(list) return { ForEach = function(self, fn) for _, s in ipairs(list) do
+                fn({}, { get = function() return { ToString = function() return s end } end }) end end } end
+            HELPER.CurrentInteractOptions = opts({ "Get In Vehicle", "Open Storage", "Push Vehicle" })
+            -- every module's hook on a function runs (door locks and vehicle locks both hook TryInteract)
+            HOOKS = {}
+            function hook(k, ...) for _, fn in pairs(HOOKS[k] or {}) do fn(...) end end
+            -- the game's TryInteract in its real order (see the door lock test): the option, then the hooks
+            function real_press()
+                local hit, labels = TRACE or HELPER.CurrentTracActor, {}
+                HELPER.CurrentInteractOptions:ForEach(function(_, v) labels[#labels + 1] = v:get():ToString() end)
+                if hit == HELPER.CurrentTracActor then RAN = labels[HELPER.CurrentInteractOptionIndex + 1] else RAN = labels[1] end
+                hook("TryInteract", { get = function() return HELPER end })
+                return RAN
+            end
+            PC = obj({ MyHUD = { InteractWidget = W }, bShowMouseCursor = false,
+                       Pawn = { DisableInput = function() end, EnableInput = function() end } })
+            package.loaded["mirror.game"] = { player = function() return { BP_JigHelperComp = HELPER } end,
+                                              controller = function() return PC end, on_widgets_cleared = function() end, on_world_reset = function() end }
+            util = require("mirror.util")
+            util.ensure_hook = function(p, fn) local k = p:match(":(%w+)$"); HOOKS[k] = HOOKS[k] or {}; HOOKS[k][tostring(fn)] = fn; return true end
+            util.cdo = function() return { Create = function() return opt(nil) end,
+                                           SetInputMode_GameAndUIEx = function() end, SetInputMode_GameOnly = function() end } end
+            StaticFindObject = function(p) return obj({ path = p }) end
+            FText = function(s) return s end
+            lock = require("mirror.doorlock")
+            vl = require("mirror.vehlock")
+            SESSION = { in_world = function() return true end, data_file = function(n) return DIR .. "/" .. n end }
+            lock.init(SESSION, function() return DIR .. "/id.txt" end)
+            doors = require("mirror.doors")
+            LIVE = true
+            doors.init({ door_sync = false }, ROLE, SESSION, function() return LIVE end)
+            function tick(n) for i = 1, (n or 1) do util.new_frame(); doors.tick(0.05); lock.tick(0.05) end end
+            function look(a) HELPER.CurrentTracActor = a; tick(4) end
+            function press() hook("TryInteract", { get = function() return HELPER end }); tick(4) end
+            -- scroll from the car's last option down onto our first row; pick2: on to our second
+            function pick() HELPER.CurrentInteractOptionIndex = 2; tick(2); HELPER.CurrentInteractOptionIndex = 0
+                            hook("CycleOptions", nil, { get = function() return false end }); tick(2) end
+            function pick2() pick(); HELPER.CurrentInteractOptionIndex = 0
+                             hook("CycleOptions", nil, { get = function() return false end }); tick(2) end
+            function st(a) return (vl.state_of(a.KEY)) end
+            function row(i) local k = VB.kids[3 + (i or 1)]; return k and k.OptionName end
+        """.replace('"D"', '"%s"' % d).replace('"R"', '"%s"' % role).replace("SID", sid).replace("NAME", name))
+        return L, d
+    H, hd = side("host", "7656001", "Hosty")
+    G, gd = side("guest", "7656002", "Guesty")
+    vfile = hd + "/mirror_coop_vehicle_locks.txt"
+    last = {}
+    def pump():
+        for src, dst, name in ((H, G, "locks"), (G, H, "lock_g"), (H, G, "vlocks"), (G, H, "vlock_g")):
+            b = src.eval('blobs_out["%s"]' % name)
+            if b is not None and last.get(name) != b:
+                last[name] = b
+                dst.execute('blobs_in["%s"] = ...' % name, b)
+        H.execute("tick(2)"); G.execute("tick(2)")
+    pump(); pump()
+
+    # the host claims a car nobody owns
+    H.execute('look(CAR1)')
+    check(H.eval('row()') == "Claim vehicle" and H.eval('#VB.kids') == 4, "a car nobody owns gets a Claim row (%s)" % H.eval('row()'))
+    H.execute('pick()')
+    check(H.eval('HELPER.CurrentInteractOptionIndex') == 3 and H.eval('VB.kids[4].sel') is True, "scrolling past the car's options selects it")
+    H.execute('press()')
+    check(H.eval('st(CAR1)') == "mine", "picking it makes the car the host's (%s)" % H.eval('st(CAR1)'))
+    check("V Vehicle_PickupTruck_C_1 7656001 U Vehicle_PickupTruck_C 1000 0 0" in open(vfile).read(),
+          "the world's vehicle file keeps the claim (%r)" % open(vfile).read())
+    check(H.eval('row(1)') == "Lock vehicle" and H.eval('row(2)') == "Unclaim vehicle",
+          "the owner's rows are Lock and Unclaim (%s, %s)" % (H.eval('row(1)'), H.eval('row(2)')))
+    H.execute('press()')
+    check(H.eval('st(CAR1)') == "mine_locked" and " L Vehicle_PickupTruck_C " in open(vfile).read(), "Lock locks it, in the file too")
+    check(H.eval('row(1)') == "Unlock vehicle", "a locked car of mine offers Unlock (%s)" % H.eval('row(1)'))
+    H.execute('HELPER.CurrentInteractOptionIndex = 0; tick()')
+    check(H.eval('real_press()') == "Get In Vehicle", "the owner still gets in a locked car (%s)" % H.eval('RAN'))
+    pump(); pump()
+
+    # the guest is kept out
+    G.execute('look(CAR1)')
+    check(G.eval('st(CAR1)') == "locked" and G.eval('row()') == "Locked" and G.eval('#VB.kids') == 4
+          and G.eval('HELPER.CurrentInteractOptionIndex') == 3, "the guest sees only a Locked row, picked")
+    check(G.eval('W.ObjectName.t') == "Hosty's vehicle - locked", "the hover title names the owner (%s)" % G.eval('W.ObjectName.t'))
+    G.execute('HELPER.CurrentInteractOptionIndex = 0; tick()')
+    check(G.eval('real_press()') is None, "pressing interact on a locked car runs none of its options (%s)" % G.eval('RAN'))
+    G.execute('tick(4)')
+    check(G.eval('CARDS[#CARDS]') == "Hosty's vehicle is locked.", "...and says whose it is (%s)" % G.eval('CARDS[#CARDS]'))
+    G.execute('HELPER.CurrentTracActor = CAR3; HELPER.CurrentInteractOptionIndex = 0; TRACE = CAR1; tick()')
+    check(G.eval('real_press()') is None, "turned to the locked car a frame before pressing: nothing runs (%s)" % G.eval('RAN'))
+    G.execute('TRACE = nil; PC.MyHUD.InteractWidget = nil; HELPER.CurrentTracActor = CAR1; HELPER.CurrentInteractOptionIndex = 0; tick()')
+    check(G.eval('real_press()') is None, "before the game's hover menu is up a locked car still runs nothing (%s)" % G.eval('RAN'))
+    G.execute('PC.MyHUD.InteractWidget = W; tick(4)')
+
+    # forged and refused changes
+    H.execute('vl.take_ops("run x\\n1 unlock 7656001 Vehicle_PickupTruck_C_1", {})')
+    H.execute('vl.take_ops("run y\\n1 unlock 7656002 Vehicle_PickupTruck_C_1\\n2 unclaim 7656002 Vehicle_PickupTruck_C_1\\n'
+              '3 claim 7656002 Vehicle_PickupTruck_C_1 Vehicle_PickupTruck_C 0 0 0", {})')
+    check(H.eval('st(CAR1)') == "mine_locked", "a guest can't unlock, unclaim or claim the host's car, nor act in the host's name")
+    H.execute('IN["Vehicle_Van_C_3"] = true; vl.take_ops("run z\\n1 claim 7656003 Vehicle_Van_C_3 Vehicle_Van_C 9000 0 0\\n'
+              '2 claim 7656003 Vehicle_Ghost_C_9 Vehicle_Van_C 0 0 0", {}); IN["Vehicle_Van_C_3"] = nil')
+    check(H.eval('st(CAR3)') == "free" and "Vehicle_Ghost_C_9" not in open(vfile).read(),
+          "a guest can't claim a car someone sits in, nor one the host's world doesn't have")
+    H.execute('S = { cars = {}, names = {} }; for i = 1, 401 do vl._apply_op(S, "claim", "o", "Vehicle_C_" .. i, "Vehicle_C", "0", "0", "0") end; '
+              'N = 0; for _ in pairs(S.cars) do N = N + 1 end')
+    check(H.eval('N') == 400, "a full list takes no new claim (%s)" % H.eval('N'))
+
+    # the guest claims and locks its own car
+    G.execute('look(CAR2); pick(); press()')
+    check(G.eval('st(CAR2)') == "mine", "the guest's claim shows at once (%s)" % G.eval('st(CAR2)'))
+    G.execute('press()')
+    check(G.eval('st(CAR2)') == "mine_locked", "...and its lock")
+    pump(); pump(); pump()
+    check(H.eval('st(CAR2)') == "locked" and "V Vehicle_SUV_C_2 7656002 L " in open(vfile).read(),
+          "the host keeps the guest's locked car in its file")
+    check(G.eval('vl.ops_text()').count("\n") == 0, "once the host took it the guest stops sending it (%r)" % G.eval('vl.ops_text()'))
+    H.execute('look(CAR2); HELPER.CurrentInteractOptionIndex = 0; tick()')
+    check(H.eval('real_press()') is None and H.eval('row()') == "Locked", "the guest's lock keeps the host out")
+    H.execute('tick(4)')
+
+    # someone in a car: nobody else can claim it
+    G.execute('IN["Vehicle_Van_C_3"] = true; look(CAR3)')
+    check(G.eval('#VB.kids') == 3, "no Claim row on a car another player drives (%s)" % G.eval('#VB.kids'))
+    G.execute('IN["Vehicle_Van_C_3"] = nil')
+    # on the host the copy of the link a guest's claim came from (doors.lua passes it) says that guest is in the car:
+    # its own seat, not someone else's. Another link's copy, or the host's own seat, still keeps it out.
+    H.execute('IN["Vehicle_Van_C_3"] = true; vl.take_ops("run s1\\n1 claim 7656002 Vehicle_Van_C_3 Vehicle_Van_C 9000 0 0", {}, VEH); '
+              'IN["Vehicle_Van_C_3"] = nil')
+    check(H.eval('(vl.state_of("Vehicle_Van_C_3"))') == "open",
+          "a guest may claim the car it sits in itself (%s)" % H.eval('(vl.state_of("Vehicle_Van_C_3"))'))
+    H.execute('vl.take_ops("run s2\\n1 unclaim 7656002 Vehicle_Van_C_3", {})')
+    H.execute('IN["Vehicle_Van_C_3"] = true; vl.take_ops("run s3\\n1 claim 7656002 Vehicle_Van_C_3 Vehicle_Van_C 9000 0 0", {}, '
+              '{ peer_drives = function() return false end }); IN["Vehicle_Van_C_3"] = nil')
+    check(H.eval('(vl.state_of("Vehicle_Van_C_3"))') == "free", "...but not one another player's copy says someone is in")
+    H.execute('VEH.my_car = function() return CAR3 end; '
+              'vl.take_ops("run s4\\n1 claim 7656002 Vehicle_Van_C_3 Vehicle_Van_C 9000 0 0", {}, VEH); VEH.my_car = function() return nil end')
+    check(H.eval('(vl.state_of("Vehicle_Van_C_3"))') == "free", "nor the car the host sits in")
+    pump(); pump()
+
+    # the host unlocks: the guest gets in again, the title comes back (the game names each new thing hovered)
+    G.execute('W.ObjectName.t = "Pickup Truck"; look(CAR1)')
+    H.execute('look(CAR1); HELPER.CurrentInteractOptionIndex = 3; tick(2); press()')
+    check(H.eval('st(CAR1)') == "mine", "Unlock unlocks it (%s)" % H.eval('st(CAR1)'))
+    pump(); pump()
+    G.execute('tick(4)')
+    check(G.eval('st(CAR1)') == "open" and G.eval('#VB.kids') == 3, "an unlocked claimed car has no rows for the guest")
+    check(G.eval('W.ObjectName.t') == "Pickup Truck", "the hover title loses its lock mark (%s)" % G.eval('W.ObjectName.t'))
+    G.execute('HELPER.CurrentInteractOptionIndex = 0; tick()')
+    check(G.eval('real_press()') == "Get In Vehicle", "the guest gets in an unlocked car (%s)" % G.eval('RAN'))
+
+    # unclaim
+    H.execute('look(CAR1); pick2()')
+    check(H.eval('VB.kids[5].sel') is True and H.eval('row(2)') == "Unclaim vehicle", "scrolling on selects Unclaim")
+    H.execute('press()')
+    check(H.eval('st(CAR1)') == "free" and "Vehicle_PickupTruck_C_1" not in open(vfile).read(), "Unclaim frees the car")
+
+    # kept apart from the door locks: own file, own blobs, no rows on each other's things
+    H.execute('look(DOOR1)')
+    check(H.eval('row()') == "Lock door" and H.eval('#VB.kids') == 4, "a door still gets only the door lock's row (%s)" % H.eval('row()'))
+    H.execute('tick(4)')
+    dl = hd + "/mirror_coop_door_locks.txt"
+    import os
+    check(not os.path.exists(dl) or "V " not in open(dl).read(), "no car claim in the door lock file")
+    vlines = open(vfile).read().splitlines()
+    check(vlines and all(l[:2] in ("V ", "N ") for l in vlines), "no door lock in the vehicle file (%r)" % vlines)
+    check("V " not in (H.eval('blobs_out["locks"]') or "") and "D " not in (H.eval('blobs_out["vlocks"]') or ""),
+          "the two stores travel in their own blobs")
+
+    # a reload: the file brings it back; a claimed name the world doesn't have goes to the same car at that spot
+    H.execute('vl.forget()')
+    check(H.eval('st(CAR2)') == "locked", "after a world reload the claims come back from the file")
+    H.execute('CARS["Vehicle_SUV_C_2"] = nil; CAR2.KEY = "Vehicle_SUV_C_77"; CARS[CAR2.KEY] = CAR2; vl.forget(); '
+              'util.new_frame(); vl.tick(25)')
+    check(H.eval('(vl.state_of("Vehicle_SUV_C_77"))') == "locked" and H.eval('(vl.state_of("Vehicle_SUV_C_2"))') == "free"
+          and "V Vehicle_SUV_C_77 7656002 L " in open(vfile).read(),
+          "a claimed car named anew after a load keeps its claim (%s/%s, %r)"
+          % (H.eval('(vl.state_of("Vehicle_SUV_C_77"))'), H.eval('(vl.state_of("Vehicle_SUV_C_2"))'), open(vfile).read()))
+
+    # the guest goes home with a change the host hasn't taken: it counts as unconfirmed; leaving drops it
+    G.execute('look(CAR3); pick(); press()')
+    check(G.eval('vl.unconfirmed()') > 0, "a claim the host hasn't taken counts as unconfirmed")
+    G.execute('LIVE = false; tick()')
+    check(G.eval('vl.unconfirmed()') == 0 and G.eval('st(CAR1)') == "free", "a guest back alone goes by its own world's claims")
+
+
 def all_players_must_sleep_before_the_night_is_skipped():
     # User 2026-10-30: "sleeping bags sync for everyone when 1 person sleeps" -> "Feature: all must sleep".
     # The game's sleep (SleepingUI_C) runs the sky's Transition Time of Day(650, 2.0, 7, 2.0, false); joined, one
@@ -4734,7 +5840,7 @@ def a_host_zombie_hit_reaches_a_guest_with_three_players():
         PLAYER.K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end
         HURT = {}
         package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return obj({}) end,
-            controller = function() return nil end, on_world_reset = function() end, keybind = function() end,
+            controller = function() return nil end, on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end,
             on_ready = function() end, on_tick = function() end,
             player_hook = function(name, fn) if name == "ReceiveAnyDamage" then HURT[#HURT + 1] = fn end end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
@@ -4783,6 +5889,65 @@ def a_host_zombie_hit_reaches_a_guest_with_three_players():
     check(L.eval('AFTER') == 1 and L.eval('GOT[#GOT]') == 20.0, "...and hits land again once the 3 s are over")
 
 
+def the_ghost_keeps_no_medical_bite_or_radiation_hit():
+    # known gap 2026-11-01: a host zombie's medical effect, bite infection or radiation on the ghost was sent to its
+    # player and then applied to the ghost as well (bleeding, infection on a character nobody plays here)
+    print("the_ghost_keeps_no_medical_bite_or_radiation_hit")
+    for role in ("host", "guest"):
+        L = lua()
+        L.execute('ROLE = %r' % role)
+        L.execute(FAKES + r"""
+            SENT = {}
+            package.loaded["mirror.events"] = evmock { new = function(name)
+                return { send = function(self, p) SENT[#SENT + 1] = p end, pump = function() end } end }
+            PLAYER = obj({ MedicalComponent = { Health = 100 } })
+            PLAYER.K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end
+            GHOST = obj({})
+            GHOST.K2_GetActorLocation = function() return { X = 50, Y = 0, Z = 0 } end
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return obj({}) end,
+                controller = function() return nil end, on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end,
+                on_ready = function(fn) fn() end, on_tick = function() end, player_hook = function() end }
+            package.loaded["mirror.ghost"] = { get = function() return GHOST end, is = function(o) return o == GHOST end,
+                location = function() return { X = 50, Y = 0, Z = 0 } end }
+            package.loaded["mirror.loader"] = { want = function() end }
+            package.loaded["mirror.invdiag"] = { summary = function() return "-" end }
+            StaticFindObject = function() return nil end
+            ModifierKey = ModifierKey or { CONTROL = 1 }
+            util = require("mirror.util")
+            util.ensure_hook = function() return true end
+            util.cdo = function() return { GetConsoleVariableBoolValue = function() return false end,
+                GetConsoleVariableIntValue = function() return 0 end } end
+            HOOKS = {}
+            util.hook = function(p, fn) HOOKS[p:match(":(.+)$")] = fn; return true end
+            CFG = { zombies = { enabled = true, send_hz = 15, despawn_after = 3.0, dmg_reach = 400 } }
+            Z = require("mirror.zombies")
+            local ok, e = pcall(Z.init, CFG, ROLE, { in_world = function() return true end })
+            if not ok then INIT_ERR = tostring(e) end
+            function box(v) local b = { v = v }; return { get = function() return b.v end, set = function(_, x) b.v = x end } end
+            function ref(o) return { get = function() return o end } end
+            -- each hit: the chances it leaves (0 = the ghost keeps nothing)
+            function med(who) local a, b, c, d = box(0.5), box(0.25), box(0.75), box(0.4)
+                HOOKS.ApplyMedicalEffect(nil, ref(who), box({}), a, b, c, d, nil); return a:get() + b:get() + c:get() + d:get() end
+            function bite(who) local c = box(0.3); HOOKS.ApplyBiteInfection(nil, ref(who), c, box(false), nil); return c:get() end
+            function rads(who) local c, r = box(0.6), box(12); HOOKS.ApplyRadiationDamage(nil, ref(who), c, r, box(false), nil)
+                return c:get() + r:get() end
+        """)
+        check(L.eval('INIT_ERR') is None and all(L.eval('HOOKS.%s ~= nil' % h) for h in ("ApplyMedicalEffect", "ApplyBiteInfection", "ApplyRadiationDamage")),
+              "%s: the three hooks are set (%s)" % (role, L.eval('INIT_ERR')))
+        if role == "host":
+            check(L.eval('med(GHOST)') == 0 and L.eval('bite(GHOST)') == 0 and L.eval('rads(GHOST)') == 0,
+                  "host: a zombie's medical effect, bite and radiation on the ghost leave it nothing")
+            sent = list(L.eval('SENT').values())
+            check(len(sent) == 3 and sent[0].startswith("M ") and " 0.500 0.250 0.750 0.400 " in sent[0]
+                  and sent[1].startswith("B ") and " 0.300 " in sent[1] and sent[2].startswith("R ") and " 0.600 12.000 " in sent[2],
+                  "...and each is still sent to its player with the chances it had (%r)" % sent)
+        else:
+            check(L.eval('med(GHOST)') == 0 and L.eval('bite(GHOST)') == 0 and L.eval('rads(GHOST)') == 0,
+                  "guest: a copy's hit on the host's ghost leaves it nothing")
+        check(abs(L.eval('med(PLAYER)') - 1.9) < 1e-9 and abs(L.eval('bite(PLAYER)') - 0.3) < 1e-9 and abs(L.eval('rads(PLAYER)') - 12.6) < 1e-9,
+              "%s: my own character still takes a zombie's hits here" % role)
+
+
 def zombie_loot_tables_are_all_looked_up_and_misses_stay_few():
     # live 2026-10-30 02:34 as a guest: only Bandit and BanditBoss were ever asked (every 2 s, 32-59 ms of misses),
     # "16/16 missing" for 3.5 min - and the host's zombies wait for those tables
@@ -4790,7 +5955,7 @@ def zombie_loot_tables_are_all_looked_up_and_misses_stay_few():
     L = lua()
     L.execute(FAKES + r"""
         package.loaded["mirror.game"] = { player = function() return nil end, world = function() return obj({}) end,
-            controller = function() return nil end, on_world_reset = function() end, keybind = function() end }
+            controller = function() return nil end, on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
         package.loaded["mirror.loader"] = { want = function() end }
         package.loaded["mirror.invdiag"] = { summary = function() return "-" end }
@@ -4837,6 +6002,68 @@ def zombie_loot_tables_are_all_looked_up_and_misses_stay_few():
     check(L.eval('WALKS') == L.eval('W50'), "all there: no more walks (%s after)" % (L.eval('WALKS') - L.eval('W50')))
 
 
+def missing_zombie_loot_tables_are_asked_of_the_game_without_a_load_from_lua():
+    # kit 2026-11-02: the forest giant waited at a quiet spot (0 of 16 tables, no ordinary AI); the engine's latent
+    # LoadAsset queues an async load and returns (15 queued in 0.0 ms, all there 0.25 s later)
+    print("missing_zombie_loot_tables_are_asked_of_the_game_without_a_load_from_lua")
+    L = lua()
+    L.execute(FAKES + r"""
+        WORLD = obj({})
+        package.loaded["mirror.game"] = { player = function() return nil end, world = function() return WORLD end,
+            controller = function() return nil end, on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end }
+        package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
+        package.loaded["mirror.loader"] = { want = function() end }
+        package.loaded["mirror.invdiag"] = { summary = function() return "-" end }
+        LOADED, ASKS, SYNC = {}, {}, 0
+        LoadAsset = function() SYNC = SYNC + 1 end
+        StaticFindObject = function() return nil end
+        FindAllOf = function(c)
+            if c ~= "ContainerItems_DataAsset_C" then return nil end
+            local out = {}
+            for p in pairs(LOADED) do
+                local o = cls(p:match("%.(DA_LootTable_.+)$"))
+                o.GetFullName = function() return "ContainerItems_DataAsset_C " .. p end
+                out[#out + 1] = o
+            end
+            return out
+        end
+        KSL = obj({
+            MakeSoftObjectPath = function(_, p) return { path = p } end,
+            Conv_SoftObjPathToSoftObjRef = function(_, sp) return { ref = sp.path } end,
+            LoadAsset = function(_, w, ref, done, info) ASKS[#ASKS + 1] = { w = w, path = ref.ref, info = info } end,
+        })
+        util = require("mirror.util")
+        util.ensure_hook = function() return true end
+        util.cdo = function(p) if p:find("KismetSystemLibrary", 1, true) then return KSL end return nil end
+        zombies = require("mirror.zombies")
+        zombies._test.setup({ zombies = { enabled = true } }, "host")
+        T = 100; os.clock = function() return T end
+        function table_path(n) return "/Game/AI/AILootTables/DA_LootTable_" .. n .. ".DA_LootTable_" .. n end
+        for _, n in ipairs({ "BanditSniper", "Bear", "Deer", "MilitaryBoss", "MilitaryRifleman", "Rabbit", "Scavenger", "Wolf",
+                             "Zombie", "ZombieBoss", "ZombieBossSmall", "ZombieHound", "ZombieInfected", "ZombieRadiated" }) do
+            LOADED[table_path(n)] = true
+        end
+        N1 = zombies.load_loot_tables()
+        A1 = #ASKS
+        UUIDS = {}
+        for _, a in ipairs(ASKS) do UUIDS[a.info.UUID] = true end
+        T = T + 0.3; N2 = zombies.load_loot_tables()
+        -- the game loads them; looked for again within a second, not after the probe's 8 s back-off
+        LOADED[table_path("Bandit")], LOADED[table_path("BanditBoss")] = true, true
+        T = T + 0.6; READY = zombies.loot_ready()
+        T = T + 30; N3 = zombies.load_loot_tables()
+    """)
+    check(L.eval('N1') == 2 and L.eval('A1') == 2, "only the two missing tables are asked for (%s asked)" % L.eval('A1'))
+    check(L.eval('ASKS[1].path == table_path("Bandit") and ASKS[2].path == table_path("BanditBoss")'),
+          "by their full object paths in the AI folder")
+    check(L.eval('ASKS[1].w == WORLD and ASKS[1].info.CallbackTarget == WORLD and ASKS[1].info.UUID ~= ASKS[2].info.UUID'),
+          "latent call on the world, one UUID per table (the latent manager keeps one action per UUID)")
+    check(L.eval('SYNC') == 0, "never Lua's own LoadAsset (a synchronous load from Lua, L-014)")
+    check(L.eval('N2') == 0 and L.eval('#ASKS') == 2, "asked again before they came: nothing (once per 20 s)")
+    check(L.eval('READY') is True, "loaded tables are seen 0.6 s later")
+    check(L.eval('N3') == 0 and L.eval('#ASKS') == 2, "all 16 there: nothing is asked")
+
+
 def zombies_go_after_the_ghost_again_after_a_save():
     # live 2026-10-30: every save let the zombies chasing the ghost go ("8 zombie(s) stopped chasing it")
     print("zombies_go_after_the_ghost_again_after_a_save")
@@ -4847,7 +6074,7 @@ def zombies_go_after_the_ghost_again_after_a_save():
         StaticFindObject = function() return obj({}) end
         FindFirstOf = function() return nil end
         ME = obj({ GetFullName = function() return "BP_PlayerCharacter_C /Game/L.L:P.Me" end, Controller = obj({}) })
-        package.loaded["mirror.game"] = { player = function() return ME end, on_world_reset = function() end }
+        package.loaded["mirror.game"] = { player = function() return ME end, on_widgets_cleared = function() end, on_world_reset = function() end }
         package.loaded["mirror.animgate"] = { destroy = function() end, flush = function() return 0 end }
         function zombie()
             local bb = { v = {} }
@@ -4909,7 +6136,7 @@ def a_ghost_the_game_removed_is_let_go_and_made_again():
         StaticFindObject = function() return obj({}) end
         FindFirstOf = function() return nil end
         ME = obj({ GetFullName = function() return "BP_PlayerCharacter_C /Game/L.L:P.Me" end, Controller = obj({}) })
-        package.loaded["mirror.game"] = { player = function() return ME end, on_world_reset = function() end }
+        package.loaded["mirror.game"] = { player = function() return ME end, on_widgets_cleared = function() end, on_world_reset = function() end }
         GATED = 0
         package.loaded["mirror.animgate"] = { destroy = function() GATED = GATED + 1 end, flush = function() return 0 end }
         local bb = { v = {} }
@@ -4977,7 +6204,7 @@ def a_ghost_destroyed_for_a_save_is_never_touched_again():
         StaticFindObject = function() return obj({}) end
         FindFirstOf = function() return nil end
         ME = obj({ GetFullName = function() return "BP_PlayerCharacter_C /Game/L.L:P.Me" end, Controller = obj({}) })
-        package.loaded["mirror.game"] = { player = function() return ME end, on_world_reset = function() end }
+        package.loaded["mirror.game"] = { player = function() return ME end, on_widgets_cleared = function() end, on_world_reset = function() end }
         ghost = require("mirror.ghost")
         ghost.configure({ ghost = { class = "/Game/X.Ghost_C", target_tag = "t", view_controller = false } })
         TOUCHED, DESTROYS = 0, 0
@@ -5027,7 +6254,7 @@ def audio_spatializes_and_shares_without_echo():
     L = lua()
     L.execute(FAKES + r"""
         PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end })
-        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end }
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end }
         package.loaded["mirror.ghost"] = { is = function() return false end }
         SENT, PLAYED = {}, {}
         package.loaded["mirror.events"] = evmock { new = function() return {
@@ -5095,6 +6322,25 @@ def audio_spatializes_and_shares_without_echo():
               'HOOKS.PlaySoundAtLocation(nil, P(CRATE), P(CUES["/Game/Audio/Shotgun_Insert_Cue.Shotgun_Insert_Cue"]), P({ X = 200, Y = 0, Z = 0 }), nil, P(1), P(1)); '
               'local t0 = os.clock(); while os.clock() - t0 < 0.12 do end; audio.tick(0.1)')
     check(L.eval('#SENT') == 1, "a sound of something the player uses nearby is shared")
+    # player list #6: every sound the game plays came through here with its name read and matched each time
+    L.execute(r"""
+        NAMES = 0
+        SHOT = cue("AR_Burst_Cue"); local gf = SHOT.GetFName
+        SHOT.GetFName = function(...) NAMES = NAMES + 1; return gf(...) end
+        STEP = cue("Footstep_Dirt_Cue"); local sf = STEP.GetFName
+        STEP.GetFName = function(...) NAMES = NAMES + 1; return sf(...) end
+        SENT = {}
+        for i = 1, 20 do
+            HOOKS.PlaySoundAtLocation(nil, P(CRATE), P(SHOT), P({ X = 200, Y = 0, Z = 0 }), nil, P(1), P(1))
+            HOOKS.PlaySoundAtLocation(nil, P(CRATE), P(STEP), P({ X = 200, Y = 0, Z = 0 }), nil, P(1), P(1))
+        end
+        local t0 = os.clock(); while os.clock() - t0 < 0.12 do end; audio.tick(0.1)
+        STEPS = 0; for _, m in ipairs(SENT) do if m:find("Footstep", 1, true) then STEPS = STEPS + 1 end end
+    """)
+    check(L.eval('NAMES') <= 2, "a sound's name is read and matched once, not each time it plays (%s, was 40)" % L.eval('NAMES'))
+    check(L.eval('#SENT') > 0 and L.eval('STEPS') == 0,
+          "the cached answer still shares the shot and skips the footstep every time (%s sent, %s steps)"
+          % (L.eval('#SENT'), L.eval('STEPS')))
 
 
 def keycard_doors_open_on_both_games():
@@ -5119,17 +6365,80 @@ def keycard_doors_open_on_both_games():
         end
         CARD = door("BP_KeycardDoor_C", { ["Open?"] = false })
         CARD.MC_OpenDoor = function(self, by) OPENED_BY = by; self["Open?"] = true end
-        SECURE = door("BP_LaboratorySecureDoors_C", { Unlocked = false })
+        -- the lab's doors as decompiled (report 2026-11-01, re-traced): a secure door's keycard opening is
+        -- IsClosed = false + TL_Mechanism (its end plays TL_Doors); pressing it shut is TL_MechanismReverse (reverses
+        -- TL_Doors, whose start sets IsClosed); Event_Close moves no door. A sliding door's keycard sets Unlocked
+        -- (OnRep_Unlocked) and slides with TL_DoorsKeycard; the entrance doors are a plain IsClosed / Event_Door door
+        function timeline(on_end) return { pos = 0, rev = false, from_start = 0,
+            Play = function(self) self.pos, self.rev = 1, false; if on_end then on_end(self) end end,
+            PlayFromStart = function(self) self.from_start = self.from_start + 1; self:Play() end,
+            Reverse = function(self) self.pos, self.rev = 0, true; if on_end then on_end(self) end end,
+            GetPlaybackPosition = function(self) return self.pos end, IsReversing = function(self) return self.rev end } end
+        SECURE = door("BP_LaboratorySecureDoors_C", { Unlocked = false, IsClosed = true })
+        SECURE.TL_Doors = timeline(function(t) if t.rev then SECURE.IsClosed = true end end)
+        SECURE.TL_Mechanism = timeline(function(t) if not t.rev then SECURE.TL_Doors:Play() end end)
+        SECURE.TL_MechanismReverse = timeline(function(t) if not t.rev then SECURE.TL_Doors:Reverse() end end)
+        SECURE.Timeline = timeline()
+        SECURE.Event_Close = function(self) SECURE_EVENT_CLOSE = true end
+        SLIDE = door("BP_LaboratorySlidingDoor_C", { Unlocked = false, Locked = true })
+        SLIDE.TL_DoorsKeycard = timeline()
+        SLIDE.OnRep_Unlocked = function(self) if self.Unlocked then self.Locked = false; GREEN = true end end
+        ENTRY = door("BP_LaboratoryEntranceDoors_C", { IsClosed = true })
+        ENTRY.Event_Door = function(self) self.IsClosed = not self.IsClosed; ENTRY_CALLS = (ENTRY_CALLS or 0) + 1 end
+        -- a light switch as decompiled: On?/Off? opposite, each OnRep sets its lights; Event_LightSwitch toggles
+        LAMP = { LightOn = false }
+        SWITCH = door("BP_LaboratoryLightSwitch_C", { ["On?"] = false, ["Off?"] = false })
+        SWITCH["OnRep_On?"] = function(self) if self["On?"] then self["Off?"] = false; LAMP.LightOn = true end end
+        SWITCH["OnRep_Off?"] = function(self) if self["Off?"] then self["On?"] = false; LAMP.LightOn = false end end
+        SWITCH.Event_LightSwitch = function() TOGGLED = true end
+        local BY = { BP_KeycardDoor_C = CARD, BP_LaboratorySecureDoors_C = SECURE, BP_LaboratorySlidingDoor_C = SLIDE,
+                     BP_LaboratoryEntranceDoors_C = ENTRY, BP_LaboratoryLightSwitch_C = SWITCH }
         util.instances = function(c)
-            if c == "BP_KeycardDoor_C" then return { CARD }, true elseif c == "BP_LaboratorySecureDoors_C" then return { SECURE }, true end
+            if BY[c] then return { BY[c] }, true end
             return {}, true
         end
         doors = require("mirror.doors")
         doors.init({}, "guest", { in_world = function() return true end })
-        for i = 1, 40 do doors.tick(0.3) end
-        BLOB = "BP_KeycardDoor_C@10,20,0 1 1 -1 0\nBP_LaboratorySecureDoors_C@10,20,0 1 -1 1 0"
+        for i = 1, 40 do doors.tick(0.3) end   -- (one class walked per tick at first: every door class known)
+        BLOB = "BP_KeycardDoor_C@10,20,0 1 1 -1 0\nBP_LaboratorySecureDoors_C@10,20,0 1 1 1 0\n" ..
+               "BP_LaboratorySlidingDoor_C@10,20,0 1 1 1 0\nBP_LaboratoryEntranceDoors_C@10,20,0 1 1 -1 0"
         doors.tick(0.3)
         OPEN1, UNLOCKED1 = CARD["Open?"], SECURE.Unlocked
+        SEC_OPEN, SEC_MECH, SEC_SLID = SECURE.IsClosed, SECURE.TL_Mechanism.from_start, SECURE.TL_Doors.pos
+        SLIDE_UNLOCKED, SLIDE_POS = SLIDE.Unlocked, SLIDE.TL_DoorsKeycard.pos
+        ENTRY_OPEN, ENTRY_CALLS1 = ENTRY.IsClosed, ENTRY_CALLS
+        for i = 1, 3 do doors.tick(0.3) end
+        LAB_ECHO = PUT
+        -- they shut the secure door and the entrance (the keycard door closes on its own timer, never from here)
+        BLOB = "BP_LaboratorySecureDoors_C@10,20,0 2 0 1 0\nBP_LaboratoryEntranceDoors_C@10,20,0 2 0 -1 0"
+        doors.tick(0.3)
+        SEC_SHUT, SEC_SHUT_SLIDE, ENTRY_SHUT = SECURE.IsClosed, SECURE.TL_Doors.pos, ENTRY.IsClosed
+        -- a copy opened from behind here (Event_AutoDoor: Timeline_0 then Timeline, TL_Doors never ran) that they shut
+        for i = 1, 25 do doors.tick(0.3) end
+        SECURE.IsClosed = false; SECURE.Timeline.pos = 1; for i = 1, 25 do doors.tick(0.3) end
+        BLOB = "BP_LaboratorySecureDoors_C@10,20,0 3 0 1 0"
+        doors.tick(0.3)
+        AUTO_SHUT, AUTO_SLIDE = SECURE.IsClosed, SECURE.Timeline.pos
+        -- the circuit box's lever on their game turned the lab lights on, then off; the same "on" twice stays on
+        BLOB = "BP_LaboratoryLightSwitch_C@10,20,0 1 1 -1 0"; doors.tick(0.3)
+        LS_ON, LS_LAMP_ON = SWITCH["On?"], LAMP.LightOn
+        for i = 1, 3 do doors.tick(0.3) end
+        LS_ECHO = PUT
+        BLOB = "BP_LaboratoryLightSwitch_C@10,20,0 1 1 -1 0"; doors.tick(0.3)
+        LS_STILL = SWITCH["On?"]
+        BLOB = "BP_LaboratoryLightSwitch_C@10,20,0 2 0 -1 0"; doors.tick(0.3)
+        LS_OFF, LS_LAMP_OFF = SWITCH["Off?"], LAMP.LightOn
+        -- pulled here: told to the other game
+        for i = 1, 25 do doors.tick(0.3) end
+        PUT = nil; SWITCH["On?"], SWITCH["Off?"] = true, false; for i = 1, 3 do doors.tick(0.3) end
+        LS_SENT = PUT
+        -- opened here with my keycard: the sliding door is told to the other game, open and unlocked
+        PUT = nil
+        for i = 1, 25 do doors.tick(0.3) end
+        SLIDE.TL_DoorsKeycard:Reverse(); for i = 1, 25 do doors.tick(0.3) end
+        PUT = nil
+        SLIDE.TL_DoorsKeycard:Play(); for i = 1, 3 do doors.tick(0.3) end
+        SLIDE_SENT = PUT
         for i = 1, 3 do doors.tick(0.3) end
         ECHO = PUT
         -- it closed on their side first (each closes on its own timer): this one isn't shut from here
@@ -5146,6 +6455,30 @@ def keycard_doors_open_on_both_games():
     check("BP_KeycardDoor_C@10,20,0" in sent and " 1 -1 " in sent, "a keycard door opened here is told to the other game (%r)" % sent)
     check(L.eval("OPEN1") is True and L.eval("OPENED_BY == GHOST"), "the other player's keycard door opens here too, facing them, no keycard")
     check(L.eval("UNLOCKED1") is True, "a secure lab door they unlocked is unlocked here")
+    check(L.eval("SEC_OPEN") is False and L.eval("SEC_MECH") == 1 and L.eval("SEC_SLID") == 1,
+          "a secure lab door they opened with their keycard opens here the keycard's way (TL_Mechanism, then the slide)")
+    check(L.eval("SLIDE_UNLOCKED") is True and L.eval("GREEN") is True and L.eval("SLIDE_POS") == 1,
+          "a lab sliding door they unlocked is unlocked here (OnRep: green, not locked) and slides open")
+    check(L.eval("ENTRY_OPEN") is False and L.eval("ENTRY_CALLS1") == 1, "the lab entrance doors they opened open here")
+    lab_echo = L.eval("LAB_ECHO") or ""
+    check("Laboratory" not in lab_echo, "the lab doors opened from there are not sent back (%r)" % lab_echo)
+    check(L.eval("SEC_SHUT") is True and L.eval("SEC_SHUT_SLIDE") == 0 and L.eval("ENTRY_SHUT") is True
+          and L.eval("ENTRY_CALLS") == 2, "their shutting the secure door and the entrance shuts them here (the slide back)")
+    check(L.eval("SECURE_EVENT_CLOSE") is None, "Event_Close (moves no door) isn't what shuts it")
+    check(L.eval("LS_ON") is True and L.eval("LS_LAMP_ON") is True, "the lab lights they switched on are on here (OnRep_On?)")
+    check("BP_LaboratoryLightSwitch_C" not in (L.eval("LS_ECHO") or ""), "...and not sent back (%r)" % L.eval("LS_ECHO"))
+    check(L.eval("LS_STILL") is True and L.eval("TOGGLED") is None, "the same state again leaves them on (no toggle)")
+    check(L.eval("LS_OFF") is True and L.eval("LS_LAMP_OFF") is False, "switched off there: off here")
+    ls_sent = L.eval("LS_SENT") or ""
+    check(any(l.startswith("BP_LaboratoryLightSwitch_C@") and l.split()[2] == "1" for l in ls_sent.split("\n")),
+          "lights switched on here are told to the other game (%r)" % ls_sent)
+    check(L.eval("AUTO_SHUT") is True and L.eval("AUTO_SLIDE") == 0,
+          "a secure door opened from behind here (Timeline) is shut by theirs too (%s, %s)"
+          % (L.eval("AUTO_SHUT"), L.eval("AUTO_SLIDE")))
+    slide_sent = L.eval("SLIDE_SENT") or ""
+    check("BP_LaboratorySlidingDoor_C@10,20,0" in slide_sent and any(
+              l.startswith("BP_LaboratorySlidingDoor_C@") and l.split()[2:4] == ["1", "1"] for l in slide_sent.split("\n")),
+          "a lab sliding door opened here is told to the other game, open and unlocked (%r)" % slide_sent)
     echo = L.eval("ECHO")
     check(not echo or "BP_KeycardDoor_C" not in echo, "opening it here is not sent back as my own (%r)" % echo)
     check(L.eval("CALLED_AGAIN") is None, "their door closing doesn't shut (or reopen) this one")
@@ -5253,13 +6586,183 @@ def doors_forget_the_old_world_at_a_load():
     check(L.eval("READ_OLD") is False, "the old world's door is never read after the load")
 
 
+def a_death_drops_our_widgets_before_the_gc():
+    # DBG-20261101-002 (report CRITICAL-20261101-194358): a death runs WidgetLayoutLibrary.RemoveAllWidgets and keeps
+    # the controller; notify kept its cards widget and filled it on freed memory 3 min later (a native crash)
+    print("a_death_drops_our_widgets_before_the_gc")
+    L = lua()
+    L.execute(FAKES + r"""
+        HOOKS = {}
+        RegisterHook = function(n, fn) HOOKS[n] = fn end
+        NotifyOnNewObject = function() end
+        StaticFindObject = function() return nil end
+        ModifierKey = ModifierKey or { CONTROL = 2 }
+        package.loaded["mirror.game"] = nil
+        game = require("mirror.game")
+        game.init()
+        game.keybind = function() end
+        package.loaded["mirror.notify"] = nil
+        notify = require("mirror.notify")
+        notify.configure({}); notify.init()
+        REMOVED = 0
+        CARDS = obj({ RemoveFromParent = function() REMOVED = REMOVED + 1 end })
+        V = notify._test.view
+        V.w, V.built_for, V.slots = CARDS, 7, { { w = obj({}) } }
+        CLEAR = HOOKS["/Script/UMG.WidgetLayoutLibrary:RemoveAllWidgets"]
+    """)
+    check(L.eval("CLEAR ~= nil"), "the game hooks WidgetLayoutLibrary:RemoveAllWidgets")
+    L.execute("if CLEAR then CLEAR() end")
+    check(L.eval("V.w == nil and V.built_for == nil and #V.slots == 0"),
+          "every widget taken off the screen: notify forgets its cards widget and its slots")
+    check(L.eval("REMOVED") == 1, "...and takes it off the screen itself while it is still valid (%r)" % L.eval("REMOVED"))
+    L.execute("V.w, V.built_for = obj({ IsValid = function() return false end }), 7; if CLEAR then CLEAR() end")
+    check(L.eval("REMOVED") == 1 and L.eval("V.w == nil"), "...a widget already gone is only forgotten")
+
+
+def ue4ss_out_parameter_tables_are_let_go():
+    """Live 2026-11-04: UE4SS references every out-parameter table for good; 2.6 GB of Lua memory after 23 minutes."""
+    print("ue4ss_out_parameter_tables_are_let_go")
+    L = lua()
+    L.execute(r"""
+        o = require("mirror.outrefs")
+        SAID = {}
+        INIT_T, MT_T, F, CO = {}, setmetatable({}, {}), function() end, coroutine.create(function() end)
+        R = { "main", {}, 0, INIT_T }
+        o.start(function(s) SAID[#SAID + 1] = s end, R)
+        A = {}
+        R[5], R[6], R[7], R[8] = A, F, MT_T, CO
+        FIRST = o.sweep()
+        SECOND = o.sweep()
+    """)
+    check(L.eval("FIRST") == 0, "a table seen once may be a call in flight: it stays")
+    check(L.eval("SECOND") == 1, "seen in the same slot by two sweeps, it is released")
+    check(L.eval("R[3]") == 5 and L.eval("R[5]") == 0, "the slot joins lauxlib's free list (t[ref] = old head, head = ref)")
+    check(L.eval("R[4] == INIT_T"), "a slot there at start-up is never touched")
+    check(L.eval("R[6] == F and R[8] == CO"), "functions and threads are UE4SS's callbacks: never touched")
+    check(L.eval("R[7] == MT_T"), "a table with a metatable is not an out-parameter table")
+    L.execute(r"""
+        B, C = {}, {}
+        R[3], R[5] = R[5], B        -- (what luaL_ref does with the free list)
+        THIRD = o.sweep()
+        HEAD_THEN = R[3]
+        R[5] = C                    -- (released and reused by someone else between two sweeps)
+        FOURTH = o.sweep()
+        FIFTH = o.sweep()
+    """)
+    check(L.eval("THIRD") == 0 and L.eval("HEAD_THEN") == 0, "a reused slot's new table gets its own two sweeps")
+    check(L.eval("FOURTH") == 0, "another table in the slot starts over")
+    check(L.eval("FIFTH") == 1 and L.eval("R[3]") == 5, "and goes after its second")
+    L.execute(r"""
+        R[9] = {}
+        o.sweep(); o.sweep()
+        for _ = 1, 3 do o.tick(1.0) end
+        BEFORE = o.stats.sweeps
+        o.tick(1.9); AT_FIVE = o.stats.sweeps
+        o.tick(0.2); PAST_FIVE = o.stats.sweeps
+        for _ = 1, 60 do o.tick(1.0) end
+    """)
+    check(L.eval("AT_FIVE") == L.eval("BEFORE") and L.eval("PAST_FIVE") == L.eval("BEFORE") + 1, "a sweep every 5 s")
+    check(any("released" in s for s in L.eval("SAID").values()), "the log says what was released")
+    # a registry not laid out as expected: nothing written, said once
+    L.execute(r"""
+        SAID = {}
+        R2 = { "main", {}, F, {} }
+        o.start(function(s) SAID[#SAID + 1] = s end, R2)
+        K = {}
+        R2[5] = K
+        o.sweep(); o.sweep(); o.sweep()
+    """)
+    check(L.eval("o.is_off()") and L.eval("R2[5] == K and R2[3] == F"), "slot 3 not an integer: off, nothing touched")
+    check(len(list(L.eval("SAID").values())) == 1, "and it says so once")
+    # the real registry and the real luaL_ref (lupa holds each Lua object it hands out by one)
+    L2 = lua()
+    L2.execute('o = require("mirror.outrefs"); REG = debug.getregistry(); o.start()')
+    keep = [L2.eval("{}") for _ in range(50)]
+    before = L2.eval("#REG")
+    L2.execute("o.sweep(); RELEASED = o.sweep()")
+    check(L2.eval("RELEASED") == 50, "real registry: 50 references released (%s)" % L2.eval("RELEASED"))
+    keep2 = [L2.eval("{}") for _ in range(50)]
+    check(L2.eval("#REG") == before, "real luaL_ref reuses the released slots: the registry stays %d slots (%d)" % (before, L2.eval("#REG")))
+    globals()["_OUTREFS_KEEP"] = (L2, keep, keep2)   # (lupa's own unref at exit is not this test's business)
+
+
+def a_moved_build_is_sent_as_a_move_not_a_new_piece():
+    """User 2026-11-03: duplicate containers in a base, moves the host made not shown. The SpawnBuild hook runs after
+    the game's StopBuildMode cleared ReplacingObject? and ReplacingActor; with the tick's sample of the move missed
+    the move went out as a place, and the other game built a second piece there and kept its own where it was."""
+    print("a_moved_build_is_sent_as_a_move_not_a_new_piece")
+    L = lua()
+    L.execute(FAKES + r"""
+        DA = obj({ GetFullName = function() return "DataAsset /Game/B/DA_Box.DA_Box" end })
+        BCOMP = obj({ ["ReplacingObject?"] = false })
+        PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end, BuildingComponent = BCOMP })
+        BCOMP.GetOwner = function() return PLAYER end
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return nil end,
+                                          on_widgets_cleared = function() end, on_world_reset = function() end }
+        package.loaded["mirror.bedtags"] = { gone = function() end, tick = function() end, init = function() end, placed = function() end }
+        SENT, INBOX = {}, {}
+        package.loaded["mirror.events"] = evmock { new = function(name) return {
+            send = function(self, m) SENT[#SENT + 1] = name .. ":" .. m end,
+            pump = function(self, fn) local q = INBOX[name] or {}; INBOX[name] = {}; for _, m in ipairs(q) do fn(m) end end } end,
+            send = function(self, m) SENT[#SENT + 1] = "builds:" .. m end }
+        StaticFindObject = function() return obj({}) end
+        util = require("mirror.util")
+        HOOKS = {}
+        util.ensure_hook = function(path, fn) HOOKS[path:match("([%w_]+:[%w_]+)$")] = fn; return true end
+        function box(x, stuck)
+            local a = obj({ x = x })
+            a.GetClass = function() return cls("Buildable_StorageBox_C") end
+            a.K2_GetActorLocation = function() return { X = a.x, Y = 0, Z = 0 } end
+            a.IsActorBeingDestroyed = function() return false end
+            a.GetFullName = function() return "Buildable_StorageBox_C /Game/L.L:P.Box_" .. x end
+            a.K2_SetActorLocationAndRotation = function(self, l) if not stuck then a.x = l.X end end
+            return a
+        end
+        function P(v) return { get = function() return v end } end
+        function T(x) return P({ Translation = { X = x, Y = 0, Z = 0 }, Rotation = { X = 0, Y = 0, Z = 0, W = 1 }, Scale3D = { X = 1, Y = 1, Z = 1 } }) end
+        builds = require("mirror.builds")
+        builds.init({}, "host", nil)
+        builds.tick(1.1)
+        -- the Move option on the crate at 10 m; the tick never saw build mode replacing; the game puts it at 30 m
+        CRATE = box(1000)
+        SENT = {}
+        if HOOKS["Buildable_MASTER_C:ReplacingObject"] then HOOKS["Buildable_MASTER_C:ReplacingObject"](P(CRATE)) end
+        BCOMP.DARef = DA; builds.tick(0.1); BCOMP.DARef = nil
+        CRATE.x = 3000
+        HOOKS["BuildingComponent_C:SpawnBuild"](P(BCOMP), T(3000))
+        MOVE_SENT = table.concat(SENT, " | ")
+        -- a Move given up (the crate stays at 50 m), then a new crate built at 70 m: a place, the old crate untouched
+        CRATE2 = box(5000)
+        SENT = {}
+        if HOOKS["Buildable_MASTER_C:ReplacingObject"] then HOOKS["Buildable_MASTER_C:ReplacingObject"](P(CRATE2)) end
+        BCOMP.DARef = DA; builds.tick(0.1); BCOMP.DARef = nil
+        HOOKS["BuildingComponent_C:SpawnBuild"](P(BCOMP), T(7000))
+        NEW_SENT = table.concat(SENT, " | ")
+        -- the other game's move: its copy follows; one that won't move is said, not counted
+        COPY, STUCK = box(1000), box(9000, true)
+        util.all_of = function() return { COPY, STUCK }, 0 end
+        INBOX.builds = { "M Buildable_StorageBox_C@100,0,0 3000.0 0.0 0.0 0.00 0.00 0.00",
+                         "M Buildable_StorageBox_C@900,0,0 4000.0 0.0 0.0 0.00 0.00 0.00" }
+        builds.tick(0.1)
+    """)
+    sent = L.eval('MOVE_SENT')
+    check("builds:M Buildable_StorageBox_C@100,0,0 3000.0 " in sent and "builds:P " not in sent,
+          "a move the tick didn't see is sent as a move of the crate from where it stood, no new piece (%s)" % sent)
+    new = L.eval('NEW_SENT')
+    check("builds:P /Game/B/DA_Box.DA_Box 7000.0 " in new and "builds:M " not in new,
+          "a Move given up and then a new crate built: a place, the old crate not moved (%s)" % new)
+    check(L.eval('COPY.x') == 3000, "the other game's move puts its copy on the new spot")
+    status = L.eval('builds.status()')
+    check("moves 1" in status, "a copy that didn't move isn't counted as moved (%s)" % status)
+
+
 def throws_and_mines_reach_the_other_game():
     print("throws_and_mines_reach_the_other_game")
     L = lua()
     L.execute(FAKES + r"""
         PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end })
         package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return nil end,
-                                          on_world_reset = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
         package.loaded["mirror.bedtags"] = { gone = function() end, tick = function() end, init = function() end }
         package.loaded["mirror.audio"] = { attenuation_for = function() return nil end }
@@ -5382,6 +6885,63 @@ def throws_and_mines_reach_the_other_game():
     """)
     check(L.eval('N1') == 0, "a fence sent again 2 mm off, across a grid line: not built twice (%s)" % L.eval('N1'))
     check(L.eval('N2') == 1, "its neighbour 2.1 m on is built")
+    # user 2026-11-01: "container names are client side" - the game's Rename (OverrideBuildName) reaches the other game
+    L.execute(r"""
+        FText = function(s) return { text = s } end
+        function T(s) return P({ ToString = function() return s end }) end
+        RN = HOOKS["BuildableMaster_Container_C:OverrideBuildName"]
+        BOX = actor("Buildable_StorageBox_C", 2000)
+        SENT = {}
+        RN(P(BOX), T("  Ammo, meds; 100% | \tdo not touch  "))
+        SENT1 = SENT[1]
+    """)
+    sent = L.eval('SENT1')
+    check(L.eval('RN') is not None, "the container's OverrideBuildName is hooked")
+    check(sent is not None and sent.startswith("builds:C Buildable_StorageBox_C@200,0,0 ") and sent.count(" ") == 2,
+          "a rename here is sent with the container's place, the name in one word (%s)" % sent)
+    L.execute(r"""
+        COPY = actor("Buildable_StorageBox_C", 2003)
+        util.all_of = function() return { COPY }, 0 end
+        INBOX.builds = { SENT1:sub(8) }
+        SENT = {}
+        builds.tick(0.1)
+    """)
+    check(L.eval('COPY.ContainerName and COPY.ContainerName.text') == "Ammo, meds; 100% |  do not touch",
+          "the other game's copy gets the same name, trimmed, control characters as spaces (%r)"
+          % L.eval('COPY.ContainerName and COPY.ContainerName.text'))
+    check(L.eval('#SENT') == 0, "...and nothing goes back")
+    L.execute(r"""
+        RN(P(BOX), T("   ")); RN(P(BOX), T(nil)); E1 = #SENT
+        RN(P(BOX), T(string.rep("x", 80))); LONG = SENT[#SENT]
+        INBOX.builds = { "C Buildable_StorageBox_C@900,0,0 Gone", "C Buildable_StorageBox_C@200,0,0", "C Buildable_StorageBox_C@200,0,0 %20%20" }
+        builds.tick(0.1)
+    """)
+    check(L.eval('E1') == 0, "an empty name isn't sent")
+    long = L.eval('LONG')
+    check(long is not None and long.endswith(" " + "x" * 64), "a long name is cut to 64 characters (%s)" % (long and len(long)))
+    check(L.eval('COPY.ContainerName.text') == "Ammo, meds; 100% |  do not touch",
+          "a container not here, a message with no name or a blank name changes nothing")
+    status = L.eval('builds.status()')
+    check(status == "builds: placed 0, moved 0, removed 2, renamed 2 | made 1, moves 0, removes 1, renames 1, not here 1",
+          "status counts renames (%s)" % status)
+    L.execute(r"""
+        SENT = {}
+        RN(P(actor("Buildable_StorageBox_C", 0)), T("Nowhere"))
+        Z0 = #SENT
+        INW = false
+        builds.init({}, "guest", { in_world = function() return INW end })
+        RN(P(BOX), T("Not in the world"))
+        INBOX.builds = { "C Buildable_StorageBox_C@200,0,0 Before" }
+        builds.tick(0.1)
+        G0 = #SENT
+        INW = true
+        RN(P(BOX), T("In the world"))
+        G1 = SENT[1]
+    """)
+    check(L.eval('Z0') == 0, "a container whose place reads 0,0,0 (gone) isn't sent")
+    check(L.eval('G0') == 0 and L.eval('COPY.ContainerName.text') == "Ammo, meds; 100% |  do not touch",
+          "a guest not in the shared world neither sends nor takes renames")
+    check(L.eval('G1') == "builds:C Buildable_StorageBox_C@200,0,0 In%20the%20world", "...and does once in it (%s)" % L.eval('G1'))
 
 
 def map_pings_reach_the_other_game():
@@ -5452,7 +7012,7 @@ def map_pings_reach_the_other_game():
         end }
         HAS_COMP = true
         PLAYER = obj({ GetComponentByClass = function() return HAS_COMP and COMP or nil end })
-        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end,
                                           world = function() return WORLD end }
         SHARE = true
         package.loaded["mirror.mysettings"] = { on = function(k) return k == "pings" and SHARE end }
@@ -5606,7 +7166,7 @@ def drops_pickup_reaches_every_guest():
     L = lua()
     L.execute(FAKES + r"""
         package.loaded["mirror.game"] = { player = function() return nil end, world = function() return nil end,
-                                          on_world_reset = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end }
         package.loaded["mirror.bedtags"] = { gone = function() end, tick = function() end, init = function() end }
         SENT, RELAYED, CHECKPOINTS = {}, {}, 0
         package.loaded["mirror.events"] = evmock { new = function(name) return {
@@ -5630,7 +7190,7 @@ def drops_pickup_reaches_every_guest():
 
 DROPS_PAIR_FAKES = FAKES + r"""
     package.loaded["mirror.game"] = { player = function() return nil end, world = function() return nil end,
-                                      on_world_reset = function() end }
+                                      on_widgets_cleared = function() end, on_world_reset = function() end }
     package.loaded["mirror.bedtags"] = { gone = function() end, tick = function() end, init = function() end }
     SENT, INBOX = {}, {}
     package.loaded["mirror.events"] = evmock { new = function(name) return {
@@ -5772,7 +7332,7 @@ def horde_rewards_reach_the_other_game():
     L.execute(FAKES + r"""
         PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end })
         package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return nil end,
-                                          on_world_reset = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end }
         package.loaded["mirror.bedtags"] = { gone = function() end, tick = function() end, init = function() end }
         SENT = {}
         package.loaded["mirror.events"] = evmock { new = function(name) return {
@@ -5834,7 +7394,7 @@ def loose_magazine_rounds_reach_the_picker():
         COPY = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end,
                      IsActorBeingDestroyed = function() return false end, GetAttachParentActor = function() return nil end,
                      GetComponentByClass = function() return COMP end, K2_DestroyActor = function() end })
-        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end,
             world = function() return { SpawnActor = function() return COPY end } end }
         SENT, IN = {}, {}
         package.loaded["mirror.events"] = evmock { new = function(name) return {
@@ -5917,7 +7477,7 @@ def a_picked_up_items_address_can_come_back_as_a_new_drop():
             if REUSE then local r = REUSE; a.GetAddress = function() return r end end
             return a
         end
-        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end,
             world = function() return { SpawnActor = function(_, c, l) COPY = pickup(l.X); return COPY end } end }
         IN = {}
         package.loaded["mirror.events"] = evmock { new = function(name) return {
@@ -5958,7 +7518,7 @@ def loose_magazine_picked_up_without_hooks_still_gets_its_rounds():
         COPY = obj({ K2_GetActorLocation = function() return { X = 100, Y = 0, Z = 0 } end,
                      IsActorBeingDestroyed = function() return GONE end, GetAttachParentActor = function() return nil end,
                      GetComponentByClass = function() return COMP end, K2_DestroyActor = function() end })
-        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end,
             world = function() return { SpawnActor = function() return COPY end } end }
         SENT, IN = {}, {}
         package.loaded["mirror.events"] = evmock { new = function(name) return {
@@ -6015,7 +7575,7 @@ def loose_magazine_picked_up_by_both_at_once_is_kept_once():
         COPY = obj({ K2_GetActorLocation = function() return { X = 100, Y = 0, Z = 0 } end,
                      IsActorBeingDestroyed = function() return GONE end, GetAttachParentActor = function() return nil end,
                      GetComponentByClass = function() return COMP end, K2_DestroyActor = function() end })
-        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end,
             world = function() return { SpawnActor = function() return COPY end } end }
         package.loaded["mirror.notify"] = { show = function() end }
         SENT, IN = {}, {}
@@ -6077,7 +7637,7 @@ def ground_weapon_attachments_reach_the_other_game():
                      GetComponentByClass = function() return COMP end, K2_DestroyActor = function() end })
         COMP.GetOwner = function() return COPY end
         PC.GetOwner = function() return PLAYER end
-        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end,
             world = function() return { SpawnActor = function() return COPY end } end }
         SENT, IN = {}, {}
         package.loaded["mirror.events"] = evmock { new = function(name) return {
@@ -6209,7 +7769,7 @@ def ground_weapon_parts_changed_by_both_at_once_keep_both_changes():
                          GetComponentByClass = function() return COMP end, K2_DestroyActor = function() end })
             COMP.GetOwner = function() return COPY end
             PC.GetOwner = function() return PLAYER end
-            package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end,
                 world = function() return { SpawnActor = function() return COPY end } end }
             SENT, IN = {}, {}
             package.loaded["mirror.events"] = evmock { new = function(name) return {
@@ -6587,7 +8147,7 @@ def an_ended_zombie_is_never_read_from_the_zombie_list():
     L = lua()
     L.execute(FAKES + r"""
         package.loaded["mirror.game"] = { player = function() return nil end, world = function() return nil end,
-                                          on_world_reset = function() end, keybind = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
         package.loaded["mirror.loader"] = { want = function() end }
         StaticFindObject = function() return nil end
@@ -6633,7 +8193,7 @@ def a_copy_the_game_keeps_removing_is_held_back():
     L.execute(FAKES + r"""
         package.loaded["mirror.game"] = { player = function() return nil end, world = function() return obj({}) end,
                                           controller = function() return nil end,
-                                          on_world_reset = function() end, keybind = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end }
         package.loaded["mirror.loader"] = { want = function() end }
         package.loaded["mirror.invdiag"] = { summary = function() return "-" end }
@@ -6695,7 +8255,7 @@ def a_new_ghost_leaves_no_name_tag_behind():
         end
         package.loaded["mirror.util"] = { valid = function(o) return o ~= nil and o.valid ~= false end,
             dist = function() return 100 end, vec = function(v) return v end }
-        package.loaded["mirror.game"] = { on_world_reset = function() end,
+        package.loaded["mirror.game"] = { on_widgets_cleared = function() end, on_world_reset = function() end,
             player = function() return { K2_GetActorLocation = function() return {} end } end }
         package.loaded["mirror.ghost"] = { get = function() return G end, generation = function() return G and GEN or nil end,
             on_destroy = function(fn) ONDESTROY[#ONDESTROY + 1] = fn end }
@@ -6759,14 +8319,27 @@ def the_message_of_the_day_shows_once_in_a_world_and_on_the_main_menu():
                 FindAllOf = function() return MENUS end
                 FText = function(s) return s end
                 FName = function(s) return s end
-                LOOPS = {}
-                LoopAsync = function(ms, fn) LOOPS[#LOOPS + 1] = fn end
+                -- (UE4SS's game-thread loops: LOOPS[h]() runs one and says whether it has stopped)
+                LOOPS, LIVE = {}, {}
+                LoopAsync = nil
+                LoopInGameThreadWithDelay = function(ms, fn)
+                    local h = #LOOPS + 1
+                    LIVE[h] = true
+                    LOOPS[h] = function() if LIVE[h] then fn() end; return not LIVE[h] end
+                    return h
+                end
+                CancelDelayedAction = function(h) LIVE[h] = nil; return true end
                 ExecuteInGameThread = function(fn) fn() end
                 package.loaded["mirror.notify"] = { show = function(text, kind, key, always, opts)
                     NOTES[#NOTES + 1] = { text = text, key = key, always = always, title = opts and opts.title, sticky = opts and opts.sticky, secs = opts and opts.secs } end }
                 package.loaded["mirror.link"] = { dir = function() return d end }
                 package.loaded["mirror.util"] = { valid = function(o) return o ~= nil and o.valid ~= false end,
                     safe = function(fn, _, ...) return pcall(fn, ...) end, cdo = function() return mock("wbl") end,
+                    game_loop = function(ms, fn)
+                        local h
+                        h = LoopInGameThreadWithDelay(ms, function() if fn() then CancelDelayedAction(h) end end)
+                        return function() CancelDelayedAction(h) end
+                    end,
                     ensure_hook = function() HOOKS = HOOKS + 1; return true end }
                 TICK, RESET = nil, nil
                 LOGS = {}
@@ -6774,7 +8347,7 @@ def the_message_of_the_day_shows_once_in_a_world_and_on_the_main_menu():
                 function nlogged(s) local n = 0; for _, l in ipairs(LOGS) do if l:find(s, 1, true) then n = n + 1 end end return n end
                 package.loaded["mirror.log"] = setmetatable({}, { __index = function(_, k)
                     return function(s) LOGS[#LOGS + 1] = k .. " " .. tostring(s) end end })
-                package.loaded["mirror.game"] = { on_tick = function(fn) TICK = fn end, on_world_reset = function(fn) RESET = fn end }
+                package.loaded["mirror.game"] = { on_tick = function(fn) TICK = fn end, on_widgets_cleared = function() end, on_world_reset = function(fn) RESET = fn end }
                 motd = require("mirror.motd")
                 function put(s) local f = io.open(d .. "/mirror_motd.txt", "wb"); f:write(s); f:close() end
                 function seenfile() local f = io.open(d .. "/mirror_motd_seen.txt", "rb"); local s = f and f:read("*a"); if f then f:close() end; return s end
@@ -6886,7 +8459,7 @@ def the_host_can_switch_the_debug_menu_off_for_everyone():
             util.ensure_hook = function(path, fn) HOOKS[path] = fn; return true end
             CLOSED = 0
             PLAYER = obj({ CloseDebugMenu = function() CLOSED = CLOSED + 1 end })
-            package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end }
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end }
             hostrules = require("mirror.hostrules")
             hostrules.init(function() return ROLE end)
             dm = require("mirror.debugmenu")
@@ -7049,6 +8622,122 @@ def human_corpses_get_their_inventory_made_first():
           "a human corpse's inventory is made once, then the host's loot goes in: %s" % (out["human"],))
     check(out["human"][3] == 0, "the body's own roll is not sent to the host as items put in (%d sent)" % out["human"][3])
     check(out["zombie"][0] == 0 and out["zombie"][1] > 0, "a zombie corpse (containers already there) is not re-made: %s" % (out["zombie"],))
+
+
+def the_body_limit_removes_the_oldest_bodies_on_both_screens():
+    """player report 1.0.0: 'many bodies drop FPS - cap the bodies'. The host rule BODY LIMIT removes the oldest dead
+    zombie/raider bodies past the limit - never one near a player (the guest's ghost counts), a trader, a living one
+    or a bag - a few per tick; the host tells the guest which ones (corpses 'X <id>'), a guest removes none itself."""
+    print("the_body_limit_removes_the_oldest_bodies_on_both_screens")
+    COMMON = FAKES + r"""
+        package.loaded["mirror.link"].peer_age = function() return 0 end
+        util = require("mirror.util")
+        util.job = function(name, fn, ...) fn(...); return true end
+        util.ensure_hook = function() return true end
+        package.loaded["mirror.ghost"] = { exists = function() return true end }
+        T = 0
+        SESSION = { in_world = function() return true end, guest_in_world = function() return true end }
+        package.loaded["mirror.jig"] = { flush_ui = function() end, generate = function() end, contents_of = function() return {} end,
+            encode = function() return "" end, decode = function() return {} end, full_path = function(x) return x end,
+            uid_str = function(x) return x end }
+    """
+    H, G = lua(), lua()
+    H.execute(COMMON + r"""
+        ROLE, LIMIT = "host", "3"
+        SH, GHOSTS, TICKS, WORLD, IDS, GONE = {}, {}, {}, {}, {}, {}
+        package.loaded["mirror.peers"] = {
+            shared = function(n, init) SH[n] = SH[n] or init or {}; return SH[n] end,
+            each = function(name, fn) fn(require(name), nil) end,
+            ghost_list = function() return GHOSTS end, role = function() return ROLE end, main = function(n) return require(n) end,
+            relay = function() end }
+        PLAYER = obj({ K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end })
+        GHOSTS[1] = obj({ K2_GetActorLocation = function() return { X = -30000, Y = 0, Z = 0 } end })
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end,
+            on_tick = function(fn) TICKS[#TICKS + 1] = fn end }
+        package.loaded["mirror.hostrules"] = { mine = function() return LIMIT ~= "off" end,
+            my_value = function() return LIMIT end, value = function() return LIMIT end }
+        package.loaded["mirror.animgate"] = { destroy = function(a) a.IsValid = function() return false end; GONE[#GONE + 1] = a end }
+        ZF = { now = function() return T end, host_zombies = function() return IDS end,
+            host_id_of = function(z) return z.id end, copies = function() return {} end, copy = function() return nil end,
+            is_trader = function(z) return z.trader == true end, is_copy = function() return false end,
+            family_of = function(z) return z.fam end, dead_of = function(z) return z.dead == true end,
+            smart_ai = function() return nil end, set_copy_hooks = function() end }
+        package.loaded["mirror.zombies"] = ZF
+        function body(name, id, x, extra)
+            local z = obj({ name = name, id = id, fam = "zombie", dead = true, bHidden = false,
+                K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end,
+                IsActorBeingDestroyed = function() return false end,
+                GetClass = function() return cls("BP_Zombie_C") end })
+            for k, v in pairs(extra or {}) do z[k] = v end
+            WORLD[#WORLD + 1] = z
+            if id then IDS[id] = z end
+            return z
+        end
+        util.instances = function(c) return c == "BP_MasterZombie_C" and WORLD or {} end
+        corpses = require("mirror.corpses")
+        corpses.init({}, "host", ZF, SESSION)
+        bodycap = require("mirror.bodycap")
+        bodycap.init(function() return ROLE end)
+        bodycap.dev_scan(1.0)
+        function step(n) for _ = 1, n or 1 do T = T + 0.5; for _, f in ipairs(TICKS) do f(0.5) end; corpses.tick(0.5) end end
+        function gone() local o = {} for _, z in ipairs(GONE) do o[#o + 1] = z.name end return table.concat(o, ",") end
+        function told() local o = {} for id in (blobs_out.zloot or ""):gmatch("X (%d+)") do o[#o + 1] = id end return table.concat(o, ",") end
+        body("B1", 1, 5000); body("B2", 2, 500); body("B3", 3, -29500)
+        body("LIVE", 9, 6000, { dead = false }); body("TRADER", 10, 6000, { trader = true })
+        body("BAG", nil, 6000, { fam = false })   -- (a death bag is no zombie or raider)
+    """)
+    G.execute(COMMON + r"""
+        package.loaded["mirror.peers"] = { shared = function(n, init) return init or {} end, each = function() end,
+            role = function() return "guest" end, main = function(n) return require(n) end, relay = function() end }
+        COPIES = {}
+        for _, id in ipairs({ 1, 2, 3, 4, 5, 6 }) do COPIES[id] = { z = obj({}), dead_at = 1, seen_snap = 10 } end
+        COPIES[8] = { z = obj({}), dead_at = 1, seen_snap = 10, trader = true }
+        ZG = { now = function() return T end, host_zombies = function() return {} end, copies = function() return COPIES end,
+            copy = function(id) return COPIES[id] end, is_trader = function() return false end, dead_of = function() return true end,
+            host_id_of = function() return nil end, copy_id_of = function() return nil end, set_copy_hooks = function() end }
+        package.loaded["mirror.zombies"] = ZG
+        corpses = require("mirror.corpses")
+        corpses.init({}, "guest", ZG, SESSION)
+        function step(n) for _ = 1, n or 1 do T = T + 0.5; corpses.tick(0.5) end end
+    """)
+
+    def carry():
+        out, inn = H.eval("blobs_out"), G.eval("blobs_in")
+        for k in list(out.keys()):
+            inn[k] = out[k]
+
+    # 3 bodies, limit 3: nothing to remove (and a living one, a trader's body and a bag are never counted)
+    H.execute("step(8)")
+    check(H.eval("gone()") == "" and H.eval("#GONE") == 0, "at the limit nothing is removed (3 bodies, limit 3)")
+    # two more: the oldest far one goes, B2 (5 m from me) and B3 (5 m from the guest's ghost) stay, then the newer far one
+    H.execute('body("B4", 4, 6000); body("B5", 5, 7000); step(8)')
+    check(H.eval("gone()") == "B1,B4", "past the limit the oldest bodies go, the ones near a player stay (%s)" % H.eval("gone()"))
+    check(H.eval("told()") == "1,4", "the host tells the guest which bodies went (%s)" % H.eval("told()"))
+    H.execute('body("B6", nil, 8000); step(8)')
+    check(H.eval("gone()") == "B1,B4,B5", "the next one over the limit is the oldest left, not the newest (%s)" % H.eval("gone()"))
+    check(H.eval("told()") == "1,4,5", "a body the guest never had (no id) is removed without a message (%s)" % H.eval("told()"))
+    check(H.eval("bodycap.status()") == "body limit 3: 3 removed", "status shows the limit and the count (%s)" % H.eval("bodycap.status()"))
+    # the guest drops its copies of exactly those bodies (a trader's copy and the other bodies stay)
+    carry()
+    G.execute("step(4)")
+    gone_here = [i for i in (1, 2, 3, 4, 5, 6) if G.eval("COPIES[%d].seen_snap" % i) == -1e9]
+    check(gone_here == [1, 4, 5], "the guest lets go of the same bodies (%s)" % gone_here)
+    G.execute('blobs_in.zloot = nil')
+    check(G.eval("COPIES[8].seen_snap") == 10, "a trader's copy is never let go by it")
+    # off: nothing is removed however many lie around
+    H.execute('LIMIT = "off"; body("B7", 7, 9000); body("B8", 8, 9500); body("B9", 11, 9800); step(12)')
+    check(H.eval("#GONE") == 3, "off removes nothing (%d removed)" % H.eval("#GONE"))
+    check(H.eval("bodycap.status()") == "body limit off", "status says off (%s)" % H.eval("bodycap.status()"))
+    # a low limit: at most 2 removals per tick
+    H.execute('LIMIT = "2"; STEPS = {}; for i = 1, 8 do step(1); STEPS[#STEPS + 1] = #GONE end')
+    steps = [H.eval("STEPS[%d]" % i) for i in range(1, 9)]
+    worst = max([steps[0] - 3] + [steps[i] - steps[i - 1] for i in range(1, 8)])
+    check(worst <= 2 and steps[-1] == 3 + 4, "removals come a few per tick: %s" % steps)
+    check(H.eval("gone()") == "B1,B4,B5,B6,B7,B8,B9", "oldest first again (%s)" % H.eval("gone()"))
+    # a guest follows the host's rule and removes none of its own
+    H.execute('ROLE = "guest"; LIMIT = "1"; body("B10", 12, 9900); body("B11", 13, 9950); step(12)')
+    check(H.eval("#GONE") == 7, "a guest never removes bodies itself (%d)" % H.eval("#GONE"))
+    check(H.eval("bodycap.status()") == "body limit 1 (the host's)", "a guest's status shows the host's limit (%s)" % H.eval("bodycap.status()"))
 
 
 def trader_stock_is_the_hosts():
@@ -7288,6 +8977,51 @@ def corpse_loot_reaches_every_player():
     check(G2.eval("count(GUN)") == 0 and G1.eval("count(GUN)") == 0, "and stays taken")
 
 
+def a_corpse_put_in_is_sent_again_after_the_item_left_and_marks_dont_pile_up():
+    """T18: corpses kept "already put in" by item uid alone, never cleared. An item put into one body, taken back
+    and put into another body never reached the other game, and the marks grew all session."""
+    print("a_corpse_put_in_is_sent_again_after_the_item_left_and_marks_dont_pile_up")
+    G = lua()
+    G.execute(CORPSE_FAKES + r"""
+        local J = package.loaded["mirror.jig"]
+        B1, B2 = obj({ BP_JigMultiplayer = obj({}) }), obj({ BP_JigMultiplayer = obj({}) })
+        HELD = { [B1.BP_JigMultiplayer] = {}, [B2.BP_JigMultiplayer] = {} }
+        J.contents_of = function(c) return HELD[c] or {} end
+        J.count_of_item = function(c, da) local n = 0; for _, w in ipairs(HELD[c] or {}) do if w.da == da then n = n + w.count end end; return n end
+        COPIES = { [7] = { z = B1, born = 0, dead_at = 1 }, [8] = { z = B2, born = 0, dead_at = 1 } }
+        ZF = { now = function() return T end, host_zombies = function() return {} end, copies = function() return COPIES end,
+               copy = function(i) return COPIES[i] end, is_trader = function() return false end, dead_of = function() return true end,
+               host_id_of = function() return nil end, set_copy_hooks = function() end,
+               copy_id_of = function(z) if z == B1 then return 7 elseif z == B2 then return 8 end end }
+        corpses = require("mirror.corpses")
+        corpses.init({}, "guest", ZF, SESSION)
+        function tick() T = T + 0.3; corpses.tick(0.3) end
+        for i = 1, 8 do tick() end
+        function fire(path, z, ...) for fn in pairs(HOOKS[MASTER .. ":" .. path] or {}) do fn({ get = function() return z end }, ...) end end
+        function put(z, uid) HELD[z.BP_JigMultiplayer][#HELD[z.BP_JigMultiplayer] + 1] = { uid = uid, da = GUN, count = 1, dx = 0, dy = 0 }
+            fire("JigMP_OnItemAdded", z, { get = function() return uid end }) end
+        function take(z, uid) local l = HELD[z.BP_JigMultiplayer]
+            for i, w in ipairs(l) do if w.uid == uid then table.remove(l, i) end end
+            fire("JigMP_OnMainContainerItemRemoved", z, nil, nil, nil, { get = function() return {
+                ItemInfo_25_937A083B4BD3D9B590E0A69C76A4F6F7 = { ItemID_28_01CA27D84AF7D1014D9E2E83894C1848 = GUN, Count_8_DD79AF2A46126A338C8DCCB4616D91CD = 1 },
+                UniqueServerID_37_C49AE0DA449ACAE3BE4633A263303B68 = uid } end }) end
+        function puts() local n = 0; for p in (blobs_out.zloot or ""):gmatch("A %d+ P1 ") do n = n + 1 end; return n end
+        put(B1, "P1"); tick(); N1 = puts()
+        fire("JigMP_OnItemAdded", B1, { get = function() return "P1" end }); tick(); N1b = puts()   -- a move inside the body
+        take(B1, "P1"); tick(); tick()
+        put(B2, "P1"); tick(); N2 = puts()
+        take(B2, "P1"); tick(); tick()
+        put(B1, "P1"); tick(); N3 = puts()
+        -- many items in and out over a long session: the marks stay as many as the items still in bodies
+        for i = 1, 300 do local u = "Q" .. i; put(B2, u); tick(); take(B2, u); tick() end
+        MARKS = corpses._added_n and corpses._added_n() or -1
+    """, "guest", 7)
+    check(G.eval("N1") == 1 and G.eval("N1b") == 1, "a put into a body is sent once, a move inside it isn't sent again")
+    check(G.eval("N2") == 2, "the same item put into another body after it was taken back is sent (%d)" % G.eval("N2"))
+    check(G.eval("N3") == 3, "and back into the first body after that (%d)" % G.eval("N3"))
+    check(0 <= G.eval("MARKS") <= 2, "300 items in and out leave no pile of marks (%d)" % G.eval("MARKS"))
+
+
 def corpse_looted_at_the_same_moment_keeps_one_copy():
     print("corpse_looted_at_the_same_moment_keeps_one_copy")
     H = lua()
@@ -7304,7 +9038,7 @@ def corpse_looted_at_the_same_moment_keeps_one_copy():
         ZF = zfake(7)
         PCI = obj({})
         INV = {}
-        package.loaded["mirror.game"] = { player = function() return obj({ BP_JigMultiplayer = PCI }) end, on_world_reset = function() end }
+        package.loaded["mirror.game"] = { player = function() return obj({ BP_JigMultiplayer = PCI }) end, on_widgets_cleared = function() end, on_world_reset = function() end }
         corpses = require("mirror.corpses")
         corpses.init({}, "guest", ZF, SESSION)
         local jg = package.loaded["mirror.jig"]
@@ -7354,7 +9088,7 @@ def corpse_partial_takes_at_the_same_moment_keep_the_total():
         ZF = zfake(7)
         PCI = obj({})
         INV = {}
-        package.loaded["mirror.game"] = { player = function() return obj({ BP_JigMultiplayer = PCI }) end, on_world_reset = function() end }
+        package.loaded["mirror.game"] = { player = function() return obj({ BP_JigMultiplayer = PCI }) end, on_widgets_cleared = function() end, on_world_reset = function() end }
         corpses = require("mirror.corpses")
         corpses.init({}, "guest", ZF, SESSION)
         local jg = package.loaded["mirror.jig"]
@@ -7426,7 +9160,7 @@ def host_settled_corpses_cost_almost_nothing():
     L = lua()
     L.execute(FAKES + r"""
         package.loaded["mirror.game"] = { player = function() return nil end, world = function() return nil end,
-                                          on_world_reset = function() end, keybind = function() end }
+                                          on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end,
                                            location = function() return { X = 0, Y = 0, Z = 0 } end }
         package.loaded["mirror.loader"] = { want = function() end }
@@ -7538,7 +9272,7 @@ SPLIT_FAKES = r"""
         set_invoker = function(on) INV = on and 0 or -1; return INV end, invoker_index = function() return INV end,
         ai_count = function() return AI end }
     package.loaded["mirror.game"] = { player = function() return { K2_GetActorLocation = function() return HL end } end,
-                                      on_world_reset = function() end }
+                                      on_widgets_cleared = function() end, on_world_reset = function() end }
     package.loaded["mirror.hostrules"] = { mine = function() return SETTING end }
     package.loaded["mirror.save_guard"] = { busy = function() return SAVING end }
     package.loaded["mirror.infest"] = { guest_hit_age = function() return NEST end }
@@ -7619,7 +9353,7 @@ POWER_FAKES = r"""
         send = function(self, m) OUT[#OUT + 1] = m end,
         pump = function(self, fn) local q = INBOX; INBOX = {}; for _, m in ipairs(q) do fn(m) end end } end }
     PLAYER = obj({}); PLAYER.K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 0 } end
-    package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end }
+    package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end }
     function turret(x)
         local t = obj({ ["PoweredOn?"] = true, cls = "Buildable_Turret_C", calls = 0 })
         t.K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end
@@ -7665,6 +9399,3494 @@ def a_turret_switched_off_is_off_for_everyone():
     check(H.eval('T["PoweredOn?"]') is True, "...and the host's turret is on again")
 
 
+def the_lab_generator_runs_on_both_games():
+    # player report 2026-11-01: "the generator inside [the laboratory] needs to be switched on by both players"
+    print("the_lab_generator_runs_on_both_games")
+    H, G = lua(), lua()
+    for L, role in ((H, "host"), (G, "guest")):
+        L.execute(FAKES + POWER_FAKES)
+        # BP_LaboratoryGenerator (decompiled): Event_TurnOn(Interactor) flips TurnedOn?, powers its Actors, starts or
+        # stops its Audio and pops a notice, and switching on completes the PowerOnGenerator quest task; TestTurnOnOff
+        # is the same flip and Actors power alone
+        L.execute('GEN = obj({ ["TurnedOn?"] = false, cls = "BP_LaboratoryGenerator_C", calls = 0, quiet = 0, '
+                  'notices = 0, quests = 0, hum = false }); '
+                  'GEN.K2_GetActorLocation = function() return { X = 3000, Y = 0, Z = 0 } end; '
+                  'GEN.Event_TurnOn = function(self, who) self["TurnedOn?"] = not self["TurnedOn?"]; self.calls = self.calls + 1; '
+                  'self.hum = self["TurnedOn?"]; self.notices = self.notices + 1; '
+                  'if self["TurnedOn?"] then self.quests = self.quests + 1 end end; '
+                  'GEN.TestTurnOnOff = function(self) self["TurnedOn?"] = not self["TurnedOn?"]; self.quiet = self.quiet + 1 end; '
+                  'GEN.Audio = { Activate = function(self, reset) GEN.hum = true end, Deactivate = function(self) GEN.hum = false end }; '
+                  'LIST["BP_LaboratoryGenerator_C"] = { GEN }; '
+                  'power.init({}, %r, { in_world = function() return true end }); run(20)' % role)
+    check(H.eval('#OUT') == 0, "a lab generator left off sends nothing")
+    H.execute('GEN["TurnedOn?"] = true; run(1)')
+    sent = list(H.eval('OUT').values())
+    check(len(sent) == 1 and sent[0].startswith("S BP_LaboratoryGenerator_C@300,0,0 w 1"), "switched on at the host: sent (%r)" % sent)
+    G.execute('INBOX = { %r }; run(0.2)' % (sent[0] if sent else ""))
+    check(G.eval('GEN["TurnedOn?"]') is True and G.eval('GEN.quiet') == 1 and G.eval('GEN.hum') is True,
+          "...and the guest's lab generator runs too (TestTurnOnOff once, humming)")
+    check(G.eval('GEN.calls') == 0 and G.eval('GEN.notices') == 0 and G.eval('GEN.quests') == 0,
+          "...without the guest's own generator notice or quest step (%r calls, %r notices, %r quests)"
+          % (G.eval('GEN.calls'), G.eval('GEN.notices'), G.eval('GEN.quests')))
+    G.execute('run(3)')
+    check(G.eval('#OUT') == 0, "...without being sent back")
+    H.execute('OUT = {}; GEN["TurnedOn?"] = false; run(1)')
+    off = list(H.eval('OUT').values())
+    check(len(off) == 1 and off[0].startswith("S BP_LaboratoryGenerator_C@300,0,0 w 0"), "switched off at the host: sent (%r)" % off)
+    G.execute('INBOX = { %r }; run(0.2)' % (off[0] if off else ""))
+    check(G.eval('GEN["TurnedOn?"]') is False and G.eval('GEN.hum') is False and G.eval('GEN.notices') == 0,
+          "...and the guest's goes quiet, no notice")
+    # a build without TestTurnOnOff still switches (the old call)
+    G.execute('GEN.TestTurnOnOff = nil; INBOX = { %r }; run(0.2)' % (sent[0] if sent else ""))
+    check(G.eval('GEN["TurnedOn?"]') is True and G.eval('GEN.calls') == 1, "...and a copy without TestTurnOnOff falls back to Event_TurnOn")
+
+
+TOW_FAKES = r"""
+    OUT, INBOX, HOOK, CARS, DRIVES = {}, {}, {}, {}, {}
+    package.loaded["mirror.events"] = { reliable = function() return {
+        send = function(self, m) OUT[#OUT + 1] = m end,
+        pump = function(self, fn) local q = INBOX; INBOX = {}; for _, m in ipairs(q) do fn(m) end end } end }
+    package.loaded["mirror.game"] = { on_widgets_cleared = function() end, on_world_reset = function() end }
+    package.loaded["mirror.vehicles"] = { peer_name_of = function(c) return c.name end,
+        car_named = function(n) return CARS[n] end, my_car = function() return MYCAR end,
+        peer_drives = function(c) return DRIVES[c.name] == true end }
+    util = require("mirror.util")
+    util.ensure_hook = function(path, pre) HOOK[path:match(":(.+)$")] = pre; return true end
+    local function fire(fn, car) if HOOK[fn] then HOOK[fn]({ get = function() return car end }) end end
+    -- BP_VehicleMaster's tow (game files): AddTowingComp(false) unhitches a car that tows, else hitches whatever
+    -- car its trace finds at the tow point (here: 500 behind); RemoveTowingComp breaks the constraint
+    function car(name, x)
+        local c = obj({ name = name, at = { X = x, Y = 0, Z = 0 }, placed = 0, ["TowingVehicle?"] = false })
+        c.K2_GetActorLocation = function(self) return self.at end
+        c.K2_GetActorRotation = function() return { Pitch = 0, Yaw = 90, Roll = 0 } end
+        c.K2_SetActorLocationAndRotation = function(self, l) self.at = l; self.placed = self.placed + 1 end
+        c.RemoveTowingComp = function(self)
+            fire("RemoveTowingComp", self)
+            self["TowingVehicle?"], self.PhysicsConstraintComp = false, nil
+        end
+        c.AddTowingComp = function(self, skip)
+            fire("AddTowingComp", self)
+            if not skip and self["TowingVehicle?"] then self:RemoveTowingComp(); return end
+            for _, o in pairs(CARS) do
+                if o ~= self and math.abs(o.at.X - (self.at.X - 500)) < 100 then
+                    self["TowingVehicle?"] = true
+                    self.PhysicsConstraintComp = { GetOwner = function() return o end }
+                    return
+                end
+            end
+        end
+        CARS[name] = c
+        return c
+    end
+    towing = require("mirror.towing")
+    function run(s) for i = 1, math.floor(s * 10 + 0.5) do towing.tick(0.1) end end
+"""
+
+
+def the_glider_opens_flies_and_shows_on_the_other_screen():
+    # user 2026-11-02: hang glider - Jump in the air with 5 m under the feet opens it (a double tap at an edge arms it
+    # until the drop is there), speed traded for height, the hands held at the bar (no run cycle), the other player sees it.
+    print("the_glider_opens_flies_and_shows_on_the_other_screen")
+
+    def side():
+        L = lua()
+        L.execute(FAKES + r"""
+            NOW = 0; os.clock = function() return NOW end
+            KEYS, SENT, INBOX, TICKS, RESETS, SPAWNED = {}, {}, {}, {}, {}, {}
+            FALLING, GROUND, HERE, YAW = false, true, true, 0
+            CTRL = { Pitch = 0, Yaw = 0, Roll = 0 }
+            HOLDS, STOPS, CUR = 0, 0, nil
+            function anim()
+                return obj({ PlaySlotAnimationAsDynamicMontage = function(_, seq, slot)
+                                 HOLDS = HOLDS + 1; HOLD_SLOT = slot; CUR = obj({}); return CUR end,
+                             Montage_Stop = function(_, b, m) STOPS = STOPS + 1; if m == CUR then CUR = nil end end })
+            end
+            function character(at)
+                local mesh = obj({ RelativeRotation = { Pitch = 0, Yaw = -90, Roll = 0 }, RelativeLocation = { X = 0, Y = 0, Z = -82 },
+                    K2_SetRelativeLocationAndRotation = function(self, l, r) self.RelativeLocation = l; self.RelativeRotation = r end,
+                    GetSocketLocation = function() return { X = at.X + 30, Y = at.Y, Z = at.Z + 40 } end })
+                local ai = anim()
+                mesh.GetAnimInstance = function() return ai end
+                return obj({ Mesh = mesh, ["PlayerDead?"] = false, SwimmingComponent = { ["IsSwimming?"] = false },
+                    CharacterMovement = { Velocity = { X = 0, Y = 0, Z = -3000 }, GravityScale = 1.75,
+                                          IsFalling = function() return FALLING end },
+                    SpringArm = { TargetArmLength = 300, CameraLagSpeed = 25, CameraLagMaxDistance = 50 },
+                    Camera = { FieldOfView = 105 },
+                    CapsuleComponent = { GetScaledCapsuleHalfHeight = function() return 90 end },
+                    K2_GetActorLocation = function() return at end,
+                    K2_GetActorRotation = function() return { Pitch = 0, Yaw = YAW, Roll = 0 } end,
+                    K2_SetActorRotation = function(_, r) YAW = r.Yaw end,
+                    GetCurrentMontage = function() return CUR end })
+            end
+            PLAYER = character({ X = 0, Y = 0, Z = 10000 })
+            PLAYER.BP_JigMultiplayer = obj({})
+            GHOST = character({ X = 500, Y = 0, Z = 9000 })
+            CARRY, JIGCALLS = 1, 0   -- Hang Gliders in my inventory; inventory walks
+            package.loaded["mirror.jig"] = { full_path = function() return nil end, count_of_item = function(c, da)
+                JIGCALLS = JIGCALLS + 1
+                return (c == PLAYER.BP_JigMultiplayer and da == "/Game/Mods/SurrounSyncGlider/DA_HangGlider.DA_HangGlider") and CARRY or 0 end }
+            WORLD = obj({ SpawnActor = function()
+                local g = obj({ K2_AttachToComponent = function(self, c) self.parent = c end })
+                g.K2_DestroyActor = function() g.IsValid = function() return false end end
+                g.StaticMeshComponent = obj({ SetMobility = function() end, SetStaticMesh = function() end,
+                    SetCollisionEnabled = function() end, SetRelativeScale3D = function(self, s) self.scale = s end,
+                    K2_SetRelativeLocationAndRotation = function(self, l, r) self.at = l; self.rot = r end })
+                SPAWNED[#SPAWNED + 1] = g
+                return g
+            end })
+            local finds = {
+                ["/Script/Engine.Default__KismetSystemLibrary"] = obj({ LineTraceSingle = function(_, _, a, b, _, _, _, _, out)
+                    if GROUNDZ then   -- (a ground height at x, y: a straight-down trace reads where it hits)
+                        local gz = GROUNDZ(b.X, b.Y)
+                        if a.X == b.X and a.Y == b.Y and gz <= a.Z and gz >= b.Z then out.OutHit = { Distance = a.Z - gz }; return true end
+                        return false
+                    end
+                    if TRACE then return TRACE(a, b) end; return GROUND end }),
+                ["/Script/Engine.Default__KismetMathLibrary"] = obj({ ComposeRotators = function(_, a, b)
+                    return { Pitch = a.Pitch + b.Pitch, Yaw = a.Yaw + b.Yaw, Roll = a.Roll + b.Roll } end }),
+            }
+            StaticFindObject = function(p)
+                if p:find("SM_Glider", 1, true) or p:find("StaticMeshActor", 1, true) or p:find("LadderIdle", 1, true) then
+                    finds[p] = finds[p] or obj({})
+                end
+                return finds[p]
+            end
+            package.loaded["mirror.game"] = { player = function() return PLAYER end,
+                controller = function() return { GetControlRotation = function() return CTRL end } end,
+                key_down = function(k) return KEYS[k] == true end, world = function() return WORLD end,
+                on_tick = function(f) TICKS[#TICKS + 1] = f end, on_world_reset = function(f) RESETS[#RESETS + 1] = f end }
+            package.loaded["mirror.ghost"] = { get = function() return GHOST end }
+            package.loaded["mirror.peers"] = { shared = function(n, init) return init end }
+            package.loaded["mirror.events"] = evmock { new = function(name)
+                return { send = function(self, p) SENT[#SENT + 1] = p end,
+                         pump = function(self, fn) local q = INBOX; INBOX = {}; for _, p in ipairs(q) do fn(p) end end } end }
+            ADMINFLY = false   -- admin fly flying
+            package.loaded["mirror.adminfly"] = { lit = function() return ADMINFLY end }
+            util = require("mirror.util")
+            util.find = function(p) return StaticFindObject(p) end
+            glider = require("mirror.glider")
+            glider.init({})
+            glider.link_init(function() return HERE end)
+            sh, C = glider._shared, glider._consts
+            function tick(s, n)
+                for i = 1, (n or 1) do
+                    NOW = NOW + (s or 0.05)
+                    for _, f in ipairs(TICKS) do f(s or 0.05) end
+                    glider.tick(s or 0.05)
+                end
+            end
+            function press() KEYS.SpaceBar = true; tick(); KEYS.SpaceBar = false; tick() end
+            function vel() return PLAYER.CharacterMovement.Velocity end
+            -- seconds of flight at a camera pitch/yaw, the highest climb and furthest heading seen
+            function fly(secs, pitch, yaw)
+                CTRL = { Pitch = pitch or 0, Yaw = yaw or CTRL.Yaw, Roll = 0 }
+                TOP_VZ, TOP_H, ROLL = -1e9, -1e9, 0
+                for i = 1, math.floor(secs / 0.05 + 0.5) do
+                    tick()
+                    TOP_VZ, TOP_H = math.max(TOP_VZ, vel().Z), math.max(TOP_H, sh.heading)
+                    local g = SPAWNED[#SPAWNED]
+                    if g and g.StaticMeshComponent.rot then ROLL = math.max(ROLL, math.abs(g.StaticMeshComponent.rot.Roll)) end
+                end
+            end
+        """)
+        return L
+
+    A = side()
+    check(len(A.eval("TICKS")) == 2, "my own glide and the item's recipe check run every frame (main.lua's on_tick)")
+    A.execute("press()")
+    check(not A.eval("sh.on"), "Space on the ground is only the game's jump")
+    # user 2026-11-02 "Add the item": no Hang Glider in the inventory, no glider
+    A.execute("CARRY = 0; FALLING, GROUND = true, false; press(); tick(0.05, 40)")
+    check(not A.eval("sh.on"), "no Hang Glider carried: Jump in the air with the drop under does nothing")
+    check(A.eval("JIGCALLS") == 1,
+          "the inventory was looked at once, on the press (%d)" % A.eval("JIGCALLS"))
+    A.execute("FALLING, GROUND = false, true; tick(); CARRY = 1")
+    A.execute("FALLING = true; press(); tick(1, 3)")
+    check(not A.eval("sh.on"), "Space in the air over flat ground (no 5 m drop): no glider, and it doesn't wait forever")
+    A.execute("GROUND = false; tick()")
+    check(not A.eval("sh.on"), "the arming runs out after %.1f s" % 1.5)
+    # a double tap at a cliff's edge: the first jumps, the second (in the air, ground still under) arms it
+    A.execute("FALLING, GROUND = false, true; press(); FALLING = true; press(); tick(0.05, 4)")
+    check(not A.eval("sh.on"), "double tap at the edge: armed, still over the cliff top")
+    A.execute("GROUND = false; tick()")
+    check(A.eval("sh.on") and A.eval("sh.vz") == -A.eval("C.CATCH_CM_S"),
+          "over the edge it opens on its own, a fast fall caught at %d cm/s (%s)" % (A.eval("C.CATCH_CM_S"), A.eval("sh.vz")))
+    check(A.eval("PLAYER.CharacterMovement.GravityScale") == A.eval("C.GRAVITY"), "the game's gravity eased off while gliding")
+    A.execute("tick(0.05, 10)")
+    m = A.eval("PLAYER.Mesh.RelativeRotation")
+    check(abs(m.Pitch + A.eval("C.PRONE_DEG")) < 0.01, "the body swung face down within %.2f s (pitch %.1f)" % (A.eval("C.OPEN_S"), m.Pitch))
+    check(A.eval("HOLDS") == 1 and A.eval("HOLD_SLOT") == "DefaultSlot",
+          "the hands held at the bar: the hold loops on the montage slot (no run cycle)")
+    check(A.eval("#SPAWNED == 1 and SPAWNED[1].parent == PLAYER.CapsuleComponent"), "one glider, on my character")
+    sc = A.eval("SPAWNED[1].StaticMeshComponent.scale")
+    check(sc and abs(sc.Y - 1) < 1e-9 and abs(sc.X - 1) < 1e-9, "the wing unfolded to full size")
+    arm = A.eval("PLAYER.SpringArm")
+    check(arm.CameraLagSpeed == 8 and arm.CameraLagMaxDistance == 150 and arm.TargetArmLength > 400,
+          "the camera backs off and trails (arm %.0f)" % arm.TargetArmLength)
+
+    A.execute("J0 = JIGCALLS; fly(20, 0)")
+    check(A.eval("JIGCALLS == J0"), "gliding never walks the inventory")
+    check(abs(A.eval("sh.speed") - A.eval("C.SPEED")) < 15 and abs(A.eval("sh.vz") + A.eval("C.SINK")) < 5,
+          "level: settles at %d cm/s forward, %d down (%.0f, %.0f)" % (A.eval("C.SPEED"), A.eval("C.SINK"), A.eval("sh.speed"), A.eval("sh.vz")))
+    v = A.eval("vel()")
+    check(abs(v.X - A.eval("sh.speed")) < 1 and abs(v.Z - A.eval("sh.vz")) < 1, "the player moves at that speed")
+    A.execute("fly(12, -45)")
+    check(A.eval("sh.speed") > 2200 and A.eval("sh.vz") < -900, "a full dive builds speed (%.0f) and sinks fast (%.0f)" % (A.eval("sh.speed"), A.eval("sh.vz")))
+    check(A.eval("PLAYER.Camera.FieldOfView") > 110, "the view widens with speed (%.1f)" % A.eval("PLAYER.Camera.FieldOfView"))
+    A.execute("fly(1.5, 45)")
+    check(A.eval("TOP_VZ") > 400, "pulling up out of the dive climbs for a moment (%.0f cm/s up)" % A.eval("TOP_VZ"))
+    A.execute("fly(12, 45)")
+    check(A.eval("sh.speed") == A.eval("C.MIN_SPEED") and A.eval("sh.vz") < -400,
+          "a held flare runs out of speed and stalls (%.0f, %.0f)" % (A.eval("sh.speed"), A.eval("sh.vz")))
+    A.execute("fly(8, 0)")
+    A.execute("fly(4, 0, 90)")
+    check(abs(A.eval("sh.heading") - 90) < 2 and A.eval("TOP_H") < 93,
+          "turns to the camera without swinging past it (%.1f, furthest %.1f)" % (A.eval("sh.heading"), A.eval("TOP_H")))
+    check(A.eval("ROLL") > 5, "the wing leans into the turn (%.1f deg)" % A.eval("ROLL"))
+    A.execute("fly(0.5, 0, -60)")
+    check(A.eval("sh.turn") < 0, "a big turn goes the short way (90 to -60: left, not 210 right)")
+    A.execute("fly(5, 0, -60)")
+
+    # a montage of the game's own (eating) is left alone; the hold comes back after it
+    A.execute("OTHER = obj({}); CUR = OTHER; tick(0.05, 10)")
+    check(A.eval("HOLDS == 1 and CUR == OTHER"), "another montage plays: the hold waits")
+    A.execute("CUR = nil; tick(0.05, 10)")
+    check(A.eval("HOLDS") == 2, "it ended: the hands go back to the bar")
+
+    # co-op: my state on the link, the other game shows it on my ghost
+    sent = A.eval("SENT")
+    check(sent[len(sent)] == "G 1", "the other player is told I glide (%s)" % sent[len(sent)])
+    B = side()
+    B.execute('INBOX[1] = "G 1"; tick(0.05, 10)')
+    check(B.eval("#SPAWNED == 1 and SPAWNED[1].parent == GHOST.CapsuleComponent and not sh.on"),
+          "their game: a glider on my ghost, theirs stays closed")
+    check(abs(B.eval("GHOST.Mesh.RelativeRotation").Pitch + B.eval("C.PRONE_DEG")) < 0.01 and B.eval("HOLDS") == 1,
+          "my ghost hangs face down, hands at the bar")
+    A.execute("SENT = {}; tick(0.05, 120)")
+    check(A.eval("#SENT") >= 1 and A.eval("SENT[1]") == "G 1", "said again while gliding (a late joiner hears it)")
+
+    # closing: a second Jump, landing, water, death; everything put back
+    A.execute("SENT = {}; press()")
+    check(not A.eval("sh.on"), "Space again: let go")
+    check(A.eval("PLAYER.CharacterMovement.GravityScale") == 1.75 and A.eval("PLAYER.SpringArm.TargetArmLength") == 300
+          and A.eval("PLAYER.SpringArm.CameraLagSpeed") == 25 and A.eval("PLAYER.Camera.FieldOfView") == 105,
+          "gravity, camera distance, lag and view put back")
+    m = A.eval("PLAYER.Mesh.RelativeRotation")
+    check(m.Pitch == 0 and m.Yaw == -90 and A.eval("PLAYER.Mesh.RelativeLocation").Z == -82, "the body upright again")
+    check(not A.eval("SPAWNED[1]:IsValid()") and A.eval("STOPS") == 1 and A.eval("CUR") is None,
+          "the glider gone, the hold stopped")
+    check(A.eval("SENT[1]") == "L 1", "the other player told it closed")
+    B.execute('INBOX[1] = "L 1"; tick()')
+    check(not B.eval("SPAWNED[1]:IsValid()") and B.eval("GHOST.Mesh.RelativeRotation").Pitch == 0,
+          "their game: the ghost lets go too")
+    A.execute("press(); tick()")
+    check(A.eval("sh.on") and A.eval("sh.ep") == 2, "Jump in the air with the drop under: opens again at once")
+    A.execute("tick(0.05, 2); KEYS.SpaceBar = true; tick(); KEYS.SpaceBar = false; tick()")
+    check(A.eval("sh.on"), "a press right after opening doesn't close it")
+    A.execute("FALLING = false; tick()")
+    check(not A.eval("sh.on"), "landing closes it")
+    A.execute("tick(); FALLING = true; tick(0.05, 5)")
+    check(not A.eval("sh.on"), "a jump after landing doesn't reopen it on its own (the arming was spent)")
+    A.execute("press(); PLAYER.SwimmingComponent['IsSwimming?'] = true; tick()")
+    check(not A.eval("sh.on"), "water closes it")
+    A.execute("PLAYER.SwimmingComponent['IsSwimming?'] = false; press(); PLAYER['PlayerDead?'] = true; tick()")
+    check(not A.eval("sh.on"), "death closes it")
+    A.execute("PLAYER['PlayerDead?'] = false; press(); HERE = false; SENT = {}; tick(0.05, 200)")
+    check(A.eval("#SENT") == 0, "the other player in another world: nothing sent")
+
+    # audit 2026-11-03: admin fly flying. Jump is its climb: the glider never opens over it (it saved the flight's
+    # zero gravity, camera and lean as the game's own and put them back on closing), and those climbs don't arm it
+    A.execute("HERE = true; FALLING = false; tick(); FALLING = true; ADMINFLY = true; PLAYER.CharacterMovement.GravityScale = 0")
+    A.execute("J0 = JIGCALLS; press(); tick(0.05, 10)")
+    check(not A.eval("sh.on") and A.eval("PLAYER.CharacterMovement.GravityScale") == 0,
+          "admin fly flying: Jump in the air leaves the glider shut")
+    check(A.eval("JIGCALLS == J0"), "(and the flight's climbs never walk the inventory)")
+    A.execute("ADMINFLY = false; PLAYER.CharacterMovement.GravityScale = 1.75; tick(0.05, 5)")
+    check(not A.eval("sh.on"), "the flight over: its climbs left the glider unarmed")
+    A.execute("press(); tick()")
+    check(A.eval("sh.on"), "Jump after the flight ended opens it")
+    A.execute("tick(0.05, 20); press()")
+    check(not A.eval("sh.on") and A.eval("PLAYER.CharacterMovement.GravityScale") == 1.75,
+          "closed: the game's own gravity back, not the flight's 0")
+    # a new character while gliding, the old one already gone: the glider model goes too (it was left in the world)
+    A.execute("press(); tick(); N = #SPAWNED")
+    check(A.eval("sh.on") and A.eval("SPAWNED[N]:IsValid()"), "(gliding again)")
+    A.execute("OLD = PLAYER; PLAYER = character({ X = 0, Y = 0, Z = 10000 }); PLAYER.BP_JigMultiplayer = obj({})"
+              "; OLD.IsValid = function() return false end; tick()")
+    check(not A.eval("sh.on") and not A.eval("SPAWNED[N]:IsValid()"),
+          "a new character while gliding (the old one gone): closed, the glider model destroyed")
+
+    # user 2026-11-03 "make the gliders use the games natural wind physics", "as natural and realistic as possible": the
+    # weather's wind (Ultra Dynamic Weather, fake here) moves the air the glider flies through. Each flight: opened and
+    # trimmed (15 s calm), then put 100 m over flat ground (or a slope) heading +X and flown on, the player really moving
+    def glide(secs, setup=""):
+        L = side()
+        L.execute(r"""
+            UDWA = nil
+            FindAllOf = function(c) if c == "Ultra_Dynamic_Weather_C" and UDWA then return { UDWA } end end
+            -- knots, and where it blows (x, y)
+            function wind(knots, x, y)
+                WIND = { knots = knots, x = x, y = y }
+                UDWA = UDWA or obj({ GetFullName = function() return "Ultra_Dynamic_Weather_C /Game/L.L:P.UDW" end,
+                    ["Wind Force Vector"] = function() return { X = WIND.x * 180, Y = WIND.y * 180, Z = 0 } end,
+                    ["Get Wind Speed in Real Units"] = function(_, k10, gusts, out)
+                        ASKED = { k10, gusts }; out.Knots = WIND.knots end })
+                UDWA["Current Wind Gust Multiplier"] = 0
+                glider._air.next_at, glider._air.look_at, glider._air.wx = 0, 0, nil
+            end
+            POS = PLAYER:K2_GetActorLocation()
+            function cruise(secs)
+                for i = 1, math.floor(secs / 0.05 + 0.5) do
+                    tick()
+                    local v = vel()
+                    POS.X, POS.Y, POS.Z = POS.X + v.X * 0.05, POS.Y + v.Y * 0.05, POS.Z + v.Z * 0.05
+                end
+            end
+            FALLING, GROUND = true, false; press(); tick()
+            cruise(15)
+            POS.X, POS.Y, POS.Z = 0, 0, 10000
+            GROUNDZ = function() return 0 end
+            %s
+            S0 = sh.speed
+            cruise(%g)
+        """ % (setup, secs))
+        return L
+    KN = 12   # a moderate breeze, 6.2 m/s
+    calm, tail, head = glide(30), glide(30, "wind(%d, 1, 0)" % KN), glide(30, "wind(%d, -1, 0)" % KN)
+    check(calm.eval("glider._air.speed") == 0 and "wind 0.0 m/s" in calm.eval("glider.status()"),
+          "no weather actor: no wind, the glide as before")
+    check(tail.eval("ASKED[1]") == 60 and tail.eval("ASKED[2]") is False,
+          "the wind's speed asked of the game's own real-units function (intensity 10 = 60 knots, gusts apart)")
+    w = KN * 51.44
+    check(abs(tail.eval("glider._air.speed") - w) < 1 and "wind %.1f m/s" % (w / 100) in tail.eval("glider.status()"),
+          "%d knots is %.0f cm/s of wind" % (KN, w))
+    cx, tx, hx = calm.eval("POS.X"), tail.eval("POS.X"), head.eval("POS.X")
+    check(tx - cx > 0.9 * w * 30 and cx - hx > 0.9 * w * 30,
+          "a tailwind carries it %.0f m further in 30 s, a headwind holds it %.0f m back (calm %.0f m)" % ((tx - cx) / 100, (cx - hx) / 100, cx / 100))
+    cz, tz, hz = calm.eval("POS.Z"), tail.eval("POS.Z"), head.eval("POS.Z")
+    check(abs(tz - cz) < 100 and abs(hz - cz) < 100,
+          "a steady wind alone lifts nothing: the same height after 30 s (%.1f / %.1f / %.1f m)" % (cz / 100, tz / 100, hz / 100))
+    check(abs(tail.eval("sh.speed") - head.eval("sh.speed")) < 5, "and the same airspeed either way")
+    cross = glide(20, "wind(%d, 0, 1)" % KN)
+    check(cross.eval("POS.Y") > 0.9 * w * 20 and abs(cross.eval("sh.heading")) < 0.5 and abs(cross.eval("YAW")) < 0.5,
+          "a crosswind drifts it %.0f m sideways in 20 s, still pointing where it flies (%.1f deg)" % (cross.eval("POS.Y") / 100, cross.eval("YAW")))
+    storm = glide(1, "wind(100, 1, 0)")
+    check(storm.eval("glider._air.speed") == 900, "a storm's wind counts up to 9 m/s (%.0f)" % storm.eval("glider._air.speed"))
+
+    # ridge lift: 20 m over a 1:2 slope, the wind blowing up it (into the hill, +X); flown into the wind, away from the hill
+    ridge_setup = "POS.Z = 2000; CTRL = { Pitch = 0, Yaw = 180, Roll = 0 }; sh.heading = 180; wind(%d, 1, 0); GROUNDZ = function(x) return %s end"
+    flat = glide(10, ridge_setup % (KN, "0"))
+    up = glide(10, ridge_setup % (KN, "0.5 * x"))
+    check(up.eval("glider._air.ridge") > 0 and flat.eval("glider._air.ridge") == 0, "(wind up the slope seen: ridge %.2f)" % up.eval("glider._air.ridge"))
+    fz, uz = flat.eval("POS.Z"), up.eval("POS.Z")
+    check(uz - fz > 1000, "wind up a slope holds it up: %.0f m higher than over flat ground after 10 s (%.1f vs %.1f m)" % ((uz - fz) / 100, uz / 100, fz / 100))
+    # (the lee: the ground rises towards it as it flies into the wind, so 3 s)
+    flat3, lee = glide(3, ridge_setup % (KN, "0")), glide(3, ridge_setup % (KN, "-0.5 * x"))
+    check(lee.eval("glider._air.ridge") < 0 and flat3.eval("POS.Z") - lee.eval("POS.Z") > 100,
+          "the lee side sinks it: %.1f m lower after 3 s" % ((flat3.eval("POS.Z") - lee.eval("POS.Z")) / 100))
+    high = glide(10, ridge_setup.replace("POS.Z = 2000", "POS.Z = 9000") % (KN, "0.5 * x"))
+    check(high.eval("glider._air.ridge") == 0, "90 m over the slope: no ridge lift that high")
+    low = glide(1, "POS.Z = 500; wind(%d, 1, 0)" % KN)
+    check(abs(low.eval("glider._air.speed * glider._air.low") - w * (0.6 + 0.4 * 500 / 3000)) < 60,
+          "5 m over the ground the wind is weaker (%.0f of %.0f cm/s)" % (low.eval("glider._air.speed * glider._air.low"), w))
+
+    # the game's gusts: into a headwind a gust gives airspeed at once (the ground speed carries on), which a level
+    # glider turns into height; a gust from behind takes airspeed
+    g = glide(5, "wind(%d, -1, 0)" % KN)
+    g.execute("SA = sh.speed; UDWA['Current Wind Gust Multiplier'] = 0.4; tick(); SB = sh.speed")
+    check(abs(g.eval("SB - SA") - 0.4 * w) < 25, "a 0.4 headwind gust: %.0f cm/s more airspeed at once" % g.eval("SB - SA"))
+    ng = glide(5, "wind(%d, -1, 0)" % KN)
+    g.execute("cruise(3)"); ng.execute("cruise(3)")
+    check(g.eval("POS.Z") - ng.eval("POS.Z") > 50,
+          "flown level through it: %.1f m higher 3 s on than without the gust" % ((g.eval("POS.Z") - ng.eval("POS.Z")) / 100))
+    t = glide(5, "wind(%d, 1, 0)" % KN)
+    t.execute("SA = sh.speed; UDWA['Current Wind Gust Multiplier'] = 0.4; tick(); SB = sh.speed")
+    check(g.eval("SB > SA") and t.eval("SA - SB") > 0.3 * w, "a gust from behind: %.0f cm/s less airspeed" % t.eval("SA - SB"))
+    t.execute("press()")
+    check(not t.eval("sh.on"), "(closes as before)")
+
+    # user 2026-11-02 "its impossible to use it on a hill ... you cant get high enough": Jump in the air 1 m over a
+    # slope falling away along +X (ground under the feet is never 5 m down there)
+    H = side()
+    H.execute(r"""
+        function hill(deg, vx, yaw, vy)
+            local slope = math.tan(math.rad(deg))
+            local function groundz(x) return 10000 - 90 - 100 - slope * x end
+            TRACES = 0
+            TRACE = function(a, b)
+                TRACES = TRACES + 1
+                if a.X == b.X and a.Y == b.Y then return b.Z <= groundz(a.X) end
+                return math.min(a.Z, b.Z) <= math.max(groundz(a.X), groundz(b.X))
+            end
+            YAW = yaw or 0
+            PLAYER.CharacterMovement.Velocity = { X = vx, Y = vy or 0, Z = -300 }
+            FALLING = false; tick(); FALLING = true; press()
+            local on = sh.on
+            FALLING = false; tick(); TRACE = nil
+            return on
+        end
+    """)
+    check(H.eval("hill(30, 600)"), "running down a 30 degree hill, 1 m up: it opens")
+    check(H.eval("hill(20, 600)"), "running down a 20 degree hill: it opens")
+    check(H.eval("hill(30, 0, 0)"), "a standing jump facing downhill: it opens")
+    check(H.eval("hill(30, 600, 180, 600)"), "running down at an angle, looking back uphill: the run decides, it opens")
+    check(not H.eval("hill(10, 600)"), "a gentle 10 degree slope (flatter than the glide): it stays closed")
+    check(not H.eval("hill(0, 600)"), "flat ground, 1 m up mid-jump: it stays closed")
+    check(not H.eval("hill(0, 600)") and H.eval("TRACES > 0"), "flat ground: the traces really ran")
+    check(not H.eval("hill(-30, 600)"), "running up the hill: it stays closed (the spot ahead is inside the hill)")
+    check(not H.eval("hill(30, -600)"), "running back up the same hill: closed")
+    check(not H.eval("hill(30, 0, 180)"), "a standing jump facing uphill: closed")
+
+
+def the_hover_bike_flies_for_its_owner_and_stores_1000():
+    # user 2026-11-03: "i built a hoverbike tho with a custom rider pose and animation", "it will use the same fpvdrone
+    # flight engine just tuned", "this is gonna have a 1000slot storage copacity". A golf cart with VehicleColor 78 wears
+    # SK_HoverBike; its owner flies it with the keys; anyone may sit on it. What's checked here is the logic against
+    # fakes: nothing here shows what the game does with any of it.
+    print("the_hover_bike_flies_for_its_owner_and_stores_1000")
+    # the flight engine is FPVDrone's, not a fork of it
+    src = r"C:\Users\arkis\Desktop\FPVDrone\mod\FPVDrone\Scripts\fpv\flight.lua"
+    if os.path.exists(src):
+        with open(src, "rb") as f:
+            theirs = f.read().replace(b"\r\n", b"\n")
+        with open(os.path.join(SCRIPTS, "mirror", "fpvflight.lua"), "rb") as f:
+            ours = f.read().replace(b"\r\n", b"\n")
+        check(theirs == ours, "mirror/fpvflight.lua is FPVDrone's fpv/flight.lua, unchanged")
+    else:
+        print("  (FPVDrone repo not here: the copy isn't compared)")
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        TICKS, SPAWNED, LOADS, NOTES, CARTS, BINDS, KEYS, PLAYS, STOPS = {}, {}, {}, {}, {}, {}, {}, {}, {}
+        ROLE, OWNER, HAVE_CART, HAVE_MESH, HAVE_ANIM = nil, true, true, true, true
+        RIDE, PEER_CAR, GHOST, SEAT = nil, nil, nil, nil
+        GROUND_Z, WALL_X, WALL_N = -1e9, nil, nil
+        TRACES = 0
+        LOAD_IDS = {}
+        ModifierKey = { CONTROL = "ctrl", SHIFT = "shift" }
+        EObjectFlags = { RF_NeedInitialization = 1, RF_NeedLoad = 2, RF_NeedPostLoad = 4, RF_NeedPostLoadSubobjects = 8 }
+        package.loaded["mirror.notify"] = { show = function(t) NOTES[#NOTES + 1] = t end }
+        package.loaded["mirror.session"] = { role = function() return ROLE end }
+        package.loaded["mirror.adminfly"] = { is_owner = function() return OWNER end, OWNER = "111" }
+        package.loaded["mirror.ghost"] = { get = function() return GHOST end }
+        -- the trunk as BP_JigComponent has it: the game's build adds to the containers there are, only ClearContainer empties them
+        JC, JR, JI = "Columns_4_1D84448048078D988999ABA138CE1809", "Rows_6_78B4BC5B449017D63758E79844375AE9", "ContainerItems_16_16E3D87B4C0AC5D6C9C861B96B5ABA8B"
+        function grid(c, r, n) return { [JC] = c, [JR] = r, [JI] = { GetArrayNum = function() return n or 0 end } } end
+        function grids(list)
+            return { list = list, GetArrayNum = function(self) return #self.list end,
+                ForEach = function(self, fn) for i, g in ipairs(self.list) do fn(i, { get = function() return g end }) end end }
+        end
+        function holds(c) return c.BP_JigMultiplayer.MainJigContainers.list end
+        package.loaded["mirror.vehicles"] = { my_ride = function() return RIDE end,
+            peer_drives = function(c)
+                if PEER_RAISE then error("no such car") end
+                return PEER_CAR ~= nil and c == PEER_CAR
+            end }
+        function cart(color)
+            local function fx() return obj({ active = true, offs = 0, IsActive = function(self) return self.active end,
+                                             Deactivate = function(self) self.active = false; self.offs = self.offs + 1 end }) end
+            local function widget() return obj({ bHiddenInGame = false, sets = 0,
+                SetHiddenInGame = function(self, h, kids) self.bHiddenInGame = h; self.kids = kids; self.sets = self.sets + 1 end }) end
+            local trunk = obj({ resets = 0, builds = 0, did = "",
+                ContainersSettings = {}, MainJigContainers = grids({ grid(4, 6) }),
+                InventoryWeight = { Empty = function(self) end },
+                ResetInitComponent = function(self) self.resets = self.resets + 1 end,
+                ClearContainer = function(self, reset)
+                    self.did = self.did .. "clear "
+                    if reset == true then self:ResetInitComponent() end
+                    self.MainJigContainers.list = {}
+                end,
+                InitNoStartingItems = function(self)
+                    self.did = self.did .. "build "
+                    self.builds = self.builds + 1
+                    local s, l = self.ContainersSettings[1], self.MainJigContainers.list
+                    l[#l + 1] = grid(s["Columns_4_A32AA159420F47D951669C9636084F9D"], s["Rows_6_E1A84D8A441B19CA3C38D0BC029805A1"])
+                end })
+            trunk.InventoryWeight.Empty = function() trunk.did = trunk.did .. "weight " end
+            local arr = { [1] = { ["Columns_4_A32AA159420F47D951669C9636084F9D"] = 4, ["Rows_6_E1A84D8A441B19CA3C38D0BC029805A1"] = 6,
+                                  ["ContainerName_13_2E875F304DF2B4B31A44F98C299C3982"] = "Trunk" },
+                          GetArrayNum = function() return 1 end }
+            trunk.ContainersSettings = arr
+            local c = obj({ VehicleColor = color, FuelComponent = { CurrentFuel = 2, MaxFuel = 50, Empty = false },
+                VehicleHealthComponent = { CurrentHealth = 20, MaxHealth = 100 }, ["EngineOn?"] = true, bCanBeDamaged = true,
+                SmokeFX = fx(), FireFX = fx(), FuelWidget = widget(), RepairWidget = widget(), BP_JigMultiplayer = trunk,
+                Name = "Golf Cart", collide = true,
+                at = { X = 0, Y = 0, Z = 0 }, rot = { Pitch = 0, Yaw = 0, Roll = 0 } })
+            c.Name = { ToString = function() return "Golf Cart" end }
+            c.K2_GetActorLocation = function(self) return self.at end
+            c.K2_GetActorRotation = function(self) return self.rot end
+            c.GetActorForwardVector = function(self) return { X = 1, Y = 0, Z = 0 } end
+            c.GetActorUpVector = function(self) return { X = 0, Y = 0, Z = 1 } end
+            c.IsActorBeingDestroyed = function() return false end
+            c.SetActorEnableCollision = function(self, on) self.collide = on end
+            c.K2_SetActorLocationAndRotation = function(self, l, r, sweep, _, tele)
+                self.at = { X = l.X, Y = l.Y, Z = l.Z }; self.rot = r; self.sweep = sweep; self.tele = tele end
+            c.exits = 0
+            c.ExitVehicle = function(self)
+                self.exits = self.exits + 1
+                if not REFUSE_EXIT and PLAYER.parent == self then PLAYER.parent = nil end
+            end
+            c.VehicleMovementComponent = obj({ SetThrottleInput = function(s, v) s.th = v end, SetSteeringInput = function(s, v) s.st = v end,
+                SetHandbrakeInput = function(s, v) s.hb = v end })
+            c.EngineSound = obj({ SetVolumeMultiplier = function(s, v) s.vol = v end })
+            c.Mesh = obj({ hidden = false, sim = true, SetHiddenInGame = function(self, h, kids) self.hidden = h; self.kids = kids end,
+                SetSimulatePhysics = function(self, on) self.sim = on end,
+                SetPhysicsLinearVelocity = function(self, v, add) self.lin = v; self.lin_add = add end,
+                SetPhysicsAngularVelocityInDegrees = function(self, v, add) self.ang = v; self.ang_add = add end })
+            return c
+        end
+        function model()
+            local m = obj({ K2_AttachToComponent = function(self, c, _, a, b, d, weld) self.parent = c; self.rules = { a, b, d, weld } end,
+                            SetActorHiddenInGame = function(self, h) self.hidden = h end })
+            m.K2_DestroyActor = function() m.IsValid = function() return false end end
+            m.StaticMeshComponent = obj({ SetMobility = function() end, SetCollisionEnabled = function() end,
+                K2_SetRelativeLocationAndRotation = function(self, l, r) self.rel_l = l; self.rel_r = r end })
+            m.AddComponentByClass = function(self, k, manual, _, deferred)
+                local c = obj({ cls = k, bones = {}, manual = manual, deferred = deferred, SetCollisionEnabled = function() end,
+                    SetSkinnedAssetAndUpdate = function(s, sk, reinit) s.sk = sk; s.reinit = reinit end,
+                    GetBoneIndex = function(s, n) return NO_BONE and -1 or 0 end,
+                    GetBoneTransformByName = function(s, n)
+                        return { Rotation = REST_Q or { X = 0, Y = 0, Z = 0, W = 1 }, Translation = { X = 0, Y = 0, Z = 0 }, Scale3D = { X = 1, Y = 1, Z = 1 } } end,
+                    SetBoneTransformByName = function(s, n, t) s.sets = (s.sets or 0) + 1; s.bones[n] = t end })
+                self.pose = c
+                return c
+            end
+            return m
+        end
+        CAM_CLS = obj({})
+        CAMS = {}
+        function camera()
+            local cam = obj({ moves = 0, CameraComponent = obj({ fov_sets = 0, SetFieldOfView = function(s, f) s.fov = f; s.fov_sets = s.fov_sets + 1 end }) })
+            cam.K2_SetActorLocationAndRotation = function(self, l, r, sweep, _, tele)
+                self.at, self.rot, self.sweep, self.tele = l, r, sweep, tele; self.moves = self.moves + 1 end
+            cam.K2_DestroyActor = function(self) self.IsValid = function() return false end end
+            CAMS[#CAMS + 1] = cam
+            return cam
+        end
+        WORLD = obj({ SpawnActor = function(self, c, at, r)
+            if c == CAM_CLS then
+                if NO_CAM then return obj({ IsValid = function() return false end }) end
+                local cam = camera()
+                cam.spawned_at, cam.spawned_rot = at, r
+                return cam
+            end
+            local a = (c == CART_CLS) and cart(3) or model()
+            a.spawned_at, a.spawned_rot = at, r
+            SPAWNED[#SPAWNED + 1] = a
+            if c == CART_CLS then CARTS[#CARTS + 1] = a end
+            return a
+        end })
+        CART_CLS, SMA, POSE = obj({}), obj({}), obj({})
+        SK, SIT, DRIVE = obj({}), obj({}), obj({})
+        KSL = obj({ MakeSoftObjectPath = function(_, p) return p end, Conv_SoftObjPathToSoftObjRef = function(_, p) return p end,
+            LoadAsset = function(_, w, p, _, la) LOADS[#LOADS + 1] = p; LOAD_IDS[p] = la and la.UUID end,
+            LineTraceSingle = function(_, p, a, b, ch, cx, ign, dbg, out, self_ign)
+                TRACES = TRACES + 1
+                if TRACE_LOG then TRACE_LOG[#TRACE_LOG + 1] = { a = a, b = b, ch = ch, cx = cx, dbg = dbg, self_ign = self_ign } end
+                if TRACE_FN then return TRACE_FN(a, b, out) end
+                if b.Z <= GROUND_Z and a.Z >= GROUND_Z then
+                    out.OutHit = { ImpactNormal = GROUND_N or { X = 0, Y = 0, Z = 1 } }
+                    return true
+                end
+                if WALL_X and a.X < WALL_X and b.X >= WALL_X then
+                    out.OutHit = { ImpactNormal = { X = -1, Y = 0, Z = 0 } }
+                    return true
+                end
+                return false
+            end })
+        function lookup(p)
+            if p:find("Vehicle_GolfCart_C", 1, true) then return HAVE_CART and CART_CLS or nil end
+            if p:find("SK_HoverBike", 1, true) then return HAVE_MESH and SK or nil end
+            if p:find("A_Rider_Sit", 1, true) then return HAVE_ANIM and SIT or nil end
+            if p:find("A_Rider_Drive", 1, true) then return HAVE_ANIM and DRIVE or nil end
+            if p:find("StaticMeshActor", 1, true) then return SMA end
+            if p:find("PoseableMeshComponent", 1, true) then return POSE end
+            if p:find("KismetSystemLibrary", 1, true) then return KSL end
+            if p:find("CameraActor", 1, true) then return not NO_CAM_CLS and CAM_CLS or nil end
+            if p:find("BikeMotor", 1, true) then return not NO_SOUND and SND_MOTOR or nil end
+            if p:find("BikeWind", 1, true) then return not NO_SOUND and not NO_WIND and SND_WIND or nil end
+            if p:find("GameplayStatics", 1, true) then return not NO_GS and GS or nil end
+        end
+        SND_MOTOR, SND_WIND = obj({}), obj({})
+        SOUNDS = {}
+        GS = obj({ SpawnSoundAttached = function(_, snd, root, _, loc, rot, kind, stop_with, vol, pitch, start, _, _, auto_destroy)
+            if SOUND_RAISE then error("no sound here") end
+            local c = obj({ snd = snd, root = root, stop_with = stop_with, auto_destroy = auto_destroy, start0 = start, on = true,
+                loc = loc, turn = rot, kind = kind, vol0 = vol, pitch0 = pitch,
+                pitch_sets = 0, vol_sets = 0, plays = 0, stops = 0 })
+            c.Play = function(s, at) s.on = true; s.at_play = at; s.plays = s.plays + 1 end
+            c.Stop = function(s) s.on = false; s.stops = s.stops + 1 end
+            c.SetPitchMultiplier = function(s, v) s.pitch = v; s.pitch_sets = s.pitch_sets + 1 end
+            c.SetVolumeMultiplier = function(s, v) s.vol = v; s.vol_sets = s.vol_sets + 1 end
+            SOUNDS[#SOUNDS + 1] = c
+            return c
+        end })
+        function rider(mesh_z)
+            local a = obj({ cur = nil })
+            local inst = obj({
+                PlaySlotAnimationAsDynamicMontage = function(self, seq)
+                    local m = obj({ seq = seq }); PLAYS[#PLAYS + 1] = seq; a.cur = m; return m end,
+                Montage_Stop = function(self, t, m) STOPS[#STOPS + 1] = m; if a.cur == m then a.cur = nil end end })
+            a.Mesh = obj({ RelativeLocation = { X = 0, Y = 0, Z = mesh_z }, RelativeRotation = { Yaw = -90 },
+                           GetAnimInstance = function() return inst end })
+            -- the Pelvis, a.hip over Root (already where HIP_Z wants it unless a test says the game pulls it elsewhere)
+            a.Mesh.GetSocketLocation = function(self, n)
+                a.bone = n
+                a.bone_reads = (a.bone_reads or 0) + 1
+                if a.no_bone then error("no such bone") end
+                local p, u = a:K2_GetActorLocation(), a.parent and a.parent:GetActorUpVector() or { X = 0, Y = 0, Z = 1 }
+                local h = (self.RelativeLocation and self.RelativeLocation.Z or -82) + (a.hip or 84.86)
+                return { X = p.X + u.X * h, Y = p.Y + u.Y * h, Z = p.Z + u.Z * h }
+            end
+            a.SetActorHiddenInGame = function(self, h) self.hidden = h end
+            a.GetCurrentMontage = function(self) self.looks = (self.looks or 0) + 1; return self.cur end
+            -- (attached, as the game seats a player: it moves with the car from where it was put)
+            a.K2_GetActorLocation = function(self)
+                local o, c = self.seat_off, self.parent and self.parent.at
+                if o and c then return { X = c.X + o.X, Y = c.Y + o.Y, Z = c.Z + o.Z } end
+                return self.placed or { X = 0, Y = 0, Z = 0 }
+            end
+            a.K2_SetActorLocationAndRotation = function(self, l, r, sweep, _, tele)
+                self.placed = l; self.placed_rot = r; self.sweep = sweep; self.tele = tele
+                local c = self.parent and self.parent.at
+                self.seat_off = c and { X = l.X - c.X, Y = l.Y - c.Y, Z = l.Z - c.Z } or nil
+            end
+            a.GetAttachParentActor = function(self) self.seat_reads = (self.seat_reads or 0) + 1; return self.parent end
+            return a
+        end
+        PLAYER = rider(-90)
+        PLAYER.no_bone = true   -- (until the height's own checks: most cars here have a fake's axes that aren't unit vectors)
+        PLAYER.K2_GetActorLocation = function(self)
+            local o, c = self.seat_off, self.parent and self.parent.at
+            if o and c then return { X = c.X + o.X, Y = c.Y + o.Y, Z = c.Z + o.Z } end
+            return { X = 1000, Y = 0, Z = 50 }
+        end
+        PLAYER.K2_GetActorRotation = function() return { Pitch = -12, Yaw = PYAW or 90, Roll = 7 } end
+        PLAYER.K2_SetActorRotation = function(self, r, tele) self.stood = r; self.stood_tele = tele end
+        PLAYER.ResetVehicleCameraArmLength = function(self) self.arm_reset = true end
+        PLAYER.VehicleInteraction = function(self, inside, car) self.inside, self.inside_car = inside, car end
+        PLAYER.VehicleDrivingComponent = { Vehicle = "stale" }
+        PC = obj({ takes = 0, SetViewTargetWithBlend = function(self, t, blend, fn, exp, lock)
+                       self.target, self.blend, self.blend_fn, self.blend_exp, self.lock = t, blend, fn, exp, lock; self.takes = self.takes + 1 end,
+                   GetViewTarget = function(self) return self.target end })
+        PC.target = PLAYER
+        PLAYER.Controller = PC
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return WORLD end,
+            on_tick = function(f) TICKS[#TICKS + 1] = f end, key_down = function(k) return KEYS[k] == true end,
+            keybind = function(name, mods, fn) BINDS[#BINDS + 1] = { name = name, mods = mods, fn = fn } end }
+        util = require("mirror.util")
+        util.find = function(p) return lookup(p) end
+        util.cdo = function(p) return lookup(p) end
+        WALKS = 0
+        util.instances = function() WALKS = WALKS + 1; return CARTS end
+        bike = require("mirror.hoverbike")
+        flight = require("mirror.fpvflight")
+        bike.init({})
+        function tick(n, dt) dt = dt or 1 / 60; for i = 1, (n or 1) do NOW = NOW + dt; for _, f in ipairs(TICKS) do f(dt) end end end
+        function model_on(c) for _, a in ipairs(SPAWNED) do if a.pose and a.parent == c.Mesh and a:IsValid() then return a end end end
+        function settings(c) return c.BP_JigMultiplayer.ContainersSettings[1] end
+        function cols(c) return settings(c)["Columns_4_A32AA159420F47D951669C9636084F9D"] end
+        function rows(c) return settings(c)["Rows_6_E1A84D8A441B19CA3C38D0BC029805A1"] end
+        -- the keys in numbers, in the air: no game involved
+        function fresh() local s = flight.new(0, 0, 10000, 0, 4711); s.thrust = 0.38; s.motor_mean = 0.38; return s end
+        function run(st, keys, secs, rec)
+            local t, dt = 0, 1 / 60
+            while t < secs do
+                flight.step(st, bike.command(st, keys, false), dt, bike.P)
+                t = t + dt
+                if rec then rec(t, st) end
+            end
+        end
+        function kmh(st) return flight.speed(st) * 0.036 end
+    """)
+    # --- the numbers
+    L.execute("s = fresh(); run(s, {}, 10)")
+    check(L.eval("math.abs(s.pos[3] - 10000) < 20 and kmh(s) < 1"), "hands off it holds its height and stays put")
+    L.execute("s = fresh(); run(s, { fwd = true }, 25)")
+    check(L.eval("kmh(s) > 60 and kmh(s) < 100 and s.pos[1] > 0"), "W flies it forward at a cruise (%.1f km/h)" % L.eval("kmh(s)"))
+    check(L.eval("math.abs(s.pos[3] - 10000) < 300"), "W keeps its height (%.0f)" % L.eval("s.pos[3]"))
+    L.execute("s = fresh(); run(s, { fwd = true, boost = true }, 25)")
+    check(L.eval("kmh(s) > 100 and kmh(s) < 150"), "Left Shift is faster, within reason (%.1f km/h)" % L.eval("kmh(s)"))
+    check(L.eval("math.abs(s.pos[3] - 10000) < 500"), "flat out it keeps its height (%.0f)" % L.eval("s.pos[3]"))
+    L.execute("run(s, {}, 15)")
+    check(L.eval("kmh(s) < 5"), "let go, it brakes itself to a stop (%.1f km/h after 15 s)" % L.eval("kmh(s)"))
+    L.execute("s = fresh(); run(s, { back = true }, 10)")
+    check(L.eval("s.pos[1] < 0"), "S flies it backward")
+    L.execute("s = fresh(); run(s, { right = true }, 1)")
+    check(L.eval("select(2, flight.rotator(s.f, s.r, s.u)) > 20"), "D turns it right")
+    L.execute("s = fresh(); run(s, { left = true }, 1)")
+    check(L.eval("select(2, flight.rotator(s.f, s.r, s.u)) < -20"), "A turns it left")
+    L.execute("s = fresh(); run(s, { right = true }, 5)")
+    check(L.eval("math.abs(s.pos[3] - 10000) < 300"), "turning on the spot doesn't climb (a yaw too weak for the motors did)")
+    L.execute("s = fresh(); run(s, { fwd = true }, 20); run(s, { fwd = true, right = true }, 1); fast = bike.command(s, { right = true }, false).yaw")
+    check(L.eval("fast > 0 and fast < 0.7"), "at speed A / D turn it wider (%.2f of the stick)" % L.eval("fast"))
+    L.execute("s = fresh(); run(s, { up = true }, 6)")
+    check(L.eval("s.vel[3] > 700"), "Space climbs")
+    L.execute("s = fresh(); run(s, { down = true }, 6)")
+    check(L.eval("s.vel[3] < -500 and s.vel[3] > -900"), "Left Ctrl sinks at a set rate, it doesn't fall")
+    L.execute("s = fresh(); c = bike.command(s, { fwd = true }, true)")
+    check(L.eval("c.thr == 0 and c.pitch == 0"), "landed, the keys don't lean it or lift it; only Space does")
+    L.execute("c = bike.command(s, { up = true }, true)")
+    check(L.eval("c.thr > 0"), "landed, Space lifts it")
+    check(L.eval("bike.P.battery == 0"), "no battery runs out on it")
+    # the keys' numbers exactly, for a nose that isn't along an axis
+    L.execute(r"""
+        function near(a, b) return math.abs(a - b) < 1e-6 end
+        s = fresh(); s.f, s.r, s.u = { 0.6, 0.8, 0 }, { -0.8, 0.6, 0 }, { 0, 0, 1 }; s.vel = { 100, 200, 50 }
+        c = bike.command(s, {}, false); d = bike.command(s, { right = true }, false)
+    """)
+    check(L.eval("near(c.pitch, -0.11) and near(c.roll, -0.02) and c.yaw == 0"), "let go, it leans against what it does along its nose and to its side")
+    check(L.eval("near(d.roll, 0.33) and near(d.yaw, 1 / (1 + 220 / 1500))"), "D banks and turns on top of that")
+    L.execute("s = fresh(); s.f = { 0, 0, 1 }; s.vel = { 100, 0, 0 }; c = bike.command(s, {}, false)")
+    check(L.eval("near(c.pitch, -0.05)"), "its nose straight up, the brake still has a direction")
+    L.execute("""s = fresh(); y = {}; for i, v in ipairs({ 0, 1500, -1500 }) do s.vel = { v, 0, 0 }; y[i] = bike.command(s, { left = true }, false).yaw end""")
+    check(L.eval("near(y[1], -1) and near(y[2], -0.5) and near(y[3], -0.5)"), "A at a stop is the full stick, half of it at 1500 cm/s either way")
+    L.execute("s = fresh(); p = {}; for i, k in ipairs({ { fwd = true }, { fwd = true, boost = true }, { back = true }, { fwd = true, back = true } }) do p[i] = bike.command(s, k, false).pitch end")
+    check(L.eval("near(p[1], 0.65) and near(p[2], 1) and near(p[3], -0.5) and near(p[4], 0.15)"), "W, W with Shift, S, and W with S lean as set")
+    L.execute("s = fresh(); s.vel = { 0, 0, -5000 }; c = bike.command(s, {}, false)")
+    check(L.eval("c.thr == 1"), "falling fast it asks for all the thrust and no more")
+    L.execute("""s = fresh(); s.u = { 0.48, 0.36, 0.8 }; s.vel = { 0, 1000, 0 }; t1 = bike.command(s, {}, false).thr
+                 s.vel = { 0, -1000, 0 }; t2 = bike.command(s, {}, false).thr""")
+    check(L.eval("t1 > t2"), "air coming in under the props takes thrust away, so it asks for more")
+    L.execute("s = fresh(); c = bike.command(s, { right = true, fwd = true, down = true }, true)")
+    check(L.eval("c.thr == 0 and c.roll == 0 and c.pitch == 0 and c.yaw == 0"), "landed, no key but Space does anything")
+    # --- wearing it
+    L.execute("B = cart(78); G = cart(2); CARTS = { B, G }; tick(70)")
+    check(L.eval("model_on(B) ~= nil and B.Mesh.hidden == true"), "a cart marked 78 wears the bike, its own mesh hidden")
+    check(L.eval("model_on(B).pose.sk == SK and model_on(B).pose.cls == POSE"), "on a poseable component with SK_HoverBike")
+    check(L.eval("bike._stats.dressed == 1"), "counted once")
+    L.execute("m = model_on(B); ms = m.StaticMeshComponent")
+    check(L.eval("m.rules[1] == 0 and m.rules[2] == 0 and m.rules[3] == 0 and m.rules[4] == false"), "attached keeping relative, not welded")
+    check(L.eval("ms.rel_l.X == 0 and ms.rel_l.Y == 0 and ms.rel_l.Z == 0 and ms.rel_r.Pitch == 0 and ms.rel_r.Yaw == 0 and ms.rel_r.Roll == 0"), "sitting exactly on the cart's origin")
+    check(L.eval("m.spawned_rot.Pitch == 0 and m.spawned_rot.Yaw == 0 and m.spawned_rot.Roll == 0"), "spawned level")
+    check(L.eval("m.pose.manual == false and m.pose.deferred == false and m.pose.reinit == true"), "its component attached and finished at once, the pose set up for the new mesh")
+    check(L.eval("B.Mesh.kids == false"), "hiding the cart's mesh doesn't hide what's attached to it (the model is)")
+    check(L.eval("model_on(G) == nil and G.Mesh.hidden == false and G['EngineOn?'] == true"), "a plain golf cart stays one")
+    check(L.eval("B['EngineOn?'] == false and B.bCanBeDamaged == false and B.VehicleHealthComponent.CurrentHealth == 100"),
+          "the game's driving is off and it doesn't wear out")
+    check(L.eval("B.Name == 'Hover Bike'"), "its interact panel says Hover Bike")
+    check(L.eval("B.FuelComponent.CurrentFuel == 50"), "its tank stays full")
+    L.execute("n = #SPAWNED; tick(120)")
+    check(L.eval("#SPAWNED == n"), "dressed once")
+    check(L.eval("B.SmokeFX.active == false and B.SmokeFX.offs == 1 and B.FireFX.offs == 1"), "its smoke and fire are put out, once")
+    check(L.eval("B.FuelWidget.bHiddenInGame == true and B.FuelWidget.sets == 1 and B.RepairWidget.sets == 1 and B.FuelWidget.kids == false"), "its fuel and repair widgets are hidden, once")
+    L.execute("w0 = WALKS; tick(60); w1 = WALKS; r0 = PLAYER.seat_reads or 0; tick(60); r1 = PLAYER.seat_reads")
+    check(L.eval("w1 - w0 <= 2"), "the carts are walked once a second, not every frame (%d in 60 frames)" % L.eval("w1 - w0"))
+    check(L.eval("r1 - r0 <= 6"), "the seat is looked at five times a second, not every frame (%d in 60 frames)" % L.eval("r1 - r0"))
+    L.execute("B.bHidden = true; tick(70); h1 = model_on(B).hidden; B.bHidden = false; tick(70); h2 = model_on(B).hidden")
+    check(L.eval("h1 == true and h2 == false"), "the model hides with its cart")
+    # the model not there yet, or found but still loading: not used
+    L.execute("HAVE_MESH = false; X = cart(78); CARTS[#CARTS + 1] = X; l = #LOADS; tick(70)")
+    check(L.eval("model_on(X) == nil and #LOADS > l and X.Mesh.hidden == false and X['EngineOn?'] == true"), "without the model: asked for, the cart left as it is")
+    check(L.eval("bike._stats.no_model > 0"), "counted")
+    L.execute("l = #LOADS; tick(12 * 60)")
+    check(L.eval("#LOADS - l >= 2 and #LOADS - l <= 3"), "asked for again every 5 s, not every look (%d in 12 s)" % L.eval("#LOADS - l"))
+    L.execute("HAVE_MESH = true; BUSY = true; SK.HasAnyFlags = function(_, f) FLAGS = f; return BUSY end; tick(70)")
+    check(L.eval("model_on(X) == nil"), "a model found but still loading isn't drawn")
+    check(L.eval("FLAGS == 15"), "looked at by all four load bits")
+    L.execute("BUSY = false; tick(70)")
+    check(L.eval("model_on(X) ~= nil"), "dressed once it has loaded")
+    # a model without its prop bones isn't used, and isn't left lying about
+    L.execute("NO_BONE = true; W = cart(78); CARTS[#CARTS + 1] = W; tick(70); NO_BONE = nil; last = SPAWNED[#SPAWNED]; CARTS[#CARTS] = nil")
+    check(L.eval("model_on(W) == nil and W.Mesh.hidden == false and W['EngineOn?'] == true"), "a model missing a prop bone: the cart left as it is")
+    check(L.eval("last:IsValid() == false"), "and the model's actor removed again")
+    # --- 1000 slots
+    check(L.eval("cols(B) * rows(B) == 1000"), "its trunk's settings say 1000 slots")
+    check(L.eval("B.BP_JigMultiplayer.resets == 1 and B.BP_JigMultiplayer.builds == 1"), "an empty trunk is built at that size, once")
+    check(L.eval("B.BP_JigMultiplayer.did == 'clear weight build '"), "the old grid and its weight row cleared first (%s)" % L.eval("B.BP_JigMultiplayer.did"))
+    check(L.eval("#holds(B) == 1 and holds(B)[1][JC] * holds(B)[1][JR] == 1000"),
+          "so there is one grid, of 1000 slots, and no old one hidden behind it (%d)" % L.eval("#holds(B)"))
+    check(L.eval("cols(G) == 4 and G.BP_JigMultiplayer.builds == 0"), "a plain cart's trunk isn't touched")
+    check(L.eval("settings(B)['IsEquipTo?_17_A70EBD1B42E398B0EB14E0B352CCC0A2'] == false"), "the grid isn't something worn")
+    L.execute("""g0 = bike._stats.grid; Y = cart(78); Y.FuelComponent.Empty = true; Y.BP_JigMultiplayer.MainJigContainers.list = { grid(4, 6, 1) }
+                 settings(Y)[bike._consts.C_NAME] = 'Box'; CARTS[#CARTS + 1] = Y; tick(70)""")
+    check(L.eval("cols(Y) * rows(Y) == 1000 and Y.BP_JigMultiplayer.resets == 0 and Y.BP_JigMultiplayer.did == '' and holds(Y)[1][JC] == 4"),
+          "a trunk holding items gets the size but is never rebuilt (a rebuild would lose them)")
+    check(L.eval("settings(Y)[bike._consts.C_NAME] == 'Box'"), "the grid keeps the name it had")
+    check(L.eval("bike._stats.grid == g0 + 1"), "counted once")
+    check(L.eval("Y.FuelComponent.Empty == false"), "and a tank marked empty isn't")
+    # a saved bike: the save kept its grid, the settings came back as the cart's. Twice over, as two reloads would
+    L.execute("""function reloaded(n)
+                     local c = cart(78)
+                     SAVED_GRID = grid(10, 100, n)
+                     c.BP_JigMultiplayer.MainJigContainers.list = { SAVED_GRID }
+                     CARTS[#CARTS + 1] = c
+                     tick(70)
+                     return c
+                 end
+                 S1 = reloaded(0); G1 = SAVED_GRID; S2 = reloaded(5); G2 = SAVED_GRID""")
+    for name, what in (("S1", "empty"), ("S2", "holding items")):
+        check(L.eval("%s.BP_JigMultiplayer.did == '' and #holds(%s) == 1" % (name, name)),
+              "a saved bike's grid, %s, is left as the save put it back: no second grid" % what)
+        check(L.eval("cols(%s) * rows(%s) == 1000" % (name, name)), "its settings get the size all the same")
+    check(L.eval("holds(S1)[1] == G1 and holds(S2)[1] == G2"), "the very grid the save gave it")
+    L.execute("""Z = cart(78); Z.BP_JigMultiplayer.MainJigContainers = nil; settings(Z)[bike._consts.C_NAME] = nil; CARTS[#CARTS + 1] = Z
+                 Z3 = cart(78); Z3.BP_JigMultiplayer.MainJigContainers.ForEach = function(_, fn) fn(1, { get = function() error('freed') end }) end; CARTS[#CARTS + 1] = Z3
+                 Z4 = cart(78); Z4.BP_JigMultiplayer.MainJigContainers.list[1][JI] = nil; CARTS[#CARTS + 1] = Z4
+                 Z5 = cart(78); Z5.BP_JigMultiplayer.MainJigContainers.GetArrayNum = function() return 2 end; CARTS[#CARTS + 1] = Z5
+                 Z6 = cart(78); Z6.BP_JigMultiplayer.MainJigContainers.ForEach = function() error('no walk') end; CARTS[#CARTS + 1] = Z6
+                 Z8 = cart(78); Z8.BP_JigMultiplayer.MainJigContainers.ForEach = function(self, fn)
+                     fn(1, { get = function() return self.list[1] end }); error('late')
+                 end; CARTS[#CARTS + 1] = Z8
+                 tick(70)""")
+    for name, what in (("Z", "no containers to read"), ("Z3", "a container that can't be read"), ("Z4", "a container whose items can't be read"),
+                       ("Z5", "fewer containers walked than it says it has"), ("Z6", "a walk that fails"), ("Z8", "a walk that fails at its end")):
+        check(L.eval("%s.BP_JigMultiplayer.resets == 0 and %s.BP_JigMultiplayer.did == ''" % (name, name)), "a trunk with %s isn't rebuilt (it may be full)" % what)
+    check(L.eval("settings(Z)[bike._consts.C_NAME] == 'Trunk'"), "a grid with no name gets one")
+    # empty, of the right width or height only: not the bike's grid yet
+    L.execute("""W1 = cart(78); W1.BP_JigMultiplayer.MainJigContainers.list = { grid(10, 6) }; CARTS[#CARTS + 1] = W1
+                 W2 = cart(78); W2.BP_JigMultiplayer.MainJigContainers.list = { grid(4, 100) }; CARTS[#CARTS + 1] = W2; tick(70)""")
+    check(L.eval("W1.BP_JigMultiplayer.builds == 1 and W2.BP_JigMultiplayer.builds == 1 and holds(W1)[1][JR] == 100 and holds(W2)[1][JC] == 10"),
+          "an empty grid right in one dimension only is built at the full size")
+    # the game's clear not there: nothing is built on top of the old grid
+    L.execute("Z7 = cart(78); Z7.BP_JigMultiplayer.ClearContainer = function() error('no such function') end; CARTS[#CARTS + 1] = Z7; tick(70)")
+    check(L.eval("Z7.BP_JigMultiplayer.builds == 0 and #holds(Z7) == 1"), "if the clear fails nothing is built on top of the old grid")
+    L.execute("Z2 = cart(78); settings(Z2)[bike._consts.C_COLS] = 10; CARTS[#CARTS + 1] = Z2; tick(70)")
+    check(L.eval("cols(Z2) == 10 and rows(Z2) == 100"), "a grid with only one side right is set too")
+    L.execute("CARTS = { B, G }; tick(70)")
+    # --- someone else sits on it
+    # (user 2026-11-04: "nobody can operate the hoverbike BUT me unless I unlock it for everyone")
+    L.execute("OWNER = false; n = #NOTES; t0 = bike._stats.told; PLAYER.placed = nil; PLAYER.parent = B; tick(30)")
+    check(L.eval("#NOTES == n + 1 and NOTES[#NOTES]:find('locked') ~= nil and NOTES[#NOTES]:find('owner') ~= nil"), "someone else sat on it is told once it's locked")
+    check(L.eval("bike._stats.told == t0 + 1"), "and that's counted")
+    check(L.eval("B.Mesh.sim == true and bike._flight() == nil and PLAYER.placed == nil"), "it doesn't fly, and they aren't seated on it")
+    check(L.eval("PLAYER.parent == nil and B.exits == 1"), "they're put off it, the game's way: the cart under it would drive for them")
+    check(L.eval("PLAYER.arm_reset == true and PLAYER.inside == false and PLAYER.inside_car == B and PLAYER.VehicleDrivingComponent.Vehicle == nil"), "with the player BP's whole exit")
+    check(L.eval("bike._stats.put_off == 1"), "counted")
+    L.execute("REFUSE_EXIT = true; PLAYER.parent = B; e0 = B.exits; n = #NOTES; tick(30); e1 = B.exits; tick(150); e2 = B.exits")
+    check(L.eval("e1 == e0 + 1 and e2 - e1 >= 2 and e2 - e1 <= 3"), "the game refusing: tried about once a second (%d in 2.5 s)" % L.eval("e2 - e1"))
+    check(L.eval("#NOTES == n + 1"), "told once all the same")
+    check(L.eval("B.VehicleMovementComponent.th == 0 and B.VehicleMovementComponent.st == 0 and B.VehicleMovementComponent.hb == true"), "the brakes on meanwhile")
+    check(L.eval("bike._flight() == nil"), "and still no flight")
+    L.execute("REFUSE_EXIT = false; tick(70)")
+    check(L.eval("PLAYER.parent == nil"), "the way clear, they're off")
+    L.execute("RIDE = 'car1'; e0 = B.exits; PLAYER.parent = B; tick(70); stayed = PLAYER.parent == B; RIDE = nil; PLAYER.parent = nil; tick(30)")
+    check(L.eval("stayed and B.exits == e0"), "riding along with whoever drives is no operating it: they stay")
+    # --- riding along: the seat and the flying stay the driver's
+    L.execute("OWNER = true; RIDE = 'car1'; PLAYER.placed = nil; PLAYER.parent = B; tick(30)")
+    check(L.eval("bike._flight() == nil and B.Mesh.sim == true and PLAYER.placed == nil"), "riding along, it isn't flown or sat on the rider's seat")
+    L.execute("RIDE = nil; PEER_CAR = B; tick(30)")
+    check(L.eval("bike._flight() == nil and B.Mesh.sim == true"), "nor when the other player already drives it")
+    L.execute("PEER_CAR = nil; PLAYER.parent = nil; tick(30)")
+    # --- its owner flies it, from the ground
+    L.execute("GROUND_Z = -2; PLAYS = {}; n = #NOTES; PLAYER.parent = B; tick(30)")
+    check(L.eval("bike._flight() ~= nil"), "its owner sat on it flies it")
+    check(L.eval("bike._flight().radio == nil"), "with no FPVDrone next to this mod there's no remote, and the keys below fly it")
+    check(L.eval("B.Mesh.sim == false and B.collide == false"), "while flown it's no physics body")
+    check(L.eval("#NOTES == n + 1 and NOTES[#NOTES]:find('Space') ~= nil"), "they're told the keys")
+    check(L.eval("bike._flight().landed == true and B.at.Z == 0"), "on the ground it stays there until told")
+    check(L.eval("PLAYS[#PLAYS] == SIT"), "landed the rider has the sitting pose")
+    # the rider's Root on the seat: the capsule offset by the mesh's own offset in it
+    check(L.eval("math.abs(PLAYER.placed.X - -34.95) < 0.01 and math.abs(PLAYER.placed.Z - (36.84 + 90)) < 0.01"),
+          "the capsule is put so the mesh's Root lands on the seat (%s, %s)" % (L.eval("PLAYER.placed.X"), L.eval("PLAYER.placed.Z")))
+    L.execute("n = #PLAYS; l0 = bike._stats.landed; KEYS.SpaceBar = true; tick(120)")
+    check(L.eval("bike._flight().landed == false and B.at.Z > 50"), "Space lifts it, and the actor goes where the flight goes (%.0f)" % L.eval("B.at.Z"))
+    check(L.eval("#PLAYS == n + 1 and bike._stats.landed == l0"),
+          "while the motors spool up it doesn't land again and again: one animation change (%d), no landing (%d)" % (L.eval("#PLAYS - n"), L.eval("bike._stats.landed - l0")))
+    check(L.eval("PLAYS[#PLAYS] == DRIVE"), "in the air the rider has the driving animation")
+    check(L.eval("B.Mesh.ComponentVelocity ~= nil and B.Mesh.ComponentVelocity.Z > 0"), "its speed is left where the driver's line reads it")
+    check(L.eval("model_on(B).pose.sets > 0"), "the props turn")
+    L.execute("""for _, x in pairs(bike._dressed()) do if x.car == B then d = x end end
+                 fl, fr = d.angle[1], d.angle[2]; tick(1)
+                 dl = (d.angle[1] - fl + 180) % 360 - 180; dr = (d.angle[2] - fr + 180) % 360 - 180; KEYS.SpaceBar = false""")
+    check(L.eval("dl ~= 0 and dr ~= 0 and (dl > 0) ~= (dr > 0)"), "neighbouring props turn opposite ways (%.1f, %.1f)" % (L.eval("dl"), L.eval("dr")))
+    # a frame's prop step never looks backward
+    check(L.eval("bike._consts.STEP_MAX <= 45"), "a prop's step stays under what looks backward on 4 blades")
+    # an emptied slot is played again; one still holding it isn't
+    L.execute("n = #PLAYS; lk = PLAYER.looks or 0; tick(60)")
+    check(L.eval("#PLAYS == n"), "the animation isn't restarted while it plays")
+    check(L.eval("PLAYER.looks - lk <= 5 and PLAYER.looks > lk"), "the slot is looked at a few times a second, not every frame (%d in 60)" % L.eval("PLAYER.looks - lk"))
+    L.execute("PLAYER.cur = nil; tick(60)")
+    check(L.eval("#PLAYS == n + 1"), "an emptied slot is played again")
+    # --- into a wall: it doesn't go through
+    L.execute("""KEYS.W = true; WALL_X = bike._flight().st.pos[1] + 500; tick(600)""")
+    check(L.eval("B.at.X < WALL_X"), "W into a wall: it stops at the wall (%.0f, wall at %.0f)" % (L.eval("B.at.X"), L.eval("WALL_X")))
+    L.execute("KEYS.W = false; WALL_X = nil; tick(60)")
+    # --- steep ground isn't landed on, and isn't gone through
+    L.execute("""GROUND_Z = bike._flight().st.pos[3] - 100; GROUND_N = { X = 0.8, Y = 0, Z = 0.6 }; KEYS.LeftControl = true; tick(120)""")
+    check(L.eval("bike._flight().landed == false and B.at.Z >= GROUND_Z - 20"), "a surface too steep to stand on isn't landed on or gone through")
+    L.execute("GROUND_N = nil; tick(240)")
+    # --- down
+    check(L.eval("bike._flight().landed == true and B.at.Z >= GROUND_Z - 20"), "Left Ctrl brings it down and it lands (%.0f)" % L.eval("B.at.Z"))
+    check(L.eval("bike._stats.landed == 1"), "counted as a landing")
+    check(L.eval("bike._flight().st.vel[1] == 0 and bike._flight().st.vel[2] == 0 and bike._flight().st.vel[3] == 0"), "landed it has no speed")
+    L.execute("KEYS.LeftControl = false; tick(60); x, y, z = B.at.X, B.at.Y, B.at.Z; tick(60)")
+    check(L.eval("B.at.X == x and B.at.Y == y and B.at.Z == z"), "and stays there")
+    check(L.eval("bike._flight().st.vel[1] == 0 and bike._flight().st.vel[2] == 0 and bike._flight().st.vel[3] == 0"), "with no speed building up")
+    # --- getting off in the air: back to the game's physics, moving as it was
+    L.execute("KEYS.SpaceBar = true; tick(60); KEYS.SpaceBar = false; KEYS.W = true; KEYS.D = true; tick(120); st = bike._flight().st")
+    check(L.eval("B.at.X == st.pos[1] and B.at.Y == st.pos[2] and B.at.Z == st.pos[3]"), "the actor is where the flight is, on every axis")
+    check(L.eval("B.sweep == false and B.tele == true"), "moved without a sweep, as a teleport (it does its own collision)")
+    check(L.eval("B.Mesh.ComponentVelocity.X == st.vel[1] and B.Mesh.ComponentVelocity.Y == st.vel[2] and B.Mesh.ComponentVelocity.Z == st.vel[3]"),
+          "its speed is left for the driver's line on every axis")
+    check(L.eval("bike.status():find('FLYING') ~= nil"), "the status line says it's flying")
+    # pressed in the air: the flight would put it straight back, so it isn't \"brought\"
+    L.execute("b0 = bike._stats.brought; x = st.pos[1]; " + 'BINDS[1]' + ".fn(); tick(1)")
+    check(L.eval("bike._stats.brought == b0 and NOTES[#NOTES]:find('already') ~= nil and math.abs(B.at.X - x) < 200"), "the make key while flying says you're on it, and leaves it")
+    L.execute("KEYS.W = false; KEYS.D = false; n = #STOPS; PLAYER.parent = nil; tick(30)")
+    check(L.eval("bike._flight() == nil and B.Mesh.sim == true and B.collide == true"), "off it, it is the game's physics body again")
+    check(L.eval("B.Mesh.lin ~= nil and B.Mesh.lin.X == st.vel[1] and B.Mesh.lin.Y == st.vel[2] and B.Mesh.lin.Z == st.vel[3]"), "moving as it was, on every axis")
+    check(L.eval("B.Mesh.ang.X == 0 and B.Mesh.ang.Y == 0 and B.Mesh.ang.Z == 0"), "not spinning")
+    check(L.eval("B.Mesh.lin_add == false and B.Mesh.ang_add == false"), "set, not added to what it had")
+    L.execute("cnt = 0; for _ in pairs(bike._dressed()) do cnt = cnt + 1 end")
+    check(L.eval("bike.status():find('FLYING') == nil and bike.status():find('^bikes ' .. cnt .. ' ') ~= nil"), "and the status line says it isn't, with how many bikes (%s)" % L.eval("bike.status()"))
+    check(L.eval("PLAYER.stood_tele == true"), "stood up as a teleport")
+    check(L.eval("#STOPS == n + 1"), "and the rider's animation stops")
+    check(L.eval("PLAYER.stood ~= nil and PLAYER.stood.Pitch == 0 and PLAYER.stood.Roll == 0 and PLAYER.stood.Yaw == 90"),
+          "and the rider stands up straight, however the bike leaned")
+    # --- the other player flies it here
+    L.execute("GHOST = rider(-88); GHOST.parent = B; PEER_CAR = B; PLAYS = {}; s0 = model_on(B).pose.sets; tick(30)")
+    check(L.eval("PLAYS[#PLAYS] == DRIVE and GHOST.placed ~= nil"), "the other player's ghost is on the seat with the driving animation")
+    check(L.eval("model_on(B).pose.sets > s0"), "and the props turn on their bike")
+    L.execute("n = #STOPS; PEER_CAR = nil; GHOST.parent = nil; tick(30)")
+    check(L.eval("#STOPS == n + 1"), "their animation stops when they leave")
+    L.execute("GHOST = nil")
+    # --- making one (no bike left in this world)
+    L.execute("for _, x in pairs(bike._dressed()) do x.car.IsValid = function() return false end end; CARTS = {}; tick(70)")
+    bind = 'BINDS[1]'
+    check(L.eval(bind + ".name == 'V' and #" + bind + ".mods == 2"), "the key is Ctrl+Shift+V")
+    L.execute("OWNER = false; CARTS = {}; n = #SPAWNED; " + bind + ".fn(); tick(120)")
+    check(L.eval("#CARTS == 0"), "nobody but the owner makes one")
+    L.execute("OWNER = true; ROLE = 'guest'; n = #NOTES; " + bind + ".fn(); tick(5)")
+    check(L.eval("#CARTS == 0 and #NOTES == n + 1 and NOTES[#NOTES]:find('host') ~= nil"), "a guest makes none, and is told why")
+    L.execute("ROLE = 'host'; HAVE_CART = false; l = #LOADS; " + bind + ".fn(); tick(5)")
+    check(L.eval("#CARTS == 0 and #LOADS > l"), "the cart's class not loaded: asked for, nothing made yet")
+    L.execute("HAVE_CART = true; tick(120)")
+    check(L.eval("#CARTS == 1 and CARTS[1].VehicleColor == 78"), "then one marked cart is made")
+    check(L.eval("model_on(CARTS[1]) ~= nil"), "and wears the bike")
+    check(L.eval("NOTES[#NOTES]:find('ready') ~= nil"), "and they're told")
+    check(L.eval("math.abs(CARTS[1].spawned_at.X - 1000) < 1e-6 and math.abs(CARTS[1].spawned_at.Y - 450) < 1e-6 and CARTS[1].spawned_at.Z == 110"), "in front of the player")
+    check(L.eval("CARTS[1].spawned_rot.Pitch == 0 and CARTS[1].spawned_rot.Yaw == 90 and CARTS[1].spawned_rot.Roll == 0"), "level, facing the way they face")
+    # a new cart whose trunk the game's start-up already filled still gets its 1000 slots
+    L.execute("""for _, x in pairs(bike._dressed()) do x.car.IsValid = function() return false end end; CARTS = {}; tick(70)
+                 ORIG = WORLD.SpawnActor; WORLD.SpawnActor = function(self, c, at, r)
+                     local a = ORIG(self, c, at, r)
+                     if c == CART_CLS then a.BP_JigMultiplayer.MainJigContainers.list = { grid(4, 6, 1) } end
+                     return a
+                 end; """ + bind + """.fn(); tick(120)""")
+    check(L.eval("#CARTS == 1 and cols(CARTS[1]) * rows(CARTS[1]) == 1000 and CARTS[1].BP_JigMultiplayer.resets == 1"),
+          "a bike just made is built at 1000 slots whatever the game's start-up put in its trunk")
+    check(L.eval("#holds(CARTS[1]) == 1 and holds(CARTS[1])[1][JC] == 10"), "with only that grid, what the start-up rolled gone with the old one")
+    L.execute("WORLD.SpawnActor = ORIG")
+    check(L.eval("bike._stats.made == 2"), "the two made are counted")
+    L.execute("PYAW = 0; N = CARTS[1]; N.at = { X = 9e5, Y = 9e5, Z = 0 }; N.Mesh.lin = { X = 9, Y = 9, Z = 9 }; " + bind + ".fn(); tick(5); PYAW = nil")
+    check(L.eval("#CARTS == 1 and N.at.X == 1450 and N.at.Y == 0 and N.at.Z == 110"), "pressed again it brings that bike instead of making a second (nothing in a lost one is lost)")
+    check(L.eval("N.rot.Pitch == 0 and N.rot.Yaw == 0 and N.rot.Roll == 0"), "level, facing the way they face")
+    check(L.eval("N.Mesh.lin.X == 0 and N.Mesh.lin.Y == 0 and N.Mesh.lin.Z == 0 and N.Mesh.lin_add == false"), "and no longer moving")
+    check(L.eval("N.sweep == false and N.tele == true"), "moved without a sweep, as a teleport")
+    check(L.eval("bike._stats.brought == 1 and NOTES[#NOTES]:find('came to you') ~= nil"), "they're told, and it's counted")
+    # (kit 2026-11-04: pressed right after a load, the saved bike not dressed yet, the key made a second one)
+    L.execute("DR = bike._dressed(); SAVED_D = {}; for k, v in pairs(DR) do SAVED_D[k] = v; DR[k] = nil end; "
+              "N.at = { X = 9e5, Y = 9e5, Z = 0 }; PYAW = 0; want = bike.make(); bike._make_now(); PYAW = nil; "
+              "for k, v in pairs(SAVED_D) do DR[k] = v end")
+    check(L.eval("#CARTS == 1 and N.at.X == 1450 and bike._stats.brought == 2"), "a saved bike not dressed yet is brought, no second one made")
+    # --- a mark lost; a trailer from an old save
+    L.execute("n = 0; N.VehicleColor = 2; tick(70)")
+    check(L.eval("model_on(N) == nil and N.Mesh.hidden == false and N['EngineOn?'] == true"), "a cart that lost the mark is a golf cart again")
+    check(L.eval("N.FuelWidget.bHiddenInGame == false and N.RepairWidget.bHiddenInGame == false"), "its widgets back")
+    L.execute("T = cart(77); T.Mesh.hidden = true; T['EngineOn?'] = false; T.bCanBeDamaged = false; T.BP_JigMultiplayer.MainJigContainers.list = { grid(8, 20, 1) }; CARTS = { T }; tick(70)")
+    check(L.eval("T.VehicleColor == 0 and T.Mesh.hidden == false and T['EngineOn?'] == true and T.bCanBeDamaged == true and T.Name == 'Golf Cart'"),
+          "a cart saved as a trailer is a golf cart again")
+    check(L.eval("#holds(T) == 1 and holds(T)[1][JC] == 8 and T.BP_JigMultiplayer.resets == 0 and T.BP_JigMultiplayer.did == ''"), "with its trunk as it was")
+    # --- what keeps it out of the world, in exact numbers: where each line goes, and the speed left after a hit
+    L.execute(r"""
+        function is3(v, x, y, z) return near(v[1], x) and near(v[2], y) and near(v[3], z) end
+        function isv(v, x, y, z) return near(v.X, x) and near(v.Y, y) and near(v.Z, z) end
+        function hit_with(n) return function(a, b, out) out.OutHit = { ImpactNormal = n }; return true end end
+        function col(prev, pos, vel, fn, f, r)
+            local st = fresh()
+            st.pos, st.vel, st.f, st.r = pos, vel, f or { 1, 0, 0 }, r or { 0, 1, 0 }
+            TRACE_FN, TRACE_LOG = fn, {}
+            local back = bike.collide(PLAYER, st, prev)
+            TRACE_FN = nil
+            return st, back
+        end
+        UP = { X = 0, Y = 0, Z = 1 }
+        s, back = col({ 100, 200, 1000 }, { 110, 220, 990 }, { 5, 6, -7 }, hit_with(UP))
+        t = TRACE_LOG[1]
+    """)
+    check(L.eval("back == true and is3(s.vel, 0, 0, 0) and is3(s.pos, 110, 220, 1000)"), "flat ground: down on it, no speed left")
+    check(L.eval("isv(t.a, 100, 200, 1070) and isv(t.b, 100, 200, 975)"), "the line down runs from its body to just under where it would be")
+    check(L.eval("t.ch == 0 and t.cx == false and t.dbg == 0 and t.self_ign == true"), "on the Visibility channel, simple collision, nothing drawn, the rider ignored")
+    L.execute("s, back = col({ 0, 0, 1000 }, { 0, 0, 990 }, { 0, 0, -9 }, function() return true end)")
+    check(L.eval("back == true and is3(s.vel, 0, 0, 0)"), "a hit with no normal to read counts as ground")
+    L.execute("s, back = col({ 0, 0, 1000 }, { 0, 0, 990 }, { 0, 0, -1000 }, hit_with({ X = 0.8, Y = 0, Z = 0.6 }))")
+    check(L.eval("back == false and s.pos[3] == 1000 and is3(s.vel, 528, 0, -504)"), "too steep: it holds its height and slides off (%s)" % L.eval("s.vel[1]"))
+    L.execute("s, back = col({ 0, 0, 1000 }, { 0, 0, 990 }, { 0.5, 50, -200 }, hit_with({ X = 1, Y = 0, Z = 0 }))")
+    check(L.eval("is3(s.vel, 0.5, 50, -200)"), "already moving off a surface, its speed is left alone")
+    # the ceiling
+    L.execute("s, back = col({ 5, 6, 1000 }, { 5, 6, 1010 }, { 0, 0, 300 }, hit_with(UP)); t = TRACE_LOG[1]")
+    check(L.eval("back == false and s.pos[3] == 1000 and s.vel[3] == 0"), "a ceiling stops the climb")
+    check(L.eval("isv(t.a, 5, 6, 1165) and isv(t.b, 5, 6, 1190)"), "the line up runs from its top to just over where it would be")
+    L.execute("s = col({ 5, 6, 1000 }, { 5, 6, 1010 }, { 0, 0, -5 }, hit_with(UP))")
+    check(L.eval("s.vel[3] == -5"), "and leaves a speed that's already downward")
+    L.execute("s = col({ 5, 6, 1000 }, { 5, 6, 1010 }, { 0, 0, 300 }, function() return false end)")
+    check(L.eval("s.pos[3] == 1010 and s.vel[3] == 300"), "no ceiling, it climbs")
+    L.execute("s = col({ 5, 6, 1000 }, { 5, 6, 1000.5 }, { 0, 0, 30 }, function() return false end); n1 = #TRACE_LOG; s = col({ 5, 6, 1000 }, { 5, 6, 1000 }, { 0, 0, 0 }, function() return false end); n0 = #TRACE_LOG")
+    check(L.eval("n1 == 1 and n0 == 0"), "a small climb still looks up; no move at all looks nowhere")
+    # walls: the middle and four sides of the body, in its own space
+    L.execute(r"""
+        s, back = col({ 100, 200, 1000 }, { 120, 230, 1000 }, { -100, 50, -100 }, function(a, b, out)
+            if #TRACE_LOG == 4 then out.OutHit = { ImpactNormal = { X = 0.6, Y = 0, Z = 0.8 } }; return true end
+            return false
+        end)
+        k = (math.sqrt(1300) + 15) / math.sqrt(1300)
+    """)
+    check(L.eval("back == false and s.pos[1] == 100 and s.pos[2] == 200 and s.pos[3] == 1000"), "a wall on one side stops the move")
+    check(L.eval("is3(s.vel, 2.4, 45, 33.2)"), "what went into it mostly gone, the rest scraping along (%s, %s, %s)" % (L.eval("s.vel[1]"), L.eval("s.vel[2]"), L.eval("s.vel[3]")))
+    check(L.eval("#TRACE_LOG == 4"), "the first hit ends the look")
+    check(L.eval("isv(TRACE_LOG[1].a, 100, 200, 1070) and isv(TRACE_LOG[1].b, 100 + 20 * k, 200 + 30 * k, 1070)"), "the middle's line runs along the move and a little further")
+    check(L.eval("isv(TRACE_LOG[2].a, 210, 200, 1070) and isv(TRACE_LOG[3].a, -10, 200, 1070) and isv(TRACE_LOG[4].a, 100, 310, 1070)"), "the sides' lines start at its sides")
+    L.execute("s, back = col({ 0, 0, 1000 }, { 10, 0, 1000 }, { 1, 2, 3 }, function() return false end, { 0.6, 0.8, 0.1 }, { -0.8, 0.6, 0.2 })")
+    check(L.eval("back == false and s.pos[1] == 10 and is3(s.vel, 1, 2, 3)"), "no wall, it moves on")
+    check(L.eval("isv(TRACE_LOG[2].a, 66, 88, 1081) and isv(TRACE_LOG[4].a, -88, 66, 1092) and isv(TRACE_LOG[5].a, 88, -66, 1048)"), "turned and tilted, the lines turn with it")
+    L.execute("s = col({ 0, 0, 1000 }, { 10, 0, 1000 }, { 200, -200, 100 }, function() return true end)")
+    check(L.eval("is3(s.vel, -40, 40, -20)"), "a wall with no normal to read sends it straight back")
+    L.execute("s = col({ 0, 0, 1000 }, { 10, 0, 1000 }, { 0, 0, 0 }, function() return true end)")
+    check(L.eval("is3(s.vel, 0, 0, 0)"), "and leaves a bike with no speed as it is")
+    # a line that can't be cast is no hit (a hit here would stop the bike dead on nothing)
+    L.execute("s, back = col({ 0, 0, 1000 }, { 10, 0, 990 }, { 1, 2, 3 }, function() error('no') end)")
+    check(L.eval("back == false and s.pos[1] == 10 and s.pos[3] == 990"), "a trace that fails is no hit")
+    L.execute("""OLD_CDO = util.cdo; util.cdo = function() return nil end
+                 s, back = col({ 0, 0, 1000 }, { 10, 0, 990 }, { 1, 2, 3 }, hit_with(UP)); util.cdo = OLD_CDO""")
+    check(L.eval("back == false and s.pos[3] == 990"), "no trace library is no hit either")
+    # --- the seat on a tilted bike, and getting on at a height
+    L.execute(r"""
+        Q = cart(78); Q.at = { X = 100, Y = 200, Z = 300 }; Q.rot = { Pitch = 5, Yaw = 10, Roll = -3 }
+        Q.GetActorForwardVector = function() return { X = 0.48, Y = 0.64, Z = 0.6 } end
+        Q.GetActorUpVector = function() return { X = 0.1, Y = 0.2, Z = 0.9 } end
+        CARTS = { Q }; tick(70)
+        GROUND_Z = 270; OWNER = true; PLAYER.parent = Q; tick(30)
+        function seat(up) return 100 + 0.48 * -34.95 + 0.1 * up, 200 + 0.64 * -34.95 + 0.2 * up, 300 + 0.6 * -34.95 + 0.9 * up end
+    """)
+    L.execute("ex, ey, ez = seat(36.84 + 90)")
+    check(L.eval("isv(PLAYER.placed, ex, ey, ez)"), "the seat is along the bike's own forward and up")
+    check(L.eval("math.abs(PLAYER.placed_rot.Yaw - Q.rot.Yaw) < 1 and PLAYER.sweep == false and PLAYER.tele == true"), "the rider takes its rotation, no sweep, as a teleport")
+    L.execute("RL = PLAYER.Mesh.RelativeLocation; PLAYER.Mesh.RelativeLocation = nil; tick(30); PLAYER.Mesh.RelativeLocation = RL; ex, ey, ez = seat(36.84 + 82)")
+    check(L.eval("isv(PLAYER.placed, ex, ey, ez)"), "a mesh offset it can't read is taken as the usual one")
+    L.execute("""PLAYER.parent = nil; tick(30); Q.at = { X = 100, Y = 200, Z = 300 }; OWNER = true; f0 = bike._stats.flights; GROUND_Z = 250; PLAYER.parent = Q; tick(30)""")
+    check(L.eval("bike._flight() ~= nil and bike._flight().landed == false"), "got on over 40 cm above the ground: in the air")
+    check(L.eval("bike._stats.flights == f0 + 1"), "the flight is counted")
+    L.execute("""PLAYER.parent = nil; tick(30); Q.at = { X = 100, Y = 200, Z = 300 }; GROUND_Z = 270; PLAYER.parent = Q; tick(30)""")
+    check(L.eval("bike._flight() ~= nil and bike._flight().landed == true"), "within 40 cm: on the ground")
+    check(L.eval("Q.at.X == 100 and Q.at.Y == 200 and Q.at.Z == 300"), "and stays exactly where it stood")
+    L.execute("PLAYER.parent = nil; tick(30); GROUND_Z = -1e9")
+    # a car call that fails counts as nobody driving: the owner still flies, a ghost isn't seated
+    L.execute("PEER_RAISE = true; PLAYER.parent = Q; tick(30)")
+    check(L.eval("bike._flight() ~= nil"), "the vehicle sync failing doesn't stop the owner flying")
+    # (tick(600): the motors of the flight just ended have run down)
+    L.execute("PLAYER.parent = nil; tick(600); GHOST = rider(-88); GHOST.parent = Q; for _, x in pairs(bike._dressed()) do pose = x.comp end; s0 = pose.sets; tick(30)")
+    check(L.eval("GHOST.placed == nil and pose.sets == s0"), "nor does it seat the ghost or turn the props")
+    L.execute("PEER_RAISE = nil; GHOST = nil")
+    # --- the props in exact numbers: turned about the bone's own up axis, from its rest, the right way, wrapping at 360
+    L.execute(r"""
+        REST_Q = { X = 0.5, Y = 0.5, Z = 0.5, W = 0.5 }
+        R = cart(78); CARTS = { R }; tick(70); REST_Q = nil
+        for _, x in pairs(bike._dressed()) do if x.car == R then dr = x end end
+        a0 = { dr.angle[1], dr.angle[2], dr.angle[3], dr.angle[4] }
+        PEER_CAR = R; dr.angle[1] = 359; tick(1); PEER_CAR = nil
+        step = 900 * math.sqrt(0.4) / 60
+        want = (359 + flight.MOTORS[1][3] * step) % 360
+        q = dr.comp.bones.prop_FL.Rotation
+        h = math.rad(dr.angle[1]) / 2
+        cs, sn = math.cos(h), math.sin(h)
+    """)
+    check(L.eval("a0[1] == 0 and a0[2] == 0 and a0[3] == 0 and a0[4] == 0"), "the props start at their rest")
+    check(L.eval("near(dr.angle[1], want)"), "a prop on a bike the other player flies turns at its share, its own way, wrapping (%.3f)" % L.eval("dr.angle[1]"))
+    check(L.eval("near(q.X, cs * 0.5 - sn * 0.5) and near(q.Y, cs * 0.5 + sn * 0.5) and near(q.Z, cs * 0.5 + sn * 0.5) and near(q.W, cs * 0.5 - sn * 0.5)"),
+          "its bone gets that angle about the up axis, on top of its rest")
+    # --- another world
+    L.execute("CARTS = { cart(78) }; tick(70); WORLD2 = obj({ SpawnActor = WORLD.SpawnActor }); WORLD = WORLD2; CARTS = {}; tick(5)")
+    check(L.eval("next(bike._dressed()) == nil and bike._flight() == nil"), "another world keeps nothing of the old one")
+    # a press waiting on the cart's class ends with the world, and after 20 s
+    L.execute("HAVE_CART = false; " + bind + ".fn(); tick(1); WORLD = obj({ SpawnActor = WORLD.SpawnActor }); HAVE_CART = true; CARTS = {}; tick(120)")
+    check(L.eval("#CARTS == 0"), "a make waiting for its class doesn't carry over to another world")
+    L.execute("HAVE_CART = false; " + bind + ".fn(); tick(21 * 60); HAVE_CART = true; tick(120)")
+    check(L.eval("#CARTS == 0"), "nor go off long after the key was pressed")
+    # no player yet: nothing is done
+    L.execute("SAVED = PLAYER; PLAYER = nil; X2 = cart(78); CARTS = { X2 }; tick(70)")
+    check(L.eval("model_on(X2) == nil"), "with no player nothing is dressed")
+    L.execute("PLAYER = SAVED; tick(70)")
+    check(L.eval("model_on(X2) ~= nil"), "with one it is")
+    # --- the remote (user 2026-11-03: "no use the HID remote too control it"), through FPVDrone's own rc.lua and config.lua
+    fpv = r"C:\Users\arkis\Desktop\FPVDrone\mod\FPVDrone\Scripts"
+    if os.path.isdir(fpv):
+        L.globals().FPV = fpv.replace("\\", "/")
+        L.execute(r"""
+            package.path = package.path .. ";" .. FPV .. "/?.lua"
+            SHARED, OPENED, SEQ, RC_MODE = {}, {}, 0, "live"
+            ModRef = { SetSharedVariable = function(_, k, v) SHARED[k] = v end, GetSharedVariable = function(_, k) return SHARED[k] end }
+            -- the user's FPVDrone.ini: mode and launch on one switch
+            INI = "roll_axis = X\npitch_axis = Y\nyaw_axis = RX\nthrottle_axis = Z\narm_axis = RY\narm_on = 65535\nmode_axis = RZ\nangle_on = 65535\nlaunch_axis = RZ\nlaunch_on = 0\n"
+            RC = { X = 32767, Y = 32767, Z = 0, RX = 32767, RY = 0, RZ = 32767, S1 = 32768, S2 = 0, DL = 0, WH = 0 }
+            function rc_line()
+                if RC_MODE == "none" then return "rc none\n" end
+                if RC_MODE == "live" then SEQ = SEQ + 1 end
+                local sum, parts = SEQ, {}
+                for _, k in ipairs({ "X", "Y", "Z", "RX", "RY", "RZ", "S1", "S2", "DL", "WH" }) do
+                    sum = sum + RC[k]; parts[#parts + 1] = string.format("%05d", RC[k])
+                end
+                return string.format("rc %010d %s %010d %05d\n", SEQ, table.concat(parts, " "), 0, sum % 65536)
+            end
+            local real_open = io.open
+            io.open = function(path, mode)
+                if path:match("rc%.txt$") then
+                    OPENED[#OPENED + 1] = path
+                    if RC_MODE == "missing" then return nil end
+                    return { read = function() return rc_line() end, close = function() end }
+                elseif path:match("FPVDrone%.ini$") then
+                    INI_PATH = path
+                    return { read = function() return INI end, close = function() end }
+                end
+                return real_open(path, mode)
+            end
+            GROUND_Z, TRACE_FN, TRACE_LOG = -2, nil, nil
+            KEYS = {}
+            H = cart(78); CARTS = { H }; tick(70)
+            NOTES = {}
+            PLAYER.parent = H; tick(30)
+            FF = bike._flight()
+            function fraction(x) return math.floor(x * 65535) end
+            function arm() RC.RY = 0; tick(2); RC.RY = 65535; tick(2) end
+        """)
+        check(L.eval("FF ~= nil and FF.radio ~= nil and FF.radio.st.status == 'disarmed'"), "FPVDrone next to this mod: its remote is read (%s)" % L.eval("FF and FF.radio and FF.radio.st.status"))
+        check(L.eval("OPENED[1]:find('/mod/FPVDrone/rc.txt', 1, true) ~= nil and INI_PATH:find('/mod/FPVDrone/FPVDrone.ini', 1, true) ~= nil"),
+              "its rc.txt and FPVDrone.ini, in its folder next to this mod's (%s)" % L.eval("OPENED[1]"))
+        check(L.eval("FF.radio.map.arm.axis == 'RY' and FF.radio.map.mode.axis == 'RZ'"), "with the player's own bindings")
+        check(L.eval("SHARED['FPVDrone.hold']:match('^until ') ~= nil and tonumber(SHARED['FPVDrone.hold']:match('[%d%.]+$')) > NOW"), "the quad's launch switch is held off while on the bike")
+        L.execute("h0 = SHARED['FPVDrone.hold']; n0 = #OPENED; tick(60)")
+        check(L.eval("SHARED['FPVDrone.hold'] ~= h0 and tonumber(SHARED['FPVDrone.hold']:match('[%d%.]+$')) - NOW > 1.5"), "and goes on being renewed, ahead of its running out")
+        check(L.eval("#OPENED - n0 == 60"), "the remote is read every frame (%d in 60)" % L.eval("#OPENED - n0"))
+        L.execute("""renewed, h1 = 0, SHARED['FPVDrone.hold']
+                     for i = 1, 240 do tick(1); if SHARED['FPVDrone.hold'] ~= h1 then renewed = renewed + 1; h1 = SHARED['FPVDrone.hold'] end end""")
+        check(L.eval("renewed >= 3 and renewed <= 5"), "renewed about once a second, not every frame (%d in 4 s)" % L.eval("renewed"))
+        check(L.eval("#NOTES == 2 and NOTES[1]:find('Space') ~= nil and NOTES[2]:find('flick arm') ~= nil"), "told once how to arm it (%d notes)" % L.eval("#NOTES"))
+        # not armed: the keys fly it
+        L.execute("KEYS.SpaceBar = true; tick(90); KEYS.SpaceBar = false; z1 = H.at.Z; tick(30)")
+        check(L.eval("z1 > 50 and FF.landed == false"), "not armed the keys fly it (%.0f)" % L.eval("z1"))
+        L.execute("KEYS.LeftControl = true; tick(240); KEYS.LeftControl = false; tick(10)")
+        # (a landing stops it its trace's PAD above the ground)
+        check(L.eval("FF.landed == true and H.at.Z < 25"), "and bring it down (%.1f)" % L.eval("H.at.Z"))
+        L.execute("z_down = H.at.Z")
+        # arming as on the quad: the switch with the throttle down, flicked after the bike was sat on
+        L.execute("RC.Z = 65535; RC.RY = 65535; tick(2); a1 = FF.radio.st.armed; RC.Z = 0; tick(2); a2 = FF.radio.st.armed; arm(); a3 = FF.radio.st.armed")
+        check(L.eval("a1 == false"), "the switch with the throttle up doesn't arm it")
+        check(L.eval("a2 == false"), "nor does lowering the throttle after that: the switch has to be cycled")
+        check(L.eval("a3 == true and NOTES[#NOTES]:find('sticks fly') ~= nil"), "cycled with the throttle down it arms, and they're told")
+        # armed, on the ground: it stays there until the throttle lifts it, the keys and sticks doing nothing
+        L.execute("KEYS.SpaceBar = true; RC.X = 65535; tick(60); KEYS.SpaceBar = false; RC.X = 32767")
+        check(L.eval("FF.landed == true and H.at.Z == z_down and math.abs(FF.st.u[3] - 1) < 1e-3"), "armed on the ground Space and the sticks don't move it (up %.4f)" % L.eval("FF.st.u[3]"))
+        L.execute("RC.Z = fraction(0.19); tick(60)")
+        check(L.eval("FF.landed == true and H.at.Z == z_down"), "nor does throttle under the lift point")
+        L.execute("f0x, f0y = FF.st.f[1], FF.st.f[2]; RC.RX = 65535; tick(30); RC.RX = 32767; m0 = FF.st.motors[1]")
+        check(L.eval("math.abs(FF.st.f[1] - f0x) + math.abs(FF.st.f[2] - f0y) < 5e-3"), "the yaw stick doesn't turn it on the ground (idle motors' noise: under 0.1 deg; the stick would be 35)")
+        check(L.eval("m0 > 0.03 and m0 < 0.2"), "and its props idle there, armed, whatever the throttle under the lift point (%.3f)" % L.eval("m0"))
+        # down on its back on some heading: it rolls about its nose, square at every frame, and nothing of the roll stays in its rate
+        L.execute(r"""
+            local s = FF.st
+            local keep_f, keep_r, keep_u = s.f, s.r, s.u
+            s.f, s.r, s.u = flight.axes(0, 37, 180)
+            local nose = { s.f[1], s.f[2], s.f[3] }
+            local r0 = { s.r[1], s.r[2], s.r[3] }
+            right_off, right_square, right_rate, right_frames, right_turn = 0, 0, 0, 0, 0
+            for i = 1, 60 do
+                local was3 = s.u[3]
+                tick(1)
+                if was3 < 0 then right_frames = i end
+                for k = 1, 3 do right_off = math.max(right_off, math.abs(s.f[k] - nose[k])) end
+                local d = function(a, b) return a[1] * b[1] + a[2] * b[2] + a[3] * b[3] end
+                right_square = math.max(right_square, math.abs(d(s.f, s.r)), math.abs(d(s.f, s.u)), math.abs(d(s.r, s.u)),
+                    math.abs(d(s.u, s.u) - 1), math.abs(d(s.r, s.r) - 1))
+                -- the right-handed set: up is nose x right
+                local cx = { s.f[2] * s.r[3] - s.f[3] * s.r[2], s.f[3] * s.r[1] - s.f[1] * s.r[3], s.f[1] * s.r[2] - s.f[2] * s.r[1] }
+                right_turn = math.max(right_turn, math.abs(d(cx, s.u) - 1))
+                if was3 < 0 then right_rate = math.max(right_rate, math.abs(s.rate[1]), math.abs(s.rate[2]), math.abs(s.rate[3])) end
+            end
+            right_end = s.u[3]; right_flat = math.abs(s.r[3])
+            s.f, s.r, s.u = keep_f, keep_r, keep_u
+        """)
+        check(L.eval("right_off < 2e-3"), "rolling back upright its nose stays put (%.5f)" % L.eval("right_off"))
+        check(L.eval("right_square < 1e-3 and right_turn < 1e-3"), "square at every frame (%.5f, %.5f)" % (L.eval("right_square"), L.eval("right_turn")))
+        check(L.eval("right_rate == 0"), "and the roll isn't left in its rate (%.3f)" % L.eval("right_rate"))
+        check(L.eval("right_end > 0.999 and right_flat < 2e-3"), "it ends level (%.4f, %.4f)" % (L.eval("right_end"), L.eval("right_flat")))
+        check(L.eval("right_frames >= 10 and right_frames <= 45"), "about half a second, not at once (%d frames on its back)" % L.eval("right_frames"))
+        L.execute("l0 = bike._stats.landed; RC.Z = fraction(0.7); tick(180); FF2 = FF.st")
+        check(L.eval("FF.landed == false and H.at.Z > 100"), "throttle lifts it off (%.0f)" % L.eval("H.at.Z"))
+        check(L.eval("bike._stats.landed == l0"), "and it doesn't land again while the motors spool up")
+        # direct throttle: lowered below hover it comes down, which the keys' height hold never would
+        L.execute("RC.Z = fraction(0.33); tick(60); RC.Z = fraction(0.5); tick(30); z2 = H.at.Z; v2 = FF.st.vel[3]; RC.Z = fraction(0.33)")
+        check(L.eval("v2 > 0"), "the throttle stick is the motors' power, not a climb the bike holds (%.0f cm/s)" % L.eval("v2"))
+        # angle: the mode switch's angle end leans it as far as the bike's angle_max and levels it again
+        L.execute("""RC.RZ = 65535; RC.X = 65535; tick(150); roll1 = select(3, flight.rotator(FF.st.f, FF.st.r, FF.st.u))
+                     RC.X = 32767; tick(120); up1 = FF.st.u[3]; RC.Y = 0; tick(120); nose1 = FF.st.f[3]; RC.Y = 32767; tick(120); up1b = FF.st.u[3]""")
+        check(L.eval("math.abs(roll1 - 32) < 4"), "angle: full roll stick leans it to its angle_max (%.1f)" % L.eval("roll1"))
+        check(L.eval("up1 > 0.99 and up1b > 0.99"), "and centred it levels itself (%.3f, %.3f)" % (L.eval("up1"), L.eval("up1b")))
+        check(L.eval("math.abs(nose1) > 0.3"), "the pitch stick leans it too (%.3f)" % L.eval("nose1"))
+        # acro: the middle of that switch; a full flip each way, height to spare
+        L.execute(r"""
+            GROUND_Z = -1e9; RC.Z = fraction(0.6); RC.RZ = 32767; tick(180)
+            function flip(axis, stick)
+                RC[axis] = stick
+                local low, t, secs = 1, 0, nil
+                for i = 1, 240 do
+                    tick(1); t = t + 1 / 60
+                    low = math.min(low, FF.st.u[3])
+                    if low < -0.9 and FF.st.u[3] > 0.9 then secs = t; break end
+                end
+                RC[axis] = 32767
+                -- (acro leaves it where the flip ended, and a pitch flip about a tilted axis never goes over: angle levels it)
+                RC.RZ = 65535; tick(180); RC.RZ = 32767
+                return low, secs
+            end
+            low_r, t_r = flip("X", 65535); low_r2, t_r2 = flip("X", 0); low_p, t_p = flip("Y", 65535); low_p2, t_p2 = flip("Y", 0)
+        """)
+        for a, b, what in (("low_r", "t_r", "right"), ("low_r2", "t_r2", "left"), ("low_p", "t_p", "forward"), ("low_p2", "t_p2", "back")):
+            check(L.eval("%s < -0.9 and %s ~= nil and %s < 1.6" % (a, b, b)), "acro: a full flip %s (lowest %.2f, %s s)" % (what, L.eval(a), L.eval(b)))
+        # no self-levelling in acro: half a roll and centred, it stays on its back (let go past level: the rate takes a moment to die)
+        L.execute(r"""
+            function on_its_back()
+                RC.X = 65535; for i = 1, 200 do tick(1); if FF.st.u[3] < -0.2 then break end end
+                RC.X = 32767
+            end
+            on_its_back(); tick(60); inv1 = FF.st.u[3]; tick(30); inv2 = FF.st.u[3]
+        """)
+        check(L.eval("inv1 < -0.3 and math.abs(inv2 - inv1) < 0.2"), "acro: centred on its back it stays there, it doesn't level itself (%.2f, %.2f)" % (L.eval("inv1"), L.eval("inv2")))
+        # disarmed on its back, in the air: the keys have it, right way up and holding height
+        L.execute("n = #NOTES; RC.RY = 0; tick(360); up2 = FF.st.u[3]; v3 = FF.st.vel[3]; z3 = H.at.Z; tick(120); z4 = H.at.Z")
+        check(L.eval("FF.radio.st.status == 'disarmed' and NOTES[n + 1]:find('keys have it') ~= nil"), "disarmed in the air they're told the keys have it")
+        check(L.eval("up2 > 0.95 and math.abs(z4 - z3) < 200"), "and it comes level and holds its height (up %.2f, moved %.0f cm)" % (L.eval("up2"), L.eval("z4 - z3")))
+        # the helper stops (frozen line): the failsafe, then the keys; back again it stays off until armed again
+        L.execute("RC.Z = 0; arm(); RC.Z = fraction(0.5); tick(5); a4 = FF.radio.st.armed; RC_MODE = 'frozen'; tick(12); a5 = FF.radio.st.armed; tick(12); a6 = FF.radio.st.armed; RC_MODE = 'live'; tick(5); a7 = FF.radio.st.armed")
+        check(L.eval("a4 == true and a5 == true"), "a remote silent for a moment still flies it")
+        check(L.eval("a6 == false and FF.radio.st.why == 'failsafe' and a7 == false"), "silent past the failsafe the keys have it, and it stays off when it's back")
+        # rc.txt can't be opened: a moment while armed is nothing, and without it the file is looked for once a second
+        L.execute("RC.Z = 0; arm(); RC.Z = fraction(0.5); tick(2); RC_MODE = 'missing'; tick(10); a8 = FF.radio.st.armed; tick(30); a9 = FF.radio.st.armed; n0 = #OPENED; tick(120); m1 = #OPENED - n0; RC_MODE = 'live'")
+        check(L.eval("a8 == true and a9 == false"), "rc.txt gone for a moment while armed still flies, gone for good is the failsafe")
+        check(L.eval("m1 <= 3"), "and with it gone it's looked for once a second, not every frame (%d in 2 s)" % L.eval("m1"))
+        L.execute("RC_MODE = 'none'; tick(70); s1 = FF.radio.st.status; RC_MODE = 'live'; tick(2); s2 = FF.radio.st.status")
+        check(L.eval("s1 == 'no radio' and s2 == 'disarmed'"), "the helper saying no radio: the same, and back when it is")
+        # down on its back with the throttle cut: it lands, and rolls itself the right way up
+        L.execute(r"""
+            GROUND_Z = H.at.Z - 400; RC.Z = 0; arm(); RC.Z = fraction(0.5); RC.RZ = 32767
+            on_its_back(); RC.Z = 0
+            for i = 1, 300 do tick(1); if FF.landed then break end end
+            land_up = FF.st.u[3]; land = FF.landed; tick(60); up3 = FF.st.u[3]; fwd3 = FF.st.f[3]
+            d3 = math.abs(FF.st.f[1] * FF.st.r[1] + FF.st.f[2] * FF.st.r[2] + FF.st.f[3] * FF.st.r[3]) + math.abs(FF.st.u[1] * FF.st.r[1] + FF.st.u[2] * FF.st.r[2] + FF.st.u[3] * FF.st.r[3])
+        """)
+        check(L.eval("land == true and land_up < 0"), "a flip into the ground lands it on its back (%.2f)" % L.eval("land_up"))
+        check(L.eval("up3 > 0.99"), "and within a second it has rolled the right way up (%.3f)" % L.eval("up3"))
+        check(L.eval("d3 < 1e-6"), "still square (%.2e)" % L.eval("d3"))
+        L.execute("RC.Z = fraction(0.7); tick(120); RC.Z = 0")
+        check(L.eval("FF.landed == false"), "and the throttle lifts it off again")
+        L.execute("GROUND_Z = -1e9")
+        # the quad out (Ctrl+Shift+D on the bike): the remote is the quad's, and the launch switch free to bring it back
+        L.execute(r"""
+            RC.Z = fraction(0.5); tick(2); was = FF.radio.st.armed
+            function quad(n) for i = 1, n do SHARED['FPVDrone.pose'] = tostring(NOW) .. ' 5inch 0 0 0'; tick(1) end end
+            quad(20); q1 = FF.radio.quad; hold1 = SHARED['FPVDrone.hold']; ar1 = FF.radio.st.armed; before = FF.st.u[3]
+            n0 = #OPENED; RC.X = 65535; quad(60); RC.X = 32767; m2 = #OPENED - n0; up4 = FF.st.u[3]
+            -- (a pose that moves on slower than the frames: the quad is out all along, the look isn't every frame)
+            q_steady = true
+            for i = 1, 60 do
+                if i % 6 == 0 then SHARED['FPVDrone.pose'] = 'slow ' .. i .. ' 0 0 0' end
+                tick(1)
+                if FF.radio.quad ~= true then q_steady = false end
+            end
+            n1 = #NOTES
+            SHARED['FPVDrone.pose'] = ''; tick(30); q2 = FF.radio.quad; hold2 = SHARED['FPVDrone.hold']; ar2 = FF.radio.st.armed
+            note_back = NOTES[n1 + 1]; notes_back = #NOTES - n1
+        """)
+        check(L.eval("q_steady == true"), "a quad's pose moving on slowly still counts as out, at every frame")
+        check(L.eval("notes_back == 1 and note_back:find('flick arm') ~= nil"), "back from the quad they're told once to arm again (%d)" % L.eval("notes_back"))
+        check(L.eval("was == true and q1 == true and ar1 == false"), "the quad out: the bike lets go of the remote")
+        check(L.eval("hold1 == ''"), "and of the launch switch")
+        check(L.eval("m2 == 0 and up4 > 0.95"), "the sticks don't move the bike meanwhile, and it isn't read (%d)" % L.eval("m2"))
+        check(L.eval("q2 == false and hold2:match('^until ') ~= nil and ar2 == false"), "the quad back: the remote is the bike's again, and has to be armed again")
+        L.execute("""SHARED['FPVDrone.pose'] = 'stuck 5inch 0 0 0'; tick(1); RC.Z = 0; tick(30); q3 = FF.radio.quad""")
+        check(L.eval("q3 == false"), "a pose that stopped changing isn't a quad flying")
+        L.execute("SHARED['FPVDrone.pose'] = ''; arm(); a10 = FF.radio.st.armed")
+        check(L.eval("a10 == true"), "and it arms")
+        # off it: the launch switch goes back to the quad at once; on again it arms again
+        L.execute("PLAYER.parent = nil; tick(30); hold3 = SHARED['FPVDrone.hold']; PLAYER.parent = H; tick(30); FG = bike._flight(); a11 = FG.radio.st.armed; tick(30); hold4 = SHARED['FPVDrone.hold']")
+        check(L.eval("hold3 == ''"), "off the bike the hold is lifted at once")
+        check(L.eval("FG ~= FF and a11 == false"), "back on it, arming starts over with the switch left on")
+        check(L.eval("hold4:match('^until ') ~= nil"), "and the hold is back")
+        L.execute("""local want, at = OPENED[1]:gsub('rc%.txt$', 'Scripts/?.lua'), 1
+                     path_once = 0
+                     while true do
+                         local a, b = package.path:find(want, at, true)
+                         if not a then break end
+                         path_once, at = path_once + 1, b + 1
+                     end""")
+        check(L.eval("path_once == 1"), "FPVDrone's scripts are on the path, once after two flights (%d)" % L.eval("path_once"))
+        L.execute("PLAYER.parent = nil; tick(30); CARTS = {}; tick(70)")
+        # no FPVDrone.ini: the defaults of its own config
+        L.execute("""local ro = io.open
+                     io.open = function(path, mode) if path:match('FPVDrone%.ini$') then return nil end return ro(path, mode) end
+                     J = cart(78); CARTS = { J }; tick(70); PLAYER.parent = J; tick(30); FJ = bike._flight(); io.open = ro""")
+        check(L.eval("FJ.radio ~= nil and FJ.radio.map.arm.axis == 'RZ'"), "no FPVDrone.ini: its default bindings")
+        # something of FPVDrone's failing: the flight starts all the same, physics being off by then, and the keys fly it
+        L.execute("""PLAYER.parent = nil; tick(30)
+                     local cf = require('fpv.config'); local parse = cf.parse; cf.parse = function() error('bad ini') end
+                     PLAYER.parent = J; tick(30); FK = bike._flight(); cf.parse = parse
+                     KEYS.SpaceBar = true; zk = J.at.Z; tick(90); KEYS.SpaceBar = false""")
+        check(L.eval("FK ~= nil and FK.radio == nil and J.at.Z > zk + 50"), "FPVDrone's config failing doesn't stop the flight: the keys fly it")
+        L.execute("PLAYER.parent = nil; tick(30); CARTS = {}; tick(70); ModRef = nil; KEYS = {}")
+    else:
+        print("  (FPVDrone repo not here: the remote isn't tried)")
+    # --- the rider's height, by the Pelvis (user 2026-11-03: "the sitting possition is way too low")
+    L.execute(r"""
+        function press(k) for _, b in ipairs(BINDS) do if b.name == k and not b.mods then b.fn() end end end
+        function off() PLAYER.parent = nil; tick(30); PLAYER.hip, PLAYER.no_bone, HAVE_ANIM = nil, nil, true end
+        function on_bike(hip)
+            off()
+            PLAYER.hip = hip
+            V = V or cart(78)
+            V.at = { X = 5000, Y = 0, Z = 10000 }
+            CARTS = { V }
+            tick(70)
+            PLAYER.parent = V
+        end
+        function seat_z() return PLAYER.seat_off.Z end
+        function hips() return seat_z() - 90 + (PLAYER.hip or 84.86) end
+        function lift() local r = bike._flight().rider; return r.lift or 0 end
+        KEYS, TRACE_FN, GROUND_Z, WALL_X, OWNER, GHOST = {}, nil, -1e9, nil, true, nil
+        C = bike._consts
+        on_bike(nil); tick(120)
+    """)
+    check(L.eval("C.HIP_Z == 121.7"), "the hips' place is the user's by eye (\"+14cm\"): 14 over the 107.7 the old cap stopped them at")
+    check(L.eval("PLAYER.bone == 'Pelvis'"), "the Pelvis bone is what's read")
+    check(L.eval("lift() == 0 and near(seat_z(), 36.84 + 90)"), "a pose with the hips already there: Root on the seat, nothing moved")
+    L.execute("on_bike(57.1); tick(12); early = lift(); reads0 = PLAYER.bone_reads; tick(150)")
+    check(L.eval("early == 0"), "not while the animation is still blending in")
+    check(L.eval("math.abs(hips() - C.HIP_Z) <= C.HIP_DEAD"), "a pose 30 cm low: the hips come up onto the seat (%.1f, %.1f wanted)" % (L.eval("hips()"), L.eval("C.HIP_Z")))
+    check(L.eval("lift() > 25 and lift() < 35"), "by about those 30 cm (%.1f)" % L.eval("lift()"))
+    check(L.eval("PLAYER.bone_reads - reads0 < 15"), "read at the seat's rate, not every frame (%d in 2.5 s)" % L.eval("PLAYER.bone_reads - reads0"))
+    L.execute("on_bike(117.1); tick(150)")
+    check(L.eval("math.abs(hips() - C.HIP_Z) <= C.HIP_DEAD and lift() < -25"), "a pose 30 cm high comes down the same way (%.1f)" % L.eval("lift()"))
+    L.execute("on_bike(84.86 - C.HIP_DEAD + 0.5); tick(150)")
+    check(L.eval("lift() == 0"), "a miss inside what breathing moves it is left alone")
+    L.execute("on_bike(-300); tick(300)")
+    check(L.eval("lift() == C.HIP_MAX"), "never lifted past %g cm" % L.eval("C.HIP_MAX"))
+    L.execute("on_bike(500); tick(300)")
+    check(L.eval("lift() == -C.HIP_MAX"), "nor pushed down past it")
+    # the game's numbers (log 2026-11-04 01:12:00): the Pelvis 0.9 cm over Root needs more than the old cap of 70 allowed
+    L.execute("on_bike(0.9); tick(300); G_L = lift(); G_H = hips()")
+    check(L.eval("math.abs(G_L - 83.96) < 0.01 and math.abs(G_H - 121.7) < 0.01"), "the pose the game has: it lands on the user's height, not just near it (hips %.2f, lifted %.2f)" % (L.eval("G_H"), L.eval("G_L")))
+    # it rises to it rather than jumping, half the miss a step, and only the last few cm land in one
+    L.execute(r"""
+        function first_step(hip) on_bike(hip); for _ = 1, 200 do tick(1); if bike._flight() and lift() ~= 0 then return lift() end end end
+        STEP_FAR = first_step(0.9); STEP_5 = first_step(84.86 - 5); STEP_3 = first_step(84.86 - 3); STEP_25 = first_step(84.86 - 2.5)
+    """)
+    check(L.eval("math.abs(STEP_FAR - 41.98) < 0.01"), "far off, half the miss at a time, not a jump (%.2f)" % L.eval("STEP_FAR"))
+    check(L.eval("math.abs(STEP_5 - 2.5) < 0.01 and math.abs(STEP_3 - 3) < 0.01 and math.abs(STEP_25 - 2.5) < 0.01"), "5 cm off still halves, 3 and 2.5 land on it (%.2f, %.2f, %.2f)" % (L.eval("STEP_5"), L.eval("STEP_3"), L.eval("STEP_25")))
+    # a tune at the cap stands: at 01:16:02 the cap took the user's +14 straight back off
+    L.execute("on_bike(-300); tick(300); press('U'); press('U'); press('U'); tick(150); C_U = lift(); press('I'); press('I'); press('I'); tick(30)")
+    check(L.eval("C_U == C.HIP_MAX + 3 * C.TUNE_STEP"), "tuned up at the cap, it stays up (%.1f)" % L.eval("C_U"))
+    L.execute("on_bike(500); tick(300); press('I'); press('I'); press('I'); tick(150); C_D = lift(); press('U'); press('U'); press('U'); tick(30)")
+    check(L.eval("C_D == -C.HIP_MAX - 3 * C.TUNE_STEP"), "tuned down at the bottom, it stays down (%.1f)" % L.eval("C_D"))
+    L.execute("on_bike(57.1); HAVE_ANIM = false; tick(150)")
+    check(L.eval("lift() == 0"), "the rider's animation not playing: no height is worked out from another pose")
+    L.execute("on_bike(57.1); PLAYER.no_bone = true; tick(150)")
+    check(L.eval("lift() == 0 and near(seat_z(), 36.84 + 90)"), "a bone that can't be read leaves the plain seat")
+    L.execute("on_bike(nil); tick(60); t0 = lift(); z0 = seat_z(); press('U'); tick(30); t1 = lift(); z1 = seat_z(); tick(150); t2 = lift()")
+    check(L.eval("t1 == t0 + C.TUNE_STEP and near(z1, z0 + C.TUNE_STEP)"), "U raises the rider a step at once")
+    check(L.eval("t2 == t1"), "and the fit keeps it there, the tune being part of what it wants")
+    L.execute("press('I'); press('I'); tick(30); t3 = lift(); tick(150); t4 = lift(); press('U'); tick(30)")
+    check(L.eval("t3 == t1 - 2 * C.TUNE_STEP and t4 == t3"), "I lowers it, several presses in a frame all count")
+    L.execute("off(); press('U'); tick(5); on_bike(nil); tick(120)")
+    check(L.eval("lift() == 0"), "off the bike U does nothing")
+    L.execute("bike._flight().rider.lift = nil; n = #NOTES; press('U'); tick(1); first_tune = lift(); note = NOTES[#NOTES]; press('I'); tick(1)")
+    check(L.eval("first_tune == C.TUNE_STEP"), "a tune before the first fit starts from nothing (%s)" % L.eval("first_tune"))
+    check(L.eval("note == 'Seat height +2 cm'"), "and it says the number to keep (%s)" % L.eval("note"))
+    # the animation taken over and not to be had again: no height from that pose either
+    L.execute("on_bike(nil); tick(60); HAVE_ANIM = false; bike._flight().rider.m = nil; PLAYER.cur = obj({}); tick(30); PLAYER.hip = 57.1; l0 = lift(); tick(150); l1 = lift(); playing = bike._flight().rider.playing")
+    check(L.eval("not playing and l1 == l0"), "the slot taken by something else: the height stays as it was (%s to %s)" % (L.eval("l0"), L.eval("l1")))
+    # the log line, what the cause is read from
+    L.execute(r"""
+        LOGS = {}
+        lg = require("mirror.log"); LG_INFO = lg.info
+        lg.info = function(t) if t:find("rider's hips", 1, true) then LOGS[#LOGS + 1] = t end end
+        function line(t)
+            local a, b, c, d, e, g, h = t:match("hips (%S+) cm over the bike, wanted (%S+): lifted (%S+), tuned (%S+) %(capsule (%S+), put at (%S+); mesh z (%S+);")
+            return { hips = tonumber(a), wanted = tonumber(b), lifted = tonumber(c), tuned = tonumber(d), capsule = tonumber(e), put = tonumber(g), mesh = tonumber(h) }
+        end
+        on_bike(57.1); tick(150)
+        n_settled = #LOGS; L1 = line(LOGS[1]); L2 = line(LOGS[2]); tick(300); n_later = #LOGS
+        PLAYER.hip = nil; tick(150); LOGS = {}; press("U"); press("U"); press("U"); tick(60); LT = LOGS[1] and line(LOGS[1])
+        press("I"); press("I"); press("I"); tick(60)
+    """)
+    L.execute("function within(a, b, t) return math.abs(a - b) <= t end")
+    check(L.eval("within(L1.hips, 93.94, 0.06) and within(L1.wanted, 121.7, 0.06) and L1.lifted == 0 and L1.tuned == 0"), "the first line: where the hips are and where they're wanted")
+    check(L.eval("within(L1.put, 126.84, 0.06) and L1.mesh == -90"), "where the capsule was put and the mesh's offset (%s)" % L.eval("L1.put"))
+    check(L.eval("L2.lifted > 10 and within(L2.put, 126.84 + L2.lifted, 0.11)"), "a later line carries the lift in where it was put (%s, %s)" % (L.eval("L2.lifted"), L.eval("L2.put")))
+    check(L.eval("n_later == n_settled and n_settled <= 6"), "settled, it stops logging (%d lines, then %d)" % (L.eval("n_settled"), L.eval("n_later")))
+    check(L.eval("LT and within(LT.wanted, 121.7 + 6, 0.06) and LT.tuned == 6"), "the tune shows in what's wanted and in its own number")
+    L.execute("lg.info = LG_INFO")
+    # the other player's rider gets the same
+    L.execute(r"""
+        off(); PEER_CAR = V; GHOST = rider(-90); GHOST.parent = V; GHOST.hip = 57.1; tick(180)
+        ghost_hips = GHOST.seat_off.Z - 90 + 57.1
+        GHOST.parent = nil; PEER_CAR = nil; tick(30); GHOST = nil
+    """)
+    check(L.eval("math.abs(ghost_hips - C.HIP_Z) <= C.HIP_DEAD"), "the other player's rider is fitted too (%.1f)" % L.eval("ghost_hips"))
+    # --- the view (user 2026-11-03: "make it so the camera stays looking wher ethe bike is looking, basically giver it a
+    # good 3rd person cam, but also a fpv cam too")
+    L.execute(r"""
+        function air() local s = flight.new(1000, 2000, 3000, 0, 4711); return s end
+        function set_yaw(s, a) local r = math.rad(a); s.f = { math.cos(r), math.sin(r), 0 }; s.r = { -math.sin(r), math.cos(r), 0 }; s.u = { 0, 0, 1 } end
+        s = air(); v = {}; at, rot = bike.chase(v, s, 1 / 60)
+    """)
+    check(L.eval("near(at[1], 1000 - C.CHASE_BACK) and near(at[2], 2000) and near(at[3], 3000 + C.CHASE_UP)"), "behind the bike, above it")
+    check(L.eval("near(rot.Yaw, 0) and rot.Roll == 0 and rot.Pitch < -5 and rot.Pitch > -25"), "looking along its heading, a little down, the horizon level (%.1f)" % L.eval("rot.Pitch"))
+    L.execute("set_yaw(s, 90); at, rot = bike.chase(v, s, 1 / 60); first = rot.Yaw; for i = 1, 300 do at, rot = bike.chase(v, s, 1 / 60) end")
+    check(L.eval("first > 1 and first < 20"), "a turn isn't copied in one frame (%.1f)" % L.eval("first"))
+    check(L.eval("near(rot.Yaw, 90)"), "it ends up looking where the bike looks (%.2f)" % L.eval("rot.Yaw"))
+    check(L.eval("math.abs(at[1] - 1000) < 0.01 and math.abs(at[2] - (2000 - C.CHASE_BACK)) < 0.01"), "and right behind it")
+    L.execute("set_yaw(s, 170); v = {}; bike.chase(v, s, 1 / 60); set_yaw(s, -170); for i = 1, 6 do at, rot = bike.chase(v, s, 1 / 60) end; wrapped = rot.Yaw")
+    check(L.eval("math.abs(wrapped) > 170"), "across 180 it turns the short way (%.1f)" % L.eval("wrapped"))
+    L.execute("""set_yaw(s, 40); v = {}; bike.chase(v, s, 1 / 60); s.u = { 0, 0, -1 }; s.f = { -1, 0, 0 }
+                 for i = 1, 60 do at, rot = bike.chase(v, s, 1 / 60) end""")
+    check(L.eval("near(rot.Yaw, 40)"), "on its back in a flip the camera doesn't swing round")
+    L.execute("""set_yaw(s, 40); v = {}; bike.chase(v, s, 1 / 60); s.f = { 0, 0, 1 }; s.u = { -1, 0, 0 }
+                 for i = 1, 60 do at, rot = bike.chase(v, s, 1 / 60) end""")
+    check(L.eval("near(rot.Yaw, 40)"), "nor with its nose straight up")
+    L.execute("""set_yaw(s, 0); v = {}; bike.chase(v, s, 1 / 60); gap = 0
+                 for i = 1, 300 do s.pos[1] = s.pos[1] + 500; bike.chase(v, s, 1 / 60); gap = math.max(gap, s.pos[1] - v.at[1]) end""")
+    check(L.eval("gap > 300 and gap <= C.CHASE_LAG + 1e-6"), "at speed it falls behind a little, never past %g cm (%.0f)" % (L.eval("C.CHASE_LAG"), L.eval("gap")))
+    L.execute("set_yaw(s, 90); v = {}; bike.chase(v, s, 1 / 60); set_yaw(s, 0); for i = 1, 300 do at, rot = bike.chase(v, s, 1 / 60) end")
+    check(L.eval("near(rot.Yaw, 0)"), "heading along X counts as much as along Y (%.2f)" % L.eval("rot.Yaw"))
+    L.execute("""s = air(); set_yaw(s, 0); v = {}; bike.chase(v, s, 1 / 60); s.pos = { 1100, 2100, 3100 }; bike.chase(v, s, 1 / 60)
+                 k = 1 - math.exp(-12 / 60)""")
+    check(L.eval("near(v.at[1], 1000 + 100 * k) and near(v.at[2], 2000 + 100 * k) and near(v.at[3], 3000 + 100 * k)"), "the focus follows on all three axes")
+    L.execute("""s = air(); set_yaw(s, 0); v = {}; bike.chase(v, s, 1 / 60); s.pos = { 4000, -4000, 5000 }; bike.chase(v, s, 1 / 60)""")
+    check(L.eval("near(v.at[1], 4000 - 150) and near(v.at[2], -4000 + 300) and near(v.at[3], 5000 - 100)"), "a jump any way: the focus held %g cm back along the line it came" % L.eval("C.CHASE_LAG"))
+    L.execute("""s = air(); s.f, s.r, s.u = { 0, 1, 0 }, { -1, 0, 0 }, { 0, 0, 1 }; at, rot = bike.eye(s)
+                 cp, cy, cr = flight.camera(s, 12)""")
+    check(L.eval("near(at[1], 1000) and near(at[2], 2000 + C.EYE_X) and near(at[3], 3000 + C.EYE_Z)"), "on the bike: the spec's eye point along its own axes")
+    check(L.eval("near(rot.Pitch, cp) and near(rot.Yaw, cy) and near(rot.Roll, cr) and rot.Pitch > 5"), "turned with it, tilted up as FPVDrone's camera is")
+    L.execute("s.u = { 1, 0, 0 }; s.r = { 0, 0, 1 }; at = bike.eye(s)")
+    check(L.eval("near(at[1], 1000 + C.EYE_Z) and near(at[3], 3000)"), "rolled over, the eye goes with its top")
+    L.execute(r"""
+        s = air(); s.f, s.u, s.r = { 2 / 3, 2 / 3, 1 / 3 }, { -2 / 3, 1 / 3, 2 / 3 }, { 1 / 3, -2 / 3, 2 / 3 }
+        at = bike.eye(s)
+        off_x, off_y, off_z = at[1] - 1000, at[2] - 2000, at[3] - 3000
+        function along(a) return off_x * a[1] + off_y * a[2] + off_z * a[3] end
+    """)
+    check(L.eval("near(along(s.f), C.EYE_X) and near(along(s.u), C.EYE_Z) and near(along(s.r), 0)"), "any attitude: that point along its axes, nothing sideways")
+    # in the game's hands
+    L.execute("off(); n0 = #CAMS; PC.target = PLAYER; PC.takes = 0; on_bike(nil); tick(30); CAM = CAMS[#CAMS]")
+    check(L.eval("#CAMS == n0 + 1 and PC.target == CAM"), "on the bike its own camera is what's looked through")
+    check(L.eval("PC.takes == 1"), "taken once, not every look")
+    check(L.eval("PC.blend == 0 and PC.blend_fn == 0 and PC.blend_exp == 0 and PC.lock == false"), "cut to, no blend")
+    check(L.eval("math.abs(CAM.spawned_at.X - 5000) < 1 and math.abs(CAM.spawned_at.Y) < 1 and math.abs(CAM.spawned_at.Z - 10000) < 200"), "made where the bike is")
+    check(L.eval("CAM.spawned_rot.Pitch == 0 and CAM.spawned_rot.Yaw == 0 and CAM.spawned_rot.Roll == 0"), "with no turn of its own")
+    L.execute("m0 = CAM.moves; tick(10)")
+    check(L.eval("CAM.moves == m0 + 10 and CAM.sweep == false and CAM.tele == true"), "it moves with the bike every frame, no sweep, as a teleport")
+    check(L.eval("CAM.at.X < V.at.X and near(CAM.at.Y, V.at.Y) and CAM.at.Z > V.at.Z"), "behind the real bike")
+    check(L.eval("math.abs(CAM.CameraComponent.fov - C.CHASE_FOV) < 3"), "at its field of view (%.1f)" % L.eval("CAM.CameraComponent.fov"))
+    L.execute("F = bike._flight(); F.st.vel = { 7000, 0, 0 }; tick(1); fast_fov = CAM.CameraComponent.fov; F.st.vel = { 0, 0, 0 }; tick(1); slow_fov = CAM.CameraComponent.fov")
+    check(L.eval("fast_fov == C.CHASE_FOV_FAST"), "wider at speed (%.1f)" % L.eval("fast_fov"))
+    check(L.eval("math.abs(slow_fov - C.CHASE_FOV) < 3"), "and back when it slows (%.1f)" % L.eval("slow_fov"))
+    L.execute("tick(30); sets0 = CAM.CameraComponent.fov_sets; tick(10); sets1 = CAM.CameraComponent.fov_sets")
+    check(L.eval("sets1 == sets0"), "its field of view isn't set again while it stays the same")
+    L.execute("F = bike._flight(); F.st.vel = { 0, 0, 0 }; PC.target = PLAYER; PC.blend, PC.blend_fn, PC.blend_exp, PC.lock = 9, 9, 9, true; tick(15)")
+    check(L.eval("PC.target == CAM"), "the view handed back to the character is taken again")
+    check(L.eval("PC.blend == 0 and PC.blend_fn == 0 and PC.blend_exp == 0 and PC.lock == false"), "with a cut, as the first time")
+    L.execute("OTHER = obj({}); PC.target = OTHER; tick(15)")
+    check(L.eval("PC.target == OTHER"), "the quad's camera keeps it while it's out")
+    check(L.eval("CAM.CameraComponent.bConstrainAspectRatio == false"), "its camera isn't held to 16:9 (black bars in any other window)")
+    # what's worn is its own actor: a hood and goggles round the eye point blacked the view out (kit 2026-11-04)
+    L.execute("""local function worn(hidden) return obj({ bHidden = hidden, shows = 0, SetActorHiddenInGame = function(self, h) self.bHidden = h; self.shows = self.shows + 1 end }) end
+                 HOOD, HOLSTERED, LATER = worn(false), worn(true), worn(false)
+                 WORN = { HOOD, HOLSTERED }
+                 PLAYER.GetAttachedActors = function(self, out, reset, deep)
+                     for i, a in ipairs(WORN) do out[i] = { get = function() return a end } end
+                 end""")
+    check(L.eval("bike.rider_out_of_sight() == false"), "behind the bike the rider's look is read")
+    L.execute("PC.target = CAM; v0 = bike._stats.views; press('G'); tick(1); g_note = NOTES[#NOTES]")
+    check(L.eval("bike._stats.views == v0 + 1 and g_note == 'View: on the bike.'"), "the switch is counted and said")
+    check(L.eval("bike._view_eye() == true and PLAYER.hidden == true"), "G: on the bike, the rider hidden, the eyes being inside the head")
+    check(L.eval("HOOD.bHidden == true"), "and what's worn on them hidden too")
+    check(L.eval("HOLSTERED.shows == 0"), "something already hidden isn't touched")
+    check(L.eval("bike.rider_out_of_sight() == true"), "the rider's look isn't read meanwhile (the others would see it lost)")
+    L.execute("eye_at = bike.eye(bike._flight().st)")
+    check(L.eval("near(CAM.at.X, eye_at[1]) and near(CAM.at.Y, eye_at[2]) and near(CAM.at.Z, eye_at[3])"), "the camera at the eye point")
+    check(L.eval("CAM.CameraComponent.fov == C.EYE_FOV"), "at its wider field of view")
+    L.execute("WORN[3] = LATER; tick(15); WORN[3] = nil")
+    check(L.eval("LATER.bHidden == true"), "something put on in the eye view is hidden as well")
+    L.execute("OTHER = obj({}); PC.target = OTHER; tick(15); shown_for_quad = PLAYER.hidden; hood_for_quad = HOOD.bHidden; PC.target = CAM; tick(15); hid_again = PLAYER.hidden")
+    check(L.eval("shown_for_quad == false and hid_again == true"), "seen from the quad the rider is there; back on the bike hidden again")
+    check(L.eval("hood_for_quad == false and LATER.bHidden == false and HOOD.bHidden == true"), "what's worn comes back with them, and goes again")
+    L.execute("r = bike._flight().rider; r.lift = 11; PLAYER.hip = 57.1; n = PLAYER.bone_reads; tick(60)")
+    check(L.eval("PLAYER.bone_reads == n and r.lift == 11"), "a hidden rider's pose isn't read")
+    L.execute("PLAYER.hip = nil; off(); shown = PLAYER.hidden; hood_off = HOOD.bHidden; n1 = #CAMS; on_bike(nil); tick(30); again = PLAYER.hidden; second = CAMS[#CAMS]")
+    check(L.eval("shown == false"), "off the bike the rider is shown")
+    check(L.eval("hood_off == false and HOLSTERED.bHidden == true"), "and what they wear, what was hidden before staying hidden")
+    check(L.eval("bike.rider_out_of_sight() == true"), "the eye view again on the next ride")
+    check(L.eval("PC.target == second and again == true and bike._view_eye() == true"), "the view chosen stays for the next ride")
+    # (turned while in the eye view: the camera comes back behind where it faces now, not where it was left)
+    L.execute("""F = bike._flight(); F.view.yaw = 0; F.st.f, F.st.r = { 0, 1, 0 }, { -1, 0, 0 }; press('G'); tick(1); g_note = NOTES[#NOTES]; back_yaw = second.rot.Yaw
+                 F.st.f, F.st.r = { 1, 0, 0 }, { 0, 1, 0 }; tick(1)""")
+    check(L.eval("math.abs(back_yaw - 90) < 2"), "back behind it: straight behind where it faces now (%.1f)" % L.eval("back_yaw"))
+    check(L.eval("g_note == 'View: behind the bike.'"), "and it's said")
+    check(L.eval("bike._view_eye() == false and PLAYER.hidden == false"), "G again: behind the bike, the rider back")
+    check(L.eval("HOOD.bHidden == false and bike.rider_out_of_sight() == false"), "with what they wear, their look read again")
+    L.execute("F.view = {}; tick(1)")
+    check(L.eval("second.at.X < V.at.X"), "and the camera behind it")
+    L.execute("old_cam = second; PC.blend, PC.blend_fn, PC.blend_exp, PC.lock = 9, 9, 9, true; off()")
+    check(L.eval("PC.target == PLAYER and old_cam:IsValid() == false"), "off the bike the view is the character's and the camera is gone")
+    check(L.eval("PC.blend == 0 and PC.blend_fn == 0 and PC.blend_exp == 0 and PC.lock == false"), "handed back with a cut too")
+    L.execute("n = #CAMS; press('G'); tick(5)")
+    check(L.eval("bike._view_eye() == false"), "off the bike G does nothing")
+    # something in the way
+    L.execute(r"""
+        on_bike(nil); tick(30); CAM = CAMS[#CAMS]; F = bike._flight()
+        CLEAR_D = math.sqrt((CAM.at.X - F.st.pos[1]) ^ 2 + (CAM.at.Z - F.st.pos[3] - C.CHASE_LOOK) ^ 2)
+        WALL = 200
+        TRACE_FN = function(a, b, out)
+            if b.X < a.X - 100 then
+                local d = math.sqrt((b.X - a.X) ^ 2 + (b.Z - a.Z) ^ 2)
+                local k = WALL / d
+                out.OutHit = { ImpactNormal = { X = 1, Y = 0, Z = 0 }, ImpactPoint = { X = a.X + (b.X - a.X) * k, Y = a.Y, Z = a.Z + (b.Z - a.Z) * k } }
+                return true
+            end
+            return false
+        end
+        tick(1)
+        function cam_d() local p = bike._flight().st.pos; return math.sqrt((CAM.at.X - p[1]) ^ 2 + (CAM.at.Z - p[3] - C.CHASE_LOOK) ^ 2) end
+        in_d = cam_d()
+        TRACE_FN = nil; tick(2); easing = cam_d(); tick(120); out_d = cam_d()
+    """)
+    check(L.eval("math.abs(in_d - (WALL - C.CHASE_PAD)) < 1"), "a wall behind brings the camera in front of it at once (%.0f cm)" % L.eval("in_d"))
+    check(L.eval("easing > in_d and easing < CLEAR_D - 50"), "the wall gone it eases back out (%.0f)" % L.eval("easing"))
+    check(L.eval("math.abs(out_d - CLEAR_D) < 2"), "all the way (%.0f of %.0f)" % (L.eval("out_d"), L.eval("CLEAR_D")))
+    # the same with the bike facing off the axes and the bike high: the wall's distance is measured in all three
+    L.execute(r"""
+        F = bike._flight(); F.st.f, F.st.r, F.st.u = { 0.6, 0.8, 0 }, { -0.8, 0.6, 0 }, { 0, 0, 1 }; F.view = {}; F.st.pos[2] = F.st.pos[2] + 700
+        tick(1)
+        function from() local p = bike._flight().st.pos; return p[1], p[2], p[3] + C.CHASE_LOOK end
+        function cam_off() local x, y, z = from(); return CAM.at.X - x, CAM.at.Y - y, CAM.at.Z - z end
+        function len(x, y, z) return math.sqrt(x * x + y * y + z * z) end
+        cx, cy, cz = cam_off(); LONG = len(cx, cy, cz)
+        TRACE_FN = function(a, b, out)
+            if b.Z <= a.Z + 50 then return false end
+            local d = len(b.X - a.X, b.Y - a.Y, b.Z - a.Z)
+            local k = WALL / d
+            TE = { X = b.X - a.X, Y = b.Y - a.Y, Z = b.Z - a.Z }
+            out.OutHit = { ImpactNormal = { X = 1, Y = 0, Z = 0 }, ImpactPoint = { X = a.X + (b.X - a.X) * k, Y = a.Y + (b.Y - a.Y) * k, Z = a.Z + (b.Z - a.Z) * k } }
+            return true
+        end
+        tick(1)
+        wx, wy, wz = cam_off(); wall_d = len(wx, wy, wz)
+        cos_way = (wx * cx + wy * cy + wz * cz) / (wall_d * LONG)
+        WALL = 10; tick(1); touching = bike._flight().view.reach; WALL = 200
+        TRACE_FN = nil; tick(120)
+    """)
+    check(L.eval("math.abs(cx + 0.6 * C.CHASE_BACK) < 5 and math.abs(cy + 0.8 * C.CHASE_BACK) < 5 and math.abs(cz - (C.CHASE_UP - C.CHASE_LOOK)) < 5"), "clear, it's behind where the bike faces, above it (%.0f, %.0f, %.0f)" % (L.eval("cx"), L.eval("cy"), L.eval("cz")))
+    check(L.eval("math.abs(TE.X - cx) < 5 and math.abs(TE.Y - cy) < 5 and math.abs(TE.Z - cz) < 5"), "the trace goes from over the bike to that place")
+    check(L.eval("LONG > 500 and math.abs(wall_d - (WALL - C.CHASE_PAD)) < 1"), "facing any way the wall's distance is right (%.1f of %.1f)" % (L.eval("wall_d"), L.eval("WALL - C.CHASE_PAD")))
+    check(L.eval("cos_way > 0.999"), "and it comes straight in along the line to the camera (%.4f)" % L.eval("cos_way"))
+    check(L.eval("touching == 0"), "a wall closer than the padding: right in over the bike, not through it")
+    L.execute(r"""
+        TRACE_FN = function(a, b, out)
+            if b.Z <= a.Z + 50 then return false end
+            out.OutHit = { ImpactNormal = { X = 1, Y = 0, Z = 0 } }
+            return true
+        end
+        r0 = bike._flight().view.reach; m0 = CAM.moves; tick(5); r1 = bike._flight().view.reach; m1 = CAM.moves; TRACE_FN = nil
+    """)
+    check(L.eval("r0 == 1 and r1 == 1 and m1 == m0 + 5"), "a hit that doesn't say where leaves the camera out, still moving")
+    L.execute("""TRACE_FN = function(a, b, out)
+            if b.Z <= a.Z + 50 then return false end
+            out.OutHit = { ImpactNormal = { X = 1, Y = 0, Z = 0 }, ImpactPoint = { X = a.X, Y = a.Y, Z = a.Z } }
+            return false
+        end
+        tick(5); r2 = bike._flight().view.reach; TRACE_FN = nil""")
+    check(L.eval("r2 == 1"), "and a trace that found nothing is nothing")
+    L.execute("CAM:K2_DestroyActor(); PC.target = PLAYER; tick(15); F = bike._flight()")
+    check(L.eval("PC.target == PLAYER and F ~= nil"), "the camera destroyed under it: nothing dead looked through, and it flies on")
+    L.execute("off(); f0 = bike._stats.flights; NO_CAM = true; PC.target = PLAYER; on_bike(nil); tick(30); FN = bike._flight(); NO_CAM = false")
+    check(L.eval("FN ~= nil and FN.cam == nil and PC.target == PLAYER"), "no camera made: it still flies, on the game's own view")
+    L.execute("off(); n = #CAMS; PLAYER.Controller = nil; on_bike(nil); tick(30); FN = bike._flight(); PLAYER.Controller = PC")
+    check(L.eval("FN ~= nil and FN.cam == nil and #CAMS == n"), "no controller yet: no camera left lying about, and it flies")
+    L.execute("off(); n = #CAMS; n_sp = #SPAWNED; NO_CAM_CLS = true; on_bike(nil); tick(30); FN = bike._flight(); NO_CAM_CLS = false")
+    check(L.eval("FN ~= nil and FN.cam == nil and #CAMS == n and #SPAWNED == n_sp"), "no camera class: nothing spawned in its place, and it flies")
+    L.execute("off(); CARTS = {}; tick(70)")
+    # --- the lock: the owner's word, over the links (user 2026-11-04: "unless I unlock it for everyone")
+    L.execute(r"""
+        function new_link()
+            local l = { blobs = {}, puts = 0, resets = 0 }
+            l.put_blob = function(n, t) l.blobs[n] = t; l.puts = l.puts + 1 end
+            l.get_blob = function(n) local b = l.inbox; l.inbox = nil; return b end
+            l.reset_blob = function(n) l.resets = l.resets + 1 end
+            return l
+        end
+        MAIN, COPY = new_link(), new_link()
+        MAIN_ID, COPY_ID, PLAYERS = "222", "333", {}
+        package.loaded["mirror.peers"] = {
+            each = function(name, fn) if name == "mirror.link" then fn(MAIN, nil); fn(COPY, { id = COPY_ID }) end end,
+            main_id = function() return MAIN_ID end, players = function() return PLAYERS end }
+        function lock_key() for _, b in ipairs(BINDS) do if b.name == "P" and b.mods then b.fn() end end end
+        function lock_opts() for _, b in ipairs(BINDS) do if b.name == "P" then return #b.mods end end end
+        function mine() local m = bike._open(); return m end
+        function seen() local _, s = bike._open(); return s end
+        V = cart(78); V.at = { X = 5000, Y = 0, Z = 10000 }; CARTS = { V }; PLAYER.no_bone = true; KEYS = {}; TRACE_FN = nil
+        OWNER = true; tick(330)
+    """)
+    # the owner's game
+    check(L.eval("lock_opts() == 2"), "the key is Ctrl+Shift+P")
+    check(L.eval("mine() == false and MAIN.blobs.bikeopen == 'locked' and COPY.blobs.bikeopen == 'locked'"), "it starts locked, and says so on every link")
+    L.execute("lock_key(); tick(1); note = NOTES[#NOTES]; p0 = MAIN.puts")
+    check(L.eval("mine() == true and MAIN.blobs.bikeopen == 'open' and COPY.blobs.bikeopen == 'open'"), "the owner's key opens it, on every link at once")
+    check(L.eval("note:find('unlocked') ~= nil and note:find('Ctrl%+Shift%+P') ~= nil"), "and they're told how to lock it again")
+    L.execute("tick(600); p1 = MAIN.puts; L2 = new_link(); COPY = L2; tick(330); late = COPY.blobs.bikeopen; COPY = L2")
+    check(L.eval("p1 - p0 >= 1 and p1 - p0 <= 3"), "said again now and then, not every frame (%d in 10 s)" % L.eval("p1 - p0"))
+    check(L.eval("late == 'open'"), "so a player who just joined hears it")
+    L.execute("lock_key(); tick(1); note = NOTES[#NOTES]")
+    check(L.eval("mine() == false and MAIN.blobs.bikeopen == 'locked' and note:find('locked') ~= nil"), "the key again locks it")
+    L.execute("PLAYER.parent = V; tick(30); F = bike._flight()")
+    check(L.eval("F ~= nil and not F.coming_down and V.exits == 0"), "locked, the owner rides as always")
+    L.execute("off()")
+    # someone else's game
+    L.execute("OWNER = false; a = MAIN.puts; n = #NOTES; lock_key(); tick(70); note = NOTES[#NOTES]")
+    check(L.eval("mine() == false and seen() == false and MAIN.puts == a"), "anyone else's key does nothing, and nothing is sent")
+    check(L.eval("note:find('owner') ~= nil"), "and they're told why")
+    L.execute("PLAYERS = { { id = '222' }, { id = '333' } }; MAIN.inbox = 'open'; COPY.inbox = 'open'; tick(70)")
+    check(L.eval("seen() == false"), "the word of a player who isn't the owner counts for nothing")
+    L.execute("MAIN_ID = '111'; n = #NOTES; MAIN.inbox = 'open'; tick(70)")
+    check(L.eval("seen() == false"), "nor the owner's link while the owner isn't among the players")
+    L.execute("PLAYERS = { { id = 111 }, { id = '333' } }; MAIN.inbox = 'open'; tick(70); note = NOTES[#NOTES]; news = bike._stats.lock_news")
+    check(L.eval("seen() == true and note:find('unlocked') ~= nil"), "the owner's word on the main link: open, and they're told")
+    L.execute("tick(120)")
+    check(L.eval("seen() == true and bike._stats.lock_news == news"), "it stays open with nothing new said, told once")
+    L.execute("MAIN.inbox = 'locked'; tick(70)")
+    check(L.eval("seen() == false"), "and the word locked shuts it")
+    L.execute("MAIN_ID = '222'; COPY_ID = '111'; COPY.inbox = 'open'; tick(70)")
+    check(L.eval("seen() == true"), "the owner on another player's link counts the same")
+    L.execute("x0 = V.exits; PLAYER.parent = V; GROUND_Z = -1e9; tick(30); F = bike._flight()")
+    check(L.eval("F ~= nil and V.exits == x0"), "unlocked, they ride it")
+    check(L.eval("V.Mesh.sim == false"), "and it flies for them")
+    # locked in the air: down first, then off
+    L.execute("""F.landed = false; KEYS = { SpaceBar = true }; tick(60); z0 = V.at.Z; n = #NOTES; COPY.inbox = 'locked'; tick(70)
+                 note = NOTES[n + 2]; tick(180); z1 = V.at.Z; tick(60); z2 = V.at.Z""")
+    check(L.eval("F.coming_down == true and note:find('bringing you down') ~= nil"), "locked in the air: they're told it's coming down")
+    check(L.eval("bike._flight() == F and PLAYER.parent == V"), "and aren't dropped")
+    check(L.eval("z2 < z1"), "Space no longer lifts it: it sinks (%.0f to %.0f)" % (L.eval("z1"), L.eval("z2")))
+    L.execute("n = #NOTES; COPY.inbox = 'open'; tick(70); note = NOTES[n + 2] or NOTES[n + 1]; back = F.coming_down; KEYS = {}")
+    check(L.eval("back == nil and note:find('yours') ~= nil"), "unlocked on the way down, the keys are theirs again")
+    L.execute("""COPY.inbox = 'locked'; tick(70); GROUND_Z = V.at.Z - 300; tick(600); F2 = bike._flight()""")
+    check(L.eval("F2 == nil and PLAYER.parent == nil and V.exits > x0"), "on the ground it's over, and they're put off it")
+    check(L.eval("V.Mesh.sim == true"), "the bike the game's again")
+    L.execute("""GROUND_Z = -1e9; COPY.inbox = 'open'; tick(70); V.at = { X = 5000, Y = 0, Z = 100000 }; PLAYER.parent = V; tick(30); F = bike._flight(); F.landed = false
+                 COPY.inbox = 'locked'; tick(70); C_DOWN = F.coming_down; tick(59 * 60); early = bike._flight(); tick(10 * 60); F2 = bike._flight()""")
+    check(L.eval("C_DOWN == true and early == F and F2 == nil"), "no ground under it: a minute down, not for ever")
+    # the owner gone
+    L.execute("""REFUSE_EXIT = false; PLAYER.parent = nil; tick(30); COPY.inbox = 'open'; tick(70); o0 = seen(); r0 = MAIN.resets; PL0 = PLAYERS
+                 s_open = bike.status(); news0 = bike._stats.lock_news; PLAYERS = {}; n = #NOTES; tick(70); note = NOTES[#NOTES]; s_shut = bike.status()""")
+    check(L.eval("o0 == true and seen() == false"), "the owner gone: locked again")
+    check(L.eval("MAIN.resets == r0 + 1 and COPY.resets > 0"), "the links forget the word, so the same one on return counts")
+    check(L.eval("note:find('locked') ~= nil and #NOTES == n + 1 and bike._stats.lock_news == news0 + 1"), "and they're told, once")
+    check(L.eval("s_open:find('(open to all,', 1, true) ~= nil and s_shut:find('(locked,', 1, true) ~= nil"), "the status line says which")
+    L.execute("PLAYERS = PL0; COPY.inbox = 'open'; tick(70); o1 = seen(); package.loaded['mirror.peers'] = nil; tick(70)")
+    check(L.eval("o1 == true and seen() == false"), "no players' list to find the owner in: locked")
+    L.execute("OWNER = true; KEYS = {}; off(); CARTS = {}; tick(70)")
+    # --- its sound (user 2026-11-04: "the same audio as tghe drones but make it sounds bigger and heavier and more powerful")
+    # the numbers: louder and higher with power, silent with none, inside the engine's pitch limits, wind only when moving
+    L.execute("""
+        local mx = require("mirror.bikenoise").mix
+        mix0 = mx({ 0, 0, 0, 0 }, 0); mixi = mx({ .08, .08, .08, .08 }, 0)
+        mixh = mx({ .385, .385, .385, .385 }, 0); mixf = mx({ 1, 1, 1, 1 }, 4000); mixo = mx({ 9, 9, 9, 9 }, 9e9)
+        mixn = mx(nil, nil); mixs = mx({ .01, -1, .05, 2 }, 2000)
+    """)
+    check(L.eval("mix0[1][2] == 0 and mix0[5][2] == 0"), "no power, no speed: silent")
+    check(L.eval("math.abs(mix0[2][1] - 0.4 * 1.012) < 1e-9 and math.abs(mix0[1][1] - 0.4) < 1e-9"), "with no power a motor sits at the bottom of its range, detuned from the others; the engine's limit holds")
+    check(L.eval("math.abs(mixi[2][1] - (0.4 + 1.1 * math.sqrt(.08)) * 1.012) < 1e-9"), "idle's pitch: the root of its share (%.3f)" % L.eval("mixi[2][1]"))
+    check(L.eval("math.abs(mixh[2][1] - (0.4 + 1.1 * math.sqrt(.385)) * 1.012) < 1e-9"), "hover's pitch (%.3f)" % L.eval("mixh[2][1]"))
+    check(L.eval("math.abs(mixf[1][1] - 1.5 * .985) < 1e-9 and math.abs(mixf[1][2] - 0.5) < 1e-9"), "full power: 1.5x at its full volume")
+    check(L.eval("mixo[4][1] == 2 and mixo[1][2] == mixf[1][2]"), "past full power: the engine's top limit, the same volume" )
+    check(L.eval("math.abs(mixi[1][2] - 0.5 * (0.3 + 0.7 * .08 ^ 0.7)) < 1e-9"), "idle's volume")
+    check(L.eval("math.abs(mixs[1][2] - 0.5 * 0.2 * (0.3 + 0.7 * .01 ^ 0.7)) < 1e-9 and mixs[2][2] == 0"), "under a twentieth of power it fades out; a negative share is none")
+    check(L.eval("mixf[5][1] == 1.4 and mixf[5][2] == 0.6 and mixo[5][2] == 0.6 and math.abs(mixs[5][1] - 1.05) < 1e-9 and math.abs(mixs[5][2] - 0.6 * .5 ^ 1.3) < 1e-9"), "the wind follows speed up to 4000 cm/s")
+    check(L.eval("mixn[1][2] == 0 and mixn[5][2] == 0"), "no numbers at all: silent")
+    check(L.eval("bike.peer_share(0, 0) == 0.4 and bike.peer_share(4000, 0) == 0.8 and bike.peer_share(9e9, 0) == 0.8 and math.abs(bike.peer_share(2000, 0) - 0.6) < 1e-9"), "another player's bike: hover's share, more with speed")
+    check(L.eval("math.abs(bike.peer_share(0, bike._consts.CLIMB) - 0.8) < 1e-9 and bike.peer_share(0, -900) == 0.4"), "or with a climb, and no less going down")
+    # flown from here
+    L.execute("""
+        B2 = cart(78); B2.at = { X = 9000, Y = 0, Z = 0 }; CARTS = { B2 }; GROUND_Z = -5; KEYS = {}; TRACE_FN = nil; tick(70)
+        M2 = model_on(B2)
+        function loops() local t = {}; for _, c in ipairs(SOUNDS) do if c.root == M2.StaticMeshComponent then t[#t + 1] = c end end; return t end
+    """)
+    check(L.eval("#loops() == 0 and B2.EngineSound.vol == 0"), "nobody on it: no sounds made, the golf cart's engine sound off")
+    L.execute("PLAYER.no_bone = true; PLAYER.parent = B2; tick(30); LP = loops(); P_I = LP[1].pitch; V_I = LP[1].vol; A_I = LP[1].on")
+    check(L.eval("#LP == 5 and LP[1].snd == SND_MOTOR and LP[4].snd == SND_MOTOR and LP[5].snd == SND_WIND"), "on it: four motors and the wind, on the bike's model")
+    check(L.eval("LP[1].stop_with == true and LP[1].auto_destroy == false and LP[1].start0 == 0 and LP[2].start0 == 0.37 and LP[4].start0 == 1.43 and LP[5].start0 == 0"), "kept when stopped, going with the model; each loop starts somewhere else")
+    check(L.eval("LP[3].loc.X == 0 and LP[3].loc.Y == 0 and LP[3].loc.Z == 0 and LP[3].turn.Pitch == 0 and LP[3].turn.Yaw == 0 and LP[3].turn.Roll == 0 and LP[3].kind == 0 and LP[3].vol0 == 0 and LP[3].pitch0 == 1"), "on the model's origin, relative to it, silent until told")
+    check(L.eval("A_I == true and LP[5].on == false"), "on the ground: the motors idle, no wind")
+    check(L.eval("math.abs(P_I - (0.4 + 1.1 * math.sqrt(.08)) * .985) < 0.02"), "at idle's pitch (%.3f)" % L.eval("P_I"))
+    check(L.eval("LP[2].at_play == 0.37"), "played from where it starts")
+    L.execute("s_a = LP[1].pitch_sets; KEYS = { SpaceBar = true }; tick(60); s_b = LP[1].pitch_sets; P_U = LP[1].pitch; V_U = LP[1].vol; KEYS = {}; tick(180);")
+    check(L.eval("s_b - s_a >= 8 and s_b - s_a <= 31"), "while it changes the engine is told at most 30 times a second, not every frame (%d)" % L.eval("s_b - s_a"))
+    L.execute("P_H = LP[1].pitch; V_H = LP[1].vol; s0 = LP[1].pitch_sets; v0 = LP[1].vol_sets; tick(60); s1 = LP[1].pitch_sets; v1 = LP[1].vol_sets")
+    check(L.eval("P_U > P_I + 0.2 and V_U > V_I"), "Space: higher and louder (pitch %.2f to %.2f, volume %.2f to %.2f)" % (L.eval("P_I"), L.eval("P_U"), L.eval("V_I"), L.eval("V_U")))
+    check(L.eval("P_H > P_I and P_H < P_U and math.abs(P_H - 0.985 * (0.4 + 1.1 * math.sqrt(1 / 2.6))) < 0.08"), "hands off it holds height: near hover's pitch (%.3f)" % L.eval("P_H"))
+    check(L.eval("s1 - s0 <= 5 and v1 - v0 <= 5"), "and steady, the engine isn't told over and over (%d, %d in a second)" % (L.eval("s1 - s0"), L.eval("v1 - v0")))
+    L.execute("KEYS = { W = true, LeftShift = true }; tick(400); W_ON = LP[5].on; W_V = LP[5].vol; W_P = LP[5].pitch; KEYS = {}")
+    check(L.eval("W_ON == true and W_V > 0.01 and W_P > 0.7 and LP[5].at_play == 0"), "flying fast the wind is heard, from its start (volume %.3f, pitch %.2f)" % (L.eval("W_V"), L.eval("W_P")))
+    # getting off: run down, then quiet, and the sound's not remade
+    L.execute("""
+        tick(240); n_snd = #SOUNDS; sets0 = M2.pose.sets; on0 = LP[1].on; p0 = LP[1].pitch; PLAYER.parent = nil; tick(13); tick(45)
+        on1 = LP[1].on; p1 = LP[1].pitch; sets1 = M2.pose.sets; tick(600); on2 = LP[1].on; w2 = LP[5].on; sets2 = M2.pose.sets; d2 = bike._dressed()
+        for _, x in pairs(d2) do if x.car == B2 then run2 = x.running end end; tick(60); sets3 = M2.pose.sets
+    """)
+    check(L.eval("on0 == true and on1 == true and p1 < p0"), "off it the motors run down, they don't cut (%.2f to %.2f)" % (L.eval("p0"), L.eval("p1")))
+    check(L.eval("sets1 > sets0"), "the props with them")
+    check(L.eval("on2 == false and w2 == false and run2 == false and sets3 == sets2 and #SOUNDS == n_snd"), "then everything stops, nothing's left being told, nothing's remade")
+    # back on: the same loops again
+    L.execute("PLAYER.parent = B2; tick(30); on3 = LP[1].on; p3 = #SOUNDS; PLAYER.parent = nil; tick(700)")
+    check(L.eval("on3 == true and p3 == n_snd"), "back on it: the same loops play")
+    # someone else flying it
+    L.execute("""
+        local i = 0; for _, c in ipairs(LP) do i = i + c.plays end; pl0 = i
+        B2.at = { X = 9000, Y = 0, Z = 0 }; GROUND_Z = -5; PEER_CAR = B2; tick(30); P_G = LP[1].pitch; S_G = M2.pose.sets
+        GROUND_Z = -1e9; tick(60); P_A = LP[1].pitch
+        function fly_by(vx, vz, n) for _ = 1, n do local a = B2.at; B2.at = { X = a.X + vx / 60, Y = a.Y, Z = a.Z + vz / 60 }; tick(1) end end
+        fly_by(4000, 0, 180); P_F = LP[1].pitch; W_F = LP[5].on
+        fly_by(0, 0, 180); P_S = LP[1].pitch; WV_S = LP[5].vol
+        fly_by(0, 900, 120); P_C = LP[1].pitch
+        fly_by(0, 0, 180); P_T0 = LP[1].pitch; B2.at = { X = 900000, Y = 0, Z = 0 }; tick(1); fly_by(0, 0, 20); P_T = LP[1].pitch
+    """)
+    check(L.eval("P_G < 0.8 and P_G > 0.4"), "their bike parked on the ground: idle (%.3f)" % L.eval("P_G"))
+    check(L.eval("S_G > 0"), "its props turning")
+    check(L.eval("math.abs(P_A - 0.985 * (0.4 + 1.1 * math.sqrt(0.4))) < 0.02"), "still in the air: hover (%.3f)" % L.eval("P_A"))
+    check(L.eval("P_F > P_A + 0.2 and W_F == true"), "going fast: harder, and the wind (%.3f)" % L.eval("P_F"))
+    check(L.eval("P_S < P_F and math.abs(P_S - P_A) < 0.03 and WV_S < 0.02"), "stopped in the air: back to hover (%.3f)" % L.eval("P_S"))
+    check(L.eval("P_C > P_A + 0.2"), "a climb works them too (%.3f)" % L.eval("P_C"))
+    check(L.eval("math.abs(P_T - P_T0) < 0.02"), "a teleport isn't speed (%.3f to %.3f)" % (L.eval("P_T0"), L.eval("P_T")))
+    # what it reads off their bike, exactly: speed in all three axes, a signed climb, smoothed over 0.3 s, the ground 4 times a second
+    L.execute("""
+        function d_of(car) for _, x in pairs(bike._dressed()) do if x.car == car then return x end end end
+        function fly3(x, y, z, n) for _ = 1, n do local a = B2.at; B2.at = { X = a.X + x / 60, Y = a.Y + y / 60, Z = a.Z + z / 60 }; tick(1) end end
+        B2.at = { X = 9000, Y = 0, Z = 5000 }; fly3(0, 0, 0, 300); D2 = d_of(B2); S_0 = D2.peer_speed
+        TR_N = 0; TRACE_FN = function() TR_N = TR_N + 1; return false end; fly3(0, 0, 0, 60); TRACE_FN = nil
+        fly3(600, 800, 2400, 1); S_1 = D2.peer_speed; fly3(600, 800, 2400, 300); S_2 = D2.peer_speed; C_2 = D2.peer_climb
+        fly3(600, 0, 0, 300); S_3 = D2.peer_speed; C_3 = D2.peer_climb; fly3(0, 0, -600, 300); C_4 = D2.peer_climb
+        local lg = require("mirror.log"); local w0 = lg.warn; W_L = 0; lg.warn = function() W_L = W_L + 1 end
+        LOC0 = B2.K2_GetActorLocation; B2.K2_GetActorLocation = function() error("gone") end; tick(1); B2.K2_GetActorLocation = LOC0; lg.warn = w0
+    """)
+    check(L.eval("S_0 < 1 and math.abs(S_1 - S_0 - 2600 * (1 - math.exp(-(1 / 60) / 0.3))) < 1"), "one frame moves its speed by that frame's share of 0.3 s (%.1f)" % L.eval("S_1"))
+    check(L.eval("math.abs(S_2 - 2600) < 1 and math.abs(C_2 - 2400) < 1"), "settled: its speed through all three axes, its climb (%.0f, %.0f)" % (L.eval("S_2"), L.eval("C_2")))
+    check(L.eval("math.abs(S_3 - 600) < 1 and math.abs(C_3) < 1 and math.abs(C_4 + 600) < 1"), "level flight high up is no climb; going down is a negative one (%.1f, %.1f)" % (L.eval("C_3"), L.eval("C_4")))
+    check(L.eval("TR_N >= 3 and TR_N <= 5"), "still, it looks for the ground about 4 times a second, not every frame (%d)" % L.eval("TR_N"))
+    check(L.eval("W_L == 0"), "a bike whose place can't be read is skipped that frame, no error (%d)" % L.eval("W_L"))
+    # I fly one and they fly another: both heard
+    L.execute("""
+        B3 = cart(78); B3.at = { X = -9000, Y = 0, Z = 5000 }; CARTS = { B2, B3 }; PEER_CAR = B2; tick(70); M3 = model_on(B3)
+        p_before = LP[1].pose_sets; S0 = M2.pose.sets; PLAYER.parent = B3; tick(30); FF3 = bike._flight(); S1 = M2.pose.sets; N3 = 0
+        for _, c in ipairs(SOUNDS) do if c.root == M3.StaticMeshComponent then N3 = N3 + 1 end end
+    """)
+    check(L.eval("FF3 ~= nil and S1 > S0 and N3 == 5"), "flying my own, the other player's still turns and each has its own sound")
+    # they leave
+    L.execute("""PLAYER.parent = nil; PEER_CAR = nil; tick(60); O1 = LP[1].on; tick(700); O2 = LP[1].on""")
+    check(L.eval("O1 == true and O2 == false"), "they leave: it runs down and stops")
+    # no sounds in the pak (the Lua is live, the pak changes only on install): asked for, a warning once, it still flies
+    L.execute("""
+        local lg = require("mirror.log"); WARNS = {}; WARN0 = lg.warn; lg.warn = function(t) WARNS[#WARNS + 1] = t end
+        B4 = cart(78); B4.at = { X = 0, Y = 9000, Z = 5000 }; CARTS = { B4 }; tick(70); NO_SOUND = true; l0 = #LOADS; n_s = #SOUNDS
+        PLAYER.parent = B4; tick(30); F4 = bike._flight(); l1 = #LOADS; tick(60 * 25); w0 = #WARNS; l1b = #LOADS; tick(60 * 15); w1 = #WARNS; l2 = #LOADS; tick(60 * 10); l3 = #LOADS
+    """)
+    check(L.eval("F4 ~= nil and l1 > l0 and #SOUNDS == n_s"), "no sounds in the pak: it's asked for, and it flies")
+    check(L.eval("w0 == 0 and l1b > l1"), "and it keeps asking for a while, not a word yet (%d)" % L.eval("w0"))
+    u_m, u_w = L.eval("LOAD_IDS['/Game/Mods/SurrounSyncArmory/BikeMotor.BikeMotor']"), L.eval("LOAD_IDS['/Game/Mods/SurrounSyncArmory/BikeWind.BikeWind']")
+    check(u_m is not None and u_w is not None and u_m != u_w, "each with its own load id: the engine ignores a second load under the same one (%s, %s)" % (u_m, u_w))
+    check(L.eval("bike._flight() == F4 and w1 == 1 and WARNS[1]:find('silent') ~= nil and l3 == l2"), "after half a minute it's said once, and it stops asking (%d warnings)" % L.eval("w1"))
+    # another world looks again; the sound failing takes only the sound
+    L.execute("""
+        PLAYER.parent = nil; NO_SOUND = false; tick(30); n_gone = #SOUNDS; B6 = cart(78); B6.at = { X = 0, Y = 19000, Z = 5000 }; CARTS = { B6 }; tick(70); PLAYER.parent = B6; tick(90); n_still = #SOUNDS
+        PLAYER.parent = nil; tick(30); require("mirror.bikenoise").reset()
+        NO_GS = true; WARNS = {}; n11 = #SOUNDS; B9 = cart(78); B9.at = { X = 29000, Y = 0, Z = 5000 }; CARTS = { B9 }; tick(70); PLAYER.parent = B9; tick(90); n12 = #SOUNDS; w9 = #WARNS
+        NO_GS = false; tick(60); n13 = #SOUNDS; PLAYER.parent = nil; tick(30)
+        WARNS = {}; B5 = cart(78); B5.at = { X = 0, Y = -9000, Z = 5000 }; CARTS = { B5 }; tick(70)
+        SOUND_RAISE = true; PLAYER.parent = B5; tick(90); F5 = bike._flight(); SOUND_RAISE = false; n5 = #SOUNDS; tick(60); n6 = #SOUNDS
+    """)
+    check(L.eval("n_still == n_gone"), "given up on, a new bike doesn't look again in this world")
+    check(L.eval("F5 ~= nil and n5 == n6 and #WARNS == 1 and WARNS[1]:find('went wrong') ~= nil"), "a sound that fails to start: told once, not tried again, it flies")
+    # a second bike failing isn't told again; one sound of the two missing is none; no GameplayStatics is silent, not a failure
+    L.execute("""
+        PLAYER.parent = nil; tick(30); B7 = cart(78); B7.at = { X = 0, Y = -19000, Z = 5000 }; CARTS = { B7 }; tick(70)
+        SOUND_RAISE = true; PLAYER.parent = B7; tick(90); SOUND_RAISE = false; w7 = #WARNS; PLAYER.parent = nil; tick(30)
+        require("mirror.bikenoise").reset(); n8 = #SOUNDS; NO_WIND = true; B8 = cart(78); B8.at = { X = 19000, Y = 0, Z = 5000 }; CARTS = { B8 }; tick(70)
+        PLAYER.parent = B8; tick(90); n9 = #SOUNDS; NO_WIND = false; tick(60); n10 = #SOUNDS; PLAYER.parent = nil; tick(30)
+    """)
+    check(L.eval("w7 == 1"), "a second bike's failing isn't said again")
+    check(L.eval("n9 == n8 and n10 == n8 + 5"), "one of the two sounds not in yet: none made until both are")
+    check(L.eval("n12 == n11 and w9 == 0 and n13 == n11"), "no GameplayStatics: silent, no error, not tried again on that bike")
+    L.execute("""
+        PLAYER.parent = nil; tick(30); require("mirror.log").warn = WARN0; KEYS = {}
+        B5.VehicleColor = 3; tick(70); ENG5 = B5.EngineSound.vol; CARTS = {}; GROUND_Z = -1e9; TRACE_FN = nil; tick(70)
+    """)
+    check(L.eval("ENG5 == 1"), "a golf cart again: its engine sound comes back")
+    # off in the config
+    L.execute("""TICKS = {}; package.loaded['mirror.hoverbike'] = nil; b2 = require('mirror.hoverbike'); b2.init({ hoverbike = false })""")
+    check(L.eval("#TICKS == 0"), "hoverbike = false in the config leaves it out")
+
+
+def admin_fly_flies_for_its_owner_only():
+    # user 2026-11-03: "keep the flight system for it and then add that too my character as a hotkey for a quick admin fly
+    # but no jetpack"; the flight from 2026-11-02: "make this flight code in depth af, add boost and make the movement
+    # smooth but also aggresive when needed and super fun"
+    print("admin_fly_flies_for_its_owner_only")
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "loginusers.vdf"), "w") as f:
+        f.write('"users"\n{\n\t"76561199756383981"\n\t{\n\t\t"AccountName"\t\t"x"\n\t\t"MostRecent"\t\t"0"\n\t}\n'
+                '\t"76561199084190564"\n\t{\n\t\t"AccountName"\t\t"y"\n\t\t"MostRecent"\t\t"1"\n\t}\n}\n')
+    L = lua()
+    L.execute(FAKES + r"""
+        KEYS, TICKS, RESETS, BINDS, CARDS = {}, {}, {}, {}, {}
+        FALLING, GROUND, GLIDING = false, false, false
+        CTRL = { Pitch = 0, Yaw = 0, Roll = 0 }
+        LOBBY = { id = "111" }
+        FindFirstOf = function() return nil end
+        local mesh = obj({ RelativeRotation = { Pitch = 0, Yaw = -90, Roll = 0 }, RelativeLocation = { X = 0, Y = 0, Z = -82 },
+            K2_SetRelativeLocationAndRotation = function(self, l, r) self.RelativeLocation = l; self.RelativeRotation = r end })
+        PLAYER = obj({ Mesh = mesh, ["PlayerDead?"] = false, SwimmingComponent = { ["IsSwimming?"] = false },
+            CharacterMovement = { Velocity = { X = 0, Y = 0, Z = 0 }, GravityScale = 1.75,
+                                  IsFalling = function() return FALLING end,
+                                  SetMovementMode = function(self, m) LIFTOFF = m; FALLING = true end },
+            SpringArm = { TargetArmLength = 300, CameraLagSpeed = 25, CameraLagMaxDistance = 50 },
+            Camera = { FieldOfView = 90 },
+            CapsuleComponent = { GetScaledCapsuleHalfHeight = function() return 90 end },
+            K2_GetActorLocation = function() return { X = 0, Y = 0, Z = 5000 } end,
+            K2_GetActorRotation = function() return { Pitch = 0, Yaw = 0, Roll = 0 } end,
+            K2_SetActorRotation = function() end })
+        package.loaded["mirror.notify"] = { show = function(t) CARDS[#CARDS + 1] = t end, clear = function() end }
+        package.loaded["mirror.link"] = { lobby = function() return LOBBY end }
+        package.loaded["mirror.glider"] = { active = function() return GLIDING end }
+        package.loaded["mirror.game"] = { player = function() return PLAYER end,
+            controller = function() return { GetControlRotation = function() return CTRL end,
+                                             GetInputAnalogKeyState = function() return 0 end } end,
+            key_down = function(k) return KEYS[k] == true end,
+            keybind = function(name, mods, fn) BINDS[name] = { mods = mods, fn = fn } end,
+            on_tick = function(f) TICKS[#TICKS + 1] = f end, on_world_reset = function(f) RESETS[#RESETS + 1] = f end }
+        local finds = {
+            ["/Script/Engine.Default__KismetSystemLibrary"] = obj({ LineTraceSingle = function() return GROUND end }),
+            ["/Script/Engine.Default__KismetMathLibrary"] = obj({ ComposeRotators = function(_, a, b)
+                return { Pitch = a.Pitch + b.Pitch, Yaw = a.Yaw + b.Yaw, Roll = a.Roll + b.Roll } end }),
+        }
+        StaticFindObject = function(p) return finds[p] end
+        util = require("mirror.util")
+        util.find = function(p) return finds[p] end
+        jp = require("mirror.adminfly")
+        jp.init({})
+        C, S, ST = jp._consts, jp._stats, jp._state
+        function tick(n) for i = 1, (n or 1) do for _, f in ipairs(TICKS) do f(1 / 60) end end end
+        function f7() BINDS.F7.fn(); tick() end
+        function vel(z) PLAYER.CharacterMovement.Velocity = { X = 0, Y = 0, Z = z } end
+        -- the model alone, 60 steps a second
+        function new(t) t = t or {}; t.vx, t.vy, t.vz = t.vx or 0, t.vy or 0, t.vz or 0; return t end
+        function run(st, inp, secs)
+            local b
+            for i = 1, math.floor(secs * 60 + 0.5) do b = jp.step(st, inp, 1 / 60) end
+            return st, b
+        end
+        function hs(st) return math.sqrt(st.vx * st.vx + st.vy * st.vy) end
+        -- a fall onto flat ground at Z 0 with gravity g (the game's when not flying), the retro burn on; the touchdown speed
+        function drop(z, vz, g)
+            local dt = 1 / 60
+            for i = 1, 60 * 120 do
+                vz = jp.retro(vz, dt, function(cm) return z <= cm end, g)
+                vz = vz - g * dt
+                z = z + vz * dt
+                if z <= 0 then return vz end
+            end
+        end
+    """)
+
+    # the model
+    check(L.eval("jp._vdf_user(...)", os.path.join(d, "loginusers.vdf")) == "76561199084190564",
+          "loginusers.vdf: the account Steam logged in last (MostRecent 1)")
+    # user 2026-11-02: "id prefer if it flew like gtav jetpack" - hovers on its own, steered by tilting, a boost burst
+    L.execute("hst = run(new(), {}, 3)")
+    check(L.eval("hs(hst)") < 1 and abs(L.eval("hst.vz")) <= 20, "hands off: it hovers where it is (a slow bob, %.0f cm/s)" % L.eval("hst.vz"))
+    vz = L.eval("run(new(), { up = true }, 2).vz")
+    vz2 = L.eval("run(new(), { down = true }, 2).vz")
+    check(vz == L.eval("C.CLIMB") and vz2 == -L.eval("C.DESCEND"), "Jump held climbs at %.0f, Crouch held sinks at %.0f cm/s" % (vz, vz2))
+    vz = L.eval("run(new({ vz = 1000 }), {}, 1).vz")
+    vz2 = L.eval("run(new({ vz = -1300 }), {}, 1).vz")
+    check(abs(vz) <= 20 and abs(vz2) <= 20, "let go of either: it holds the height again within 1 s (%.0f, %.0f)" % (vz, vz2))
+    L.execute("wst = run(new(), { f = 1, fx = 1, fy = 0 }, 0.15)")
+    s, tilt = L.eval("wst.vx"), L.eval("wst.tilt_f")
+    check(s < 150 and tilt > 8, "W: the body tilts first (%.0f deg), the thrust follows a moment later (%.0f cm/s at 0.15 s)" % (tilt, s))
+    L.execute("run(wst, { f = 1, fx = 1, fy = 0 }, 5)")
+    s, tilt = L.eval("wst.vx"), L.eval("wst.tilt_f")
+    check(1950 < s < 2350 and abs(tilt - L.eval("C.TILT_MAX")) < 0.5,
+          "W held: it builds up to cruise (%.0f of %.0f cm/s) at the full %.0f deg tilt" % (s, L.eval("C.CRUISE"), tilt))
+    s = L.eval("run(new(), { r = 1, fx = 1, fy = 0 }, 4).vy")
+    check(s > 1800 and L.eval("run(new(), { r = 1, fx = 1, fy = 0 }, 1).tilt_r") > 15, "D: it banks right and slides right (%.0f cm/s)" % s)
+    L.execute("lst = run(new({ vx = 2300, tilt_f = 24 }), {}, 0.3)")
+    s1, t1 = L.eval("lst.vx"), L.eval("run(lst, {}, 0.4).tilt_f")
+    s2 = L.eval("hs(run(lst, {}, 3))")
+    check(s1 > 1900 and t1 < 0 and s2 < 100,
+          "let go at cruise: it carries on a moment (%.0f), tilts back against the drift (%.0f deg) and stops (%.0f after 3.7 s)" % (s1, t1, s2))
+    s = L.eval("run(new({ vx = 2300, tilt_f = 24 }), { f = 1, fx = 0, fy = 1 }, 3).vy")
+    check(s > 1500 and L.eval("run(new({ vx = 2300, tilt_f = 24 }), { f = 1, fx = 0, fy = 1 }, 3).vx") < 600,
+          "turning the camera swings the drift round to the new heading (%.0f cm/s that way after 3 s)" % s)
+    L.execute("bst = new(); jp.step(bst, { kick = true, f = 1, fx = 1, fy = 0 }, 1 / 60); run(bst, { f = 1, fx = 1, fy = 0 }, 1.6)")
+    s = L.eval("bst.vx")
+    check(3800 < s <= L.eval("C.BOOST_SPEED"), "Sprint pressed: a boost surges it to about %.0f cm/s (%.0f after 1.6 s)" % (L.eval("C.BOOST_SPEED"), s))
+    L.execute("run(bst, { f = 1, fx = 1, fy = 0 }, 1.0)")
+    check(L.eval("(bst.boost_t or 0) <= 0") and L.eval("bst.charge") < 0.01,
+          "a full charge boosts %.1f s, then it's empty" % L.eval("C.BOOST_S"))
+    check(not L.eval("jp.step(bst, { kick = true, f = 1, fx = 1, fy = 0 }, 1 / 60)"), "(Sprint on an empty charge doesn't boost)")
+    s = L.eval("run(bst, { f = 1, fx = 1, fy = 0 }, 4).vx")
+    check(s < 1.1 * L.eval("C.CRUISE"), "after the boost the speed bleeds back to within 10%% of cruise in 4 s (%.0f)" % s)
+    L.execute("run(bst, {}, C.RECHARGE_S + C.RECHARGE_DELAY)")
+    check(L.eval("bst.charge") == 1 and L.eval("jp.step(bst, { kick = true }, 1 / 60)"),
+          "the charge refills in %.0f s and boosts again" % L.eval("C.RECHARGE_S"))
+    L.execute("pst = new({ charge = 0.4 }); jp.step(pst, { kick = true }, 1 / 60); run(pst, {}, 0.9); MID = pst.boost_t > 0; run(pst, {}, 0.15)")
+    check(L.eval("MID") and L.eval("pst.boost_t <= 0"), "a part charge gives a shorter boost (40%%: %.1f s)" % (0.4 * L.eval("C.BOOST_S")))
+    land = [L.eval("drop(...)", z, 0, 1715) for z in (3000, 20000)] + [L.eval("drop(...)", 2000, -2400, 0)]
+    check(all(v >= -L.eval("C.SAFE_VZ") - 30 for v in land),
+          "the retro burn lands every fall at a jump's speed (30 m, 200 m, lit descent from 20 m: %s cm/s)" % [round(v) for v in land])
+
+    # the hotkey and the owner lock
+    check(L.eval("BINDS.F7 ~= nil and BINDS.F7.mods == nil"), "F7, with no Ctrl or Shift: those are the flight's own Crouch and Sprint")
+    L.execute("N0 = #TICKS; jp.init({ adminfly = false })")
+    check(L.eval("#TICKS == N0"), "(config adminfly = false: no key, no tick)")
+    L.execute("LOBBY = { id = '111' }; tick(); f7(); tick(30)")
+    check(not L.eval("ST.on") and L.eval("S.toggled") == 0 and L.eval("#CARDS") == 0
+          and L.eval("PLAYER.CharacterMovement.GravityScale") == 1.75, "someone else's game: F7 does nothing, not even a card")
+    L.execute("FALLING = true; KEYS.SpaceBar = true; vel(-3000); GROUND = true; tick(30); KEYS.SpaceBar = false; FALLING = false; GROUND = false; vel(0)")
+    check(not L.eval("ST.on") and L.eval("S.retro") == 0, "(no flight and no retro burn for them either)")
+
+    # F7 on: it lifts off at once
+    L.execute("LOBBY = { id = jp.OWNER }; tick(%d); f7()" % (6 * 60))
+    check(L.eval("ST.on") and L.eval("LIFTOFF") == 3 and L.eval("PLAYER.CharacterMovement.GravityScale") == 0,
+          "the owner's game, on the ground: F7 lifts off at once, off the floor, its own gravity taking over")
+    check(L.eval("CARDS[#CARDS]") == "Admin fly on.", "(a card says so)")
+    L.execute("tick(math.floor(C.LIFT_S * 60))")
+    z = L.eval("PLAYER.CharacterMovement.Velocity.Z")
+    check(z > 300, "it climbs by itself for a moment (%.0f cm/s after %.1f s)" % (z, L.eval("C.LIFT_S")))
+    L.execute("tick(120)")
+    z = L.eval("PLAYER.CharacterMovement.Velocity.Z")
+    check(abs(z) <= 20, "then it holds the height, hands off (%.0f cm/s)" % z)
+    L.execute("KEYS.SpaceBar = true; tick(60)")
+    check(L.eval("PLAYER.CharacterMovement.Velocity.Z") > 600, "Jump held climbs (%.0f cm/s)" % L.eval("PLAYER.CharacterMovement.Velocity.Z"))
+    L.execute("KEYS.SpaceBar = false; KEYS.W = true; KEYS.LeftShift = true; tick(60)")
+    check(L.eval("PLAYER.Mesh.RelativeRotation.Pitch") < -10 and L.eval("PLAYER.Camera.FieldOfView") > 90 and L.eval("S.boosts") == 1,
+          "boosting: the body leans into it and the view widens")
+
+    # landing, and taking off again
+    L.execute("KEYS.W, KEYS.LeftShift = false, false; FALLING = false; tick()")
+    check(not L.eval("ST.on") and L.eval("S.landed") == 1 and L.eval("PLAYER.CharacterMovement.GravityScale") == 1.75
+          and L.eval("PLAYER.Mesh.RelativeRotation.Pitch") == 0 and L.eval("PLAYER.Camera.FieldOfView") == 90,
+          "landing ends the flight: the game's gravity, body and camera back")
+    check("on" in L.eval("jp.status()"), "(F7 stays on: %s)" % L.eval("jp.status()"))
+    L.execute("KEYS.SpaceBar = true; tick(); FALLING = true; tick(4)")
+    check(not L.eval("ST.on"), "a tapped jump stays a jump")
+    L.execute("tick(10)")
+    check(L.eval("ST.on") and L.eval("PLAYER.CharacterMovement.GravityScale") == 0, "a held jump takes off again")
+    L.execute("LIFTOFF = nil; FALLING = false; tick()")
+    check(L.eval("ST.on") and L.eval("LIFTOFF") == 3, "Jump still held as it touches down: it stays up")
+    L.execute("KEYS.SpaceBar = false; FALLING = false; tick(); FALLING = true; GROUND = true; vel(-3000); tick()")
+    check(not L.eval("ST.on") and L.eval("PLAYER.CharacterMovement.Velocity.Z") == -L.eval("C.SAFE_VZ") and L.eval("S.retro") == 1,
+          "on but not flying, a long fall: the retro burn still catches it")
+    L.execute("FALLING = false; GROUND = false; vel(0); tick()")
+
+    # F7 off
+    L.execute("KEYS.SpaceBar = true; tick(); FALLING = true; tick(10); KEYS.SpaceBar = false; tick(30); f7()")
+    check(not L.eval("ST.on") and L.eval("PLAYER.CharacterMovement.GravityScale") == 1.75 and L.eval("CARDS[#CARDS]") == "Admin fly off.",
+          "F7 in the air: out of flight, the game's gravity back, a card")
+    L.execute("RETRO0 = S.retro; GROUND = true; vel(-3000); tick()")
+    check(L.eval("PLAYER.CharacterMovement.Velocity.Z") == -L.eval("C.SAFE_VZ") and L.eval("S.retro") == L.eval("RETRO0 + 1"),
+          "and that drop is still caught: no fall damage from turning it off high up")
+    L.execute("FALLING = false; GROUND = false; vel(0); tick(); FALLING = true; GROUND = true; vel(-3000); tick()")
+    check(L.eval("PLAYER.CharacterMovement.Velocity.Z") == -3000, "once landed, off really is off: the next fall isn't caught")
+    L.execute("KEYS.SpaceBar = true; tick(30)")
+    check(not L.eval("ST.on"), "(and Jump in the air doesn't take off)")
+    L.execute("KEYS.SpaceBar = false; FALLING = false; GROUND = false; vel(0); tick()")
+
+    # what keeps it down
+    L.execute("PLAYER['PlayerDead?'] = true; f7()")
+    check(not L.eval("ST.on") and L.eval("LIFTOFF") == 3 and L.eval("PLAYER.CharacterMovement.GravityScale") == 1.75, "dead: F7 doesn't lift off")
+    L.execute("f7(); PLAYER['PlayerDead?'] = false; PLAYER.SwimmingComponent['IsSwimming?'] = true; f7()")
+    check(not L.eval("ST.on"), "in the water: nor there")
+    L.execute("f7(); PLAYER.SwimmingComponent['IsSwimming?'] = false; GLIDING = true; f7()")
+    check(not L.eval("ST.on"), "under an open hang glider: nor there")
+    L.execute("f7(); GLIDING = false; FALLING = false; f7(); tick(30); PLAYER['PlayerDead?'] = true; tick()")
+    check(not L.eval("ST.on") and L.eval("PLAYER.CharacterMovement.GravityScale") == 1.75, "flying and killed: the flight ends")
+    L.execute("PLAYER['PlayerDead?'] = false; FALLING = false; tick(); KEYS.SpaceBar = true; tick(); FALLING = true; tick(10); KEYS.SpaceBar = false; GLIDING = true; tick()")
+    check(not L.eval("ST.on") and L.eval("PLAYER.CharacterMovement.GravityScale") == 1.75, "flying and the hang glider opens: the flight ends")
+    L.execute("GLIDING = false; FALLING = false; tick(); f7(); RETRO0 = S.retro; GLIDING = true; FALLING = true; GROUND = true; vel(-3000); tick()")
+    check(L.eval("PLAYER.CharacterMovement.Velocity.Z") == -3000 and L.eval("S.retro") == L.eval("RETRO0"), "(F7 off under the glider: no burn fighting it)")
+
+    # the world and the account changing under it
+    L.execute("GLIDING = false; GROUND = false; FALLING = false; vel(0); tick(); f7(); tick(30); for _, f in ipairs(RESETS) do f() end; tick()")
+    check(not L.eval("ST.on") and L.eval("PLAYER.CharacterMovement.GravityScale") == 1.75, "the world reset: the flight ends")
+    L.execute("FALLING = false; tick(); T0 = S.toggled; f7()")
+    check(L.eval("ST.on") and L.eval("CARDS[#CARDS]") == "Admin fly on.", "(and starts off: the next F7 turns it on, not off)")
+    L.execute("LOBBY = { id = '111' }; tick(%d)" % (6 * 60))
+    check(not L.eval("ST.on") and L.eval("PLAYER.CharacterMovement.GravityScale") == 1.75, "not the owner's account any more: out within a check")
+    L.execute("LOBBY = { id = jp.OWNER }; tick(%d); FALLING = true; KEYS.SpaceBar = true; tick(30)" % (6 * 60))
+    check(not L.eval("ST.on"), "(and back on the owner's account it stays off until F7)")
+
+
+def an_fpv_quad_flown_by_one_player_shows_on_the_others_screen():
+    # user 2026-11-03: "make it ship with SurrounSync but mainly so I can brag and show off" - FPVDrone's pose (the
+    # shared variable FPVDrone.pose) goes with mine as a "Q ..." segment; their game shows the quad, turned, props spinning.
+    print("an_fpv_quad_flown_by_one_player_shows_on_the_others_screen")
+    L = lua()
+    L.execute(FAKES + r"""
+        SHAREDV, SPAWNED, RESETS, HERE = {}, {}, {}, true
+        ModRef = { GetSharedVariable = function(self, k) return SHAREDV[k] end }
+        REST = { prop_FL = { 0.1, 0.2, 0.3 }, prop_FR = { -0.2, 0.1, 0.4 }, prop_RL = { 0.3, -0.1, 0.2 }, prop_RR = { 0, 0.5, 0 } }
+        local function unit(v) local n = math.sqrt(v[1]^2 + v[2]^2 + v[3]^2 + 1); return { X = v[1]/n, Y = v[2]/n, Z = v[3]/n, W = 1/n } end
+        LOADED, LOADS = true, 0
+        SMCCLS, DISCS, BLUR_LOADED = obj({}), {}, true
+        SOUND_COMPS, SOUNDS_IN, NO_HIT, SPAWN_CALLS = {}, true, false, 0
+        local finds = { ["/Script/Engine.StaticMeshActor"] = obj({}), ["/Script/Engine.PoseableMeshComponent"] = obj({}),
+                        ["/Script/Engine.StaticMeshComponent"] = SMCCLS,
+                        ["/Game/Mods/FPVDrone/DroneMotor.DroneMotor"] = obj({ name = "motor" }),
+                        ["/Game/Mods/FPVDrone/DroneWind.DroneWind"] = obj({ name = "wind" }),
+                        ["/Game/Mods/FPVDrone/DroneHit.DroneHit"] = obj({ name = "hit" }),
+                        ["/Script/Engine.Default__GameplayStatics"] = obj({ SpawnSoundAttached = function(_, snd, root, sock, l, r, kind, stop_with, vol, pitch, start, att, con, auto)
+                            SPAWN_CALLS = SPAWN_CALLS + 1
+                            if SPAWN_ERR and #SOUND_COMPS >= SPAWN_ERR then error("boom") end
+                            if snd.name == "hit" and NO_HIT then return nil end
+                            local c = obj({ snd = snd.name, root = root, born_at = l, born_turn = r, stop_with = stop_with, born_vol = vol, auto = auto, vol = vol, pitch = pitch, plays = 0, playing = true, sets = 0 })
+                            function c:SetPitchMultiplier(p) self.pitch = p; self.sets = self.sets + 1 end
+                            function c:SetVolumeMultiplier(v) self.vol = v; self.sets = self.sets + 1 end
+                            function c:Play(t) self.playing, self.plays, self.start = true, self.plays + 1, t end
+                            function c:Stop() self.playing = false end
+                            SOUND_COMPS[#SOUND_COMPS + 1] = c
+                            return c
+                        end }),
+                        ["/Game/Mods/FPVDrone/SM_FPVPropBlur.SM_FPVPropBlur"] = obj({ name = "BLUR" }),
+                        ["/Game/Mods/FPVDrone/SK_FPVDrone.SK_FPVDrone"] = obj({ name = "SK" }),
+                        ["/Game/Mods/FPVDrone/SM_FPVWhoop.SM_FPVWhoop"] = obj({ name = "WHOOP" }),
+                        ["/Script/Engine.Default__KismetSystemLibrary"] = obj({ LoadAsset = function(_, w, ref, o, info) LOADS = LOADS + 1; UUIDS[ref] = info and info.UUID end,
+                            Conv_SoftObjPathToSoftObjRef = function(_, p) return p end, MakeSoftObjectPath = function(_, p) return p end }) }
+        UUIDS = {}
+        WORLD = obj({ SpawnActor = function(self, c, at, rot)
+            local a = obj({ at = at, rot = rot })
+            a.StaticMeshComponent = { SetMobility = function() end, SetCollisionEnabled = function(c, v) c.coll = v end,
+                                      SetStaticMesh = function(c, m) c.mesh = m end }
+            a.K2_SetActorLocationAndRotation = function(self, l, r) self.at, self.rot = l, r end
+            a.K2_DestroyActor = function(self) self.IsValid = function() return false end end
+            a.AddComponentByClass = function(self, cls, manual, t)
+                if cls == SMCCLS then
+                    local d = { t = t, visible = true }
+                    function d:SetStaticMesh(m) self.mesh = m end
+                    function d:SetCollisionEnabled(v) self.coll = v end
+                    function d:SetCastShadow(v) self.shadow = v end
+                    function d:SetVisibility(v) self.visible = v end
+                    DISCS[#DISCS + 1] = d
+                    return d
+                end
+                local comp = { set = {} }
+                function comp:SetSkinnedAssetAndUpdate(m) self.mesh = m end
+                function comp:SetCollisionEnabled(v) self.coll = v end
+                function comp:GetBoneIndex(n) return REST[n] and 1 or -1 end
+                function comp:GetBoneTransformByName(n) return { Rotation = unit(REST[n]), Translation = { X = 7, Y = 8, Z = 2 }, Scale3D = { X = 1, Y = 1, Z = 1 } } end
+                function comp:SetBoneTransformByName(n, t, space) self.set[n] = t; self.space = space end
+                self.comp = comp
+                return comp
+            end
+            SPAWNED[#SPAWNED + 1] = a
+            return a
+        end })
+        StaticFindObject = function(p)
+            if p:find("SK_FPVDrone", 1, true) and not LOADED then return nil end
+            if p:find("SM_FPVPropBlur", 1, true) and not BLUR_LOADED then return nil end
+            if p:find("Mods/FPVDrone/Drone", 1, true) and not SOUNDS_IN then return nil end
+            return finds[p]
+        end
+        package.loaded["mirror.game"] = { world = function() return WORLD end, on_world_reset = function(f) RESETS[#RESETS + 1] = f end }
+        util = require("mirror.util")
+        util.find = function(p) return StaticFindObject(p) end
+        util.cdo = function(p) return StaticFindObject(p) end
+        drone = require("mirror.drone")
+        poseline = require("mirror.poseline")
+        drone.link_init(function() return HERE end)
+        -- a fresh quad, the sounds on the actor it spawned
+        function fresh_quad() drone.stop(); SOUND_COMPS = {}; SEQ = 1000; X = 0 end
+        function glide(n, step, m)
+            for _ = 1, n do
+                SEQ, X = SEQ + 1, X + step
+                fly(pose(SEQ, X, 0, 0, 0, m))
+            end
+        end
+        T = drone._theirs
+        -- one 30 Hz pose from my game to theirs, through the packet line: ME is my drone module, drone theirs
+        function fly(line)
+            SHAREDV["FPVDrone.pose"] = line
+            local q = drone.line()
+            local packet = "POSE" .. (q and ("|D Vehicle_Van_C_1 0 0 0 0 0 0 0 0 0 1 0 1.000|" .. q) or "")
+            local body, rest = packet:match("^([^|]*)|?(.*)$")
+            local base, quad, car = poseline.segments(rest)
+            CAR = car
+            drone.sample(quad)
+            drone.tick(1 / 30)
+        end
+        function pose(seq, x, p, y, r, m) return string.format("%d 5inch %.1f 200.0 300.0 %.1f %.1f %.1f %s", seq, x, p, y, r, m or "0.50 0.50 0.50 0.50") end
+    """)
+    # the rotator <-> quaternion pair is UE's: the quaternion turns forward (+X) to where pitch/yaw point, and back
+    for p, y, r in ((0, 0, 0), (30, 45, -20), (-60, 170, 80), (89.9, -30, 10), (0, 90, 179)):
+        q = L.eval("drone.quat(%r, %r, %r)" % (p, y, r))
+        x, yy, z, w = q.X, q.Y, q.Z, q.W
+        fwd = [1 - 2 * (yy * yy + z * z), 2 * (x * yy + z * w), 2 * (x * z - yy * w)]
+        want = [math.cos(math.radians(p)) * math.cos(math.radians(y)), math.cos(math.radians(p)) * math.sin(math.radians(y)), math.sin(math.radians(p))]
+        rr = L.eval("drone.rotator(drone.quat(%r, %r, %r))" % (p, y, r))
+        ok = all(abs(a - b) < 1e-6 for a, b in zip(fwd, want)) and abs(rr.Pitch - p) < 1e-4 and abs((rr.Yaw - y + 180) % 360 - 180) < 1e-4 \
+            and abs((rr.Roll - r + 180) % 360 - 180) < 1e-4
+        check(ok, "rotator %s <-> quaternion matches UE's (forward %s)" % ((p, y, r), [round(v, 3) for v in fwd]))
+    # a flip through straight up: blended as a quaternion, every in-between stays a unit turn and pitches up past 60
+    mid = L.eval("drone.rotator(drone.nlerp(drone.quat(80, 0, 0), drone.quat(80, 180, 180), 0.5))")
+    check(mid.Pitch > 85, "a loop over the top blends through straight up, not round the side (%.1f)" % mid.Pitch)
+
+    check(L.eval("drone.line()") is None, "no FPVDrone (no shared variable): nothing sent")
+    L.execute('fly("")')
+    check(len(L.eval("SPAWNED")) == 0 and not L.eval("T.flying"), "on foot (an empty pose): no quad")
+    L.execute('fly(pose(1, 1000, 0, 0, 0))')
+    seg = L.eval("drone.line()")
+    check(seg is not None and seg.startswith("Q 5inch 1000.0 "), "my flown pose goes out as a Q segment (%s)" % seg)
+    check(L.eval("CAR") is not None and L.eval("CAR").startswith("D "), "the car's segment still reaches the car (%s)" % L.eval("CAR"))
+    for i in range(2, 12):
+        L.execute('fly(pose(%d, %d, 0, 90, 30))' % (i, 1000 + i * 10))
+    a = L.eval("SPAWNED[1]")
+    check(len(L.eval("SPAWNED")) == 1 and L.eval("SPAWNED[1].comp.mesh.name") == "SK", "one quad, the 5\" rig on a poseable mesh")
+    check(a.StaticMeshComponent.coll == 0 and a.comp.coll == 0, "no collision on their quad (it never pushes anything)")
+    # shown DELAY_S (0.1 s = 3 poses) behind the newest: between the 8th and 9th pose's spots
+    check(1075 <= a.at.X <= 1095 and a.at.Y == 200 and abs(a.rot.Yaw - 90) < 1e-3 and abs(a.rot.Roll - 30) < 1e-3,
+          "the quad where their game had it a moment ago, turned as it was (X %.1f yaw %.1f roll %.1f)" % (a.at.X, a.rot.Yaw, a.rot.Roll))
+    ang = L.eval("T.angle")
+    check(ang[1] > 0 and ang[2] > 0 and abs(ang[1] - (360 - ang[2])) < 1e-6, "props turn, FL and FR opposite ways (%.1f %.1f)" % (ang[1], ang[2]))
+    t = a.comp.set["prop_FL"]
+    want = L.eval("drone.spun((function(v) local n = math.sqrt(v[1]^2 + v[2]^2 + v[3]^2 + 1) return { X = v[1]/n, Y = v[2]/n, Z = v[3]/n, W = 1/n } end)(REST.prop_FL), T.angle[1])")
+    check(a.comp.space == 1 and t.Translation.X == 7 and all(abs(t.Rotation[c] - want[c]) < 1e-9 for c in "XYZW"),
+          "each prop bone: its rest turn spun about up, its place kept (component space)")
+    # past what a frame can draw: a blur disc over each prop, the blades hidden in the hub (motors at 0.5 here)
+    D = L.eval("DISCS")
+    check(len(D) == 4 and all(D[k].mesh.name == "BLUR" and D[k].coll == 0 and D[k].shadow is False for k in range(1, 5)),
+          "four blur discs, no collision, no shadow")
+    check(abs(D[1].t.Translation.Z - (2 + L.eval("drone.BLUR_UP"))) < 1e-9 and D[1].t.Translation.X == 7,
+          "each disc over its prop bone, BLUR_UP above it")
+    check(all(D[k].visible for k in range(1, 5)) and abs(a.comp.set["prop_FL"].Scale3D.X - L.eval("drone.BLADES_HIDDEN")) < 1e-9,
+          "motors at half: discs shown, blades hidden")
+    L.execute('fly(pose(12, 1120, 0, 90, 30, "0.15 0.15 0.15 0.05")); for i = 13, 16 do fly(pose(i, 1120, 0, 90, 30, "0.15 0.15 0.15 0.05")) end')
+    check(D[1].visible and not D[4].visible and a.comp.set["prop_RR"].Scale3D.X == 1,
+          "throttle down: a motor still over BLUR_OFF keeps its disc, one under it shows its blades again")
+    L.execute('for i = 17, 21 do fly(pose(i, 1120, 0, 90, 30, "0.18 0.10 0.10 0.10")) end')
+    check(D[1].visible and not D[2].visible, "between BLUR_OFF and BLUR_ON a disc stays as it was (no flicker)")
+    L.execute('for i = 22, 26 do fly(pose(i, 1120, 0, 90, 30, "0.10 0.10 0.10 0.10")) end')
+    L.execute('for i = 27, 31 do fly(pose(i, 1120, 0, 90, 30, "0.18 0.18 0.18 0.18")) end')
+    check(not any(D[k].visible for k in range(1, 5)), "idle then just under BLUR_ON: the blades, no discs")
+    # their FPVDrone stopped without clearing: my game stops sending it after STALE_S, theirs drops the quad
+    for i in range(20):
+        L.execute('fly(SHAREDV["FPVDrone.pose"])')
+    check(L.eval("drone.line()") is None and not L.eval("SPAWNED[1]:IsValid()"), "a pose that stops moving is dropped on both sides")
+    L.execute('fly(pose(100, 0, 0, 0, 0)); fly(pose(101, 0, 0, 0, 0))')
+    check(len(L.eval("SPAWNED")) == 2 and L.eval("SPAWNED[2]:IsValid()"), "flying again: the quad is back")
+    L.execute('fly("")')
+    check(not L.eval("SPAWNED[2]:IsValid()"), "back on foot: their quad goes at once")
+    L.execute('HERE = false; fly(pose(102, 0, 0, 0, 0)); fly(pose(103, 0, 0, 0, 0))')
+    check(len(L.eval("SPAWNED")) == 2, "another world (not same_world): no quad shown")
+    L.execute('HERE = true; fly(pose(104, 0, 0, 0, 0))')
+    check(len(L.eval("SPAWNED")) == 3, "back in the same world: shown")
+    # bad lines are dropped, never shown
+    for bad in ("Q 5inch 1 2 3", "Q 5inch 1 2 3 4 5 6 7 8 9 x", "Q nope 1 2 3 4 5 6 0 0 0 0", "Q 5inch 1e99 2 3 4 5 6 0 0 0 0"):
+        check(L.eval("drone.parse(%r)" % bad) is None, "a broken quad segment is refused (%s)" % bad)
+    check(L.eval("drone.parse('Q whoop 1 2 3 4 5 6 2 -1 0.5 0.5').m[1]") == 1 and L.eval("drone.parse('Q whoop 1 2 3 4 5 6 2 -1 0.5 0.5').m[2]") == 0,
+          "motor shares held to 0..1")
+    # audit 2026-11-03: the shared variable is another mod's string - a tab or newline (the pose line's history
+    # separators) or a runaway length would break my whole pose line, so it isn't sent
+    for bad in ('"300 5inch 1 2 3\\t4 5 6 0 0 0 0"', '"301 5inch 1 2 3\\n4 5 6 0 0 0 0"', '"302 5inch " .. string.rep("1 ", 300)'):
+        L.execute('SHAREDV["FPVDrone.pose"] = %s' % bad)
+        check(L.eval("drone.line()") is None, "a quad pose with a tab, a newline or too long isn't sent (%s)" % bad[:24])
+    # the whoop: its static model, the 5" taken down (three whoop poses: two land exactly DELAY_S back, on the
+    # boundary, where float rounding of the clock picks the side)
+    L.execute('for i = 105, 107 do fly((pose(i, 0, 0, 0, 0):gsub("5inch", "whoop"))) end')
+    check(not L.eval("SPAWNED[3]:IsValid()") and L.eval("SPAWNED[4].StaticMeshComponent.mesh.name") == "WHOOP",
+          "a whoop flown instead: the 5\" goes, the whoop's static model shows")
+    # audit 2026-11-03: a rig that goes wrong (a bone missing) is tried once per MAKE_RETRY_S, not spawned and
+    # destroyed every frame
+    L.execute('SAVED_FL = REST.prop_FL; REST.prop_FL = nil; N0 = #SPAWNED')
+    for i in range(30):
+        L.execute('fly(pose(%d, 0, 0, 0, 0))' % (108 + i))
+    check(L.eval("#SPAWNED - N0") == 1 and not L.eval("SPAWNED[#SPAWNED]:IsValid()"),
+          "a broken rig: one quad tried in 1 s, and destroyed (%d)" % L.eval("#SPAWNED - N0"))
+    L.execute('REST.prop_FL = SAVED_FL')
+    for i in range(75):
+        L.execute('fly(pose(%d, 0, 0, 0, 0))' % (138 + i))
+    check(L.eval("#SPAWNED - N0") == 2 and L.eval("SPAWNED[#SPAWNED]:IsValid()"), "...tried again a moment later, it shows")
+    # a model not in memory: asked for in the background, then said once and let be
+    L.execute('N_BEFORE = #SPAWNED; drone.stop(); LOADED = false; T.samples = {}')
+    L.execute('package.loaded["mirror.drone"] = nil; drone = require("mirror.drone"); drone.link_init(function() return true end); T = drone._theirs')
+    for i in range(400):
+        L.execute('fly(pose(%d, 0, 0, 0, 0))' % (200 + i))
+    check(L.eval("LOADS") == L.eval("drone.LOAD_TRIES"), "no model: the game is asked to load it %d times (%d)" % (L.eval("drone.LOAD_TRIES"), L.eval("LOADS")))
+    check(len(L.eval("SPAWNED")) == L.eval("N_BEFORE"), "and no quad made without it")
+    # in memory but not read in yet (the background loader's objects are findable early): not drawn, no try spent -
+    # FPVDrone's follow take-off crashes 2026-11-03 (GPU skin cache, a rig 14 ms after its load was asked)
+    L.execute(r"""
+        EObjectFlags = { RF_NeedInitialization = 0x200, RF_NeedLoad = 0x400, RF_NeedPostLoad = 0x1000,
+                         RF_NeedPostLoadSubobjects = 0x2000 }
+        PEND = 0x1000
+        local sf = StaticFindObject
+        StaticFindObject = function(p)
+            local o = sf(p)
+            if o and p:find("SK_FPVDrone", 1, true) then o.HasAnyFlags = function(_, f) return (PEND & f) ~= 0 end end
+            return o
+        end
+        LOADED = true; LOADS0 = LOADS
+    """)
+    for i in range(60):
+        L.execute('fly(pose(%d, 0, 0, 0, 0))' % (600 + i))
+    check(len(L.eval("SPAWNED")) == L.eval("N_BEFORE") and L.eval("LOADS") == L.eval("LOADS0"),
+          "a rig still loading isn't drawn, and the game isn't asked again")
+    L.execute('PEND = 0')
+    for i in range(3):
+        L.execute('fly(pose(%d, 0, 0, 0, 0))' % (660 + i))
+    check(len(L.eval("SPAWNED")) == L.eval("N_BEFORE") + 1 and L.eval("SPAWNED[#SPAWNED].comp.mesh.name") == "SK",
+          "...read in: their quad shows")
+    L.execute('RESETS[#RESETS]()')   # (the module loaded again above hooked its own)
+    check(not L.eval("T.flying") and L.eval("#T.samples") == 0, "a world reset forgets their quad")
+
+    # user 2026-11-03: "drone noises ... that change pitch as the drone moves and speeds up" - their quad is heard too:
+    # components 1..4 are its motors, 5 the wind, 6 the crash
+    def snd(k):
+        return L.eval("SOUND_COMPS[%d]" % k)
+    L.execute('HALF = "0.50 0.50 0.50 0.50"; fresh_quad(); glide(20, 0, "0.25 0.25 0.25 0.25")')
+    check(L.eval("#SOUND_COMPS") == 6 and [snd(k).snd for k in range(1, 7)] == ["motor"] * 4 + ["wind", "hit"],
+          "their quad has a loop per motor, the wind and a waiting crash (%d)" % L.eval("#SOUND_COMPS"))
+    check(all(L.eval("SOUND_COMPS[%d].root == T.actor.StaticMeshComponent" % k) and snd(k).born_vol == 0 and snd(k).auto is False
+              for k in range(1, 7)), "on the quad's actor, made silent, kept when they stop")
+    check(all(snd(k).stop_with is True and snd(k).born_at.X == 0 and snd(k).born_at.Y == 0 and snd(k).born_at.Z == 0
+              and snd(k).born_turn.Pitch == 0 and snd(k).born_turn.Yaw == 0 and snd(k).born_turn.Roll == 0 for k in range(1, 7)),
+          "right on the actor's centre, and they stop if it's destroyed")
+    check(all(snd(k).playing for k in range(1, 5)) and not snd(5).playing and not snd(6).playing,
+          "hovering: the motors play, no wind, no crash")
+    check([snd(k).start for k in range(1, 5)] == [0, 0.37, 0.91, 1.43], "the motors start apart in the loop")
+    low = snd(1).pitch
+    want_vol = 0.3 * (0.35 + 0.65 * 0.25 ** 0.7)
+    check(abs(low - 1.2 * 0.985) <= 0.006 and abs(snd(1).vol - want_vol) <= 0.004,
+          "a motor at a quarter power: the pitch of the root of it, its detune on top (%.3f, volume %.3f)" % (low, snd(1).vol))
+    L.execute('glide(10, 0, "1.00 1.00 1.00 1.00")')
+    check(snd(1).pitch > low + 0.5 and snd(2).pitch <= 2.0 and snd(1).pitch != snd(3).pitch,
+          "throttle up: the pitch rises, the engine's limit kept, no two motors alike (%.3f %.3f)" % (snd(1).pitch, snd(2).pitch))
+    L.execute('glide(10, 0, "0.10 0.90 0.10 0.90")')
+    check(snd(2).pitch > snd(1).pitch + 0.5 and snd(4).vol > snd(3).vol, "a flip pulls the motors apart, each following its own")
+    L.execute('glide(10, 0, "0.00 0.50 0.50 0.50")')
+    check(not snd(1).playing and snd(2).playing and snd(2).plays == 1, "a motor that stops goes quiet; a running one isn't started again")
+    L.execute('glide(10, 0, "0.50 0.50 0.50 0.50")')
+    check(snd(1).playing and snd(1).plays == 2, "...and comes back")
+    sets = snd(2).sets
+    L.execute('glide(30, 0, HALF)')
+    check(snd(2).sets == sets, "a steady motor costs the game no calls")
+    check("heard" in L.eval("drone.status()"), "the status line says it's heard (%s)" % L.eval("drone.status()"))
+    # the wind follows how fast it moves (100 cm a pose: 3000 cm/s)
+    L.execute('glide(30, 100, HALF)')
+    want = 0.55 * (3000 / 3500) ** 1.3
+    check(snd(5).playing and abs(snd(5).vol - want) < 0.02 and abs(snd(5).pitch - (0.7 + 0.7 * 3000 / 3500)) < 0.02,
+          "moving at 3000 cm/s: the wind blows, louder and higher (%.3f, %.3f)" % (snd(5).vol, snd(5).pitch))
+    check(snd(6).plays == 0, "flying along: no crash")
+    L.execute('glide(30, 0, HALF)')
+    check(snd(6).plays == 1 and snd(6).playing and snd(6).vol == 1 and snd(6).start == 0,
+          "stopped dead from 3000 cm/s: one crash, loud, from its start (%d, %.2f)" % (snd(6).plays, snd(6).vol))
+    check(not snd(5).playing, "stopped: the wind's gone")
+    L.execute('glide(60, 0, HALF)')
+    check(snd(6).plays == 1, "the one stop is one crash")
+    L.execute('glide(60, 300, HALF); glide(60, 0, HALF)')
+    check(snd(6).plays == 2, "another crash, from 9000 cm/s: heard once more, once (%d)" % snd(6).plays)
+    # as FPVDrone's ghost: under 400 cm/s a landing, over it a crash
+    L.execute('fresh_quad(); glide(60, 20, HALF); glide(30, 0, HALF)')
+    check(snd(6).plays == 1 and 0.25 < snd(6).vol < 1, "a crash from 600 cm/s: heard, quieter (%d, %.2f)" % (snd(6).plays, snd(6).vol))
+    L.execute('fresh_quad(); glide(60, 12, HALF); glide(30, 0, HALF)')
+    check(snd(6).plays == 0, "a landing at 360 cm/s: no crash")
+    # the network's doing isn't a crash: uneven arrival, poses that stop for a moment, a teleport
+    L.execute("""fresh_quad()
+        for i = 1, 150 do glide(1, ({ 40, 160, 100, 20, 180 })[i % 5 + 1], HALF) end""")
+    check(snd(6).plays == 0, "uneven pose spacing at speed: no crash")
+    L.execute('fresh_quad(); glide(40, 100, HALF); for _ = 1, 12 do drone.tick(1 / 30) end; glide(20, 100, HALF)')
+    check(L.eval("T.flying") and snd(6).plays == 0, "poses stopping for 0.4 s at speed: no crash")
+    L.execute('fresh_quad(); glide(30, 100, HALF); glide(1, 30000, HALF); glide(30, 0, HALF)')
+    check(snd(6).plays == 0 and not snd(5).playing, "put somewhere else (a reset): no crash, no gust")
+    L.execute('fresh_quad(); glide(30, 100, HALF); glide(1, 500, HALF); glide(3, 100, HALF)')
+    check(snd(5).vol <= 0.56, "a jump that's still under the limit doesn't blow past the top")
+    # a new quad doesn't inherit the last one's speed
+    L.execute('fresh_quad(); glide(30, 100, HALF); fly(""); OLD = #SOUND_COMPS; OLD_SETS = SOUND_COMPS[2].sets')
+    check(L.eval("T.noise") is None and not L.eval("SPAWNED[#SPAWNED]:IsValid()"), "back on foot: the quad and its sounds go")
+    L.execute('SEQ = SEQ + 1; glide(30, 0, "0.90 0.90 0.90 0.90")')
+    check(L.eval("#SOUND_COMPS") == L.eval("OLD") + 6 and L.eval("SOUND_COMPS[OLD + 6].plays") == 0,
+          "flying again from rest: new sounds, no crash from the old speed")
+    check(L.eval("SOUND_COMPS[2].sets") == L.eval("OLD_SETS"), "the old quad's sounds aren't touched")
+    # sounds not in memory: asked for, each under its own id (the engine ignores a second load under the same one)
+    L.execute('SOUNDS_IN = false; fresh_quad(); UUIDS = {}; glide(30, 0, HALF)')
+    ids = [L.eval('UUIDS[drone.SOUNDS.%s]' % n) for n in ("motor", "wind", "hit")]
+    check(L.eval("#SOUND_COMPS") == 0 and L.eval("util.valid(T.actor)") and None not in ids and len(set(ids)) == 3,
+          "not in memory: the quad flies, silent, each sound asked for under its own id (%s)" % ids)
+    L.execute("""SOUNDS_IN = true; SOUND_PEND = 0x1000
+        local sf = StaticFindObject
+        StaticFindObject = function(p)
+            local o = sf(p)
+            if o and p:find("Mods/FPVDrone/Drone", 1, true) then o.HasAnyFlags = function(_, f) return (SOUND_PEND & f) ~= 0 end end
+            if p:find("DroneMotor", 1, true) then MOTOR_LOOKS = MOTOR_LOOKS + 1 end
+            return o
+        end
+        MOTOR_LOOKS = 0
+        glide(30, 0, HALF)""")
+    check(L.eval("#SOUND_COMPS") == 0, "found but not read in yet: no component on it")
+    check(L.eval("MOTOR_LOOKS") <= 3, "...looked for twice a second, not every frame (%d in 1 s)" % L.eval("MOTOR_LOOKS"))
+    L.execute('SOUND_PEND = 0; glide(30, 0, HALF)')
+    check(L.eval("#SOUND_COMPS") == 6 and snd(1).playing, "...read in: it's heard")
+    # a peer whose pak has no sounds: said once, silent, the game not asked for ever
+    L.execute('SOUNDS_IN = false; fresh_quad(); for _ = 1, 500 do glide(1, 0, HALF) end; LOADS1 = LOADS; glide(120, 0, HALF)')
+    check(L.eval("T.noise") is False and L.eval("LOADS") == L.eval("LOADS1") and L.eval("util.valid(T.actor)") and L.eval("#SOUND_COMPS") == 0,
+          "an old pak without the sounds: their quad flies silent, asked for no more")
+    check("heard" not in L.eval("drone.status()"), "...and the status line doesn't say it's heard")
+    L.execute('SOUNDS_IN = true')
+    # a sound the engine has freed is never called; the others go on
+    L.execute("""fresh_quad(); glide(30, 0, HALF)
+        local c = SOUND_COMPS[1]
+        c.IsValid = function() return false end
+        c.SetPitchMultiplier = function() BADCALL = true end; c.SetVolumeMultiplier = c.SetPitchMultiplier
+        c.Play = c.SetPitchMultiplier; c.Stop = c.SetPitchMultiplier
+        glide(30, 0, "0.90 0.90 0.90 0.90")""")
+    check(L.eval("BADCALL") is None and snd(2).pitch > 1.5, "a freed sound isn't called, the rest follow on")
+    L.execute('SOUND_COMPS[6].IsValid = function() return false end; SOUND_COMPS[6].Play = function() BADCALL = true end; glide(30, 100, HALF); glide(30, 0, HALF)')
+    check(L.eval("BADCALL") is None and L.eval("T.noise") not in (None, False), "...nor a freed crash, at a crash")
+    # the engine gives no component (a crash can be refused): flying goes on without it
+    L.execute('NO_HIT = true; fresh_quad(); glide(30, 100, HALF); glide(30, 0, HALF); NO_HIT = false')
+    check(L.eval("#SOUND_COMPS") == 5 and L.eval("T.noise") not in (None, False) and snd(1).playing, "no crash component: the rest is heard")
+    # it going wrong: the quad still flies, tried once for this quad
+    L.execute("""SOUND_WARNS = 0; require("mirror.log").warn = function() SOUND_WARNS = SOUND_WARNS + 1 end
+        SPAWN_ERR = 2; fresh_quad(); glide(30, 100, HALF); SPAWN_CALLS0 = SPAWN_CALLS; XAT = T.actor.at.X; glide(30, 100, HALF)""")
+    check(L.eval("T.noise") is False and L.eval("SPAWN_CALLS") == L.eval("SPAWN_CALLS0") and L.eval("T.actor.at.X") > L.eval("XAT"),
+          "the sounds going wrong leave the quad flying, not retried every frame")
+    L.execute('fresh_quad(); glide(30, 100, HALF); fresh_quad(); glide(30, 100, HALF); SPAWN_ERR = nil')
+    check(L.eval("SOUND_WARNS") == 1, "...and it's said once, however many quads (%d)" % L.eval("SOUND_WARNS"))
+    # the whoop: the static model has its sound too, higher and quieter
+    L.execute("""fresh_quad()
+        for i = 1, 30 do SEQ = SEQ + 1; fly((pose(SEQ, 0, 0, 0, 0, "0.25 0.25 0.25 0.25"):gsub("5inch", "whoop"))) end""")
+    check(L.eval("#SOUND_COMPS") == 6 and L.eval("SOUND_COMPS[1].root == T.actor.StaticMeshComponent") and L.eval("T.comp") is None,
+          "a whoop is heard too")
+    check(snd(1).pitch > low + 0.1 and abs(snd(1).vol - 0.6 * L.eval('drone.noise_mix("5inch", {0.25}, 0)[1][2]')) <= 0.004,
+          "...higher and quieter than the 5\" (%.3f, %.3f)" % (snd(1).pitch, snd(1).vol))
+    L.execute('RESETS[#RESETS]()')
+    check(L.eval("T.noise") is None and L.eval("T.was") is None, "a world reset forgets its sounds")
+
+
+def only_players_the_drone_owner_allows_fly_the_bundled_fpv_drone():
+    # user 2026-11-03: "If others wanna use it make it so there's a permissions tab in the menu where they can only use
+    # it if I give them permission, I wanna sell the mod separately" - the owner's SETTINGS -> PERMISSIONS list goes
+    # on each link; FPVDrone.allowed (what the bundled FPVDrone's gate reads) says yes only while the owner's link says so.
+    print("only_players_the_drone_owner_allows_fly_the_bundled_fpv_drone")
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    L = lua()
+    L.execute(FAKES + r"""
+        SHAREDV, CLOCK, IS_OWNER, ME, MAIN, PLAYERS = {}, 100, true, nil, nil, {}
+        ModRef = { SetSharedVariable = function(self, k, v) SHAREDV[k] = v end }
+        os.clock = function() return CLOCK end
+        OWNER = "76561199084190564"
+        package.loaded["mirror.adminfly"] = { OWNER = OWNER, is_owner = function() return IS_OWNER end }
+        package.loaded["mirror.peers"] = { my_id = function() return ME end, main_id = function() return MAIN end,
+                                           players = function() return PLAYERS end }
+        package.loaded["mirror.localdir"] = { get = function() return DIR end }
+        TICKS = {}
+        package.loaded["mirror.game"] = { world = function() return nil end, on_world_reset = function() end,
+                                          on_tick = function(fn) TICKS[#TICKS + 1] = fn end }
+        function FRAME() for _, fn in ipairs(TICKS) do fn(1/30) end end
+        package.loaded["mirror.events"] = { reliable = function(name)
+            local ch = { name = name, out = {}, inbox = {} }
+            function ch:send(m) self.out[#self.out + 1] = m end
+            function ch:pump(fn) local b = self.inbox; self.inbox = {}; for _, m in ipairs(b) do fn(m) end end
+            CH = ch
+            return ch
+        end }
+        dg = require("mirror.dronegrant")
+        -- a link's own drone copy (peer: that link's player)
+        function link(peer)
+            package.loaded["mirror.drone"] = nil
+            drone = require("mirror.drone")
+            drone.link_init(function() return true end, peer)
+        end
+        function sent() local o = CH.out; CH.out = {}; return table.concat(o, ";") end
+    """)
+    L.globals().DIR = tmp.replace("\\", "/")
+    # the owner's game alone (no link, so no drone.tick): main.lua's dronegrant.init ticks it from the start
+    L.execute("dg.init(); dg.init(); FRAME()")
+    check(L.eval("#TICKS") == 1 and L.eval("SHAREDV['FPVDrone.allowed']") == "owner",
+          "the owner flies solo: FPVDrone.allowed set with no co-op link (one tick hook)")
+    L.execute("SHAREDV = {}; dg._reset()")
+    # the owner's game
+    L.execute('PLAYERS = { { id = "111", name = "Bob" }, { id = "222", name = "Al" } }; link("111")')
+    rows = L.eval("dg.setting_rows()")
+    check(len(rows) == 2 and rows[1].label == "Bob" and rows[1].text == "NOT ALLOWED" and rows[1].key == "111",
+          "the owner's PERMISSIONS tab: everyone in co-op with them, nobody allowed yet")
+    L.execute("drone.tick(1/30)")
+    check(L.eval("SHAREDV['FPVDrone.allowed']") == "owner", "the owner's own game may always fly")
+    check(L.eval("sent()") == "A ", "the owner's game sends the (empty) list on the link")
+    L.execute('dg.toggle("111")')
+    rows = L.eval("dg.setting_rows()")
+    check(rows[1].text == "ALLOWED" and rows[2].text == "NOT ALLOWED", "clicking Bob allows Bob only")
+    with open(os.path.join(tmp, "SurrounSync_drone_grants.txt")) as f:
+        saved = f.read()
+    check(saved == "111 Bob\n", "the list is saved on the owner's PC (%r)" % saved)
+    L.execute("drone.tick(1/30)")
+    check(L.eval("sent()") == "A 111", "a change goes out at once")
+    L.execute("for i = 1, 30 do drone.tick(1/30) end")
+    check(L.eval("sent()") == "", "and not again every frame")
+    L.execute("for i = 1, 150 do drone.tick(1/30) end")
+    check(L.eval("sent()") == "A 111", "but again every %g s (a guest who joined late hears it)" % L.eval("dg.SEND_S"))
+    # loaded again (the next game start): from the file; a granted player not here still listed
+    L.execute('dg._reset(); PLAYERS = {}')
+    rows = L.eval("dg.setting_rows()")
+    check(len(rows) == 1 and rows[1].label == "Bob" and rows[1].text == "ALLOWED" and "not with you" in rows[1].hint,
+          "after a restart the list comes back from the file, Bob shown though not here")
+    # not the owner: no toggling, no tab rows sent
+    # more players than the tab's 12 rows: pages of 11 and a page row; every one reachable, taken off from page 2
+    L.execute('for i = 1, 14 do dg.toggle(tostring(1000 + i), "P" .. i) end')
+    rows = L.eval("dg.setting_rows()")
+    check(len(rows) == 12 and rows[12].key == "page" and rows[12].text == "PAGE 1 / 2" and rows[11].label == "P10",
+          "15 allowed: page 1 shows 11 and PAGE 1 / 2")
+    L.execute('dg.toggle("page")')
+    rows = L.eval("dg.setting_rows()")
+    check(len(rows) == 5 and rows[4].label == "P14" and rows[5].text == "PAGE 2 / 2", "page 2: the last 4")
+    L.execute('dg.toggle("1014")')
+    check(L.eval("dg.allowed('1014')") is False, "a player only on page 2 can be taken off")
+    L.execute('dg.toggle("page")')
+    check(L.eval("dg.setting_rows()")[1].label == "Bob", "past the last page: back to page 1")
+    L.execute('for i = 1, 13 do dg.toggle(tostring(1000 + i)) end')
+    check(L.eval("#dg.setting_rows()") == 1, "back to one player: no page row")
+    L.execute('dg.toggle("2000", "Пётр the very long steam name")')
+    lab = L.eval("dg.setting_rows()")[2].label
+    check(len(lab.encode("utf-8")) <= 18 and lab.startswith("Пётр"), "a long Steam name is cut on a whole letter (%s)" % ascii(lab))
+    L.execute('dg.toggle("2000")')
+    L.execute('IS_OWNER = false; dg._reset(); dg.toggle("222")')
+    check(L.eval("dg.allowed('222')") is False, "only the owner's game can allow anyone")
+
+    # a guest's game (Bob, 111) in co-op with the owner on another guest's link
+    L.execute('IS_OWNER, ME = false, "111"; dg._reset(); link(OWNER); drone.tick(1/30)')
+    check((L.eval("SHAREDV['FPVDrone.allowed']") or "") == "", "Bob before the owner's list: not allowed")
+    check(L.eval("sent()") == "", "a game that isn't the owner's sends no list")
+    L.execute('CH.inbox = { "A 111" }; drone.tick(1/30)')
+    v = L.eval("SHAREDV['FPVDrone.allowed']")
+    check(v == "until 115.0", "the owner's list names Bob: allowed for %g s (%s)" % (L.eval("dg.HOLD_S"), v))
+    L.execute('CLOCK = 110; CH.inbox = { "A 111" }; drone.tick(1/30)')
+    check(L.eval("SHAREDV['FPVDrone.allowed']") == "until 125.0", "each new list holds it on")
+    L.execute('CLOCK = 111; CH.inbox = { "A 222" }; drone.tick(1/30)')
+    check(L.eval("SHAREDV['FPVDrone.allowed']") == "", "taken off the list: not allowed at once")
+    L.execute('CH.inbox = { "A 111" }; drone.tick(1/30); CLOCK = 130; drone.tick(1/30)')
+    check(L.eval("SHAREDV['FPVDrone.allowed']") == "", "the owner's game gone (no list for %g s): not allowed" % L.eval("dg.HOLD_S"))
+    # a list from anyone but the owner counts for nothing
+    L.execute('dg._reset(); link("999"); CH.inbox = { "A 111" }; drone.tick(1/30)')
+    check((L.eval("SHAREDV['FPVDrone.allowed']") or "") == "", "a list from a player who isn't the owner is ignored")
+    # the main link (no peer id): its player from the roster
+    L.execute('dg._reset(); MAIN = OWNER; link(nil); CH.inbox = { "A 111 333" }; drone.tick(1/30)')
+    check(L.eval("SHAREDV['FPVDrone.allowed']") == "until 145.0", "on the main link the owner is known from the roster")
+    L.execute('dg._reset(); ME = "333000"; link(OWNER); CH.inbox = { "A 3330001" }; drone.tick(1/30)')
+    check((L.eval("SHAREDV['FPVDrone.allowed']") or "") == "", "only my whole id counts, not a part of another")
+
+    # /fpv unlock and /fpv lock (user 2026-11-04), on top of the list, which is kept
+    grants = os.path.join(tmp, "SurrounSync_drone_grants.txt")
+    def saved_grants():
+        with open(grants) as f:
+            return f.read()
+    L.execute('IS_OWNER, ME = true, OWNER; dg._reset(); PLAYERS = { { id = "111", name = "Bob" }, { id = "222", name = "Al" } }; link("111"); drone.tick(1/30); sent()')
+    check(saved_grants() == "111 Bob\n", "(the list before: Bob, %r)" % saved_grants())
+    L.execute('dg.set_mode("open"); drone.tick(1/30)')
+    check(L.eval("sent()") == "A *", "/fpv unlock: goes out at once, for everyone")
+    check(L.eval("dg.allowed('222')") is True and L.eval("dg.setting_rows()")[2].text == "UNLOCKED", "Al, not on the list, may fly; the tab says UNLOCKED")
+    check(L.eval("SHAREDV['FPVDrone.allowed']") == "owner", "the owner still flies")
+    check(saved_grants() == "mode open\n111 Bob\n", "saved on the owner's PC: %r" % saved_grants())
+    L.execute('dg._reset()')
+    check(L.eval("dg.message()") == "A *", "after a restart it's still unlocked")
+    L.execute('dg.toggle("222")')
+    check(saved_grants() == "mode open\n111 Bob\n", "a click on the tab's row changes nothing while it's set for everyone")
+    L.execute('dg.set_mode("locked"); drone.tick(1/30)')
+    check(L.eval("sent()") == "A ", "/fpv lock: nobody on the wire, even Bob on the list")
+    check(L.eval("dg.allowed('111')") is False and L.eval("dg.setting_rows()")[1].text == "LOCKED", "Bob may not fly; the tab says LOCKED")
+    check(L.eval("SHAREDV['FPVDrone.allowed']") == "owner", "the owner still flies while it's locked")
+    L.execute('dg._reset()')
+    check(L.eval("dg.message()") == "A " and saved_grants() == "mode locked\n111 Bob\n", "after a restart it's still locked, the list kept")
+    L.execute('dg.set_mode(nil); drone.tick(1/30)')
+    check(L.eval("sent()") == "A 111" and saved_grants() == "111 Bob\n", "/fpv list: back to the list as it was")
+    L.execute('IS_OWNER = false; dg.set_mode("open"); IS_OWNER = true')
+    check(L.eval("dg.message()") == "A 111", "only the owner's game can set it")
+    # a guest hearing them
+    L.execute('IS_OWNER, ME, CLOCK = false, "222", 200; dg._reset(); link(OWNER); CH.inbox = { "A *" }; drone.tick(1/30)')
+    check(L.eval("SHAREDV['FPVDrone.allowed']") == "until 215.0", "a guest not on any list hears unlock: allowed")
+    L.execute('CLOCK = 201; CH.inbox = { "A " }; drone.tick(1/30)')
+    check(L.eval("SHAREDV['FPVDrone.allowed']") == "", "hears lock: not allowed at once")
+    L.execute('dg._reset(); link("999"); CH.inbox = { "A *" }; drone.tick(1/30)')
+    check((L.eval("SHAREDV['FPVDrone.allowed']") or "") == "", "an unlock from anyone but the owner is ignored")
+
+
+def the_hang_glider_is_made_at_the_workbench():
+    # user 2026-11-02 "Add the item" (crafting): the glider's recipe is put in the CraftingWorkbench row once, a copy
+    # of a 3-ingredient recipe (the game appends a deep copy, kit 2026-11-02), and again after the table reloads
+    print("the_hang_glider_is_made_at_the_workbench")
+    L = lua()
+    L.execute(FAKES + r"""
+        NOW = 0; os.clock = function() return NOW end
+        RECIPES = "ItemsToCraft_4_BD8109364B29C67733A91FB124A74183"
+        OUT = "ItemToCraft_4_D2CE3CA74FD5DD913A8E86BB23414908"
+        NEED = "ItemsNeeded_8_03B3B6B348EE04631090FFB588341C30"
+        ID, CNT = "ItemID_28_01CA27D84AF7D1014D9E2E83894C1848", "Count_8_DD79AF2A46126A338C8DCCB4616D91CD"
+        local ARRS = {}
+        local deep
+        function arr(items)
+            local a = { n = #items, items = items }
+            local p = setmetatable({}, { __index = function(_, k)
+                    if k == "GetArrayNum" then return function() return a.n end end
+                    return a.items[k] end,
+                __newindex = function(_, k, v) a.items[k] = deep(v); if k > a.n then a.n = k end end })
+            ARRS[p] = a
+            return p
+        end
+        deep = function(v)   -- a struct copy: objects by reference, structs and arrays copied
+            if type(v) ~= "table" or v.GetFullName then return v end
+            if ARRS[v] then local t = {}; for i = 1, ARRS[v].n do t[i] = deep(ARRS[v].items[i]) end; return arr(t) end
+            local t = {}; for k, x in pairs(v) do t[k] = deep(x) end; return t
+        end
+        local RES = "/Game/Inventory/Items/DataAssets/CraftingMaterials/Resources/"
+        function da(path) return obj({ GetFullName = function() return "JigsawItem_DataAsset_C " .. path end }) end
+        ITEM = da("/Game/Mods/SurrounSyncGlider/DA_HangGlider.DA_HangGlider")
+        WB, BAG = da("/Game/X/DA_ConstructionWorkbench.DA_ConstructionWorkbench"), da("/Game/X/DA_SleepingBag.DA_SleepingBag")
+        MAT = {}
+        for _, n in ipairs({ "Cloth", "Rope", "MetalRods", "ScrapMetal", "WoodenLog", "Nails", "Tape" }) do
+            MAT[n] = da(RES .. "DA_" .. n .. ".DA_" .. n)
+        end
+        LOADED = { [ITEM:GetFullName():match(" (.+)$")] = false }
+        for n, o in pairs(MAT) do LOADED[o:GetFullName():match(" (.+)$")] = true end
+        function recipe(out, needs)
+            local t = {}
+            for i, x in ipairs(needs) do t[i] = { [ID] = x[1], [CNT] = x[2], ToContainerIndex = 0 } end
+            return { [OUT] = { [ID] = out, [CNT] = 1, Weight = 0 }, [NEED] = arr(t) }
+        end
+        function table_rows()
+            ROW = { [RECIPES] = arr({ recipe(BAG, { { MAT.Cloth, 10 }, { MAT.Tape, 2 } }),
+                                      recipe(WB, { { MAT.ScrapMetal, 10 }, { MAT.WoodenLog, 10 }, { MAT.Nails, 5 } }) }) }
+            OTHER = { [RECIPES] = arr({ recipe(BAG, { { MAT.Cloth, 10 }, { MAT.Tape, 2 }, { MAT.Nails, 1 } }) }) }
+        end
+        table_rows()
+        DT = obj({ ForEachRow = function(self, fn) fn("WeaponsWorkbench", OTHER); fn("CraftingWorkbench", ROW) end })
+        StaticFindObject = function(p)
+            if p == "/Game/Inventory/Crafting/DT_CraftingTableTypes.DT_CraftingTableTypes" then return DT end
+            if LOADED[p] then
+                if p == ITEM:GetFullName():match(" (.+)$") then return ITEM end
+                for _, o in pairs(MAT) do if o:GetFullName():match(" (.+)$") == p then return o end end
+            end
+            return nil
+        end
+        GI = obj({ ReferencedObjects = arr({}) })
+        WALKS = 0
+        FindFirstOf = function(c) WALKS = WALKS + 1; return c == "SD_GameInstance_C" and GI or nil end
+        package.loaded["mirror.jig"] = { full_path = function(o) return o and o:GetFullName():match("^%S+ (.+)$") end,
+                                         count_of_item = function() return 0 end }
+        util = require("mirror.util")
+        util.find = function(p) return StaticFindObject(p) end
+        gi = require("mirror.glideritem")
+        function n() return ROW[RECIPES]:GetArrayNum() end
+        function last() return ROW[RECIPES][n()] end
+        function run(s) local t = 0; while t < s - 1e-9 do NOW = NOW + 0.5; t = t + 0.5; gi.tick(0.5) end end
+    """)
+    L.execute("run(30)")
+    check(L.eval("n()") == 2 and L.eval("GI.ReferencedObjects:GetArrayNum()") == 0,
+          "the pak not loaded (no DA_HangGlider): no recipe, nothing pinned")
+    L.execute('LOADED[ITEM:GetFullName():match(" (.+)$")] = true; LOADED[MAT.Rope:GetFullName():match(" (.+)$")] = false; run(10)')
+    check(L.eval("n()") == 2, "an ingredient not in memory yet: no recipe (asked again later)")
+    check(L.eval("GI.ReferencedObjects:GetArrayNum() == 1 and GI.ReferencedObjects[1] == ITEM"),
+          "the item is kept in the game instance's ReferencedObjects")
+    L.execute('LOADED[MAT.Rope:GetFullName():match(" (.+)$")] = true; run(10)')
+    check(L.eval("n()") == 3, "the recipe goes in once everything is loaded (%d)" % L.eval("n()"))
+    check(L.eval("last()[OUT][ID] == ITEM and last()[OUT][CNT] == 1"), "it makes one Hang Glider")
+    needs = [(L.eval("last()[NEED][%d][ID]:GetFullName():match('DA_(%%w+)%%.')" % i), L.eval("last()[NEED][%d][CNT]" % i))
+             for i in (1, 2, 3)]
+    check(needs == [("Cloth", 12), ("Rope", 3), ("MetalRods", 4)] and L.eval("last()[NEED]:GetArrayNum()") == 3,
+          "from cloth x12, rope x3, metal rods x4 (%s)" % needs)
+    check(L.eval("ROW[RECIPES][2][OUT][ID] == WB and ROW[RECIPES][2][NEED][1][ID] == MAT.ScrapMetal and ROW[RECIPES][2][NEED][1][CNT] == 10"),
+          "the copied recipe still makes the construction workbench from scrap x10")
+    check(L.eval("OTHER[RECIPES]:GetArrayNum()") == 1, "other benches are left alone")
+    L.execute("WALKS = 0; run(60)")
+    check(L.eval("n()") == 3 and L.eval("GI.ReferencedObjects:GetArrayNum()") == 1, "checked again and again: added once, pinned once")
+    check(L.eval("WALKS") == 0, "pinned: no walk over every object to find the game instance again (%d)" % L.eval("WALKS"))
+    L.execute("table_rows(); run(10)")
+    check(L.eval("n()") == 3 and L.eval("last()[OUT][ID] == ITEM"), "a reloaded table (recipe lost) gets it again within 10 s")
+    L.execute("GI.IsValid = function() return false end; GI = obj({ ReferencedObjects = arr({}) }); run(10)")
+    check(L.eval("GI.ReferencedObjects:GetArrayNum()") == 1, "a new game instance keeps the item too")
+    L.execute("ROW = { [RECIPES] = arr({ recipe(BAG, { { MAT.Cloth, 10 }, { MAT.Tape, 2 } }) }) }; run(10)")
+    check(L.eval("n()") == 1, "no 3-ingredient recipe to copy: no recipe, no error")
+
+
+def a_lethal_hit_in_coop_downs_the_player_until_revived_given_up_or_bled_out():
+    # user 2026-11-02: downed + revive, "make it so the player can choose to bleed out if they want as well".
+    # ReceiveAnyDamage at Health <= 0 calls DeathBringer(out Used?) and dies when Used? is false (decompiled); the
+    # UE4SS hook runs after it and a Used? set there is what the caller reads (kit 2026-11-02).
+    print("a_lethal_hit_in_coop_downs_the_player_until_revived_given_up_or_bled_out")
+
+    def side(main=True, cfg="{}"):
+        L = lua()
+        L.execute(FAKES + r"""
+            local main, cfg = ...
+            NOW = 0; os.clock = function() return NOW end
+            PHOOK, RESETS, SENT, INBOX, LATER, CARDS, KEYS, KILLS = {}, {}, {}, {}, {}, {}, {}, {}
+            HERE, MOVE, INPUT, CUR = true, 1, true, nil
+            AT, GHOST_AT = { X = 0, Y = 0, Z = 0 }, { X = 100, Y = 0, Z = 0 }
+            MONTAGE = obj({})
+            PLAYER = obj({ MedicalComponent = { Health = 100.0, MaxHealth = 100.0, ["CanTakeDamage?"] = true },
+                ["PlayerDead?"] = false, ["Sitting?"] = false,
+                CharacterMovement = { DisableMovement = function() MOVE = 0 end, SetMovementMode = function(_, m) MOVE = m end },
+                DisableInput = function() INPUT = false end, EnableInput = function() INPUT = true end,
+                PlayAnimMontage = function(_, m) CUR = m; return 1.5 end, StopAnimMontage = function() CUR = nil end,
+                GetCurrentMontage = function() return CUR end, SendHealthToClient = function() end,
+                SetPostProcessHealth = function() end, K2_GetActorLocation = function() return AT end })
+            -- the game's ApplyDamage with damage on runs ReceiveAnyDamage: the same lethal path
+            GSCDO = obj({ ApplyDamage = function(_, who, amt)
+                KILLS[#KILLS + 1] = amt
+                if PLAYER.MedicalComponent["CanTakeDamage?"] then LASTHIT = HIT(SKILL) end
+            end })
+            StaticFindObject = function(p)
+                if p:find("SittingFloor", 1, true) then return MONTAGE end
+                if p:find("GameplayStatics", 1, true) then return GSCDO end
+                return nil
+            end
+            package.loaded["mirror.game"] = { player = function() return PLAYER end, controller = function() return {} end,
+                key_down = function(k) return KEYS[k] == true end,
+                player_hook = function(n, fn) PHOOK[n] = fn end, on_world_reset = function(f) RESETS[#RESETS + 1] = f end }
+            package.loaded["mirror.ghost"] = { location = function() return GHOST_AT end }
+            package.loaded["mirror.link"].peer_name = function() return "Bob" end
+            package.loaded["mirror.notify"] = { show = function(t, k, key, a, o) CARDS[key or t] = { t = t, o = o } end,
+                                                clear = function(key) CARDS[key] = nil end }
+            package.loaded["mirror.animgate"] = { later = function(fn) LATER[#LATER + 1] = fn end }
+            RULES = {}
+            package.loaded["mirror.hostrules"] = { get = function(k) return (RULES[k] or "on") ~= "off" end }
+            package.loaded["mirror.events"] = evmock { new = function(name)
+                return { send = function(self, p) SENT[#SENT + 1] = p end,
+                         pump = function(self, fn) local q = INBOX; INBOX = {}; for _, p in ipairs(q) do fn(p) end end } end }
+            util = require("mirror.util")
+            downed = require("mirror.downed")
+            downed.init(load("return " .. cfg)(), function() return HERE end, main)
+            -- the game's lethal hit: ReceiveAnyDamage's Health <= 0 calls DeathBringer; Used? false = death
+            function HIT(skill)
+                local box = { v = skill == true }
+                PLAYER.MedicalComponent.Health = 0.0
+                if PHOOK.DeathBringer then
+                    PHOOK.DeathBringer({ get = function() return PLAYER end }, { get = function() return box.v end, set = function(_, x) box.v = x end })
+                end
+                if box.v then return "alive" end
+                PLAYER["PlayerDead?"] = true
+                return "dead"
+            end
+            function tick(s, n) for i = 1, (n or 1) do NOW = NOW + (s or 0.1); downed.tick(s or 0.1) end end
+            function run_later() local q = LATER; LATER = {}; for _, f in ipairs(q) do f() end end
+            tick()
+        """, main, cfg)
+        return L
+
+    def card(L, key):
+        return L.eval('CARDS["%s"] and CARDS["%s"].t or ""' % (key, key)) or ""
+
+    def wire(a, b):
+        for x, y in ((a, b), (b, a)):
+            for i in range(1, x.eval("#SENT") + 1):
+                y.execute('INBOX[#INBOX + 1] = %r' % x.eval("SENT[%d]" % i))
+            x.execute("SENT = {}")
+
+    # alone, or the other player not in my world: a lethal hit kills as it always did
+    D = side()
+    check(D.eval("PHOOK.DeathBringer ~= nil"), "the main copy hooks the game's DeathBringer")
+    D.execute("HERE = false; tick()")
+    check(D.eval("HIT()") == "dead", "nobody in my world: a lethal hit kills as before")
+    check(side(cfg="{ revive = false }").eval("PHOOK.DeathBringer == nil"), "revive = false in the settings: no hook")
+    check(side(main=False).eval("PHOOK.DeathBringer == nil"), "another player's copy doesn't hook my death")
+    D = side(); D.execute('RULES.revive = "off"')
+    check(D.eval("HIT()") == "dead", "the host's REVIVE rule off: together, a lethal hit kills as before")
+    D = side(); D.eval("HIT()"); D.execute('tick(); RULES.revive = "off"; tick(); run_later()')
+    check(not D.eval("downed._shared.down") and D.eval("LASTHIT") == "dead" and D.eval("INPUT") is True,
+          "the host turns REVIVE off while I'm down: up off the floor and the death goes on")
+    hr_src = open(os.path.join(SCRIPTS, "mirror", "hostrules.lua"), encoding="utf-8").read()
+    rv = hr_src[hr_src.find('{ key = "revive", label = "REVIVE",'):]
+    check(hr_src.count('key = "revive"') == 1 and 'default = "on" }' in rv[:rv.find("}") + 1],
+          "REVIVE is a host rule (HOST RULES page, sent to every guest), on unless the host turns it off")
+    D = side()
+    check(D.eval("HIT(true)") == "alive" and not D.eval("downed._shared.down"),
+          "the Deathbringer skill saves me first: not downed")
+
+    # together: downed, the other player told
+    D, R = side(), side()
+    check(D.eval("HIT()") == "alive", "together: the lethal hit doesn't kill")
+    check(D.eval("PLAYER.MedicalComponent.Health") == 1.0 and D.eval("downed._shared.down"), "down at 1 health")
+    D.execute("KEYS.F = true; tick()")
+    check(D.eval("MOVE") == 0 and D.eval("INPUT") == False and D.eval('PLAYER["Sitting?"]') is True
+          and D.eval("CUR == MONTAGE") and D.eval('PLAYER.MedicalComponent["CanTakeDamage?"]') is False,
+          "down: on the floor (the game's sit), no moving, no input, no more damage")
+    check("YOU'RE DOWN" in (D.eval('CARDS["downed.me"] and CARDS["downed.me"].o.title') or ""), "down: told so, with the time left")
+    check(D.eval("SENT[1]") == "D 1 60", "the other player is told I'm down (%s)" % D.eval("SENT[1]"))
+    D.execute("tick(0.5, 4)")
+    check(D.eval("downed._shared.down"), "F already held when I went down (looting) gives nothing up")
+    D.execute("KEYS.F = false; tick()")
+    wire(D, R); R.execute("tick()")
+    check("Bob is down" in card(R, "downed.peer.Bob"), "the other player sees I'm down (%s)" % card(R, "downed.peer.Bob"))
+
+    # revive: 2.5 m is out of reach, at 1 m holding F for 4 s gets me up
+    R.execute("GHOST_AT = { X = 400, Y = 0, Z = 0 }; KEYS.F = true; tick(0.5, 10)")
+    check(R.eval("#SENT") == 0, "holding F 4 m away revives nobody")
+    R.execute("GHOST_AT = { X = 100, Y = 0, Z = 0 }; tick(0.5, 4)")
+    check(R.eval("#SENT") == 0 and "GETTING BOB UP" in (R.eval('CARDS["downed.revive.Bob"].o.title') or ""),
+          "next to them, holding F: a revive bar")
+    R.execute("tick(0.5, 5)")
+    check(R.eval("SENT[1]") == "V 1", "held 4 s: the revive is sent (%s)" % R.eval("SENT[1]"))
+    D.execute('INBOX[1] = "V 0"; tick()')
+    check(D.eval("downed._shared.down"), "a revive for an older down does nothing")
+    wire(R, D); D.execute("tick()")
+    check(not D.eval("downed._shared.down") and D.eval("PLAYER.MedicalComponent.Health") == 30.0,
+          "revived: up with 30 health (%s)" % D.eval("PLAYER.MedicalComponent.Health"))
+    check(D.eval("MOVE") == 1 and D.eval("INPUT") is True and D.eval('PLAYER["Sitting?"]') is False
+          and D.eval("CUR") is None and D.eval('PLAYER.MedicalComponent["CanTakeDamage?"]') is True,
+          "revived: standing, moving, input and damage back")
+    check(D.eval("#KILLS") == 0 and "got you up" in card(D, "downed.me"), "revived: no death, told who got me up")
+    check(D.eval("SENT[#SENT]") == "U 1", "the other player is told I'm up (%s)" % D.eval("SENT[#SENT]"))
+
+    # give up: hold F 1.5 s -> the real death (through the animation gate), past the Deathbringer skill
+    D.execute("SENT = {}"); D.eval("HIT()"); D.execute("tick(); KEYS.F = true; tick(0.5, 2)")
+    check(D.eval("downed._shared.down") and "GIVING UP" in (D.eval('CARDS["downed.me"].o.title') or ""),
+          "holding F while down: a give-up bar")
+    D.execute("tick(0.5, 2)")
+    check(not D.eval("downed._shared.down") and D.eval("#LATER") == 1 and D.eval("#KILLS") == 0,
+          "held 1.5 s: given up, the death hit waits for the animation gate")
+    D.execute("SKILL = true; run_later()")
+    check(D.eval("#KILLS") == 1 and D.eval('PLAYER.MedicalComponent["CanTakeDamage?"]') is True,
+          "the death hit lands with damage on")
+    check(D.eval("LASTHIT") == "dead", "and that hit kills, Deathbringer skill or not (%s)" % D.eval("LASTHIT"))
+
+    def respawn(L):
+        L.execute('SKILL = nil; LASTHIT = nil; tick(); PLAYER["PlayerDead?"] = false; '
+                  'PLAYER.MedicalComponent.Health = 100; tick(); KILLS = {}')
+    respawn(D)
+    check(D.eval("HIT()") == "alive", "after the respawn the next lethal hit downs me again")
+
+    # bleed out after 60 s; the other player gone for 5 s ends it too
+    D.execute("KEYS.F = false; tick(1, 58)")
+    check(D.eval("downed._shared.down"), "58 s down: still down")
+    D.execute("tick(1, 3); run_later()")
+    check(not D.eval("downed._shared.down") and D.eval("#KILLS") == 1 and D.eval("LASTHIT") == "dead", "60 s: bled out")
+    respawn(D)
+    D.eval("HIT()"); D.execute("HERE = false; tick(1, 4)")
+    check(D.eval("downed._shared.down"), "the other player away 4 s: still down")
+    D.execute("tick(1, 4); run_later()")
+    check(not D.eval("downed._shared.down") and D.eval("LASTHIT") == "dead",
+          "nobody in my world for 5 s: the death goes on")
+    # audit 2026-11-03: co-op starting again while down (a host switch makes the links anew, nobody "here" for a
+    # few seconds) isn't being left alone; after the grace the alone rule is back, and the bleed-out never stops
+    respawn(D)
+    D.execute("HERE = true; tick()")
+    check(D.eval("HIT()") == "alive", "(together again: down)")
+    D.execute("tick(); HERE = false; downed.init({}, function() return HERE end, true); tick(1, 12)")
+    check(D.eval("downed._shared.down") and D.eval("#KILLS") == 0, "co-op restarts while down, 12 s with nobody here: still down")
+    D.execute("tick(1, 14); run_later()")
+    check(not D.eval("downed._shared.down") and D.eval("LASTHIT") == "dead",
+          "past the %g s grace with still nobody here: the death goes on" % D.eval("downed._consts.SWITCH_GRACE_S"))
+    respawn(D)
+    D.execute("HERE = true; tick()"); D.eval("HIT()")
+    D.execute("tick(); downed.init({}, function() return HERE end, true); tick(1, 62); run_later()")
+    check(not D.eval("downed._shared.down") and D.eval("LASTHIT") == "dead", "a restart while down doesn't stop the bleed-out")
+
+    # co-op stops while down: not left on the floor
+    D = side(); D.eval("HIT()"); D.execute("tick(); downed.stop(); run_later()")
+    check(not D.eval("downed._shared.down") and D.eval("INPUT") is True and D.eval("LASTHIT") == "dead",
+          "co-op stops while I'm down: input back and the death goes on")
+    # audit 2026-11-03: the world goes while I'm down - its "you're down" card went on into the next world
+    D = side(); D.eval("HIT()"); D.execute("tick()")
+    check(D.eval('CARDS["downed.me"] ~= nil'), "(down: the card is up)")
+    D.execute("for _, f in ipairs(RESETS) do f() end")
+    check(not D.eval("downed._shared.down") and D.eval('CARDS["downed.me"] == nil'), "a world reset while down: the card goes too")
+
+    peers_src = open(os.path.join(SCRIPTS, "mirror", "peers.lua"), encoding="utf-8").read()
+    pres = peers_src[peers_src.index("local PRESENCE"):]
+    check("downed = true" in pres[:pres.index("\n}")], "another guest's copy on a guest has its own (peers PRESENCE)")
+    p1 = open(os.path.join(SCRIPTS, "mirror", "phase1.lua"), encoding="utf-8").read()
+    check("downed.init(cfg, same_world, false)" in p1 and "downed.init(cfg, same_world, not tags)" in p1
+          and p1.count('downed.tick, "downed.tick"') == 2 and "downed.stop" in p1, "phase1 runs it on every link, main and mates")
+
+
+def searched_containers_show_looted_for_everyone():
+    # user 2026-11-01: "making containers looted for all after 1 loots them and shows them looted for others".
+    # The game's ContainerLooted turns true at the first OpenContainer (decompiled); only the searching game set it.
+    print("searched_containers_show_looted_for_everyone")
+
+    def setup(role, inw=True):
+        L = lua()
+        L.execute(FAKES + r"""
+            local role, inw = ...
+            INW = inw
+            HOOKS, SENT, INBOX, RELAYS, RESETS, WORLD = {}, {}, {}, {}, {}, {}
+            package.loaded["mirror.events"] = evmock { new = function(name)
+                return { send = function(self, p) SENT[#SENT + 1] = p end,
+                         pump = function(self, fn) local q = INBOX; INBOX = {}; for _, p in ipairs(q) do fn(p) end end } end }
+            package.loaded["mirror.game"] = { on_world_reset = function(f) RESETS[#RESETS + 1] = f end }
+            package.loaded["mirror.peers"] = { relay = function(name, self_mod, fn)
+                if role ~= "host" then return end
+                fn({ relay_send = function(p) RELAYS[#RELAYS + 1] = p end }) end }
+            util = require("mirror.util")
+            util.ensure_hook = function(p, fn) HOOKS[p] = fn; return true end
+            FindAllOf = function(c) local t = {}; for _, o in ipairs(WORLD) do if o.cname == c then t[#t + 1] = o end end; return t end
+            function box(cname, x, extra)
+                local o = obj(extra or {})
+                o.cname, o.ContainerLooted, o.writes = cname, false, 0
+                o.GetClass = function() return cls(cname) end
+                o.GetFullName = function() return cname .. " /Game/Maps/World.World:PersistentLevel." .. cname .. "_1" end
+                o.K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end
+                WORLD[#WORLD + 1] = o
+                return o
+            end
+            function P(v) return { get = function() return v end } end
+            LC = "/Game/Inventory/Containers/BP_LootContainer.BP_LootContainer_C:OpenContainer"
+            TOOL = "/Game/Inventory/Containers/ToolRequiredContainer/BP_MASTER_ToolRequiredContainer.BP_MASTER_ToolRequiredContainer_C:OpenContainer"
+            PICK = "/Game/Inventory/Containers/PicklockContainer/BP_MASTER_PicklockContainer.BP_MASTER_PicklockContainer_C:OpenContainer"
+            looted = require("mirror.looted")
+            looted.init({}, role, { in_world = function() return INW end })
+            -- (game time: util.all_of keeps a class's list for 5 s of os.clock)
+            CLOCK = 0; os.clock = function() return CLOCK end
+            function run(s) for i = 1, math.floor(s * 10 + 0.5) do CLOCK = CLOCK + 0.1; looted.tick(0.1) end end
+            run(0.1)
+        """, role, inw)
+        return L
+
+    for role in ("host", "guest"):
+        L = setup(role)
+        check(all(L.eval('HOOKS[%s] ~= nil' % h) for h in ("LC", "TOOL", "PICK")),
+              "%s: OpenContainer hooked on the three container masters" % role)
+        L.execute(r"""
+            D = box("BP_LootContainer_Drawer_C", 1000)
+            HOOKS[LC](P(D)); run(0.3); S0 = #SENT
+            D.ContainerLooted = true; run(0.1); S1 = SENT[1]
+            HOOKS[LC](P(D)); run(0.3); S2 = #SENT
+        """)
+        check(L.eval('S0') == 0, "%s: opened but not yet searched: nothing sent" % role)
+        check(L.eval('S1') == "S BP_LootContainer_Drawer_C@100,0,0", "%s: searched: its id is sent (%s)" % (role, L.eval('S1')))
+        check(L.eval('S2') == 1, "%s: opened again: not sent again" % role)
+        # another player on this link (peers.lua runs init again on the same copy): what the last one was told is
+        # forgotten, so the next open of it reaches the new one (audit 2026-11-03)
+        L.execute('looted.init({}, %r, { in_world = function() return INW end }); HOOKS[LC](P(D)); run(0.3); S2B = SENT[#SENT]; S2N = #SENT' % role)
+        check(L.eval('S2N') == 2 and L.eval('S2B') == "S BP_LootContainer_Drawer_C@100,0,0",
+              "%s: a new session on the link: a searched container opened again is sent to the new player (%s)" % (role, L.eval('S2N')))
+        L.execute('SENT = { SENT[1] }')
+        L.execute(r"""
+            Q = box("BP_LootContainer_Shelf_C", 2000)
+            HOOKS[LC](P(Q)); run(3.5); Q.ContainerLooted = true; run(1); S3 = #SENT
+            T = box("Tool_Locker_C", 3000)
+            HOOKS[TOOL](P(T)); run(1); T.ContainerLooted = true; run(0.1); S4 = SENT[#SENT]
+        """)
+        check(L.eval('S3') == 1, "%s: a flag set long after the open (not by it) isn't sent" % role)
+        check(L.eval('S4') == "S Tool_Locker_C@300,0,0", "%s: a tool container that sets it a second after OpenContainer is sent" % role)
+        # the other game's searched lock-pick container
+        L.execute(r"""
+            K = box("Pick_Safe_C", 4000, { ["IsLocked?"] = true })
+            N0 = #SENT
+            INBOX = { "S Pick_Safe_C@400,0,0" }; run(0.1)
+            HOOKS[PICK](P(K)); run(0.3); N1 = #SENT
+        """)
+        check(L.eval('K.ContainerLooted') is True, "%s: the other player's searched container is searched here" % role)
+        check(L.eval('K["IsLocked?"]') is False, "%s: ...and a lock-pick one unlocked (the game ties the two)" % role)
+        check(L.eval('N1') == L.eval('N0'), "%s: ...and never sent back, even when opened here" % role)
+        if role == "host":
+            check(L.eval('RELAYS[1]') == "S Pick_Safe_C@400,0,0", "host: passed on to the other guests")
+        else:
+            check(L.eval('#RELAYS') == 0, "guest: nothing passed on")
+        # one not loaded here yet: kept and set when it shows up; one already searched isn't written
+        L.execute(r"""
+            INBOX = { "S Far_Crate_C@9000,0,0" }; run(0.1)
+            W0 = looted._test.later()["Far_Crate_C@9000,0,0"] ~= nil
+            F = box("Far_Crate_C", 90000)
+            run(16)
+            W1 = looted._test.later()["Far_Crate_C@9000,0,0"] ~= nil
+        """)
+        check(L.eval('W0') and L.eval('F.ContainerLooted') is True and not L.eval('W1'),
+              "%s: a container not loaded here yet is searched when it shows up" % role)
+        check("waiting" not in L.eval('looted.status()'), "%s: status: nothing waiting (%s)" % (role, L.eval('looted.status()')))
+        L.execute(r"""
+            INBOX = { "S Gone_C@7000,0,0" }; run(0.1)
+            run(610)
+            GONE = looted._test.later()["Gone_C@7000,0,0"]
+        """)
+        check(L.eval('GONE') is None, "%s: one that never shows up is dropped after 10 min" % role)
+        if role == "guest":
+            # audit 2026-11-03: the host searched while I loaded in - it was dropped, unsearched here for good
+            L.execute(r"""
+                H = box("Held_Crate_C", 8000)
+                INW = false; INBOX = { "S Held_Crate_C@800,0,0" }; run(0.5)
+                H0, HN = H.ContainerLooted, #looted._test.held()
+                INW = true; run(0.2)
+            """)
+            check(L.eval('H0') is False and L.eval('HN') == 1 and L.eval('H.ContainerLooted') is True
+                  and L.eval('#looted._test.held()') == 0,
+                  "guest: a search that came while I loaded in waits, and is applied once I'm in the host's world")
+        # a world load forgets what was sent
+        L.execute(r"""
+            for _, f in ipairs(RESETS) do f() end
+            HOOKS[LC](P(D)); run(0.1); S5 = SENT[#SENT]; S5N = #SENT
+        """)
+        check(L.eval('S5') == "S BP_LootContainer_Drawer_C@100,0,0" and L.eval('S5N') == 3,
+              "%s: after a world load the same place can be sent again" % role)
+        # a refill (Difficulty.Refill: Bind_Refill clears ContainerLooted, decompiled) goes to the other game too
+        L.execute(r"""
+            RLC = LC:gsub(":OpenContainer$", ":Bind_Refill"); RPICK = PICK:gsub(":OpenContainer$", ":Bind_Refill")
+            B = box("BP_LootContainer_Bin_C", 6000)
+            HOOKS[LC](P(B)); B.ContainerLooted = true; run(0.1)
+            HOOKS[RLC](P(B)); run(0.1); R0 = #SENT
+            B.ContainerLooted = false; run(0.1); R1 = SENT[#SENT]; R1N = #SENT
+            HOOKS[LC](P(B)); B.ContainerLooted = true; run(0.1); R2 = SENT[#SENT]
+            -- the other game's refill: ours by the game's own Bind_Refill (its hook here is no refill of mine)
+            C = box("Pick_Crate_C", 6500, { ["IsLocked?"] = false })
+            C.ContainerLooted, C.ran = true, 0
+            C.Bind_Refill = function(self) HOOKS[RPICK](P(C)); C.ran = C.ran + 1; C.ContainerLooted = false end
+            N2 = #SENT; NR = #RELAYS
+            INBOX = { "R Pick_Crate_C@650,0,0" }; run(4); N3 = #SENT; RL = RELAYS[#RELAYS]; NR2 = #RELAYS; CF = C.ContainerLooted
+            -- searched again here afterwards: sent again (the refill cleared it as known)
+            HOOKS[PICK](P(C)); C.ContainerLooted = true; run(0.1); R3 = SENT[#SENT]
+            -- a copy whose Bind_Refill fails still loses the flag
+            G = box("Odd_Crate_C", 6800); G.ContainerLooted = true
+            G.Bind_Refill = function() error("no such function") end
+            INBOX = { "R Odd_Crate_C@680,0,0" }; run(0.1)
+            -- one waiting to be searched here (not loaded) is forgotten by its refill
+            INBOX = { "S Late_C@8800,0,0" }; run(0.1); INBOX = { "R Late_C@8800,0,0" }; run(0.1)
+            LATE = looted._test.later()["Late_C@8800,0,0"]
+        """)
+        check(all(L.eval('HOOKS[%s] ~= nil' % h) for h in ("RLC", "RPICK")),
+              "%s: Bind_Refill hooked on the container masters" % role)
+        check(L.eval('R1N') == L.eval('R0') + 1 and L.eval('R1') == "R BP_LootContainer_Bin_C@600,0,0",
+              "%s: refilled here: sent once its flag is clear (%s)" % (role, L.eval('R1')))
+        check(L.eval('R2') == "S BP_LootContainer_Bin_C@600,0,0", "%s: searched again after the refill: sent again" % role)
+        check(L.eval('C.ran') == 1 and L.eval('CF') is False,
+              "%s: the other game's refill runs Bind_Refill on our copy (ran %s, flag %s)"
+              % (role, L.eval('C.ran'), L.eval('CF')))
+        check(L.eval('N3') == L.eval('N2'), "%s: ...and is never sent back" % role)
+        check(L.eval('R3') == "S Pick_Crate_C@650,0,0", "%s: ...and its next search here is sent" % role)
+        check(L.eval('G.ContainerLooted') is False, "%s: a copy whose Bind_Refill fails still loses the flag" % role)
+        check(L.eval('LATE') is None, "%s: a search still waiting for its container is dropped by the refill" % role)
+        if role == "host":
+            check(L.eval('RL') == "R Pick_Crate_C@650,0,0" and L.eval('NR2') == L.eval('NR') + 1,
+                  "host: a guest's refill is passed on to the other guests")
+
+    # a guest at home (not in the host's world) neither sends nor takes
+    L = setup("guest", False)
+    L.execute(r"""
+        D = box("BP_LootContainer_Drawer_C", 1000)
+        HOOKS[LC](P(D)); D.ContainerLooted = true; run(0.2)
+        E = box("BP_LootContainer_Drawer_C", 5000)
+        INBOX = { "S BP_LootContainer_Drawer_C@500,0,0" }; run(0.1)
+    """)
+    check(L.eval('#SENT') == 0, "guest at home: its own world's searches aren't sent")
+    check(L.eval('E.ContainerLooted') is False, "guest at home: the host's searches don't touch its own world")
+    # relay_send: once per container
+    L = setup("host")
+    L.execute('looted.relay_send("S A_C@1,0,0"); looted.relay_send("S A_C@1,0,0")')
+    check(L.eval('#SENT') == 1, "host: a relayed container is sent to this guest once")
+
+
+def radio_screen_opens_the_songs_folder_and_reads_new_songs():
+    # user 2026-11-01: "car radios dont work", custom songs, "a button on the radio screen too open the folder".
+    # The game's RadioComponent plays <game>\Radio (decompiled), a folder it never makes, read once at BeginPlay.
+    print("radio_screen_opens_the_songs_folder_and_reads_new_songs")
+    L = lua()
+    L.execute(FAKES + r"""
+        SAID = {}
+        package.loaded["mirror.notify"] = { show = function(m) SAID[#SAID + 1] = m end }
+        TICK, RESET, CLEARED = nil, nil, nil
+        package.loaded["mirror.game"] = { on_tick = function(f) TICK = f end, on_world_reset = function(f) RESET = f end,
+                                          on_widgets_cleared = function(f) CLEARED = f end }
+        MADE, FILES, RUN = {}, {}, {}
+        package.loaded["mirror.savefs"] = { mkdir = function() error("radio must not use savefs (save-safety guard)") end }
+        LISTED = 0
+        package.loaded["mirror.fs"] = { list_files = function() LISTED = LISTED + 1; return FILES end,
+                                        mkdir = function(p) MADE[#MADE + 1] = p; return true end,
+                                        dir_exists = function() error("probe file in the songs folder") end }
+        os.execute = function(c) RUN[#RUN + 1] = c end
+        -- no bridge (file transport) until BRIDGE_UP: the click opens the folder itself
+        BRIDGE_UP, CMDS = false, {}
+        package.loaded["mirror.link"] = { bridge_cmd = function(c) if not BRIDGE_UP then return false end
+                                                                     CMDS[#CMDS + 1] = c; return true end }
+        util = require("mirror.util")
+        HOOKED = {}
+        util.ensure_hook = function(p, pre) HOOKED[p] = pre; return true end
+        FText = function(s) return s end
+        StaticFindObject = function(p) return obj({ path = p }) end
+        StaticConstructObject = function(c, outer)
+            local o = obj({ cls = c.path, outer = outer })
+            o.SetText = function(self, s) self.text = s end
+            o.SetContent = function(self, w) self.content = w end
+            o.GetContent = function(self) return self.content end
+            o.GetText = function(self) local s = self.text; return { ToString = function() return s end } end
+            -- DBG-20261103-004: an FButtonStyle passed to SetStyle overran UE4SS's 0x200-byte parameter buffer
+            o.SetStyle = function(self, s) SET_STYLE_CALLS = (SET_STYLE_CALLS or 0) + 1 end
+            o.SetFont = function(self, f) self.font = f end
+            o.SetColorAndOpacity = function(self, c) self.color = c end
+            o.Font = { Size = 10 }
+            o.IsPressed = function(self) return self.down == true end
+            o.IsHovered = function(self) return true end
+            return o
+        end
+        ADDED = {}
+        local slot = { SetPadding = function(self, p) self.pad = p end, SetHorizontalAlignment = function(self, a) self.align = a end }
+        local next_label = obj({ Font = { FontObject = "F", TypefaceFontName = "Bold", Size = 22 }, ColorAndOpacity = "WHITE",
+                                 GetText = function() return { ToString = function() return "NEXT" end } end })
+        -- each screen its own panel (power, next, ...): what is on it stays with that screen
+        function screen()
+            local kids = {}
+            local panel = obj({ AddChildToVerticalBox = function(self, w) kids[#kids + 1] = w; ADDED[#ADDED + 1] = w; return slot end,
+                                GetChildrenCount = function() return #kids end, GetChildAt = function(_, i) return kids[i + 1] end })
+            local nb = obj({ WidgetStyle = "NEXT_STYLE", Slot = { Padding = "PAD", HorizontalAlignment = 2 },
+                             GetParent = function() return panel end, GetContent = function() return next_label end })
+            kids[1] = nb
+            return obj({ NextButton = nb, WidgetTree = obj({}) })
+        end
+        BEGUN = 0
+        RADIO = obj({ ["TurnedOn?"] = false, RadioUI = nil, known = 0 })
+        RADIO["Found Files"] = { GetArrayNum = function() return RADIO.known end }
+        RADIO.ReceiveBeginPlay = function(self) BEGUN = BEGUN + 1; self.known = #FILES end
+        radio = require("mirror.radio")
+        radio.init()
+        function run(n) for i = 1, n do TICK(0.1) end end
+        run(1)
+        MADE_AT_START = MADE[1]
+        -- R in a car: the game's ToggleRadioUI makes its screen
+        HOOKED["/Game/Blueprints/Components/RadioComponent.RadioComponent_C:ToggleRadioUI"]({ get = function() return RADIO end })
+        RADIO.RadioUI = screen()
+        run(1)
+        BTN = ADDED[1]
+        EMPTY_SAID = SAID[#SAID]
+        -- a click: pressed, then let go over it
+        BTN.down = true; run(1); BTN.down = false; run(1)
+        CLICK_RUN, CLICK_MADE = RUN[1], MADE[#MADE]
+        -- two songs put in while the screen is up and the radio is off: read again
+        FILES = { "a.mp4", "b.mp3" }
+        run(25)
+        BEGUN1, KNOWN1 = BEGUN, RADIO.known
+        run(25)
+        BEGUN2 = BEGUN
+        -- a third added while it plays: not read again until it's off
+        FILES = { "a.mp4", "b.mp3", "c.mp4" }
+        RADIO["TurnedOn?"] = true; run(30)
+        BEGUN_PLAYING = BEGUN
+        RADIO["TurnedOn?"] = false; run(25)
+        BEGUN_OFF = BEGUN
+        -- the screen closed and opened again: one button on the new screen, none added twice
+        RADIO.RadioUI = nil; run(1)
+        RADIO.RadioUI = screen(); run(1); run(5)
+        N_ADDED = #ADDED
+        -- UE4SS: every read of RadioUI is a new wrapper of the same screen (same address, no __eq)
+        local held
+        rawset(RADIO, "RadioUI", nil)
+        setmetatable(RADIO, {
+            __index = function(_, k)
+                if k == "RadioUI" then UI_READS = (UI_READS or 0) + 1 end
+                if k == "RadioUI" and held then return setmetatable({}, { __index = held }) end
+            end,
+            __newindex = function(t, k, v) if k == "RadioUI" then held = v else rawset(t, k, v) end end })
+        RADIO.RadioUI = screen(); run(1)
+        WRAP_BTN, WRAP_RUNS = ADDED[#ADDED], #RUN
+        WRAP_BTN.down = true; run(1); WRAP_BTN.down = false; run(1)
+        WRAP_CLICKED = #RUN - WRAP_RUNS
+        LISTED = 0; run(20)
+        WRAP_ADDED, WRAP_LISTED = #ADDED, LISTED
+        -- a death clears the widgets (forget) while the game keeps the same radio screen: the toggle comes again and
+        -- the button already on its panel is used, not a second one put under it (audit 2026-11-03)
+        CLEARED()
+        HOOKED["/Game/Blueprints/Components/RadioComponent.RadioComponent_C:ToggleRadioUI"]({ get = function() return RADIO end })
+        run(3)
+        KEPT_ADDED, KEPT_RUNS = #ADDED, #RUN
+        WRAP_BTN.down = true; run(1); WRAP_BTN.down = false; run(1)
+        KEPT_CLICKED = #RUN - KEPT_RUNS
+        -- the bridge up: it opens the folder, off the game thread (os.execute here froze the game 5 s a click,
+        -- user 2026-11-03: "hella lag spike when opening radio folder")
+        BRIDGE_UP = true
+        BRIDGE_RUNS = #RUN
+        WRAP_BTN.down = true; run(1); WRAP_BTN.down = false; run(1)
+        BRIDGE_EXECUTED = #RUN - BRIDGE_RUNS
+        -- the screen closed: the radio stays known for the rest of the world, and isn't read every frame for it
+        RADIO.RadioUI = nil; run(1)
+        UI_READS = 0; for i = 1, 60 do TICK(1 / 60) end
+        CLOSED_READS = UI_READS
+        ADDED_BEFORE = #ADDED
+        HOOKED["/Game/Blueprints/Components/RadioComponent.RadioComponent_C:ToggleRadioUI"]({ get = function() return RADIO end })
+        RADIO.RadioUI = screen(); TICK(1 / 60)
+        TOGGLE_ADDED = #ADDED - ADDED_BEFORE
+        UI_READS = 0; for i = 1, 10 do TICK(1 / 60) end
+        OPEN_READS = UI_READS
+    """)
+    check(L.eval("MADE_AT_START") == "..\\..\\..\\Radio", "the game's Radio folder (next to SurrounDead.exe) is made at start (%r)" % L.eval("MADE_AT_START"))
+    btn = L.eval("BTN")
+    check(btn is not None and L.eval("BTN.content.text") == "SONGS FOLDER" and L.eval("BTN.WidgetStyle") == "NEXT_STYLE",
+          "the radio screen gets a SONGS FOLDER button styled like NEXT")
+    check(L.eval("SET_STYLE_CALLS") is None,
+          "the style goes in by its field, never through SetStyle (FButtonStyle overran UE4SS's 0x200 parameter buffer, R crashed the game)")
+    check(L.eval("BTN.content.font.Size") == 22 and L.eval("BTN.content.font.TypefaceFontName") == "Bold",
+          "its label has NEXT's font")
+    check("No songs yet" in (L.eval("EMPTY_SAID") or ""), "an empty folder is told when the screen opens")
+    run = L.eval("CLICK_RUN") or ""
+    check(run.startswith('start "" ') and "..\\..\\..\\Radio" in run and L.eval("CLICK_MADE") == "..\\..\\..\\Radio",
+          "clicking it makes the folder and opens it (%r)" % run)
+    check(L.eval("BEGUN1") == 1 and L.eval("KNOWN1") == 2, "songs added while the radio is off are read in")
+    check(L.eval("BEGUN2") == 1, "...once, not again while nothing changed")
+    check(L.eval("BEGUN_PLAYING") == 1, "a playing radio is never made to read the folder again")
+    check(L.eval("BEGUN_OFF") == 2, "it reads the new song once it is off")
+    check(L.eval("N_ADDED") == 2, "a reopened screen gets its own one button (%r)" % L.eval("N_ADDED"))
+    # audit 2026-11-02: the screen was compared with ~= on UE4SS wrappers, a new one each read: a button added every
+    # tick, the click state reset every tick (it never worked) and the folder listed every frame
+    check(L.eval("WRAP_ADDED") == 3, "a fresh wrapper each read is still the same screen: one button (%r)" % L.eval("WRAP_ADDED"))
+    check(L.eval("WRAP_CLICKED") == 1, "...and its click opens the folder (%r)" % L.eval("WRAP_CLICKED"))
+    check(L.eval("KEPT_ADDED") == 3, "cleared widgets, same screen kept: no second SONGS FOLDER button (%r)" % L.eval("KEPT_ADDED"))
+    check(L.eval("KEPT_CLICKED") == 1, "...and the one there still opens the folder (%r)" % L.eval("KEPT_CLICKED"))
+    check(L.eval("WRAP_LISTED") <= 2, "...and the folder is read every 2 s, not every frame (%r in 20 ticks)" % L.eval("WRAP_LISTED"))
+    check(L.eval("#CMDS") == 1 and L.eval("CMDS[1]") == "openradio" and L.eval("BRIDGE_EXECUTED") == 0,
+          "with the bridge up a click asks it to open the folder and runs nothing on the game thread (%r, %r)"
+          % (L.eval("CMDS[1]"), L.eval("BRIDGE_EXECUTED")))
+    check(L.eval("CLOSED_READS") <= 7, "no screen up: RadioUI read a few times a second, not every frame (%r in 60)" % L.eval("CLOSED_READS"))
+    check(L.eval("TOGGLE_ADDED") == 1, "...and a toggle looks at once: the button is there on the next frame (%r)" % L.eval("TOGGLE_ADDED"))
+    check(L.eval("OPEN_READS") >= 10, "...and every frame while it is up, for the clicks (%r in 10)" % L.eval("OPEN_READS"))
+
+
+def radio_button_goes_in_the_new_radio_screens_row():
+    # Game build 26467602's radio screen: PAUSE, PLAY, SHUFFLE, PREVIOUS in a HorizontalBox, each an icon and a
+    # label, and no NEXT (dump + widget tree 2026-11-07). The button goes after PREVIOUS, dressed like it.
+    print("radio_button_goes_in_the_new_radio_screens_row")
+    L = lua()
+    L.execute(FAKES + r"""
+        package.loaded["mirror.notify"] = { show = function() end }
+        TICK = nil
+        package.loaded["mirror.game"] = { on_tick = function(f) TICK = f end, on_world_reset = function() end,
+                                          on_widgets_cleared = function() end }
+        package.loaded["mirror.fs"] = { list_files = function() return {} end, mkdir = function() return true end }
+        package.loaded["mirror.link"] = { bridge_cmd = function() return true end }
+        util = require("mirror.util")
+        HOOKED = {}
+        util.ensure_hook = function(p, pre) HOOKED[p] = pre; return true end
+        FText = function(s) return s end
+        StaticFindObject = function(p) return obj({ path = p }) end
+        StaticConstructObject = function(c, outer)
+            local o = obj({ cls = c.path })
+            o.SetText = function(self, s) self.text = s end
+            o.SetContent = function(self, w) self.content = w end
+            o.GetContent = function(self) return self.content end
+            o.SetFont = function(self, f) self.font = f end
+            o.SetColorAndOpacity = function(self, c) self.color = c end
+            o.Font = { Size = 10 }
+            return o
+        end
+        ROW, COLUMN, SIZES = {}, {}, {}
+        SLOT = { SetPadding = function(self, p) self.pad = p end, SetHorizontalAlignment = function(self, a) self.halign = a end,
+                 SetVerticalAlignment = function(self, a) self.valign = a end, SetSize = function(self, s) SIZES[#SIZES + 1] = s end }
+        local function w(kind, t) t.GetClass = function() return cls(kind) end; return obj(t) end
+        GAME_SIZE = { SizeRule = 1, Value = 1.0 }
+        local label = w("TextBlock", { Font = { FontObject = "F", TypefaceFontName = "Regular", Size = 18 }, ColorAndOpacity = "GREY" })
+        local icon = w("Image", {})
+        local inner = w("HorizontalBox", { GetChildrenCount = function() return 2 end,
+                                           GetChildAt = function(_, i) return ({ [0] = icon, [1] = label })[i] end })
+        local row = w("HorizontalBox", { AddChildToHorizontalBox = function(self, b) ROW[#ROW + 1] = b; return SLOT end,
+                                         AddChildToVerticalBox = function(self, b) COLUMN[#COLUMN + 1] = b; return SLOT end,
+                                         GetChildrenCount = function() return #ROW end, GetChildAt = function(_, i) return ROW[i + 1] end })
+        local prev = w("Button", { WidgetStyle = "PREVIOUS_STYLE", GetParent = function() return row end, GetContent = function() return inner end,
+                                   Slot = { Padding = "PAD", HorizontalAlignment = 0, VerticalAlignment = 2, Size = GAME_SIZE } })
+        ROW[1] = prev
+        RADIO = obj({ ["TurnedOn?"] = false, RadioUI = obj({ PreviousButton = prev, WidgetTree = obj({}) }) })
+        RADIO["Found Files"] = { GetArrayNum = function() return 0 end }
+        radio = require("mirror.radio")
+        radio.init()
+        TICK(0.1)
+        HOOKED["/Game/Blueprints/Components/RadioComponent.RadioComponent_C:ToggleRadioUI"]({ get = function() return RADIO end })
+        TICK(0.1)
+        BTN = ROW[2]
+    """)
+    check(L.eval("#ROW") == 2 and L.eval("#COLUMN") == 0 and L.eval("BTN.content.text") == "SONGS FOLDER",
+          "SONGS FOLDER goes in the row after PREVIOUS (%d in the row, %d in a column)" % (L.eval("#ROW"), L.eval("#COLUMN")))
+    check(L.eval("BTN.WidgetStyle") == "PREVIOUS_STYLE" and L.eval("BTN.content.font.Size") == 18,
+          "it looks like PREVIOUS: its style and its label's font (the label inside the icon + label panel)")
+    check(L.eval("SLOT.pad") == "PAD" and L.eval("SLOT.valign") == 2 and L.eval("#SIZES") == 1
+          and L.eval("SIZES[1] ~= GAME_SIZE and SIZES[1].SizeRule == 1 and SIZES[1].Value == 1.0"),
+          "its slot gets PREVIOUS's padding, alignment and size (the size as fresh numbers, not the game's struct)")
+
+
+def fs_lists_the_names_of_files_and_folders_in_a_folder():
+    # 2026-11-03: fs.list_files read each FoundPaths entry with v:ToString() only - "" in game, so the radio never saw
+    # a song put in and the MODS list never a pak. One reading for files and folders now, every element form.
+    print("fs_lists_the_names_of_files_and_folders_in_a_folder")
+    L = lua()
+    L.execute(r"""
+        package.loaded["mirror.uepath"] = { of = function(p) return "C:/G/Radio" end }
+        CALLS = {}
+        local function fstr(s) return { ToString = function() return s end } end
+        local function held(s) return { get = function() return fstr(s) end } end
+        StaticFindObject = function() return {
+            FindRecursive = function(self, dir, out, filter, files, dirs)
+                CALLS[#CALLS + 1] = { dir = dir, files = files, dirs = dirs }
+                out.FoundPaths = { "C:/G/Radio/a.mp4", fstr("C:\\G\\Radio\\b.mp3"), held("c:/g/radio/c.wav"),
+                                   "C:/G/Radio/sub/deep.mp3", "C:/Other/x.mp3", fstr(nil) }
+            end } end
+        fs = require("mirror.fs")
+        F = fs.list_files("..\\..\\..\\Radio")
+        D = fs.list_dirs("..\\..\\..\\Radio")
+        StaticFindObject = function() return { FindRecursive = function() error("no such folder") end } end
+        FAILED = fs.list_files("..\\..\\..\\Radio")
+    """)
+    names = [L.eval("F[%d]" % i) for i in range(1, L.eval("#F") + 1)]
+    check(names == ["a.mp4", "b.mp3", "c.wav"],
+          "a string, an FString and a held FString are each read; deeper and outside paths are left out (%r)" % names)
+    check(L.eval("CALLS[1].files") is True and L.eval("CALLS[1].dirs") is False
+          and L.eval("CALLS[2].files") is False and L.eval("CALLS[2].dirs") is True,
+          "list_files asks for files, list_dirs for folders")
+    check(L.eval("FAILED") is None, "a failed search is nil, not an empty folder")
+
+
+def start_with_gps_gives_one_on_entry_and_after_death():
+    # user 2026-11-01: "make it so all characters spawn with a GPS upon entry and after death with a setting in the menu"
+    print("start_with_gps_gives_one_on_entry_and_after_death")
+    L = lua()
+    L.execute('''
+        GPS = "/Game/Inventory/Items/DataAssets/Equipment/Tools/DA_GPS.DA_GPS"
+        SPAWN = {}; NOTES = {}; ADDS = {}; WARNS = {}
+        RULE, SOURCE, RANGE = "on", "mine", false
+        BUSY = { loading = false, saving = false, joining = false }
+        -- the character's inventory: a 1-cell equipment slot first, then two grids; HAVE = GPS count in it
+        -- the game's equip: the item's slot widget (SLOTMADE) in a grid whose root holds the comp the equip runs on;
+        -- EQUIPOK = the equip takes (WORN, read by the character's IsGPSEquipped?), EQUIPERR = it throws
+        EQUIPS, FINDS = {}, {}
+        WORN, SLOTMADE, EQUIPOK, EQUIPERR = false, true, true, false
+        INV = { name = "inv" }
+        ROOTC = { name = "root", JigMultiplayerComp = { name = "rootcomp" } }
+        -- (the first argument as padinv passes it)
+        GRID = { name = "pockets", GetRootContainerRef = function(self, b, o) if b == false then o.ContainerRef = ROOTC end end }
+        ITEM = { name = "gpsslot", ContainerMother = GRID }
+        function INV:FindItemByUID(g, out) FINDS[#FINDS + 1] = g; if SLOTMADE then out.Found = ITEM end end
+        ROOTC.JigMultiplayerComp.Context_TryEquip = function(self, item, root)
+            EQUIPS[#EQUIPS + 1] = self.name .. " " .. item.name .. " " .. root.name
+            if EQUIPERR then error("no equip slot") end
+            WORN = EQUIPOK
+        end
+        PLAYER = { BP_JigMultiplayer = INV, ["IsGPSEquipped?"] = function(self, out) out["GPS?"] = WORN end }
+        CONTS = { { raw = { cells = 1 }, slot = 1 }, { raw = { cells = 12 }, slot = 2 }, { raw = { cells = 40 }, slot = 3 } }
+        HAVE, ROOM = 0, true
+        package.loaded["mirror.log"] = { info = function() end, warn = function(m) WARNS[#WARNS + 1] = m end }
+        package.loaded["mirror.util"] = { valid = function(x) return x ~= nil end, addr = function(x) return x and tostring(x) or nil end }
+        SHARED_T = {}
+        package.loaded["mirror.peers"] = { shared_table = function(n) SHARED_T[n] = SHARED_T[n] or {}; return SHARED_T[n] end }
+        package.loaded["mirror.game"] = {
+            player = function() return PLAYER end, in_shooting_range = function() return RANGE end,
+            on_new_player = function(fn) SPAWN[#SPAWN + 1] = fn end }
+        package.loaded["mirror.hostrules"] = {
+            source = function() return SOURCE end,
+            get = function(k) return k == "gps" and SOURCE ~= nil and RULE ~= "off" end }
+        package.loaded["mirror.notify"] = { show = function(m, kind) NOTES[#NOTES + 1] = kind .. ": " .. m end }
+        package.loaded["mirror.jig"] = {
+            asset = function(p) return p == GPS and not NOASSET and { Durability = 100.0, MaxDurability = 100.0 } or nil end,
+            guid = function(uid) return "guid:" .. uid end,
+            top_containers = function(comp) return PLAYER and comp == PLAYER.BP_JigMultiplayer and CONTS or {} end,
+            container_arg = function(raw) return {}, raw.cells end,
+            container_count = function(comp) return #CONTS end,
+            count_of_item = function(comp, da) return da == GPS and HAVE or 0 end,
+            add_item = function(comp, da, n, dx, dy, conts)
+                local slots = {}
+                for _, c in ipairs(conts or {}) do slots[#slots + 1] = c.slot end
+                ADDS[#ADDS + 1] = string.format("%s x%d %g/%g in %s", da:match("[%w_]+$"), n, dx, dy, table.concat(slots, ","))
+                if not ROOM then return nil, "no room" end
+                HAVE = HAVE + 1
+                return "1_2_3_4"
+            end }
+        package.loaded["mirror.startgps"] = nil
+        sg = require("mirror.startgps")
+        sg.init({ loading = function() return BUSY.loading end, saving = function() return BUSY.saving end,
+                  joining = function() return BUSY.joining end })
+        -- a new character wears nothing
+        function spawn() WORN = false; for _, fn in ipairs(SPAWN) do fn() end end
+        function run(s) for i = 1, math.floor(s * 10 + 0.5) do sg.tick(0.1) end end
+        function until_added() local n = #ADDS; for i = 1, 200 do sg.tick(0.1); if #ADDS > n then return i end end end
+    ''')
+    adds = lambda: list(L.eval("ADDS").values())
+    equips = lambda: list(L.eval("EQUIPS").values())
+    notes = lambda: list(L.eval("NOTES").values())
+    check(L.eval("#SPAWN") == 1, "listens for the character's spawns (entry and respawn)")
+    # entry: nothing until the saved inventory is in, then one GPS into a grid, never the equipment slot
+    L.execute("spawn(); run(11.5)")
+    check(adds() == [], "nothing in the first 11.5 s after the spawn (the saved inventory goes in first)")
+    L.execute("until_added()")
+    check(adds() == ["DA_GPS x1 100/100 in 2,3"], "then one GPS, the asset's durability, into the grids only: %s" % adds())
+    check(equips() == [] and notes() == [], "not equipped in the add's own frame (its slot widget comes a frame later)")
+    L.execute("run(0.7)")
+    check(equips() == ["rootcomp gpsslot root"] and list(L.eval("FINDS").values()) == ["guid:1_2_3_4"],
+          "then the game's equip on the new item's slot, through its root's comp: %s" % equips())
+    check(notes() == [], "...not told yet: the equip is read back first")
+    L.execute("run(0.7)")
+    check(notes() == ["info: You got a GPS (START WITH GPS is on)."], "worn: the player is told (%s)" % notes())
+    L.execute("run(60)")
+    check(len(adds()) == 1 and len(equips()) == 1, "once per spawn: no second GPS or equip however long it runs")
+    # a reload with the GPS in the save: none more
+    L.execute("NOTES = {}; spawn(); run(13)")
+    check(len(adds()) == 1 and len(equips()) == 1 and notes() == [],
+          "a character that has a GPS (worn or packed) gets none, and nothing is equipped")
+    # after death: the new character carries none - one more
+    L.execute("HAVE = 0; spawn(); run(13)")
+    check(len(adds()) == 2, "after a death and respawn without a GPS: one more")
+    L.execute("run(2)")
+    # the rule off: nothing
+    L.execute("HAVE, RULE = 0, 'off'; spawn(); run(30)")
+    check(len(adds()) == 2, "START WITH GPS off: no GPS")
+    L.execute("RULE = 'on'")
+    # busy: loading, saving, a guest joining - it waits, then gives one
+    for busy in ("loading", "saving", "joining"):
+        n = len(adds())
+        L.execute("HAVE = 0; BUSY.%s = true; spawn(); run(40)" % busy)
+        check(len(adds()) == n, "waits while %s" % busy)
+        L.execute("BUSY.%s = false; run(1.1)" % busy)
+        check(len(adds()) == n + 1, "gives it once %s is over" % busy)
+        L.execute("run(2)")
+    # a guest before the host's rules arrive (value() would be the default): waits for them
+    n = len(adds())
+    L.execute("HAVE, SOURCE, RULE = 0, nil, 'on'; spawn(); run(30)")
+    check(len(adds()) == n, "a guest waits for the host's rules")
+    L.execute("SOURCE = 'host'; run(1.1)")
+    check(len(adds()) == n + 1, "then follows them")
+    L.execute("run(2); HAVE, SOURCE, RULE = 0, nil, 'on'; spawn(); run(13); SOURCE, RULE = 'host', 'off'; run(5)")
+    check(len(adds()) == n + 1, "a host whose rule is off: the guest gets none")
+    L.execute("SOURCE, RULE = 'mine', 'on'")
+    # no inventory yet / no player: waits, gives up after 90 s without adding anything
+    n = len(adds())
+    L.execute("HAVE = 0; CONTS_SAVE = CONTS; CONTS = {}; spawn(); run(89)")
+    check(len(adds()) == n and len(L.eval("WARNS")) == 0, "no inventory containers yet: waits")
+    L.execute("run(2)")
+    warns = list(L.eval("WARNS").values())
+    check(len(adds()) == n and len(warns) == 1 and "no inventory yet" in warns[0], "gives up after 90 s, logged: %s" % warns)
+    L.execute("CONTS = CONTS_SAVE; run(30)")
+    check(len(adds()) == n, "a dropped check stays dropped until the next spawn")
+    L.execute("SAVEP = PLAYER; PLAYER = nil; spawn(); run(20); PLAYER = SAVEP; run(1.1)")
+    check(len(adds()) == n + 1, "no player yet: waits, then gives it")
+    L.execute("run(2)")
+    # the shooting range is not a world
+    n = len(adds())
+    L.execute("HAVE, RANGE = 0, true; spawn(); run(30); RANGE = false")
+    check(len(adds()) == n, "no GPS in the shooting range")
+    # a respawn while an earlier check still waits starts the wait again
+    L.execute("HAVE = 0; spawn(); run(8); spawn(); run(8)")
+    check(len(adds()) == n, "a second spawn restarts the 12 s wait")
+    L.execute("run(4.1)")
+    check(len(adds()) == n + 1, "one GPS for the two spawns")
+    L.execute("run(2)")
+    # no room: told, counted, not retried, nothing to equip
+    n, e = len(adds()), len(equips())
+    L.execute("HAVE, ROOM, NOTES = 0, false, {}; spawn(); run(30)")
+    check(len(adds()) == n + 1 and notes() == ["bad: START WITH GPS: no room for your GPS."],
+          "no room: one try, the player is told")
+    check(len(equips()) == e, "...and no equip")
+    status = L.eval("sg.status()")
+    check(status == "start gps: given 8 (worn 8), had one 1, failed 1", "status counts it: %s" % status)
+    check(len(equips()) == 8, "one equip per GPS given (%d)" % len(equips()))
+    # the asset not readable here: no durability to copy, 0/0 (jig.add_item then reports it isn't loaded)
+    L.execute("HAVE, ROOM, NOASSET = 0, true, true; spawn(); run(13)")
+    check(adds()[-1] == "DA_GPS x1 0/0 in 2,3", "no asset: durability 0/0 (%s)" % adds()[-1:])
+    L.execute("run(2); NOASSET = nil")
+    # the equip doesn't take: three tries, then the GPS stays in the inventory, the player is told where it is
+    for setup, why, tries in (("EQUIPOK = false", None, 3), ("SLOTMADE = false", "its slot isn't made yet", 0),
+                              ("EQUIPERR = true", "the game's equip failed", 3)):
+        e = len(equips())
+        L.execute("HAVE, NOTES, WARNS = 0, {}, {}; %s; spawn(); run(12); run(1.5)" % setup)
+        check(notes() == [] and len(L.eval("WARNS")) == 0, "%s: still trying, not told yet" % setup)
+        L.execute("run(1.5)")
+        warns = list(L.eval("WARNS").values())
+        check(len(equips()) - e == tries, "%s: %d equip calls (%d)" % (setup, tries, len(equips()) - e))
+        check(len(warns) == 1 and "after 3 tries" in warns[0] and "left in the inventory" in warns[0]
+              and (why is None or why in warns[0]), "%s: logged once: %s" % (setup, warns))
+        check(notes() == ["info: You got a GPS (START WITH GPS is on) - it's in your inventory, equip it there."],
+              "%s: the player is told it's in the inventory (%s)" % (setup, notes()))
+        check(int(L.eval("HAVE")) == 1, "%s: the GPS stays" % setup)
+        L.execute("run(10); EQUIPOK, SLOTMADE, EQUIPERR = true, true, false")
+        check(len(equips()) - e == tries and len(L.eval("WARNS")) == 1, "%s: then left alone" % setup)
+    # the GPS gone before it is worn (dropped, moved to a box): no equip try on nothing
+    e = len(equips())
+    L.execute("HAVE, NOTES, WARNS = 0, {}, {}; spawn(); until_added(); HAVE = 0; run(3)")
+    check(len(equips()) == e and len(L.eval("WARNS")) == 1, "a GPS gone before the equip: none tried, logged")
+    # a respawn mid-equip: the old character's GPS is not equipped on the new one
+    e = len(equips())
+    L.execute("HAVE = 0; spawn(); until_added(); HAVE = 0; spawn(); run(0.7)")
+    check(len(equips()) == e, "a respawn drops the old character's equip")
+    status = L.eval("sg.status()")
+    check(status.startswith("start gps: given 14 (worn 9)"), "the misses aren't counted as worn: %s" % status)
+    # a host who loaded the world before hosting: its spawn came before the hook - the start of co-op looks once
+    # (audit 2026-11-03)
+    L.execute("run(15)")   # (the respawn above still had its check due)
+    n = len(adds())
+    L.execute("HAVE = 0; PLAYER = { BP_JigMultiplayer = INV, ['IsGPSEquipped?'] = PLAYER['IsGPSEquipped?'] }; "
+              "SESSION = { loading = function() return false end, saving = function() return false end, joining = function() return false end }; "
+              "sg.init(SESSION); run(13)")
+    check(len(adds()) == n + 1, "a character already in the world when co-op starts gets its GPS (%d)" % (len(adds()) - n))
+    L.execute("run(5); HAVE = 0; sg.init(SESSION); run(20)")
+    check(len(adds()) == n + 1, "...once: co-op started again for the same character gives none more")
+
+
+def a_tow_hitch_is_made_on_every_game():
+    # user 2026-11-01: "towing vehicles is client side vs server side fix it"
+    print("a_tow_hitch_is_made_on_every_game")
+    H, G = lua(), lua()
+    for L, role in ((H, "host"), (G, "guest")):
+        L.execute(FAKES + TOW_FAKES)
+        L.execute('T = car("Truck_1", 0); B = car("Sedan_2", %d); towing.init({}, %r, { in_world = function() return true end }); run(3)'
+                  % (-500 if role == "host" else 9000, role))
+    check(H.eval('HOOK.AddTowingComp') is not None and H.eval('HOOK.RemoveTowingComp') is not None,
+          "both tow functions are hooked")
+    H.execute('L = car("Lone_9", 50000); L:AddTowingComp(false, false); run(1)')
+    check(H.eval('#OUT') == 0, "a hitch whose trace finds no car sends nothing")
+    H.execute('T:AddTowingComp(false, false); run(0.5)')
+    check(H.eval('#OUT') == 0, "a hitch isn't read before the game has set its constraint")
+    H.execute('run(0.5)')
+    sent = list(H.eval('OUT').values())
+    check(len(sent) == 1 and sent[0].startswith("H Truck_1 Sedan_2 0.0 0.0 0.0 ") and " -500.0 0.0 0.0 " in sent[0],
+          "a hitch made on the host is sent once, with both cars' places (%r)" % sent)
+    G.execute('INBOX = { %r }; run(1)' % sent[0])
+    check(G.eval('T["TowingVehicle?"]') is True and G.eval('T.PhysicsConstraintComp:GetOwner() == B') is True,
+          "...the guest's truck tows the same car")
+    check(G.eval('B.at.X') == -500 and G.eval('B.placed') == 1, "...which was put behind it first (it stood 90 m away)")
+    G.execute('run(3)')
+    check(G.eval('#OUT') == 0, "...and nothing is sent back")
+    G.execute('T:AddTowingComp(false, false); run(1)')
+    back = list(G.eval('OUT').values())
+    check(back == ["U Truck_1"], "the guest unhitching it is sent (%r)" % back)
+    H.execute('INBOX = { %r }; run(3)' % back[0])
+    check(H.eval('T["TowingVehicle?"]') is False and H.eval('#OUT') == 1, "...unhitched on the host, not sent back")
+    # the trace there finds another car: that hitch is undone and nothing goes back
+    H.execute('T:AddTowingComp(false, false); run(1)')
+    again = H.eval('OUT[2]')
+    G.execute('OUT = {}; B.at = { X = 9000, Y = 0, Z = 0 }; MYCAR = B; W = car("Van_3", -500); INBOX = { %r }; run(5)' % again)
+    check(G.eval('B.placed') == 1 and G.eval('T["TowingVehicle?"]') is False,
+          "a car the player there drives isn't moved, and a hitch to the wrong car is undone")
+    check(G.eval('#OUT') == 0 and G.eval('towing.status()') == "towing: sent 1, hitched/unhitched here 1, failed 1",
+          "...given up after its tries, nothing sent (%s)" % G.eval('towing.status()'))
+    # two cars at once: each its own change
+    H.execute('OUT = {}; T2 = car("Truck_4", 30000); B2 = car("Sedan_5", 29500); '
+              'T:AddTowingComp(false, false); T2:AddTowingComp(false, false); run(1)')
+    both = sorted(H.eval('OUT').values())
+    check(len(both) == 2 and both[0].startswith("H Truck_4 Sedan_5 ") and both[1] == "U Truck_1",
+          "two trucks changed in the same moment are both sent (%r)" % both)
+    # a guest outside the world takes none and sends none
+    G.execute('MYCAR = nil; W.at = { X = -500, Y = 0, Z = 0 }; '
+              'towing.init({}, "guest", { in_world = function() return false end }); T:AddTowingComp(false, false); run(1)')
+    check(G.eval('T["TowingVehicle?"]') is True and G.eval('#OUT') == 0, "a guest not in the world sends no hitch")
+    # a car another player locked isn't towed away (audit 2026-11-03)
+    L = lua()
+    L.execute(FAKES + TOW_FAKES)
+    L.execute(r"""
+        SAID = {}
+        package.loaded["mirror.notify"] = { show = function(m) SAID[#SAID + 1] = m end }
+        LOCKS = { Sedan_2 = "locked" }
+        package.loaded["mirror.vehlock"] = { state_of = function(n) return LOCKS[n] or "free" end }
+        T = car("Truck_1", 0); B = car("Sedan_2", -500)
+        towing.init({}, "host", { in_world = function() return true end }); run(3)
+        T:AddTowingComp(false, false); run(2)
+    """)
+    check(L.eval('T["TowingVehicle?"]') is False and L.eval('#OUT') == 0 and "locked" in (L.eval('SAID[1]') or ""),
+          "a hitch on a car another player locked is undone, sent nowhere, and the player told (%s)" % list(L.eval('OUT').values()))
+    L.execute('LOCKS.Sedan_2 = "mine_locked"; T:AddTowingComp(false, false); run(2)')
+    check(L.eval('T["TowingVehicle?"]') is True and L.eval('#OUT') == 1, "...its owner can still tow it")
+
+
 def a_teleport_landing_lets_off_the_first_hits():
     # live 2026-10-30 02:28:59: teleported into a fight, dead 4 s later (zombies.lua lets the hits off, see
     # a_host_zombie_hit_reaches_a_guest_with_three_players)
@@ -7686,7 +12908,7 @@ def a_teleport_landing_lets_off_the_first_hits():
         GHOST = obj({}); GHOST.K2_GetActorLocation = function() return { X = 50000, Y = 0, Z = 0 } end
         package.loaded["mirror.ghost"] = { get = function() return GHOST end,
             location = function() return { X = 50000, Y = 0, Z = 0 } end }
-        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_world_reset = function() end }
+        package.loaded["mirror.game"] = { player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function() end }
         util = require("mirror.util")
         util.cdo = function() return { LineTraceSingle = function(self, p, a, b, _, _, _, _, out)
             out.OutHit = { ImpactPoint = { X = a.X, Y = a.Y, Z = 0 } }; return true end } end
@@ -7831,7 +13053,7 @@ def load_split_hands_the_ai_to_the_guest():
     L.execute(FAKES + r"""
         ME, HOST = { X = 0, Y = 0, Z = 0 }, { X = 90000, Y = 0, Z = 0 }
         package.loaded["mirror.game"] = { player = function() return { K2_GetActorLocation = function() return ME end } end,
-            world = function() return nil end, on_world_reset = function() end, keybind = function() end }
+            world = function() return nil end, on_widgets_cleared = function() end, on_world_reset = function() end, keybind = function() end }
         package.loaded["mirror.ghost"] = { get = function() return nil end, is = function() return false end,
                                            location = function() return HOST end }
         package.loaded["mirror.loader"] = { want = function() end }
@@ -8329,7 +13551,7 @@ def tooltip_never_calls_into_null_objects():
     print("tooltip_never_calls_into_null_objects")
     L = lua()
     L.execute(FAKES + r"""
-        package.loaded["mirror.game"] = { player = function() return nil end, on_world_reset = function() end,
+        package.loaded["mirror.game"] = { player = function() return nil end, on_widgets_cleared = function() end, on_world_reset = function() end,
                                           keybind = function() end, on_ready = function() end }
         util = require("mirror.util")
         HOOKS = {}
@@ -8376,7 +13598,7 @@ def settlement_camps_follow_the_host():
             for i = 1, 4 do spawner("Prefab_Settlement" .. i .. "_C") end
             JOINED = true
             -- (no world: the animation gate lets a camp's destroy run at once)
-            package.loaded["mirror.game"] = { on_world_reset = function() end, world = function() return nil end }
+            package.loaded["mirror.game"] = { on_widgets_cleared = function() end, on_world_reset = function() end, world = function() return nil end }
             camps = require("mirror.camps")
             camps.init({}, "%s", { in_world = function() return JOINED end }, function() return true end)
             function n(cls) return #util.instances(cls) end
@@ -8423,7 +13645,7 @@ def military_trader_follows_the_host():
                     a.loc, a.yaw, a.tp = { X = l.X, Y = l.Y, Z = l.Z }, r.Yaw, tp end
                 WORLD.BP_MilitaryTrader_C = { a }; return a end
             JOINED = true
-            package.loaded["mirror.game"] = { on_world_reset = function() end }
+            package.loaded["mirror.game"] = { on_widgets_cleared = function() end, on_world_reset = function() end }
             camps = require("mirror.camps")
             camps.init({}, "%s", { in_world = function() return JOINED end }, function() return true end)
             T = trader(%s)
@@ -8447,6 +13669,44 @@ def military_trader_follows_the_host():
     check(H.eval('T.loc.X') == -1937, "the host's trader is never moved")
     H.execute('blobs_out.miltrader = nil; camps.tick(5)')
     check(H.eval('blobs_out.miltrader') is None, "an unchanged spot is not sent again")
+
+
+def ice_cream_trader_follows_the_host():
+    print("ice_cream_trader_follows_the_host")
+    # BP_ShakesConesSpawner puts its van at a random one of 5 spawn points in each game, like the military trader
+    def side(role, mil, ice):
+        L = lua()
+        L.execute(FAKES + r"""
+            util = require("mirror.util")
+            WORLD = {}
+            util.instances = function(cls) return WORLD[cls] or {} end
+            function trader(cls, x, y, z, yaw)
+                local a = obj({ loc = { X = x, Y = y, Z = z }, yaw = yaw })
+                a.K2_GetActorLocation = function() return a.loc end
+                a.K2_GetActorRotation = function() return { Pitch = 0, Yaw = a.yaw, Roll = 0 } end
+                a.K2_SetActorLocationAndRotation = function(_, l, r) a.loc, a.yaw = { X = l.X, Y = l.Y, Z = l.Z }, r.Yaw end
+                WORLD[cls] = { a }; return a end
+            JOINED = true
+            package.loaded["mirror.game"] = { on_widgets_cleared = function() end, on_world_reset = function() end }
+            camps = require("mirror.camps")
+            camps.init({}, "%s", { in_world = function() return JOINED end }, function() return true end)
+            M = trader("BP_MilitaryTrader_C", %s)
+            I = trader("BP_ShakesConesTrader_C", %s)
+        """ % (role, mil, ice))
+        return L
+    H = side("host", "-1937, 239448, 1737, 90", "50120, 80400, 1500, 45")
+    G = side("guest", "-1937, 239448, 1737, 90", "-90310, 12050, 1630, 180")
+    H.execute('camps.tick(5)')
+    sent = H.eval('blobs_out.icetrader')
+    check(sent == "50120.00 80400.00 1500.00 45.0", "the host sends where its ice cream van stands (%r)" % sent)
+    G.execute('blobs_in.icetrader, blobs_in.miltrader = ...; blobs_in.camps = "-"', sent, H.eval('blobs_out.miltrader'))
+    for _ in range(4):
+        G.execute('camps.tick(5)')
+    check(G.eval('I.loc.X') == 50120 and G.eval('I.loc.Y') == 80400 and G.eval('I.yaw') == 45.0,
+          "the guest's ice cream van stands where the host's does (%s, %s)" % (G.eval('I.loc.X'), G.eval('I.loc.Y')))
+    check(G.eval('M.loc.X') == -1937, "a military trader already in the host's spot is left alone")
+    check(H.eval('I.loc.X') == 50120, "the host's van is never moved")
+    check("traders moved 1" in G.eval('camps.status()'), "the guest counts the move (%r)" % G.eval('camps.status()'))
 
 
 PEERS_FAKES = r'''
@@ -8505,7 +13765,18 @@ def airdrops_follow_the_host():
                 end
                 return out
             end
-            package.loaded["mirror.game"] = { on_world_reset = function() end,
+            -- a landed crate's map marker (its own BP_Marker actor) and the player's minimap that lists it
+            REMOVED = {}
+            function marker(a)
+                a.Marker = obj({ Marker = "mk" .. tostring(a.at.X), K2_DestroyActor = function(self) self.gone = true end })
+                return a.Marker
+            end
+            PLAYER = obj({ GetComponentByClass = function(_, cc)
+                if not (cc and cc.path:match("BPC_MinimapSystem_C$")) then return nil end
+                return obj({ ["Remove World Marker"] = function(_, mk, actor) REMOVED[#REMOVED + 1] = { mk = mk, actor = actor } end })
+            end })
+            package.loaded["mirror.game"] = { on_widgets_cleared = function() end, on_world_reset = function() end,
+                player = function() return PLAYER end,
                 world = function() return { SpawnActor = function(_, cls, l) return actor(cls.path:match("%%.(.+)$"), l) end } end }
             JOINED = true
             airdrops = require("mirror.airdrops")
@@ -8531,8 +13802,29 @@ def airdrops_follow_the_host():
           "once landed it is put on the host's exact spot and held there (the loot ids match)")
     G.execute('for i = 1, 5 do airdrops.tick(3) end')
     check(G.eval('#WORLD.AirdropContainer_Military_C') == 1, "and only spawned once")
+    # player report 2026-11-01: airdrops on the guest's map that aren't on the host's and aren't physically there
+    G.execute('COPY = util.instances("AirdropContainer_Military_C")[1]; COPY_MK = marker(COPY)')
+    G.execute('blobs_in.airdrops = ...; os.clock = function() return os_clock() + 10 end; for i = 1, 3 do airdrops.tick(3) end; '
+              'os.clock = os_clock', sent.replace("1000.25 2000.50", "1005.25 2000.50"))
+    check(G.eval('COPY.gone') is not True and G.eval('#WORLD.AirdropContainer_Military_C') == 1,
+          "the host's crate moved a little: its copy stays (not destroyed and spawned again)")
+    check(abs(G.eval('COPY.at.X') - 1005.25) < 1e-6, "...and is put on the new spot")
+    G.execute('OWN = actor("AirdropContainer_Medical_C", { X = 9000, Y = 9000, Z = 100 }); OWN_MK = marker(OWN); airdrops.tick(3)')
+    check(G.eval('OWN.gone') is True, "a crate from this game's own plane the host doesn't have is taken away")
+    check(G.eval('OWN_MK.gone') is True and G.eval('REMOVED[1] and REMOVED[1].actor == OWN_MK and REMOVED[1].mk == OWN_MK.Marker'),
+          "...and its map marker off the map, as the game's own open does it")
+    check(G.eval('COPY.gone') is not True, "...the host's crate stays")
+    # audit 2026-11-03: a host crate nudged drops out of the host's list for a check (sent only while still)
     G.execute('blobs_in.airdrops = "-"; airdrops.tick(3)')
-    check(G.eval('util.instances("AirdropContainer_Military_C")[1]') is None, "the host's crate gone: the copy goes too")
+    check(G.eval('COPY.gone') is not True, "the host's crate missing for one check: its copy stays (someone may be looting it)")
+    G.execute('blobs_in.airdrops = ...; airdrops.tick(3); blobs_in.airdrops = "-"; airdrops.tick(3)', sent.replace("1000.25 2000.50", "1005.25 2000.50"))
+    check(G.eval('COPY.gone') is not True, "back in the list, then missing once again: still there (the count starts over)")
+    G.execute('airdrops.tick(3)')
+    check(G.eval('util.instances("AirdropContainer_Military_C")[1]') is None, "the host's crate gone two checks in a row: the copy goes too")
+    check(G.eval('COPY_MK.gone') is True and G.eval('#REMOVED == 2 and REMOVED[2].actor == COPY_MK'),
+          "...and its map marker with it (no marker left with nothing there)")
+    H.execute('PLAYER = nil; C.gone = true; airdrops.tick(3)')
+    check(H.eval('blobs_out.airdrops') == sent, "a host with no player (a world loading) sends no empty list")
 
 
 def event_sites_follow_the_host():
@@ -8595,7 +13887,7 @@ def event_sites_follow_the_host():
             end
             MARKERS, XP = {}, 0
             ME = obj({ K2_GetActorLocation = function() return ME_AT end }); ME_AT = { X = 0, Y = 0, Z = 0 }
-            package.loaded["mirror.game"] = { on_world_reset = function() end, player = function() return ME end,
+            package.loaded["mirror.game"] = { on_widgets_cleared = function() end, on_world_reset = function() end, player = function() return ME end,
                 controller = function() return { LevellingComponent = { AddXP = function(_, n) XP = XP + n end } } end,
                 world = function() return { SpawnActor = function(_, c, l)
                     if c.cls == "BP_Marker_C" then
@@ -8666,6 +13958,81 @@ def event_sites_follow_the_host():
     check(G.eval('n("Prefab_CrashedMilitaryPlane_C")') == 1, "and only once")
 
 
+def a_guest_keeps_the_site_classes_its_failed_spawners_held():
+    """Player report 2026-11-01: a camp / convoy on one player's map only (guest logs 2026-10-30/31: "Prefab_
+    AbandonedConvoy_C isn't loaded here - not spawning it yet"). A BP_PrefabSpawner whose roll fails destroys itself in
+    its BeginPlay, and its prefab class could then be dropped by the GC - the host's site of it never came. A guest keeps
+    the prefab class of every spawner that ends in the game instance's ReferencedObjects."""
+    print("a_guest_keeps_the_site_classes_its_failed_spawners_held")
+
+    def side(role):
+        L = lua()
+        L.execute(FAKES + r"""
+            util = require("mirror.util")
+            HOOKS = {}
+            util.hook = function(p, fn) HOOKS[p] = fn; return true end
+            SPAWNER_CLS, DYN_CLS, ZOMBIE_CLS = cls("BP_PrefabSpawner_C"), cls("BP_PrefabSpawner_Dynamic_C"), cls("BP_Zombie_C")
+            CONVOY, HELI = cls("Prefab_AbandonedConvoy_C"), cls("Prefab_CrashedHelicopter01_C")
+            function ended(c, prefab)
+                local a = obj({ GetClass = function() return c end, Prefab = prefab })
+                local h = HOOKS["/Script/Engine.Actor:ReceiveEndPlay"]
+                if h then h({ get = function() return a end }) end
+            end
+            GI = obj({ ReferencedObjects = { n = 0, GetArrayNum = function(self) return self.n end } })
+            setmetatable(GI.ReferencedObjects, { __newindex = function(t, k, v) rawset(t, k, v); t.n = k end })
+            FindFirstOf = function(c) if c == "SD_GameInstance_C" then return GI end end
+            package.loaded["mirror.game"] = { on_widgets_cleared = function() end, on_world_reset = function() end }
+            prefabs = require("mirror.prefabs")
+            prefabs.init({}, "%s", { in_world = function() return true end }, function() return true end)
+        """ % role)
+        return L
+
+    G = side("guest")
+    check(G.eval('HOOKS["/Script/Engine.Actor:ReceiveEndPlay"] ~= nil'),
+          "EndPlay is watched from the start (the spawners roll in the map's own BeginPlay)")
+    G.execute('ended(SPAWNER_CLS, CONVOY)')
+    check(G.eval('GI.ReferencedObjects.n') == 1 and G.eval('GI.ReferencedObjects[1] == CONVOY'),
+          "a spawner that ends (its roll failed): its prefab class is kept loaded")
+    G.execute('ended(SPAWNER_CLS, CONVOY)')
+    check(G.eval('GI.ReferencedObjects.n') == 1, "...once, however many spawners of it end")
+    G.execute('ended(DYN_CLS, HELI)')
+    check(G.eval('GI.ReferencedObjects.n') == 2 and G.eval('GI.ReferencedObjects[2] == HELI'), "...a dynamic event spawner's too")
+    G.execute('ended(ZOMBIE_CLS, cls("Prefab_Nope_C")); ended(SPAWNER_CLS, nil)')
+    check(G.eval('GI.ReferencedObjects.n') == 2, "other actors ending, or a spawner with no prefab: nothing kept")
+    G.execute('prefabs.forget(); ended(SPAWNER_CLS, CONVOY); ended(SPAWNER_CLS, cls("Prefab_LargeBanditCamp2_C"))')
+    check(G.eval('GI.ReferencedObjects.n') == 3, "a new world: a kept class isn't kept twice, a new one is")
+    check("site classes kept loaded" in (G.eval('prefabs.status()') or ""), "the status line counts them")
+    H = side("host")
+    H.execute('ended(SPAWNER_CLS, CONVOY)')
+    check(H.eval('GI.ReferencedObjects.n') == 0, "the host keeps nothing (it never spawns a site from Lua)")
+    # the spawners roll at the save's own load, before co-op starts (kit 2026-11-01: 0 kept); a failed one stays
+    # listed until the next garbage collection: when the player arrives, every listed spawner's class is kept, in
+    # every role, from the mod's start
+    for role in ("guest", "host"):
+        L = side(role)
+        L.execute(r"""
+            NEWP = {}
+            package.loaded["mirror.game"].on_new_player = function(fn) NEWP[#NEWP + 1] = fn end
+            CAMP = cls("Prefab_LargeBanditCamp2_C")
+            SPAWNERS = { obj({ Prefab = CONVOY }), obj({ Prefab = CONVOY }), obj({ Prefab = cls("Prefab_Settlement02_C") }),
+                         obj({ Prefab = cls("Prefab_Quest_Radio_C") }), obj({}) }
+            FindAllOf = function(c)
+                if c == "BP_PrefabSpawner_C" then return SPAWNERS end
+                if c == "BP_PrefabSpawner_Dynamic_C" then return { obj({ Prefab = HELI }) } end
+            end
+            prefabs.watch(); prefabs.watch()
+            function has(c) for i = 1, GI.ReferencedObjects.n do if GI.ReferencedObjects[i] == c then return true end end return false end
+        """)
+        check(L.eval('#NEWP') == 1, "%s: the arrival watch goes in once" % role)
+        L.execute('NEWP[1]()')
+        check(L.eval('GI.ReferencedObjects.n') == 2 and L.eval('has(CONVOY) and has(HELI)') is True,
+              "%s: arriving keeps every listed spawner's event site class (no settlement, quest or empty one) (%s)"
+              % (role, L.eval('GI.ReferencedObjects.n')))
+        L.execute('SPAWNERS[#SPAWNERS + 1] = obj({ Prefab = CAMP }); NEWP[1]()')
+        check(L.eval('GI.ReferencedObjects.n') == 3 and L.eval('has(CAMP)') is True,
+              "%s: the next world's new class is kept, the old ones not twice" % role)
+
+
 def a_destroyed_sites_address_can_come_back_as_a_new_site():
     """Audit 2026-10-30: an event site or camp destroyed here stays listed until garbage collection, so it is marked;
     the mark was its address, kept for the whole world. After the collection the address can come back as a new actor:
@@ -8688,7 +14055,7 @@ def a_destroyed_sites_address_can_come_back_as_a_new_site():
             a.K2_DestroyActor = function(self) self.destroyed = true end   -- still listed until "garbage collection"
             ALL[#ALL + 1] = a; return a
         end
-        package.loaded["mirror.game"] = { on_world_reset = function() end, player = function() end,
+        package.loaded["mirror.game"] = { on_widgets_cleared = function() end, on_world_reset = function() end, player = function() end,
             world = function() return { SpawnActor = function() end } end }
         JOINED = true
         prefabs = require("mirror.prefabs")
@@ -8973,7 +14340,7 @@ def zombies_stop_at_arms_length():
         PLAYER = obj({ K2_GetActorLocation = function() return at(0) end })
         GHOST = obj({ K2_GetActorLocation = function() return at(5000) end })
         package.loaded["mirror.game"] = { player = function() return PLAYER end, world = function() return {} end,
-            on_tick = function(f) TICKS[#TICKS + 1] = f end, on_world_reset = function(f) RESET = f end }
+            on_tick = function(f) TICKS[#TICKS + 1] = f end, on_widgets_cleared = function() end, on_world_reset = function(f) RESET = f end }
         package.loaded["mirror.peers"] = { each = function(n, fn) fn({ get = function() return GHOST end }) end }
         function zombie(x)
             local cap = obj({ resp = 0, r = 15 })
@@ -9078,6 +14445,11 @@ def peers_give_every_player_their_own_copy():
         # that Realm right now" - the copy's own realmplay was never started and said it hosted nothing
         check(L.eval('inst.require("mirror.realmplay") == require("mirror.realmplay")'),
               "a copy asks the game's own realmplay which Realm it hosts")
+        # audit 2026-11-02: a copy per guest each ran the forest giant - spawned, grew (100x health) and mourned it
+        check(L.eval('inst.require("mirror.giant") == require("mirror.giant")'), "one forest giant for the whole game")
+        # audit 2026-11-02: only main.lua inits animgate (its tick runs queued destroys and lets holds lapse)
+        check(L.eval('inst.require("mirror.animgate") == require("mirror.animgate")'),
+              "a copy's zombie removals wait on the game's one animation gate, the one that ticks")
         check(L.eval('inst.require("mirror.events") ~= require("mirror.events")'), "per-player state (events) is a copy")
         check(L.eval('debug.getinfo(inst.require("mirror.events").new, "S").short_src:sub(-4) == "#to2"'),
               "a copy's chunk name ends with its tag, so call-site keyed hook/tick slots stay apart")
@@ -9201,6 +14573,100 @@ def chat_and_voice_reach_every_player():
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+def handheld_radio_makes_voice_a_walkie():
+    """user 2026-11-02: a carried handheld radio (DA_Radio) at both ends = walkie (the bridge carries voice 3x as far)."""
+    print("handheld_radio_makes_voice_a_walkie")
+    d = tempfile.mkdtemp()
+    try:
+        L = lua()
+        L.execute('''
+            local d = ...
+            SHARED = {}; OUT = { main = {}, to2 = {} }; IN = { main = {}, to2 = {} }; SAME = true
+            COMP = { radios = 0 }
+            local function mklink(tag)
+                return { dir = function() return d end, tags = function() return nil end, lobby = function() return {} end,
+                    put_blob = function(n, s) OUT[tag][n] = s end,
+                    get_blob = function(n) local b = IN[tag][n]; IN[tag][n] = nil; return b end }
+            end
+            package.loaded["mirror.notify"] = { show = function() end }
+            package.loaded["mirror.util"] = { valid = function(o) return o ~= nil end, vec = function(v) return v end,
+                dist = function(a, b) return math.sqrt((a.X - b.X) ^ 2 + (a.Y - b.Y) ^ 2 + (a.Z - b.Z) ^ 2) end }
+            local at = function(x) return { K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end } end
+            PLAYER = at(0); PLAYER.BP_JigMultiplayer = COMP
+            package.loaded["mirror.game"] = { player = function() return PLAYER end }
+            package.loaded["mirror.ghost"] = { get = function() return at(12000) end }
+            package.loaded["mirror.jig"] = { count_of_item = function(c, da)
+                return (c == COMP and da == "/Game/Inventory/Items/DataAssets/Buildable/Special/DA_Radio.DA_Radio") and c.radios or 0 end }
+            package.loaded["mirror.peers"] = { shared = function(n, t) SHARED[n] = SHARED[n] or t; return SHARED[n] end,
+                each = function(_, fn) fn(V1, nil); fn(V2, { tag = "to2" }) end }
+            package.loaded["mirror.link"] = mklink("to2"); V2 = require("mirror.voice"); package.loaded["mirror.voice"] = nil
+            package.loaded["mirror.link"] = mklink("main"); V1 = require("mirror.voice")
+            V1.init(function() return SAME end); V2.init(function() return SAME end)
+        ''', d.replace("\\", "/"))
+        path = os.path.join(d, "mirror_voice.txt")
+
+        def tick(n=1):
+            for _ in range(n):  # one write per 0.3 s; the inventory is looked at every 2 s of writes
+                L.execute('V1.tick(0.3)')
+            with open(path) as f:
+                return f.read()
+
+        COMP_RADIOS = 'COMP.radios = %d'
+        t = tick()
+        check("walkie 0" in t and "walkie_to2 0" in t and "dist 999.0" in t and "dist_to2 999.0" in t,
+              "voice off: no walkie, and no distance to follow (the bridge plays nothing with it off) (%s)" % t)
+        L.execute(COMP_RADIOS % 1 + '; IN.main.radio = "1"; IN.to2.radio = "1"')
+        t = tick()
+        check("walkie 0" in t and "walkie_to2 0" in t and L.eval('OUT.main.radio') == "0",
+              "voice off: a radio in the bag doesn't count (%s, put %s)" % (t, L.eval('OUT.main.radio')))
+        L.execute('V1.toggle(); IN.main.radio = "1"; IN.to2.radio = "1"')
+        t = tick()
+        check("on 1" in t and "walkie 1" in t and "walkie_to2 1" in t, "voice on, a radio at both ends: walkie on every link (%s)" % t)
+        check("dist 120.0" in t and "dist_to2 120.0" in t, "voice on: the real distance, at once (%s)" % t)
+        check(L.eval('OUT.main.radio') == "1" and L.eval('OUT.to2.radio') == "1", "each link is told we carry one")
+        L.execute('IN.to2.radio = "0"')
+        t = tick()
+        check("walkie 1" in t and "walkie_to2 0" in t, "the player without one is no walkie, the one with one still is (%s)" % t)
+        L.execute(COMP_RADIOS % 0)
+        t = tick()
+        check("walkie 1" in t, "radio dropped: still a walkie until the next look (%s)" % t)
+        t = tick(8)
+        check("walkie 0" in t and L.eval('OUT.main.radio') == "0", "radio dropped: walkie off, the other game is told (%s)" % t)
+        L.execute(COMP_RADIOS % 1 + '; SAME = false')
+        t = tick(8)
+        check("walkie 0" in t and "dist 999.0" in t, "not in the same world: no walkie (%s)" % t)
+        L.execute('SAME = true')
+        t = tick(8)
+        check("walkie 1" in t, "back in the world with the radio: walkie again, the other's radio still known (%s)" % t)
+        L.execute('OUT.main.radio = nil; OUT.to2.radio = nil')
+        tick(8)
+        check(L.eval('OUT.main.radio') == "1" and L.eval('OUT.to2.radio') == "1",
+              "a reopened link (rejoin, host switch) is told again at the next look, not only on a change")
+        L.execute('PLAYER.BP_JigMultiplayer = nil')
+        t = tick(8)
+        check("walkie 0" in t, "no inventory component: no walkie, no error (%s)" % t)
+        # the other player walking: with voice off the file isn't replaced four times a second for nobody
+        L.execute('''
+            GX, WRITES = 12000, 0
+            package.loaded["mirror.ghost"].get = function()
+                GX = GX + 100
+                local x = GX
+                return { K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end }
+            end
+            local rename = os.rename
+            os.rename = function(...) WRITES = WRITES + 1; return rename(...) end
+            V1.toggle()
+        ''')
+        tick(20)
+        n = L.eval('WRITES')
+        check(n <= 1, "voice off, a player walking: the settings file written once, not 20 times (%d)" % n)
+        L.execute('V1.toggle(); WRITES = 0')
+        tick(20)
+        n = L.eval('WRITES')
+        check(n >= 15, "voice on, a player walking: the distance still follows them (%d writes)" % n)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
 def settings_pages_cycle_save_and_follow_the_host():
     print("settings_pages_cycle_save_and_follow_the_host")
     d = tempfile.mkdtemp()
@@ -9222,6 +14688,11 @@ def settings_pages_cycle_save_and_follow_the_host():
         for _ in range(4):
             L.execute('hr.toggle("itemclean")'); seq.append(L.eval('hr.my_value("itemclean")'))
         check(seq == ["10", "20", "40", "off"], "ITEM CLEANUP cycles OFF -> 10 -> 20 -> 40 -> OFF (%s)" % seq)
+        check(L.eval('hr.my_value("bodycap")') == "off" and L.eval('hr.mine("bodycap")') is False, "BODY LIMIT starts off")
+        seq = []
+        for _ in range(5):
+            L.execute('hr.toggle("bodycap")'); seq.append(L.eval('hr.my_value("bodycap")'))
+        check(seq == ["20", "40", "60", "100", "off"], "BODY LIMIT cycles OFF -> 20 -> 40 -> 60 -> 100 -> OFF (%s)" % seq)
         L.execute('hr.toggle("joins"); hr.toggle("pvp"); hr.tick()')
         check("joins friends" in (L.eval('BLOBS.rules') or "") and "pvp on" in L.eval('BLOBS.rules'), "the rules blob carries every value")
         L.execute('ROLE = "guest"; package.loaded["mirror.hostrules"] = nil; hr2 = require("mirror.hostrules"); hr2.init(function() return ROLE end)')
@@ -9399,18 +14870,21 @@ def mods_switch_restart_and_match_the_host():
         w64 = os.path.join(d, "SurrounDead", "Binaries", "Win64")
         mods = os.path.join(w64, "ue4ss", "Mods")
         paks = os.path.join(d, "SurrounDead", "Content", "Paks")
-        for m in ("SurrounSync", "shared", "AimRun", "HeadshotBrains", "Keybinds", "SelfOn", "ConsoleEnablerMod", "SyncFX"):
+        for m in ("SurrounSync", "shared", "AimRun", "HeadshotBrains", "Keybinds", "SelfOn", "ConsoleEnablerMod", "SyncFX",
+                  "SurrounDeadGore"):
             os.makedirs(os.path.join(mods, m))
         open(os.path.join(mods, "SelfOn", "enabled.txt"), "w").close()
         with open(os.path.join(mods, "mods.txt"), "w", newline="") as f:
             f.write("SurrounSync : 1\r\nAimRun : 1\r\nHeadshotBrains : 0\r\nConsoleEnablerMod : 0\r\nSyncFX : 0\r\n"
-                    "; Built-in keybinds, do not move up!\r\nKeybinds : 1\r\n")
+                    "SurrounDeadGore : 0\r\n; Built-in keybinds, do not move up!\r\nKeybinds : 1\r\n")
         with open(os.path.join(mods, "mods.json"), "w") as f:
             f.write('[\n    {\n        "mod_name": "AimRun",\n        "mod_enabled": true\n    }\n]\n')
         os.makedirs(os.path.join(paks, "~mods"))
         os.makedirs(os.path.join(paks, "LogicMods"))
-        for n in ("Cars_P.pak", "Cars_P.ucas", "Cars_P.utoc", "Old_P.pak.off"):
+        # (SurrounSync's own paks: never listed, switched or matched with a host - 2026-11-03, once the file list worked)
+        for n in ("Cars_P.pak", "Cars_P.ucas", "Cars_P.utoc", "Old_P.pak.off", "SurrounSyncSounds_P.pak"):
             open(os.path.join(paks, "~mods", n), "w").close()
+        open(os.path.join(paks, "LogicMods", "SurrounDeadGore.pak.off"), "w").close()
         L = lua()
         g = L.globals()
 
@@ -9442,7 +14916,8 @@ def mods_switch_restart_and_match_the_host():
               "a self-enabled mod's enabled.txt is set aside")
         check('"mod_enabled": false' in open(os.path.join(mods, "mods.json")).read(), "mods.json follows")
         pk = sorted(os.listdir(os.path.join(paks, "~mods")))
-        check(pk == ["Cars_P.pak.off", "Cars_P.ucas.off", "Cars_P.utoc.off", "Old_P.pak"], "pak and its .ucas/.utoc renamed together (%s)" % pk)
+        check(pk == ["Cars_P.pak.off", "Cars_P.ucas.off", "Cars_P.utoc.off", "Old_P.pak", "SurrounSyncSounds_P.pak"],
+              "pak and its .ucas/.utoc renamed together (%s)" % pk)
         m, r = L.eval('rows()')
         check(m["restart"] and r["HeadshotBrains"]["note"] == "on after a restart" and r["AimRun"]["note"] == "off after a restart",
               "changes wait for a restart and say so")
@@ -9463,6 +14938,8 @@ def mods_switch_restart_and_match_the_host():
         check(m["can_match"] and m["missing"] == 1, "a guest can MATCH HOST")
         n, missing = L.eval('ml.match(peer)')
         check(n == 2 and list(missing.values()) == ["Map_P.pak"], "match switches 2 and names the missing one (%s, %s)" % (n, list(missing.values())))
+        check(os.path.exists(os.path.join(paks, "~mods", "SurrounSyncSounds_P.pak")),
+              "a host without our sounds pak in its list doesn't make MATCH switch it off")
         m, r = L.eval('rows(peer)')
         check(not r["AimRun"]["differs"] and not r["HeadshotBrains"]["differs"] and not r["ConsoleEnablerMod"]["on"] and m["restart"],
               "after MATCH only the missing one differs, the client mod is left alone, restart asked")
@@ -9485,32 +14962,77 @@ def mods_switch_restart_and_match_the_host():
         first = L.eval('ms.rows()[1]')
         check("SyncFX : 1\r\n" in open(os.path.join(mods, "mods.txt"), newline="").read() and first.text == "ON"
               and "next game start" in first.hint, "switching it writes mods.txt and says it starts next time")
-        check(L.eval('ms.rows()[2].key') == "nametags", "the other settings follow it")
+        check(L.eval('ms.rows()[3].key') == "nametags", "the other settings follow it")
+
+        # GORE: the gore mod's Lua and its asset pak, second in MY SETTINGS, switched together, never in MODS or matched
+        check("SurrounDeadGore" not in ids and "pak:SurrounDeadGore.pak" not in ids, "the gore mod and its pak aren't in the MODS list")
+        gore = L.eval('ms.rows()[2]')
+        check(gore.key == "gore" and gore.label == "GORE" and gore.text == "OFF" and "next game start" not in gore.hint,
+              "MY SETTINGS' second row is GORE, OFF")
+        logic = os.path.join(paks, "LogicMods")
+        check(L.eval('ml.set_gore(true)') is True, "switching gore on works")
+        txt = open(os.path.join(mods, "mods.txt"), newline="").read()
+        check("SurrounDeadGore : 1\r\n" in txt and sorted(os.listdir(logic)) == ["SurrounDeadGore.pak"],
+              "gore on: mods.txt says 1 and the pak is live (%s)" % sorted(os.listdir(logic)))
+        gore = L.eval('ms.rows()[2]')
+        check(gore.text == "ON" and "next game start" in gore.hint, "the row says ON from the next game start")
+        L.execute('peer3 = { set = { SyncFX = true, ["pak:Cars_P.pak"] = true }, who = "Host", host = true,'
+                  ' kind = function() return "unknown" end }; ml.match(peer3)')
+        check(L.eval('(select(2, ml.state("SurrounDeadGore")))') is True and sorted(os.listdir(logic)) == ["SurrounDeadGore.pak"],
+              "MATCH HOST with a host without gore leaves it on")
+        check(L.eval('ml.set_gore(false)') is True and "SurrounDeadGore : 0\r\n" in open(os.path.join(mods, "mods.txt"), newline="").read()
+              and sorted(os.listdir(logic)) == ["SurrounDeadGore.pak.off"], "gore off: mods.txt 0 and the pak set aside again")
+        os.rename(os.path.join(logic, "SurrounDeadGore.pak.off"), os.path.join(logic, "SurrounDeadGore.pak"))
+        check(L.eval('ml.set_gore(true)') is True and sorted(os.listdir(logic)) == ["SurrounDeadGore.pak"],
+              "a pak already live (switched by hand) doesn't stop the switch")
+        L.execute('ml.set_gore(false)')
+        os.remove(os.path.join(logic, "SurrounDeadGore.pak.off"))
+        check(L.eval('ml.set_gore(true)') is True and "SurrounDeadGore : 1\r\n" in open(os.path.join(mods, "mods.txt"), newline="").read(),
+              "without its pak the Lua mod still switches")
+        cp = L.eval('''(function()
+            local saved = {}
+            for _, n in ipairs({ "mirror.link", "mirror.notify", "mirror.game", "mirror.jig" }) do saved[n] = package.loaded[n]; package.loaded[n] = {} end
+            package.loaded["mirror.compat"] = nil
+            local c = require("mirror.compat")
+            for n, v in pairs(saved) do package.loaded[n] = v end
+            return c.kind("SurrounDeadGore") .. " " .. c.kind("pak:SurrounDeadGore.pak") .. " " .. c.kind("pak:Cars_P.pak") end)()''')
+        check(cp == "client client unknown", "compat: the gore mod and its pak only change this screen, other paks stay unknown (%s)" % cp)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
-for t in (drops_pickup_reaches_every_guest, drops_rejoin_pairs_the_saved_pickups, drops_pile_pickups_take_only_their_own_item, loose_magazine_picked_up_by_both_at_once_is_kept_once,corpse_looted_at_the_same_moment_keeps_one_copy,corpse_partial_takes_at_the_same_moment_keep_the_total,same_moment_container_takes_keep_one_copy, same_moment_partial_takes_keep_the_total, refused_put_in_taken_back_tells_the_host_nothing,one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, player_rip_in_a_container_is_a_take, bench_output_made_on_a_guest_reaches_the_host, ui_no_room_removal_is_not_a_take, lights_come_back_on_a_respawned_ghost, perf_run_puts_the_outer_step_back, fs_write_is_whole_or_old, utf8_cut_never_splits_a_character, crumb_keeps_the_last_64_steps,unanswered_join_keeps_the_friends_list, coop_tab_in_a_realm_has_nothing_of_it, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, plain_events_skip_late_lines_and_bound_the_window, jig_probe_names_what_a_patch_removed, jig_price_follows_the_traders_table, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, military_trader_follows_the_host, role_switch_reads_nothing_of_its_own_old_role, new_realm_character_gets_the_starting_kit, realm_takes_the_creators_difficulty, coop_guest_runs_the_hosts_world_settings, zombies_stop_at_arms_length, human_copies_hold_the_hosts_weapon, hounds_bark_when_they_come_for_you, airdrops_follow_the_host, event_sites_follow_the_host, a_destroyed_sites_address_can_come_back_as_a_new_site, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, a_player_in_the_game_menu_is_not_a_frozen_game, link_restart_puts_the_games_blobs_again, link_keeps_putting_the_hello, clockmap_quiet_places_without_stats, util_null_objects_are_invalid,
+for t in (fast_fire_asks_little_per_shot, drops_pickup_reaches_every_guest,drops_rejoin_pairs_the_saved_pickups, drops_pile_pickups_take_only_their_own_item, loose_magazine_picked_up_by_both_at_once_is_kept_once,corpse_looted_at_the_same_moment_keeps_one_copy,corpse_partial_takes_at_the_same_moment_keep_the_total,same_moment_container_takes_keep_one_copy, same_moment_partial_takes_keep_the_total, refused_put_in_taken_back_tells_the_host_nothing,one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, player_rip_in_a_container_is_a_take, bench_output_made_on_a_guest_reaches_the_host, ui_no_room_removal_is_not_a_take, lights_come_back_on_a_respawned_ghost, perf_run_puts_the_outer_step_back, fs_write_is_whole_or_old, utf8_cut_never_splits_a_character, crumb_keeps_the_last_64_steps,unanswered_join_keeps_the_friends_list, coop_tab_in_a_realm_has_nothing_of_it, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, handheld_radio_makes_voice_a_walkie, the_hover_bike_flies_for_its_owner_and_stores_1000, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, plain_events_skip_late_lines_and_bound_the_window, jig_probe_names_what_a_patch_removed, jig_price_follows_the_traders_table, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, military_trader_follows_the_host, ice_cream_trader_follows_the_host, role_switch_reads_nothing_of_its_own_old_role, new_realm_character_gets_the_starting_kit, realm_takes_the_creators_difficulty, coop_guest_runs_the_hosts_world_settings, zombies_stop_at_arms_length, human_copies_hold_the_hosts_weapon, hounds_bark_when_they_come_for_you, airdrops_follow_the_host, event_sites_follow_the_host, a_guest_keeps_the_site_classes_its_failed_spawners_held, a_destroyed_sites_address_can_come_back_as_a_new_site, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, a_player_in_the_game_menu_is_not_a_frozen_game, link_restart_puts_the_games_blobs_again, link_keeps_putting_the_hello, clockmap_quiet_places_without_stats, util_game_loop_runs_on_the_game_thread_loop, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, weapon_slots_get_their_stats, tactical_reads_only_lights_the_class_has, host_rules_and_mod_list_survive_a_full_disk,
           vehicles_keep_this_worlds_fuel, car_horn_reaches_the_other_game, raiders_can_hit_the_guests_ghost, harvest_uses_up_nodes_once, zombie_spawn_pins_hold_or_refuse,
           zombie_copies_take_the_hosts_look,
           copy_deaths_and_removals_wait_for_the_animation_gate,
           animgate_runs_waiting_calls_once_animation_is_on_the_game_thread,
           copy_radiation_is_taken_back, nests_keep_real_health, horde_beacon_runs_only_on_the_host, goto_and_bring_move_only_your_own_player, backpack_tooltip_reads_the_item_once, foreach_keeps_temporary_arrays_alive, backpack_names_travel_with_the_item, beds_get_a_rename_row_and_shared_names,
-          ghost_swims_without_its_own_water_detection, a_player_sitting_down_sits_on_the_other_screen, all_players_must_sleep_before_the_night_is_skipped, sleeping_screen_stays_until_everyone_sleeps, door_code_locks_keep_other_players_out_until_they_type_it, ghost_stands_on_cars_but_never_pushes_them,zombies_go_after_the_ghost_again_after_a_save, a_ghost_the_game_removed_is_let_go_and_made_again, a_ghost_destroyed_for_a_save_is_never_touched_again, zombie_loot_tables_are_all_looked_up_and_misses_stay_few, a_host_zombie_hit_reaches_a_guest_with_three_players, audio_spatializes_and_shares_without_echo,
-          throws_and_mines_reach_the_other_game, map_pings_reach_the_other_game, keycard_doors_open_on_both_games, doors_of_one_master_are_found_in_one_walk, doors_forget_the_old_world_at_a_load, refused_realm_join_disarms_the_realm, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, a_picked_up_items_address_can_come_back_as_a_new_drop, loose_magazine_picked_up_without_hooks_still_gets_its_rounds, ground_weapon_attachments_reach_the_other_game, ground_weapon_parts_changed_by_both_at_once_keep_both_changes, ghost_gun_in_hand_is_known, ghost_wears_its_players_face_beard_and_tattoos, ghost_look_is_applied_over_frames, missing_zombie_looks_get_loaded,
+          ghost_swims_without_its_own_water_detection, a_player_sitting_down_sits_on_the_other_screen, all_players_must_sleep_before_the_night_is_skipped, sleeping_screen_stays_until_everyone_sleeps, door_code_locks_keep_other_players_out_until_they_type_it, vehicle_claims_keep_other_players_out_of_a_locked_car, ghost_stands_on_cars_but_never_pushes_them,zombies_go_after_the_ghost_again_after_a_save, a_ghost_the_game_removed_is_let_go_and_made_again, a_ghost_destroyed_for_a_save_is_never_touched_again, zombie_loot_tables_are_all_looked_up_and_misses_stay_few, missing_zombie_loot_tables_are_asked_of_the_game_without_a_load_from_lua, a_host_zombie_hit_reaches_a_guest_with_three_players, the_ghost_keeps_no_medical_bite_or_radiation_hit, audio_spatializes_and_shares_without_echo,
+          throws_and_mines_reach_the_other_game, map_pings_reach_the_other_game, keycard_doors_open_on_both_games, doors_of_one_master_are_found_in_one_walk, doors_forget_the_old_world_at_a_load, a_death_drops_our_widgets_before_the_gc, refused_realm_join_disarms_the_realm, horde_rewards_reach_the_other_game, loose_magazine_rounds_reach_the_picker, a_picked_up_items_address_can_come_back_as_a_new_drop, loose_magazine_picked_up_without_hooks_still_gets_its_rounds, ground_weapon_attachments_reach_the_other_game, ground_weapon_parts_changed_by_both_at_once_keep_both_changes, ghost_gun_in_hand_is_known, ghost_wears_its_players_face_beard_and_tattoos, ghost_look_is_applied_over_frames, missing_zombie_looks_get_loaded,
           random_and_debug_weather_is_shared,
           trader_stock_is_the_hosts, instances_walk_once_then_follow_beginplay, grouped_classes_share_one_walk, walk_skip_is_measured_after_a_load, unloaded_tracked_classes_cost_few_lookups,
+          a_new_class_spreads_its_lookups_and_walk, power_scans_a_class_again_until_it_is_walked, the_lab_generator_runs_on_both_games,
+          radio_screen_opens_the_songs_folder_and_reads_new_songs, radio_button_goes_in_the_new_radio_screens_row,
+          fs_lists_the_names_of_files_and_folders_in_a_folder,
+          searched_containers_show_looted_for_everyone,
+          a_lethal_hit_in_coop_downs_the_player_until_revived_given_up_or_bled_out,
+          the_glider_opens_flies_and_shows_on_the_other_screen, the_hang_glider_is_made_at_the_workbench, only_players_the_drone_owner_allows_fly_the_bundled_fpv_drone,
+          an_fpv_quad_flown_by_one_player_shows_on_the_others_screen,
+          admin_fly_flies_for_its_owner_only,
+          the_other_players_radiation_and_eating_stay_theirs,
           link_reads_only_blobs_the_index_says_changed, corpse_loot_reaches_every_player, host_settled_corpses_cost_almost_nothing,
           human_corpses_get_their_inventory_made_first, the_nuke_goes_off_on_both_screens,
           the_host_can_switch_the_debug_menu_off_for_everyone, a_realm_plays_by_its_owners_rules,
           the_message_of_the_day_shows_once_in_a_world_and_on_the_main_menu, a_new_ghost_leaves_no_name_tag_behind,
           an_ended_zombie_is_never_read_from_the_zombie_list, a_copy_the_game_keeps_removing_is_held_back,
           reshade_follows_the_syncfx_switch,
-          standing_hooks_skip_the_lookup, hook_lookups_share_one_budget, find_remembers_misses, container_items_keep_their_cell_and_rotation, loot_skips_containers_gone_since_listed, bags_are_never_consumed_and_twin_grids_are_counted,
-          a_turret_switched_off_is_off_for_everyone, a_teleport_landing_lets_off_the_first_hits, load_split_waits_after_a_respawn_and_for_a_teleport, load_split_switches_only_when_both_agree, load_split_hands_the_ai_to_the_guest, a_looping_reload_stops_on_the_other_game,
+          standing_hooks_skip_the_lookup, hook_lookups_share_one_budget, find_remembers_misses, a_corpse_put_in_is_sent_again_after_the_item_left_and_marks_dont_pile_up, find_by_id_never_keeps_a_neighbour_for_the_one_meant, a_handler_made_again_replaces_its_hook_instead_of_adding_one, a_put_back_while_the_host_lacks_the_container_is_kept_not_lost, loot_tables_stay_small_and_a_recent_echo_survives_the_prune, container_items_keep_their_cell_and_rotation, loot_skips_containers_gone_since_listed, bags_are_never_consumed_and_twin_grids_are_counted,
+          a_turret_switched_off_is_off_for_everyone, a_tow_hitch_is_made_on_every_game, start_with_gps_gives_one_on_entry_and_after_death,a_teleport_landing_lets_off_the_first_hits, load_split_waits_after_a_respawn_and_for_a_teleport, load_split_switches_only_when_both_agree, load_split_hands_the_ai_to_the_guest, a_looping_reload_stops_on_the_other_game,
           loot_first_open_never_undoes_a_take_the_host_has_not_acked, loot_first_open_takes_over_an_older_list_without_takes,
-          twin_compartments_are_merged_into_one):
+          twin_compartments_are_merged_into_one, the_body_limit_removes_the_oldest_bodies_on_both_screens,
+          a_put_into_an_item_in_a_container_lands_in_that_item, a_moved_build_is_sent_as_a_move_not_a_new_piece,
+          ue4ss_out_parameter_tables_are_let_go):
     try:
         t()
     except Exception as e:

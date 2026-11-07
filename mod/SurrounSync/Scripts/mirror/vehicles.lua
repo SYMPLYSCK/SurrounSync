@@ -163,7 +163,6 @@ local function transform(a)
     return l, r
 end
 local function fmt(l, r) return string.format("%.1f %.1f %.1f %.2f %.2f %.2f", l.X, l.Y, l.Z, r.Pitch, r.Yaw, r.Roll) end
-local function place(car, l, r) pcall(function() car:K2_TeleportTo(l, r) end) end
 local function place_hard(car, l, r) pcall(function() car:K2_SetActorLocationAndRotation(l, r, false, {}, true) end) end
 -- Never switch a car's physics off: once switched back on, the vehicle can't be driven.
 -- (a module table: this file is near Lua's local-variable limit)
@@ -647,6 +646,50 @@ function vehicles.drive_line()
     return line
 end
 
+-- Standing on a car, not in it: which car and where on it ("B <car> <forward> <right> <up> <yaw>"), sent with the pose
+-- instead of a drive sample. The other games put the ghost on their own car with it: a world spot trailed a moving car
+-- on the driver's screen by the pose delay plus the delay of our copy of the car (user 2026-11-02). An older game
+-- reads it as a car sample of a kind it skips.
+local function axes(a)
+    local l, f, r, u, rot
+    pcall(function()
+        l, rot = a:K2_GetActorLocation(), a:K2_GetActorRotation()
+        f, r, u = a:GetActorForwardVector(), a:GetActorRightVector(), a:GetActorUpVector()
+    end)
+    if l and rot and f and r and u then return l, f, r, u, rot end
+end
+function vehicles.base_line(p)
+    if not (cfg and cfg.mirror_vehicles and in_world) then return nil end
+    local car
+    -- the property: GetMovementBase isn't callable here (a TrivialObject); on a roof it is the car's VehicleMesh (kit 2026-11-02)
+    pcall(function() local b = p.BasedMovement.MovementBase; if b and b:IsValid() then car = b:GetOwner() end end)
+    if not is_car(car) then return nil end
+    local n = peer_name(car)
+    local cl, f, r, u, cr = axes(car)
+    local pl, yaw
+    pcall(function() pl, yaw = p:K2_GetActorLocation(), p:K2_GetActorRotation().Yaw end)
+    if not (n and cl and pl and yaw) then return nil end
+    local dx, dy, dz = pl.X - cl.X, pl.Y - cl.Y, pl.Z - cl.Z
+    return string.format("B %s %.1f %.1f %.1f %.1f", n, dx * f.X + dy * f.Y + dz * f.Z, dx * r.X + dy * r.Y + dz * r.Z,
+        dx * u.X + dy * u.Y + dz * u.Z, yaw - cr.Yaw)
+end
+
+-- The world spot and yaw of a base (poseline.parse_base) on our copy of that car; nil when we don't have the car, or
+-- ours is more than BASE_TRUST cm from where the other player stands (another car under that name: keep the world spot).
+vehicles.BASE_TRUST = 2000
+function vehicles.on_base(base, world)
+    if not (base and in_world) then return nil end
+    local car = car_named(base.name)
+    if not alive(car) then return nil end
+    local cl, f, r, u, cr = axes(car)
+    if not cl then return nil end
+    local l = { X = cl.X + f.X * base.X + r.X * base.Y + u.X * base.Z,
+                Y = cl.Y + f.Y * base.X + r.Y * base.Y + u.Y * base.Z,
+                Z = cl.Z + f.Z * base.X + r.Z * base.Y + u.Z * base.Z }
+    if world and (l.X - world.X) ^ 2 + (l.Y - world.Y) ^ 2 + (l.Z - world.Z) ^ 2 > vehicles.BASE_TRUST ^ 2 then return nil end
+    return l, cr.Yaw + base.yaw
+end
+
 -- Seats: 0 driver (the car's PlayerLocation), 1 front passenger (mirrored across the car), 2 and 3 the
 -- seats behind them. The game has only the driver's seat; the others are spots the mod puts people in.
 local REAR = 95
@@ -704,6 +747,7 @@ seat_of = function(n, slot)
     return got[slot] or 1
 end
 function vehicles.my_ride() return seats.name, ride_seat end
+function vehicles.my_car() return driving end
 function vehicles.peer_seat() return seats.peer end
 
 local function seat_ghost(car, seat)
@@ -744,6 +788,26 @@ local function unseat_ghost()
     seated_as = nil
 end
 
+-- The car's lights as the driver has them: LightsOn? and the intensity of every light in its Lights (the game's
+-- switch sets LIT or 0; each car type's construction script fills Lights, the lights start at 0 with the flag off).
+-- The switch lights a car only above 0 health (decompiled TurnOnOffLights), and this game's copy of a car the other
+-- player drives keeps its own health meanwhile (damage here counts on it; the driver's number comes at the park): a
+-- copy at 0 here stayed dark (user 2026-11-03: the host drives, the guest rides along, the lights look off). What
+-- the switch didn't do is set here directly. Returns nil when they matched, else what was found.
+local LIT = 50000.0
+local function lights_match(car, lit)
+    local on, level = nil, nil
+    pcall(function() on = car["LightsOn?"] == true end)
+    pcall(function() util.each(car.Lights, function(_, e) if level == nil then level = e:get().Intensity end end) end)
+    level = tonumber(level)
+    if on == lit and (level == nil or (level > 0) == lit) then return nil end
+    pcall(function() util.each(car.Lights, function(_, e) e:get():SetIntensity(lit and LIT or 0) end) end)
+    pcall(function() car["LightsOn?"] = lit end)
+    local h
+    pcall(function() h = car.VehicleHealthComponent.CurrentHealth end)
+    return string.format("flag %s, intensity %s, health %s", tostring(on), tostring(level), tostring(h))
+end
+
 -- Lights the game's own way: TurnOnOffLights flips LightsOn? and sets the Lights' intensity (it never touches their
 -- visibility). They used to be shown/hidden here (SetVisibility): the driver's own switch then lit hidden lights - the
 -- other player saw them, the driver didn't (user 2026-10-29, both directions).
@@ -756,6 +820,11 @@ local function car_effects(car, eng, lit)
     local on
     pcall(function() on = car["LightsOn?"] == true end)
     if on ~= nil and on ~= lit then pcall(function() car:TurnOnOffLights() end) end
+    local was = lights_match(car, lit)
+    if was then
+        log.info("vehicles: the game's light switch didn't turn the other player's car " .. (lit and "on" or "off")
+            .. " here (" .. was .. ") - set directly")
+    end
 end
 
 local function release_peer_car(final_l, final_r)
@@ -973,6 +1042,12 @@ local function follow(dt)
         peer.hitbox_at = now
         pcall(function() car.HitBoxCollision:SetGenerateOverlapEvents(false) end)
         if peer.tow and alive(peer.tow.car) then pcall(function() peer.tow.car.HitBoxCollision:SetGenerateOverlapEvents(false) end) end
+        -- (and its lights as the driver has them: something here changed them after they were set)
+        local was = peer.lights ~= nil and lights_match(car, peer.lights)
+        if was then
+            log.every("vehicles.lights", 30, "vehicles: the other player's car had its lights " .. (peer.lights and "off" or "on")
+                .. " here (" .. was .. (riding and ", riding in it" or "") .. ") - put back")
+        end
     end
     if riding then
         pcall(function() car.VehicleMovementComponent:SetThrottleInput(0) end)
@@ -991,13 +1066,12 @@ local function follow(dt)
             m:SetHandbrakeInput(false)
         end)
     end
-    local ok, moved = pcall(function() return car:K2_TeleportTo(l, r) end)
-    if not (ok and moved ~= false) then
-        stats.refused = (stats.refused or 0) + 1
-        pcall(function() car:SetActorEnableCollision(false) end)
-        place(car, l, r)
-        pcall(function() car:SetActorEnableCollision(true) end)
-    end
+    -- A teleport move, no encroachment check. K2_TeleportTo refused a car standing on the ground nearly every frame
+    -- (kit 2026-11-02: 25k refusals, even to the spot it stood on, nothing overlapping), and the old way round it -
+    -- collision off, teleport, collision on - every frame left the copy shaking (after a drive and stop it showed
+    -- 0.6-1.75 m/s and a 5 degree roll while the driver's car stood still). A suspected part of the car fling,
+    -- which was not reproduced (DBG-20261027-002).
+    place_hard(car, l, r)
     pcall(function() car.Mesh:SetPhysicsLinearVelocity(v, false, FName("None")) end)
     pcall(function() car.Mesh:SetPhysicsAngularVelocityInDegrees({ X = 0, Y = 0, Z = 0 }, false, FName("None")) end)
     local tc = peer.tow and peer.tow.car
@@ -1156,7 +1230,6 @@ function vehicles.tick(dt)
     if d then util.safe(apply_drive, "vehicles.drive", d) end
     util.safe(follow, "vehicles.follow", dt)
     if mate then
-        util.safe(follow, "vehicles.follow", dt)
         local g = ghost.get()
         if g and seated and peer_rides and not peer then
             -- someone else got in or out: riders keep their seats, newcomers take free ones

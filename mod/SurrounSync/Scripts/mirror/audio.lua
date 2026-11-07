@@ -7,6 +7,7 @@ local game = require("mirror.game")
 local ghost = require("mirror.ghost")
 local peers = require("mirror.peers")
 local events = require("mirror.events")
+local perf = require("mirror.perf")
 
 local audio = {}
 
@@ -109,6 +110,23 @@ local function skipped(name)
     return false
 end
 
+-- (every sound the game plays came here: its name read and matched against SKIP each time - the same few cues over and
+-- over while a gun fires; kept by address with the paths)
+local names, names_n = {}, 0
+local function name_of(snd)
+    local a = util.addr(snd)
+    local e = a and names[a]
+    if e then return e[1], e[2] end
+    local name = ""
+    pcall(function() name = util.fname(snd) end)
+    local skip = skipped(name)
+    if a then
+        if names_n > 1024 then names, names_n = {}, 0 end
+        names[a], names_n = { name, skip }, names_n + 1
+    end
+    return name, skip
+end
+
 local function chain(obj)
     local a, o
     pcall(function() a = obj:GetOwner() end)
@@ -131,9 +149,8 @@ local function on_sound(kind, ctx, snd, l, vol, pitch)
     if playing then return end
     if not shared() then drop("notshared"); return end
     if not util.valid(snd) or not util.valid(ctx) then drop("invalid"); return end
-    local name = ""
-    pcall(function() name = util.fname(snd) end)
-    if skipped(name) then drop("skip"); return end
+    local name, skip = name_of(snd)
+    if skip then drop("skip"); return end
     local path0 = path_of(snd)
     if path0 and l then remember(path0, l) end
     local a, owner = chain(ctx)
@@ -189,7 +206,7 @@ local function hook_all()
                     end
                     local prev = crumb.current()
                     crumb.at(step)
-                    util.safe(on_sound, "audio.sound", kind, ctx, snd, l, tonumber(vol), tonumber(pitch))
+                    perf.hook("hook audio", util.safe, on_sound, "audio.sound", kind, ctx, snd, l, tonumber(vol), tonumber(pitch))
                     crumb.leave(prev, after)
                 end)
             end)
@@ -293,7 +310,9 @@ end
 function audio.init(c, r, s, z, f)
     cfg, role, session, zombies, fire = c, r, s, z, f
     game.on_world_reset(function()
+        -- (names too: a freed sound's address back as another sound kept the old name and its SKIP answer; audit 2026-11-03)
         paths, paths_n, att_of, att_obj, recent, queue, cache = {}, 0, {}, {}, {}, {}, {}
+        names, names_n = {}, 0
         audio.late_reset()
     end)
     if cfg.audio_sync == false then role = "off" end

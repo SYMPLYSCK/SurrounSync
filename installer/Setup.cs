@@ -26,13 +26,22 @@ namespace SurrounSyncSetup
 
         const string ModPath = "game/ue4ss/Mods/SurrounSync/";
         const string FxPath = "game/ue4ss/Mods/SyncFX/";   // the graphics mod: installed off, switched in MY SETTINGS
+        const string GorePath = "game/ue4ss/Mods/SurrounDeadGore/";   // the gore mod: installed off, switched in MY SETTINGS
+        const string GorePak = "gore/SurrounDeadGore.pak";   // its blood assets, for Paks\LogicMods (.pak.off while it's off)
         const string BpPath = "game/ue4ss/Mods/BPModLoaderMod/";   // UE4SS's loader of Paks\LogicMods (the dog sounds)
+        // the FPV drone mod's copy that comes with SurrounSync (bundled.txt): it flies only for a player its owner allows
+        const string DronePath = "game/ue4ss/Mods/FPVDrone/";
+        const string DroneMark = "bundled.txt";
+        // the FPVDrone sold on its own has owned.txt: bought and unpacked over the SurrounSync copy, the old bundled.txt
+        // stays behind, and this says it's the player's own (FPVDrone's fpv/gate.lua reads it the same way)
+        const string DroneOwned = "owned.txt";
+        static bool OwnDrone(string dir) { return !File.Exists(Path.Combine(dir, DroneMark)) || File.Exists(Path.Combine(dir, DroneOwned)); }
         // what BPModLoaderMod requires first ("module 'UEHelpers' not found" on a player's PC: no dog sounds, 2026-10-30)
         const string UeHelpersPath = "game/ue4ss/Mods/shared/UEHelpers/";
         const string ContentPath = "content/";             // into SurrounDead\Content: the intro movie, the sound pak
         const string Intro = "Movies/UE5 Intro.mp4";
         // UE4SS's own files (the mods are installed on their own)
-        static bool NotAMod(ZipArchiveEntry e) { string n = N(e); return !n.StartsWith(ModPath) && !n.StartsWith(FxPath) && !n.StartsWith(BpPath); }
+        static bool NotAMod(ZipArchiveEntry e) { string n = N(e); return !n.StartsWith(ModPath) && !n.StartsWith(FxPath) && !n.StartsWith(GorePath) && !n.StartsWith(BpPath) && !n.StartsWith(DronePath); }
         public static string RecordFile { get { return Path.Combine(Release.AppDir, "install.txt"); } }
 
         static byte[] payloadBytes;
@@ -185,6 +194,95 @@ namespace SurrounSyncSetup
             Log("Installed SyncFX (experimental graphics) - switched off. Press F8 in the game to switch it on (F6 opens its menu).");
         }
 
+        // The gore mod (SurrounDeadGore): its Lua mod and the pak of its blood assets, switched together in MY SETTINGS
+        // (modlist.set_gore). A new install has it off: "SurrounDeadGore : 0" and the pak as .pak.off, so BPModLoaderMod
+        // doesn't load the assets either. An update keeps the player's on/off and settings.ini (only Scripts is replaced)
+        // and writes the new pak under the name that matches that on/off.
+        internal void InstallGore(ZipArchive z, string game, string mods, Dictionary<string, string> rec)
+        {
+            if (!PayloadHasIn(z, GorePath)) return;
+            string gore = Path.Combine(mods, "SurrounDeadGore");
+            if (IsLink(gore)) { Log("Mods\\SurrounDeadGore is a developer link - left as it is."); return; }
+            string txt = Path.Combine(mods, "mods.txt");
+            string list = File.Exists(txt) ? File.ReadAllText(txt) : "";
+            bool listed = Regex.IsMatch(list, "^\\s*SurrounDeadGore\\s*:", RegexOptions.Multiline);
+            // (on like UE4SS and modlist read it: a 1 in mods.txt, or its own enabled.txt from a standalone install)
+            bool on = Regex.IsMatch(list, "^\\s*SurrounDeadGore\\s*:\\s*1\\s*$", RegexOptions.Multiline)
+                || File.Exists(Path.Combine(gore, "enabled.txt"));
+            string ini = GorePath + "settings.ini";
+            bool keepIni = File.Exists(Path.Combine(gore, "settings.ini"));
+            ExtractStaged(z, GorePath, gore, e => !(keepIni && N(e) == ini));
+            rec["gore"] = "ours";
+            string content = Path.Combine(game, "SurrounDead", "Content");
+            ZipArchiveEntry pak = null;
+            foreach (var e in z.Entries) if (N(e) == GorePak) { pak = e; break; }
+            if (pak != null && Directory.Exists(content))
+            {
+                string logic = Path.Combine(content, "Paks", "LogicMods");
+                Directory.CreateDirectory(logic);
+                string live = Path.Combine(logic, "SurrounDeadGore.pak"), off = live + ".off";
+                TryDelete(live); TryDelete(off);
+                pak.ExtractToFile(on ? live : off, true);
+                rec["gore_pak"] = "ours";
+            }
+            if (listed || on) { Log("Updated the gore mod (your on/off choice is kept)."); return; }
+            File.AppendAllText(txt, (list.Length > 0 && !list.EndsWith("\n") ? "\r\n" : "") + "SurrounDeadGore : 0\r\n");
+            Log("Installed the gore mod - switched off. Switch it on in the game: J -> CO-OP -> gear -> MY SETTINGS -> GORE.");
+        }
+
+        // The FPV drone mod's SurrounSync copy (bundled.txt): on, but it flies only once its owner allows the player
+        // (their SETTINGS -> PERMISSIONS). A developer link or a separately installed FPVDrone (no bundled.txt) is
+        // never touched. An update keeps the player's FPVDrone.ini (their radio bindings).
+        internal void InstallDrone(ZipArchive z, string mods, Dictionary<string, string> rec)
+        {
+            if (!PayloadHasIn(z, DronePath)) return;
+            string dir = Path.Combine(mods, "FPVDrone");
+            if (IsLink(dir)) { Log("Mods\\FPVDrone is a developer link - left as it is."); return; }
+            if (Directory.Exists(dir) && OwnDrone(dir))
+            {
+                Log("Your own FPVDrone is installed - left as it is.");
+                return;
+            }
+            string ini = DronePath + "FPVDrone.ini";
+            bool keepIni = File.Exists(Path.Combine(dir, "FPVDrone.ini"));
+            ExtractStaged(z, DronePath, dir, e => !(keepIni && N(e) == ini));
+            rec["fpvdrone"] = "ours";
+            EnableMod(mods, "FPVDrone");
+            Log("Installed the FPV drone (it flies once its owner allows you).");
+        }
+
+        internal void RemoveDrone(string mods, Dictionary<string, string> rec)
+        {
+            string v;
+            if (!rec.TryGetValue("fpvdrone", out v) || v != "ours") return;
+            string dir = Path.Combine(mods, "FPVDrone");
+            if (IsLink(dir)) { Log("Mods\\FPVDrone is a developer link - left as it is."); return; }
+            if (!Directory.Exists(dir) || OwnDrone(dir)) return;
+            DeleteDir(dir);
+            DisableMod(mods, "FPVDrone");
+            Log("Removed the FPV drone.");
+        }
+
+        internal void RemoveGore(string game, string mods, Dictionary<string, string> rec)
+        {
+            string v;
+            if (rec.TryGetValue("gore", out v) && v == "ours")
+            {
+                string gore = Path.Combine(mods, "SurrounDeadGore");
+                if (IsLink(gore)) Log("Mods\\SurrounDeadGore is a developer link - left as it is.");
+                else
+                {
+                    if (Directory.Exists(gore)) { DeleteDir(gore); Log("Removed the gore mod."); }
+                    DisableMod(mods, "SurrounDeadGore");
+                }
+            }
+            if (rec.TryGetValue("gore_pak", out v) && v == "ours" && game != null)
+            {
+                string live = Path.Combine(game, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounDeadGore.pak");
+                TryDelete(live); TryDelete(live + ".off");
+            }
+        }
+
         static bool OlderThan(string v, string than)
         {
             Version a, b;
@@ -251,7 +349,10 @@ namespace SurrounSyncSetup
             if (rec.TryGetValue("sounds", out v) && v == "ours")
             {
                 TryDelete(Path.Combine(content, "Paks", "LogicMods", "SurrounSyncSounds.pak"));
-                Log("Removed SurrounSync's sounds.");
+                TryDelete(Path.Combine(content, "Paks", "LogicMods", "SurrounSyncGlider.pak"));
+                TryDelete(Path.Combine(content, "Paks", "LogicMods", "SurrounSyncArmory.pak"));
+                TryDelete(Path.Combine(content, "Paks", "LogicMods", "SurrounSyncDrone.pak"));
+                Log("Removed SurrounSync's sounds, glider model, armory and drone models.");
             }
             if (rec.TryGetValue("intro", out v) && v == "ours")
             {
@@ -373,6 +474,8 @@ namespace SurrounSyncSetup
                     if (on) { DisableMod(mods, c); Log("Switched off " + c + " (an older multiplayer mod - it fights with SurrounSync)."); }
                 }
                 InstallSyncFx(z, mods, rec);
+                InstallGore(z, game, mods, rec);
+                InstallDrone(z, mods, rec);
                 InstallContent(z, game, mods, rec);
                 Progress(55);
 
@@ -498,6 +601,8 @@ namespace SurrounSyncSetup
                         else if (Directory.Exists(fx)) { DeleteDir(fx); Log("Removed SyncFX."); }
                         if (!IsLink(fx)) { DisableMod(mods, "SyncFX"); RestoreReShade(w64); }
                     }
+                    RemoveGore(game, mods, rec);
+                    RemoveDrone(mods, rec);
                     RemoveOldPds(game, mods, rec);
                     RemoveContent(game, mods, rec);
                     if (rec.TryGetValue("ue4ss", out v) && v == "ours")
@@ -656,6 +761,41 @@ namespace SurrounSyncSetup
                 if (!dst.StartsWith(Path.GetFullPath(to).TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)) continue;
                 Directory.CreateDirectory(Path.GetDirectoryName(dst));
                 e.ExtractToFile(dst, true);
+            }
+        }
+        // A mod folder's update: unpacked beside it first (".<name>.new"), its Scripts swapped in and its other files
+        // copied over only once that worked. Deleting Scripts and then unpacking left the mod without its Lua when the
+        // unpack failed (a full disk, a file in use; audit 2026-11-03). Files the update leaves out stay, as before.
+        void ExtractStaged(ZipArchive z, string prefix, string to, Func<ZipArchiveEntry, bool> filter)
+        {
+            string full = Path.GetFullPath(to).TrimEnd('\\');
+            string stage = Path.Combine(Path.GetDirectoryName(full), "." + Path.GetFileName(full) + ".new");
+            if (Directory.Exists(stage)) DeleteDir(stage);
+            try { Extract(z, prefix, stage, filter); }
+            catch
+            {
+                // (the unpack's own error is the one that matters: it goes up, the half-made copy is cleared if it can be)
+                try { if (Directory.Exists(stage)) DeleteDir(stage); }
+                catch (Exception ce) { Log("Couldn't clear " + stage + ": " + ce.Message); }
+                throw;
+            }
+            Directory.CreateDirectory(full);
+            string scripts = Path.Combine(full, "Scripts"), news = Path.Combine(stage, "Scripts");
+            if (Directory.Exists(news))
+            {
+                if (Directory.Exists(scripts)) DeleteDir(scripts);
+                MoveDir(news, scripts);
+            }
+            if (Directory.Exists(stage))
+            {
+                foreach (var f in Directory.GetFiles(stage, "*", SearchOption.AllDirectories))
+                {
+                    string dst = Path.Combine(full, f.Substring(stage.Length + 1));
+                    Directory.CreateDirectory(Path.GetDirectoryName(dst));
+                    if (File.Exists(dst)) File.SetAttributes(dst, FileAttributes.Normal);
+                    File.Copy(f, dst, true);
+                }
+                DeleteDir(stage);
             }
         }
         static void DeleteDir(string d)
@@ -840,6 +980,8 @@ namespace SurrounSyncSetup
             if (key == null) return "None";
             return key == "experimental" ? "Experimental 0.8" : key;
         }
+        // Game 0.8 (Unreal 5.6) is on the normal branch and on "experimental" since 2026-11-05; "previous" is the old 0.7.1
+        public static bool Is08(string key) { return key == null || key == "experimental"; }
         public static string BetaOf(string game) { string b = Acf(Manifest(game), "BetaKey"); return string.IsNullOrEmpty(b) || b == "public" ? null : b; }
 
         // ---- UE4SS ----
@@ -912,20 +1054,27 @@ namespace SurrounSyncSetup
             string wantBeta = Installer.PayloadText("made_for_beta.txt") ?? "experimental";
             if (wantBeta == "" || wantBeta == "public") wantBeta = null;
             string betaNote = beta != null ? " You are on the Steam beta \"" + beta + "\"." : " You are on the normal (non-beta) branch.";
-            string betaFix = "In Steam: right-click SurrounDead -> Properties -> Betas -> pick \"" + BranchName(wantBeta) + "\". ";
-            if (beta != wantBeta)
-                add("problem", "Your SurrounDead is on the wrong Steam branch:" + betaNote + " SurrounSync is made for \"" + BranchName(wantBeta) +
-                    "\". The CO-OP tab may not show up, and players on different branches can't play together.",
+            string betaFix = "In Steam: right-click SurrounDead -> Properties -> Game Versions & Betas -> pick \"" + BranchName(null) + "\" (the normal branch). ";
+            // either 0.8 branch works; the exact build is only compared on the branch this SurrounSync was built on (the
+            // other branch's newest build can be older or newer, and Steam can't change that)
+            bool sameBranch = beta == wantBeta, okBranch = sameBranch || Is08(beta) && Is08(wantBeta);
+            if (!okBranch)
+                add("problem", "Your SurrounDead is on the wrong Steam branch:" + betaNote + (beta == "previous" ? " That is the old game 0.7.1." : "") +
+                    " SurrounSync is made for game 0.8 (the normal branch, or \"" + BranchName("experimental") +
+                    "\"). The CO-OP tab may not show up, and players on different branches can't play together.",
                     betaFix + "Steam then downloads that version. Click Check again when it's done.");
+            else if (!sameBranch)
+                add("info", "This SurrounSync was made on the \"" + BranchName(wantBeta) + "\" branch; you are on \"" + BranchName(beta) + "\". Both are game 0.8.",
+                    "Everyone in one game needs the same branch and game update: pick the branch your friends use.");
             string want = Installer.PayloadText("made_for_build.txt"), have = Game.BuildId(game);
             long a, b;
-            if (!string.IsNullOrEmpty(want) && long.TryParse(want, out a) && long.TryParse(have, out b) && a != b)
+            if (sameBranch && !string.IsNullOrEmpty(want) && long.TryParse(want, out a) && long.TryParse(have, out b) && a != b)
             {
                 if (b < a)
                 {
                     var x = add("problem", "Your SurrounDead is an OLDER version (build " + have + ") than this SurrounSync was made for (build " + want + ")." + betaNote +
                         " The CO-OP tab may not show up, and the game can crash when joining.",
-                        (beta != wantBeta ? betaFix : "") + "FIX makes Steam check and update the game files. Then click Check again.");
+                        "FIX makes Steam check and update the game files. Then click Check again.");
                     x.Auto = "Ask Steam to update and verify SurrounDead"; x.Do = verify;
                 }
                 else
@@ -937,7 +1086,7 @@ namespace SurrounSyncSetup
             {
                 var x = add("problem", "Your SurrounDead program is an old version (Unreal " + Game.EngineOf(w64) + ") - SurrounSync needs the current game (Unreal " +
                     Game.Engine + ")." + betaNote + " Mods won't start, and pak mods made for the current game crash it while loading.",
-                    (beta != wantBeta ? betaFix : "") + "FIX makes Steam check and update the game files. Then click Check again.");
+                    (!okBranch ? betaFix : "") + "FIX makes Steam check and update the game files. Then click Check again.");
                 x.Auto = "Ask Steam to update and verify SurrounDead"; x.Do = verify;
             }
             int flags;
@@ -1007,7 +1156,7 @@ namespace SurrounSyncSetup
                 else if (scanFail)
                 {
                     var x = add("problem", "UE4SS couldn't attach to the game in the last run - the game program doesn't match.",
-                        "FIX asks Steam to verify the game files." + (beta != wantBeta ? " " + betaFix : ""));
+                        "FIX asks Steam to verify the game files." + (!okBranch ? " " + betaFix : ""));
                     x.Auto = "Ask Steam to verify SurrounDead"; x.Do = verify;
                 }
             }

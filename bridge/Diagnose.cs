@@ -456,6 +456,19 @@ namespace SurrounSyncShared
                 f.DevLook = "mirror/phase1.lua protocol handshake; mirror/version.lua PROTOCOL (" + d.Protocol + " here).";
                 return f;
             }
+            if (s.Contains("slotguard: refused purge") && s.Contains("holds a save SurrounSync didn't make"))
+            {
+                // The start-up sweep keeps an unmarked co-op slot on purpose (it may hold a co-op character that was never
+                // copied home), so this repeats on every start and a restart never changes it (report 2026-11-01 21:24).
+                f.Title = "A leftover co-op save is kept on purpose"; f.Category = "Save safety"; f.Severity = "MINOR"; f.Confidence = "confirmed";
+                f.What = "A SurrounSync_Session save folder holds a save without SurrounSync's marker, so the mod won't clear it. Nothing was changed or lost.";
+                f.Affects = "Nothing in play. The folder stays in the game's load list and this line is logged on every start.";
+                f.Cause = "The folder wasn't made by this install's co-op session (older version, or a session that ended before its marker was written): " + Trunc(Signature(s), 160);
+                f.PlayerTry = "Load one of your own saves, not 'SurrounSync_Session'. If you don't need that folder, delete it by hand from the game's Saved\\SaveGames folder (copy it somewhere first if unsure).";
+                f.Workaround = "Don't play inside the SurrounSync_Session slot directly.";
+                f.DevLook = "mirror/slotguard.lua foreign() / purge refusal; mirror/session.lua purge_all_coop_slots.";
+                return f;
+            }
             if (s.Contains("slotguard: refused") || s.Contains("couldn't copy your co-op character home") || s.Contains("couldn't copy the character home"))
             {
                 f.Title = "Save protection refused a save action"; f.Category = "Save safety"; f.Severity = "CRITICAL"; f.Confidence = "confirmed";
@@ -585,23 +598,49 @@ namespace SurrounSyncShared
             return m.Success && Features.ContainsKey(m.Groups[1].Value) ? m.Groups[1].Value : null;
         }
 
+        // "<time> <step>" of a mirror_steps*.txt ring's newest line (the highest sequence number), or null
+        public static string NewestStep(string text)
+        {
+            if (text == null) return null;
+            long best = -1; string step = null;
+            foreach (Match m in Regex.Matches(text, @"(?m)^(\d+) (\d\d:\d\d:\d\d) [\d.]+ (.*\S)"))
+            {
+                long seq;
+                if (long.TryParse(m.Groups[1].Value, out seq) && seq > best) { best = seq; step = m.Groups[2].Value + " " + m.Groups[3].Value; }
+            }
+            return step;
+        }
+
+        // The mod step running when the run that ended near `at` stopped: its step ring's newest line (1.0.1+ writes
+        // only the ring), else its mirror_step file (mods from before the ring). A file last written outside
+        // -5..600 s of `at` belongs to another run.
+        public static string StepAt(string win64, DateTime at, out string file)
+        {
+            file = null;
+            if (win64 == null) return null;
+            foreach (var names in new[] { StepRings, StepFiles })
+                foreach (var n in names)
+                {
+                    string p = Path.Combine(win64, n);
+                    if (!File.Exists(p)) continue;
+                    double gap = (at - File.GetLastWriteTime(p)).TotalSeconds;
+                    if (gap < -5 || gap > 600) continue;
+                    string text = ReadText(p);
+                    string step = names == StepRings ? NewestStep(text) : (text ?? "").Trim();
+                    if (string.IsNullOrEmpty(step) || step.StartsWith("(")) continue;   // "(" = 1.0.1+'s pointer note
+                    file = n;
+                    return step;
+                }
+            return null;
+        }
+
         static Finding CrashFinding(string win64, string crash, DateTime at, Diagnosis d)
         {
             d.CrashDir = Path.GetFileName(crash);
             string xml = ReadText(Path.Combine(crash, "CrashContext.runtime-xml")) ?? "";
             string msg = Tag(xml, "ErrorMessage"), stack = Tag(xml, "CallStack");
             string module = Regex.Match(stack, @"^\s*([A-Za-z0-9_\-]+)").Groups[1].Value;
-            string step = null, stepFile = null;
-            if (win64 != null)
-                foreach (var n in StepFiles)
-                {
-                    string p = Path.Combine(win64, n);
-                    if (!File.Exists(p)) continue;
-                    double gap = (at - File.GetLastWriteTime(p)).TotalSeconds;
-                    if (gap < -5 || gap > 600) continue;
-                    step = (ReadText(p) ?? "").Trim(); stepFile = n;
-                    break;
-                }
+            string stepFile, step = StepAt(win64, at, out stepFile);
             string feat = StepFeature(step);
             var f = new Finding { Category = "Crash", Severity = "CRITICAL" };
             f.Evidence.Add("Game crash at " + at.ToString("yyyy-MM-dd HH:mm:ss") + " (" + d.CrashDir + ")");
@@ -762,7 +801,7 @@ namespace SurrounSyncShared
                     What = "SurrounSync " + d.ModVersion + " was made for game build " + a + "; this game is build " + b + ".",
                     Affects = "Possibly nothing - but game updates can change things the mod relies on.",
                     Cause = "Possible only: a version difference is not proof of a problem.",
-                    PlayerTry = b > a ? "Check for a SurrounSync update." : "Update the game in Steam (Betas: Experimental 0.8), then verify files.",
+                    PlayerTry = b > a ? "Check for a SurrounSync update." : "Update the game in Steam (game 0.8: the normal branch or Experimental 0.8), then verify files.",
                     DevLook = "Patch notes between builds " + Math.Min(a, b) + " and " + Math.Max(a, b) + "; hooks/properties the findings above touch.",
                     Evidence = { "made_for_build.txt " + a + ", appmanifest buildid " + b },
                 });

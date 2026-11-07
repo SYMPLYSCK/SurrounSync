@@ -24,6 +24,8 @@ local request_seen_at = {}
 
 local phase1
 local function p1() phase1 = phase1 or require("mirror.phase1"); return phase1 end
+-- backups (co-op's and a Realm character's) are restored only with nothing open: no co-op, no Realm session
+local function can_restore() return p1().can_switch() and not require("mirror.slotguard").log_exists() end
 
 local function my_role() return p1().started() end
 
@@ -154,6 +156,7 @@ local function leave_link_tick()
     if waited < LEAVE_LINK_MIN then return end
     -- (door code changes too: a code set just before leaving, the host still paused, would be gone)
     local left = require("mirror.events").unconfirmed() + require("mirror.doorlock").unconfirmed()
+        + require("mirror.vehlock").unconfirmed()
     if left > 0 and waited < LEAVE_LINK_MAX then return end
     session.forget_home()
     if left > 0 then log.warn("menu: home - " .. left .. " message(s) the host never confirmed; disconnecting after " .. LEAVE_LINK_MAX .. " s")
@@ -283,6 +286,10 @@ local function model()
     m.my_settings = require("mirror.mysettings").rows()
     m.settings_editable = require("mirror.hostrules").can_edit()
     m.settings_note = require("mirror.hostrules").note()
+    -- (the FPV drone's owner: SETTINGS -> PERMISSIONS, who may fly the copy that comes with SurrounSync)
+    local dg = require("mirror.dronegrant")
+    m.drone_owner = dg.owner()
+    m.permissions = m.drone_owner and dg.setting_rows() or nil
     if steam then
         m.me = l and ("Signed in as " .. (l.name or "?")) or
             "The Steam connection isn't running. Make sure Steam is running and your antivirus isn't blocking SurrounSyncBridge."
@@ -596,6 +603,10 @@ local function tick(dt)
 end
 
 -- Realms (realmplay.lua) host, join and stop through the same paths as the CO-OP tab
+-- what Ctrl+H and Ctrl+1-3 do, and /host and /join too (chatcmd.lua)
+function menu.key_host() want_host = true end
+function menu.key_join(i) want_join = i end
+
 function menu.realm_host() host(true) end
 function menu.realm_join(steamid, who, realm_name) join(steamid, who, realm_name) end
 function menu.realm_stop(why)
@@ -689,7 +700,17 @@ function menu.init(c)
                     notify.show(who .. (on and "off from your next game start." or "on from your next game start. Its own menu opens with F6.")
                         .. (rs == false and " ReShade couldn't be switched (see the log)." or ""), "info", nil, true)
                     if ml.restart_needed() then mods_restart_note() end
+                elseif tab == "mine" and key == "gore" then
+                    -- the gore mod: its Lua mod and asset pak, from the next game start
+                    local ml, ms = require("mirror.modlist"), require("mirror.mysettings")
+                    local _, on = ml.state(ms.GORE)
+                    if not ml.set_gore(not on) then
+                        notify.show("Couldn't switch the gore mod (is a file in use or read-only?).", "bad"); return
+                    end
+                    notify.show("Gore goes " .. (on and "off" or "on") .. " from your next game start.", "info", nil, true)
+                    if ml.restart_needed() then mods_restart_note() end
                 elseif tab == "mine" then require("mirror.mysettings").toggle(key)
+                elseif tab == "perm" then require("mirror.dronegrant").toggle(key)
                 else require("mirror.hostrules").toggle(key) end
             end,
             refresh = function()
@@ -731,6 +752,10 @@ function menu.init(c)
             realm_open = function(id, how) require("mirror.realmplay").open(id, how) end,
             realm_invite = function(id) require("mirror.realmmembers").invite(id) end,
             realm_key = function(id) require("mirror.realmmembers").copy_key(id) end,
+            -- the REALMS tab's SERVERS: the public server list and the owner's switch (realmmembers.lua)
+            realm_browse = function(force) require("mirror.realmmembers").browse(force) end,
+            realm_join_public = function(id, password, name) require("mirror.realmmembers").join_public(id, password, name) end,
+            realm_set_public = function(id, on, password) require("mirror.realmmembers").set_public(id, on, password) end,
             realm_remove = function(id) require("mirror.realmplay").remove(id) end,
             realm_my_difficulty = function() require("mirror.realmplay").use_my_difficulty() end,
             realm_create = function(name) require("mirror.realmplay").create(name) end,
@@ -744,6 +769,32 @@ function menu.init(c)
             realm_friends = function() require("mirror.realmplay").add_members(nil) end,
             realm_end = function() require("mirror.realmplay").leave() end,
             realm_cancel = function() require("mirror.realmplay").cancel_create() end,
+            -- the REALMS tab's BACKUPS: copies of my character in a Realm (backups.lua), apart from co-op's
+            realm_backups = function(id) return require("mirror.backups").list_realm(id) end,
+            realm_backup_now = function(id)
+                local rm = require("mirror.realm")
+                local f, why = require("mirror.backups").take_realm(id, rm.char_dir(id), "backed up by hand")
+                if f then notify.show("Your character in this Realm is backed up.", "good")
+                elseif why then notify.show("Couldn't back up your Realm character. Please check the SurrounSync log.", "bad")
+                else notify.show("You have no character in this Realm yet - open it once first.", "info") end
+            end,
+            -- (a Realm character is only read when a Realm opens, so this applies at once: no restart like a co-op save's)
+            realm_restore = function(id, folder, when)
+                if not can_restore() then
+                    notify.show("You can't restore while in co-op or a Realm. Leave first, or wait until your guest has left.", "bad")
+                    return
+                end
+                local rm = require("mirror.realm")
+                local ok, why = require("mirror.backups").restore_realm(id, folder, rm.char_dir(id), function(rid, files)
+                    rm.hold_character(rid, nil)   -- (a held character would make the store a no-op)
+                    return rm.store_character(rid, files)
+                end)
+                if ok then notify.show("Your character in this Realm is back to the backup from " .. (when or folder) .. ".", "good")
+                else
+                    log.error("menu: Realm character restore failed: " .. tostring(why))
+                    notify.show("Couldn't restore your Realm character. Nothing was changed. Please check the SurrounSync log.", "bad")
+                end
+            end,
         },
         realms_on = function() return require("mirror.realm").enabled() end,
         realms = function() return require("mirror.realmplay").model() end,
@@ -754,17 +805,18 @@ function menu.init(c)
             return m
         end,
         backups = page,
-        can_restore = function() return p1().can_switch() and not require("mirror.slotguard").log_exists() end,
+        can_restore = can_restore,
     }
     quickchat.configure{
         active = function() return my_role() ~= nil end,
         send = function(txt) return require("mirror.chat").send(txt) end,
         recent = function(n) return require("mirror.chat").recent(n) end,
-        tip = function(txt) return require("mirror.teleport").tip(txt) end,
+        tip = function(txt) return require("mirror.chatcmd").tip(txt) end,
+        say = function(txt) notify.show(txt, "info") end,
     }
-    game.keybind("H", { ModifierKey.CONTROL }, function() want_host = true end)
+    game.keybind("H", { ModifierKey.CONTROL }, menu.key_host)
     for i, k in ipairs({ "One", "Two", "Three" }) do
-        game.keybind(k, { ModifierKey.CONTROL }, function() want_join = i end)
+        game.keybind(k, { ModifierKey.CONTROL }, function() menu.key_join(i) end)
     end
     game.on_tick(function(dt) util.safe(tick, "menu.tick", dt) end)
     game.on_ready(function()

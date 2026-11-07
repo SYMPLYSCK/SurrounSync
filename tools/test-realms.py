@@ -134,7 +134,8 @@ def start_backend():
                         ".wrangler/test-state", "--file", "schema.sql"], cwd=BACKEND, capture_output=True,
                        encoding="utf-8", errors="replace")
     if r.returncode != 0:
-        print(r.stdout[-2000:], r.stderr[-2000:])
+        # (ascii: wrangler prints box and emoji characters, and a redirected Windows console is cp1252)
+        print((r.stdout[-2000:] + "\n" + r.stderr[-2000:]).encode("ascii", "replace").decode())
         sys.exit("couldn't make the local database")
     # wrangler's own output goes to a file, shown when the server doesn't come up
     out_path = os.path.join(tempfile.gettempdir(), "realms_wrangler_%d.log" % os.getpid())
@@ -261,6 +262,140 @@ def hosting_guard_checks(c, d):
     d.cmd("release " + rid)
 
 
+def server_list_checks(c, d, g):
+    # user 2026-11-01: "realms server list ... Name|Players0/0|Ping|Locked/Unlocked -Join" + public Realms.
+    # C and D are still running from hosting_guard_checks (C: fast heartbeats, needs the game's hosting confirms)
+    g.start()
+    r = c.cmd("create Public World")
+    rid = r.split(" ")[1] if r.startswith("ok ") else "0000000000"
+
+    def rows(x):
+        x.cmd("browse")
+        return [l for l in x.lines("server") if l[0] == rid]
+
+    def keep(secs):
+        end = time.time() + secs
+        while time.time() < end:
+            c.cmd("hosting " + rid)
+            time.sleep(0.8)
+
+    check(rows(d) == [], "a new Realm isn't on the server list")
+    check(d.cmd("joinpublic " + rid).startswith("fail no_realm"), "a private Realm can't be joined from the list")
+    check(c.cmd("public %s maybe" % rid).startswith("fail bad_input"), "public needs on or off")
+    r = c.cmd("public %s on" % rid)
+    check(r == "ok on open" and [rid, "1", "0", "invited"] in c.lines("pub"), "the owner lists it, open: %s %s" % (r, c.lines("pub")))
+    check(c.cmd("claim " + rid) == "ok won 0", "(setup) C hosts the public Realm")
+
+    def numbers():
+        st, body = http("GET", "/realms/public")
+        x = [s for s in json.loads(body).get("realms", []) if s.get("realm_id") == rid] if st == 200 else []
+        return x[0] if x and x[0].get("live") and x[0].get("players", 0) >= 1 and (x[0].get("ping_loc") or "").startswith("test=") else None
+    got = None
+    end = time.time() + 8
+    while got is None and time.time() < end:
+        keep(1)
+        got = numbers()
+    check(got is not None and got["max_players"] >= got["players"], "the host's heartbeat carries players, max and its ping location: %s" % got)
+    keep(0.1)
+    row = rows(d)
+    check(len(row) == 1 and row[0][1:3] == ["1", "0"] and row[0][5] == "40" and row[0][6] == "0"
+          and " ".join(row[0][7:]) == "Public World" and row[0][3] == str((got or {}).get("players")),
+          "D's list: live, open, players, ping from the test net (40 ms), not mine, name last: %s" % row)
+    hd = d.lines("servers")
+    check(len(hd) == 1 and int(hd[0][0]) > 0 and int(hd[0][1]) == len(d.lines("server")),
+          "one servers header: browse time and the row count: %s" % hd)
+
+    r = d.cmd("joinpublic " + rid)
+    check(r.startswith("ok " + rid) and os.path.exists(os.path.join(d.realm_dir(rid), "member.key")), "D joins from the list: " + r)
+    d.cmd("list")
+    check([rid, "1", "0", "public"] in d.lines("pub"), "D's pub line: listed, open, joined from the list: %s" % d.lines("pub"))
+    check(d.cmd("joinpublic " + rid).startswith("ok " + rid), "JOIN again with a key: no second request")
+    keep(0.1)
+    row = rows(d)
+    check(len(row) == 1 and row[0][6] == "1", "D's list marks it mine now: %s" % row)
+    keep(0.1)
+    r = d.cmd("claim " + rid)
+    check(r.startswith("ok hosted"), "a list member finds C hosting (the game then joins it): " + r)
+
+    # locked: the password may hold spaces; it reaches only the server
+    pw = "secret pass"
+    check(c.cmd("public %s on %s" % (rid, pw)) == "ok on locked", "the owner locks it with a password")
+    keep(0.1)
+    row = rows(g)
+    check(len(row) == 1 and row[0][2] == "1", "G's list shows it locked: %s" % row)
+    check(g.cmd("joinpublic " + rid).startswith("fail bad_password"), "no password: refused")
+    check(g.cmd("joinpublic %s wrong one" % rid).startswith("fail bad_password"), "a wrong password: refused")
+    check(not os.path.exists(os.path.join(g.realm_dir(rid), "member.key")), "...and no key saved")
+    r = g.cmd("joinpublic %s %s" % (rid, pw))
+    check(r.startswith("ok " + rid), "the right password: G joins: " + r)
+    d.cmd("list")
+    check(not any(l[0] == rid and l[1] != "offline" for l in d.lines("realm")), "locking removed D, who joined while it was open: %s" % d.lines("realm"))
+
+    # a dead key (removed by the lock, or by a list join made with D's Steam id) must not answer JOIN: D joins afresh
+    def key_of(x):
+        return open(os.path.join(x.realm_dir(rid), "member.key"), encoding="utf-8").read().strip()
+
+    def key_works(x):
+        return http("GET", "/realms/" + rid, auth=key_of(x))[0] == 200
+    dead = key_of(d)
+    r = d.cmd("joinpublic %s %s" % (rid, pw))
+    check(r.startswith("ok " + rid) and key_of(d) != dead and key_works(d), "D's dead key: JOIN makes a new working one: " + r)
+    st = json.loads(http("GET", "/realms/" + rid, auth=key_of(c))[1])
+    d_steam = next((x["steam_id"] for x in st.get("members", []) if x["member_id"] == key_of(d).split(":")[0]), None)
+    req = urllib.request.Request(URL + "/v1/realms/%s/join" % rid, method="POST", headers={"content-type": "application/json"},
+                                 data=json.dumps({"steam_id": d_steam, "player_name": "Fake", "password": pw}).encode())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            code = resp.status
+    except urllib.error.HTTPError as e:
+        code = e.code
+    check(code == 201 and not key_works(d), "a list join made with D's Steam id replaces D's membership (%s)" % code)
+    r = d.cmd("joinpublic %s %s" % (rid, pw))
+    check(r.startswith("ok " + rid) and key_works(d), "...and D's next JOIN gets back in at once: " + r)
+    files = [tb_log(x) + (x.state() or "") for x in (c, g)]
+    for x in (c, g):
+        for root, _, names in os.walk(x.dir):
+            for n in names:
+                try:
+                    files.append(open(os.path.join(root, n), encoding="utf-8", errors="replace").read())
+                except OSError:
+                    pass
+    check(not any(pw in f for f in files), "the password is in no file or log the bridges write")
+
+    check(c.cmd("public %s off" % rid) == "ok off", "the owner takes it off the list")
+    check(rows(d) == [], "...and it's gone from the list")
+    c.cmd("release " + rid)
+    g.stop()
+
+
+def raw_cmd(x, text):
+    """A plain bridge command (the CO-OP tab's), not a Realm one."""
+    path = os.path.join(x.dir, "mirror_bridge_cmd.txt")
+    wait_for(lambda: not os.path.exists(path), 5)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    wait_for(lambda: not os.path.exists(path), 5)
+
+
+def presence_checks(e):
+    # user 2026-11-01: "only coop worlds show up in coop, and realms only show up in realms" - a Realm host set the
+    # same Steam presence ("host") as a co-op host, and friends' CO-OP tabs list every "host"
+    e.start()
+    raw_cmd(e, "host")
+    time.sleep(3)
+    check("presence: hosting a Realm" not in tb_log(e), "a co-op host without a Realm stays a co-op game")
+    r = e.cmd("create Presence World")
+    rid = r.split(" ")[1] if r.startswith("ok ") else "0000000000"
+    check(e.cmd("claim " + rid) == "ok won 0", "(setup) E hosts its Realm")
+    check(wait_for(lambda: "presence: hosting a Realm - not listed as a co-op game" in tb_log(e), 6) is not None,
+          "hosting a Realm: the bridge stops saying it hosts a co-op game")
+    check(e.cmd("release " + rid) == "ok", "(setup) E ends its Realm")
+    check(wait_for(lambda: tb_log(e).rstrip().endswith("presence: host") or "presence: host\n" in tb_log(e), 6) is not None,
+          "the Realm ended, still hosting: a co-op game again")
+    raw_cmd(e, "stop")
+    e.stop()
+
+
 def tb_log(x):
     try:
         with open(os.path.join(x.dir, "mirror_bridge.log"), encoding="utf-8", errors="replace") as f:
@@ -280,6 +415,8 @@ def main():
     # (1 s heartbeats against the server's 3 s leases; a lease the game stopped confirming goes after 2.5 s)
     fast = ["--realm-beat", "1000", "--hosting-stale", os.environ.get("REALMS_TEST_STALE_MS", "2500")]
     c, d = B("C", 1004, fast), B("D", 1005, fast)
+    e = B("E", 1006)
+    g = B("G", 1007)
     try:
         # an id can itself start with R (1 in 32): read as an id, not as a code losing its R (CI 2026-10-30: the
         # server turned RWE288BGVE into WE288BGVE and refused every request for that Realm)
@@ -501,10 +638,12 @@ def main():
         check(r == "ok" and not os.path.exists(akey), "DELETE of a Realm already gone on the server: forgotten here: " + r)
         a.stop(); b.stop()
         hosting_guard_checks(c, d)
+        server_list_checks(c, d, g)
+        presence_checks(e)
     finally:
-        a.stop(); b.stop(); c.stop(); d.stop()
+        a.stop(); b.stop(); c.stop(); d.stop(); e.stop(); g.stop()
         kill_tree(server)
-        for x in (a, b, c, d):
+        for x in (a, b, c, d, e, g):
             shutil.rmtree(x.dir, ignore_errors=True)
     print("\n%d failure(s)" % len(failures))
     return 1 if failures else 0

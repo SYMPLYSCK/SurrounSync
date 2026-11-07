@@ -37,9 +37,10 @@ local function name_str(n)
     return s
 end
 -- Weapons keep their damage etc. in the asset's RandomStats, rolled per item by the game's
--- BP_JigComponent:GenerateRandomStats(RandomStats, ItemStats): the rolls (until MaxStats is reached), then the
+-- BP_JigComponent:GenerateRandomStats(RandomStats, ItemStats): every roll that passes its chance, then the
 -- ItemStats. Without the roll a weapon made by us has no FirearmDamage/MeleeDamage stat and every hit does 1
--- (FindStat's default). Same order as the game's bytecode.
+-- (FindStat's default). Same order as the game's bytecode. MaxStats caps nothing there: its length check comes after
+-- both loops and both ways out keep all the stats. Nearly every gun has one row more than MaxStats, DamageFallOff.
 local RS_LIST, RS_MAXN = "Stats_8_78B6E3C14C0578F96B7C9FBBA7820A46", "MaxStats_7_971BC4334FEFC6C1B39175A3D0721033"
 local RS_TAG, RS_TXT = "STAT_NAME_23_8D9D8D5D48A145FB1BAD6E98C69D0A10", "Txt_22_E0F5EFD44434F58678FE088E508B5B53"
 local RS_MIN, RS_MAX = "RandomMinValue_9_4B4822A7420F784740B6A58155973EE6", "RandomMaxValue_10_04A5809A498E900862BCCA9A6E412BD7"
@@ -71,29 +72,53 @@ local function raw_stats(asset)
     end
     return raw
 end
+local function new_stat(tag, prefix, mn, mx, txt)
+    return { [S_TAG] = { TagName = FName(tag or "None") }, [S_PREFIX] = FName(prefix or "None"),
+             [S_MIN] = mn, [S_MAX] = mx, [S_TXT] = FName(txt or "None") }
+end
+local function rolled_stat(r)
+    local lo, hi = r.min, r.max
+    if not r.force then
+        lo = r.min + math.random() * (r.max - r.min)
+        hi = lo + math.random() * (r.max - lo)
+        if r.round then lo, hi = math.floor(lo + 0.5), math.floor(hi + 0.5) end
+        if not r.both then hi = lo end
+    end
+    return new_stat(r.tag, "None", lo, hi, r.txt)
+end
 function jig.base_stats(asset)
     if not util.valid(asset) then return {} end
     local raw = raw_stats(asset)
     local out = {}
-    local function add(tag, prefix, mn, mx, txt)
-        out[#out + 1] = { [S_TAG] = { TagName = FName(tag or "None") }, [S_PREFIX] = FName(prefix or "None"),
-                          [S_MIN] = mn, [S_MAX] = mx, [S_TXT] = FName(txt or "None") }
-    end
     for _, r in ipairs(raw.random) do
-        if math.random() * 100 <= r.chance then
-            local lo, hi = r.min, r.max
-            if not r.force then
-                lo = r.min + math.random() * (r.max - r.min)
-                hi = lo + math.random() * (r.max - lo)
-                if r.round then lo, hi = math.floor(lo + 0.5), math.floor(hi + 0.5) end
-                if not r.both then hi = lo end
-            end
-            add(r.tag, "None", lo, hi, r.txt)
-            if #out == raw.max then return out end
-        end
+        if math.random() * 100 <= r.chance then out[#out + 1] = rolled_stat(r) end
     end
-    for _, r in ipairs(raw.fixed) do add(r.tag, r.prefix, r.min, r.max, r.txt) end
+    for _, r in ipairs(raw.fixed) do out[#out + 1] = new_stat(r.tag, r.prefix, r.min, r.max, r.txt) end
     return out
+end
+-- 1.0.0 and older stopped a roll at MaxStats, so a weapon we made then is short: no DamageFallOff on nearly every gun,
+-- FindStat gives 1 for it and a hit loses 7 damage per metre, down to 1. Such an item has exactly MaxStats stats, one a
+-- game-made item can't have while a 100% row is missing. Adds only those rows (not fixed stats: the game's roll doesn't
+-- show them landing beside random ones), keeps every roll it has; returns how many were added. info = the item's info
+-- in the container data.
+function jig.add_missing_stats(info, asset)
+    local n = 0
+    pcall(function()
+        local raw = raw_stats(asset)
+        local arr = info[STATS]
+        local count = arr:GetArrayNum()
+        if raw.max < 1 or count ~= raw.max then return end
+        local have = {}
+        util.each(arr, function(_, e) have[name_str(e:get()[S_TAG].TagName) or ""] = true end)
+        for _, r in ipairs(raw.random) do
+            if r.chance >= 100 and not have[r.tag] then
+                have[r.tag] = true
+                n = n + 1
+                arr[count + n] = rolled_stat(r)
+            end
+        end
+    end)
+    return n
 end
 -- Fills the Stats of an item info already in the game (a dropped copy); returns how many were written.
 function jig.write_stats(info, asset)
@@ -194,6 +219,7 @@ function jig.repair_stats(comp)
         if asset and jig.always_has_stats(asset) then
             local n, info
             pcall(function() info = h.el:get()[INFO]; n = jig.write_stats(info, asset) end)
+            if n == -1 then n = jig.add_missing_stats(info, asset) end
             if n and n > 0 then
                 fixed = fixed + 1; names[#names + 1] = h.da:match("[%w_]+$")
                 jig.refresh_slot_stats(comp, h.uid, info)   -- its slot was made without them
@@ -801,6 +827,10 @@ function jig.container_count(comp)
     local ok, n = pcall(function() return #containers_of(comp, nil) end)
     return ok and n or 0
 end
+-- those containers ({ raw, slot }, in the inventory's order), for jig.add_item's conts
+function jig.top_containers(comp) return containers_of(comp, nil) end
+-- the grids the item holder_uid holds (an ammo tin's, a bag's), same form
+function jig.containers_in(comp, holder_uid) return containers_of(comp, holder_uid) end
 
 function jig.generate(comp)
     return pcall(function() comp:InitializeJigComponent() end)

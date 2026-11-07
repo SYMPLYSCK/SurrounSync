@@ -24,6 +24,7 @@ local split = require("mirror.split")
 local power = require("mirror.power")
 local audio = require("mirror.audio")
 local loot = require("mirror.loot")
+local looted = require("mirror.looted")
 local builds = require("mirror.builds")
 local pings = require("mirror.pings")
 local lights = require("mirror.lights")
@@ -45,6 +46,9 @@ local teleport = require("mirror.teleport")
 local compat = require("mirror.compat")
 local voice = require("mirror.voice")
 local pvp = require("mirror.pvp")
+local downed = require("mirror.downed")
+local glider = require("mirror.glider")
+local drone = require("mirror.drone")
 local perf = require("mirror.perf")
 local crumb = require("mirror.crumb")
 local devtest = require("mirror.devtest")
@@ -146,6 +150,21 @@ local pose_gaps = { seq = nil, got = 0, skipped = 0 }
 
 local pose_line = nil
 local pose_out = posepack.new(2)
+
+-- Standing on a car (the newest pose's base, vehicles.base_line): the ghost is pinned to that spot on our own copy of
+-- the car, where it stands for whoever drives it here; the world spot trails a moving car by the pose and car delays
+-- (user 2026-11-02). The newest spot, not a played-back one: nothing to wait for, it moves with our car.
+local car_view, car_mt = {}, {}
+local function on_car(pose)
+    local n = remote:newest()
+    local base = n and n.base
+    if not (pose and base) then return pose end
+    local l, yaw = vehicles.on_base(base, pose.loc)
+    if not l then return pose end
+    car_mt.__index = pose
+    car_view.loc, car_view.yaw = l, yaw
+    return setmetatable(car_view, car_mt)
+end
 local function sample(player)
     pose_line = nil
     pcall(function()
@@ -178,7 +197,7 @@ local function status()
         role, rx_count / cfg.phase1.status_interval, age,
         ghost.exists() and ghost.kind() or "none",
         ((gl and pl) and string.format(" %.0f m from you", util.dist(gl, pl) / 100) or "")
-        .. " | zombies: " .. zombies.status() .. " | " .. fire.status() .. " | " .. drops.status() .. " | " .. world.status() .. " | " .. require("mirror.camps").status() .. " | " .. require("mirror.airdrops").status() .. " | " .. require("mirror.prefabs").status() .. " | " .. doors.status() .. " | " .. infest.status() .. " | " .. horde.status() .. " | " .. split.status() .. " | " .. power.status() .. " | " .. audio.status() .. " | " .. loot.status() .. " | " .. builds.status() .. " | " .. pings.status() .. " | " ..corpses.status() .. " | " .. deathbags.status() .. " | " .. tactical.status() .. " | " .. throwables.status() .. " | " .. vehicles.status() .. " | " .. harvest.status() .. " | " .. pvp.status() .. " | " .. require("mirror.personalspace").status() .. " | " .. require("mirror.dogs").status() .. " | " .. require("mirror.itemclean").status() .. " | find misses " .. util.find_misses))
+        .. " | zombies: " .. zombies.status() .. " | " .. fire.status() .. " | " .. drops.status() .. " | " .. world.status() .. " | " .. require("mirror.camps").status() .. " | " .. require("mirror.airdrops").status() .. " | " .. require("mirror.prefabs").status() .. " | " .. doors.status() .. " | " .. infest.status() .. " | " .. horde.status() .. " | " .. split.status() .. " | " .. power.status() .. " | " .. require("mirror.towing").status() .. " | " .. require("mirror.startgps").status() .. " | " .. audio.status() .. " | " .. loot.status() .. " | " .. looted.status() .. " | " .. downed.status() .. " | " .. glider.status() .. " | " .. drone.status() .. " | " .. require("mirror.hoverbike").status() .. " | " .. builds.status() .. " | " .. pings.status() .. " | " ..corpses.status() .. " | " .. deathbags.status() .. " | " .. tactical.status() .. " | " .. throwables.status() .. " | " .. vehicles.status() .. " | " .. harvest.status() .. " | " .. pvp.status() .. " | " .. require("mirror.personalspace").status() .. " | " .. require("mirror.dogs").status() .. " | " .. require("mirror.itemclean").status() .. " | " .. require("mirror.bodycap").status() .. " | find misses " .. util.find_misses))
     rx_count = 0
 end
 
@@ -214,7 +233,7 @@ local bye_seen = nil
 local opened_at = nil          -- os.time() when this link opened (phase1.init)
 local function on_tick(dt)
     if not started then return end
-    if not tags then perf.frame_begin(); perf.run("peers", peers.tick, dt) end
+    if not tags then perf.run("peers", peers.tick, dt) end   -- (the perf frame is game.lua's, around every handler)
     now = now + dt
     perf.run("link", util.safe, link.tick, "link.tick", dt)
     away.tick()
@@ -228,9 +247,14 @@ local function on_tick(dt)
         if pose_line then
             local ps = perf.start()
             seq = seq + 1
-            -- The car we're driving travels with the pose: same rate, same redundancy.
-            local car = vehicles.drive_line()
-            link.send(seq, pose_out:pack(seq, car and (pose_line .. "|" .. car) or pose_line))
+            -- The car we're driving travels with the pose: same rate, same redundancy. Or the car we stand on.
+            -- And the FPV quad we fly (drone.lua, "Q ..."). Segments after the pose, each its own "|".
+            local car = vehicles.drive_line() or vehicles.base_line(player)
+            local quad = drone.line()
+            local line = pose_line
+            if car then line = line .. "|" .. car end
+            if quad then line = line .. "|" .. quad end
+            link.send(seq, pose_out:pack(seq, line))
             perf.stop("pose.send", ps)
         end
     end
@@ -246,10 +270,13 @@ local function on_tick(dt)
             if pose_gaps.seq then pose_gaps.skipped = pose_gaps.skipped + (e.seq - pose_gaps.seq - 1) end
             pose_gaps.seq = e.seq
             if e.live then pose_gaps.got = pose_gaps.got + 1 else pose_gaps.recovered = (pose_gaps.recovered or 0) + 1 end
-            local body, car = e.line:match("^([^|]*)|?(.*)$")
-            if car ~= "" then vehicles.drive_sample(car) end
+            local body, rest = e.line:match("^([^|]*)|?(.*)$")
+            local base, quad, car = poseline.segments(rest)
+            if car then vehicles.drive_sample(car) end
+            if e.live then drone.sample(quad) end
             local pose = poseline.parse(body)
             if pose then
+                pose.base = base
                 local t = pose_clock:place(pose.sent, now, not e.live)
                 if t or not pose.sent then remote:push(t or now, pose) end
                 last_rx = now; first_rx = first_rx or now; rx_count = rx_count + 1
@@ -429,9 +456,9 @@ local function on_tick(dt)
     local pose_delay = pose_clock:delay(dt)
     if ghost.exists() then
         if now - last_rx > cfg.phase1.hold_after then
-            perf.run("ghost", ghost.apply, remote:newest(), false)
+            perf.run("ghost", ghost.apply, on_car(remote:newest()), false)
         else
-            perf.run("ghost", ghost.apply, remote:at(now - pose_delay, util, cfg.phase1.max_extrapolation), true)
+            perf.run("ghost", ghost.apply, on_car(remote:at(now - pose_delay, util, cfg.phase1.max_extrapolation)), true)
         end
     end
 
@@ -446,7 +473,9 @@ local function on_tick(dt)
         look_in = now < look_fast_until and 0.15 or cfg.phase1.look_interval
         local ads = false
         pcall(function() ads = player["IsADS?"] == true end)
-        local mine = (not ads) and look.capture(player) or my_look
+        local bike = package.loaded["mirror.hoverbike"]
+        local unseen = bike and bike.rider_out_of_sight and bike.rider_out_of_sight()
+        local mine = (not ads and not unseen) and look.capture(player) or my_look
         if mine and mine ~= my_look then
             my_look = mine
             link.put_blob("look", mine)
@@ -531,6 +560,9 @@ local function on_tick(dt)
         perf.run("compat", util.safe, compat.tick, "compat.tick")
         perf.run("voice", util.safe, voice.tick, "voice.tick", dt)
         perf.run("pvp", util.safe, pvp.tick, "pvp.tick", dt)
+        perf.run("downed", util.safe, downed.tick, "downed.tick", dt)
+        perf.run("glider", util.safe, glider.tick, "glider.tick", dt)
+        perf.run("drone", util.safe, drone.tick, "drone.tick", dt)
         perf.run("nametag", util.safe, nametag.tick, "nametag.tick", dt)
         perf.run("lights", util.safe, lights.tick, "lights.tick", dt, remote:newest())
         perf.run("tactical", util.safe, tactical.tick, "tactical.tick", dt)
@@ -560,8 +592,11 @@ local function on_tick(dt)
     perf.run("split", util.safe, split.tick, "split.tick", dt)
     perf.run("jobs", util.safe, util.jobs_tick, "util.jobs_tick", 0.004)
     perf.run("power", util.safe, power.tick, "power.tick", dt)
+    perf.run("towing", util.safe, require("mirror.towing").tick, "towing.tick", dt)
+    perf.run("startgps", util.safe, require("mirror.startgps").tick, "startgps.tick", dt)
     perf.run("audio", util.safe, audio.tick, "audio.tick", dt)
     perf.run("loot", util.safe, loot.tick, "loot.tick", dt)
+    perf.run("looted", util.safe, looted.tick, "looted.tick", dt)
     perf.run("builds", util.safe, builds.tick, "builds.tick", dt)
     perf.run("pings", util.safe, pings.tick, "pings.tick", dt)
     perf.run("netq", util.safe, netq.tick, "netq.tick", dt, first_rx and (now - last_rx) or math.huge)
@@ -570,6 +605,9 @@ local function on_tick(dt)
     perf.run("compat", util.safe, compat.tick, "compat.tick")
     perf.run("voice", util.safe, voice.tick, "voice.tick", dt)
     perf.run("pvp", util.safe, pvp.tick, "pvp.tick", dt)
+    perf.run("downed", util.safe, downed.tick, "downed.tick", dt)
+    perf.run("glider", util.safe, glider.tick, "glider.tick", dt)
+    perf.run("drone", util.safe, drone.tick, "drone.tick", dt)
     perf.run("corpses", util.safe, corpses.tick, "corpses.tick", dt)
     perf.run("deathbags", util.safe, deathbags.tick, "deathbags.tick", dt)
     perf.run("nametag", util.safe, nametag.tick, "nametag.tick", dt)
@@ -587,7 +625,6 @@ local function on_tick(dt)
 
     status_in = status_in - dt
     if status_in <= 0 then status_in = cfg.phase1.status_interval; perf.run("status", util.safe, status, "phase1.status") end
-    if not tags then perf.frame_end(dt) end
 end
 
 function phase1.connected() return now - last_rx < 15 end
@@ -625,7 +662,7 @@ end
 
 function phase1.peer_where() return peer_where end
 
--- (the pause/settings menu stops game ticks; LoopAsync + the game thread still run: away.lua)
+-- (the pause/settings menu stops game ticks; UE4SS's game-thread loops still run: away.lua)
 function phase1.menu_watch()
     if not started then return end
     local can = util.valid(game.player()) and not busy_where(session.where())
@@ -637,14 +674,10 @@ function phase1.menu_watch()
 end
 local menu_watching = false
 local function watch_menu()
-    if menu_watching or type(LoopAsync) ~= "function" or type(ExecuteInGameThread) ~= "function" then return end
-    menu_watching = true
-    LoopAsync(1000, function()
-        ExecuteInGameThread(function()
-            util.safe(function() peers.each("mirror.phase1", function(m) m.menu_watch() end) end, "phase1.menu_watch")
-        end)
-        return false
-    end)
+    if menu_watching then return end
+    menu_watching = util.game_loop(1000, function()
+        peers.each("mirror.phase1", function(m) m.menu_watch() end)
+    end, "phase1.menu_watch") ~= nil
 end
 
 -- group split (group.lua): the other guest's ghost here becomes a body the AI goes for ("host") or goes back
@@ -664,6 +697,9 @@ end
 function phase1.stop()
     if not started then return end
     log.info("phase1: co-op stopped (" .. tostring(role) .. ")")
+    util.safe(downed.stop, "downed.stop")
+    util.safe(glider.stop, "glider.stop")
+    util.safe(drone.stop, "drone.stop")
     reset_link_state()
     if not tags then peers.stop(); link.bridge_cmd("stop") end
     started, cur_peer = false, nil
@@ -683,6 +719,10 @@ function phase1.init(c, r, peer_id, t)
     if not tags then peers.start(cfg, role) end
     ghost_kind = (role == "host") and "host" or "guest"
     remote = track.new(3.0)
+    teleport.set_locator(function()
+        local n = remote:newest()
+        return n and n.loc and { X = n.loc.X, Y = n.loc.Y, Z = n.loc.Z } or nil
+    end)
     keepalive.configure(cfg)
     perf.configure(cfg)
     save_guard.configure(cfg, function() end)
@@ -710,6 +750,9 @@ function phase1.init(c, r, peer_id, t)
         nametag.init(cfg)
         voice.init(same_world)
         pvp.init(role, same_world)
+        downed.init(cfg, same_world, false)
+        glider.link_init(same_world)
+        drone.link_init(same_world, peer_id)
         game.on_ready(function() save_guard.install() end)
         game.on_tick(on_tick)
         log.info(string.format("phase1: another guest (%s), sending %s, reading %s", tostring(peer_id), mine, theirs))
@@ -737,8 +780,14 @@ function phase1.init(c, r, peer_id, t)
     horde.init(cfg, role, session, same_world)
     split.init(cfg, role, session, phase1.revived_age, teleport.busy)
     power.init(cfg, role, session)
+    require("mirror.towing").init(cfg, role, session)
+    require("mirror.startgps").init(session)
     audio.init(cfg, role, session, zombies, fire)
     loot.init(cfg, role, session)
+    looted.init(cfg, role, session)
+    downed.init(cfg, same_world, not tags)
+    glider.link_init(same_world)
+    drone.link_init(same_world, peer_id)
     builds.init(cfg, role, session)
     pings.init(cfg, role, session)
     corpses.init(cfg, role, zombies, session)
@@ -769,5 +818,10 @@ function phase1.init(c, r, peer_id, t)
     game.on_tick(on_tick)
     log.info(string.format("phase1: role=%s, sending %s, reading %s", role, mine, theirs))
 end
+
+-- The body limit ticks on its own, also outside co-op (when this file loads, which the menu does early).
+util.safe(function() require("mirror.bodycap").init(phase1.started) end, "bodycap.init")
+-- The forest giant too (a solo world has one as well; a guest only resizes the host's).
+util.safe(function() require("mirror.giant").init(phase1.started) end, "giant.init")
 
 return phase1

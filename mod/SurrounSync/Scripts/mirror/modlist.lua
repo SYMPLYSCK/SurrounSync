@@ -16,8 +16,9 @@ local list_win64, list_paks = nil, nil
 local NOT_MODS = { shared = true, SurrounSync = true, MirrorCoop = true }
 -- Mods SurrounSync switches from its own settings (MY SETTINGS), not from the MODS list: they only change how this
 -- PC's game looks, so they're never matched with the host either.
-modlist.BUILT_IN = { SyncFX = true }
+modlist.BUILT_IN = { SyncFX = true, SurrounDeadGore = true, ["pak:SurrounDeadGore.pak"] = true }
 modlist.FX = "SyncFX"
+modlist.GORE, modlist.GORE_PAK = "SurrounDeadGore", "pak:SurrounDeadGore.pak"
 local PAKS = { "~mods", "LogicMods" }
 local PAK_PARTS = { ".pak", ".ucas", ".utoc", ".sig" }
 
@@ -67,29 +68,10 @@ local function roots()
     return list_win64, list_paks
 end
 
--- folder names in p (UE's BlueprintFileUtils, like fs.list_files; savefs is only for the save code)
-local function list_dirs(p)
-    local cdo = StaticFindObject and StaticFindObject("/Script/BlueprintFileUtils.Default__BlueprintFileUtilsBPLibrary")
-    if not cdo then return nil end
-    local out = {}
-    if not pcall(function() cdo:FindRecursive(p, out, "*", false, true) end) then return nil end
-    local arr = out.FoundPaths or out
-    local names, prefix = {}, (p:gsub("[\\/]+$", "") .. "\\"):lower():gsub("/", "\\")
-    local function add(v)
-        local s = v
-        if type(s) ~= "string" then pcall(function() s = v:ToString() end) end
-        if type(s) ~= "string" then pcall(function() s = v:get():ToString() end) end
-        local full = tostring(s or ""):gsub("/", "\\")
-        local rest = full:lower():sub(1, #prefix) == prefix and full:sub(#prefix + 1) or nil
-        if rest and rest ~= "" and not rest:find("\\", 1, true) then names[#names + 1] = rest end
-    end
-    if type(arr) == "table" then for _, v in ipairs(arr) do add(v) end
-    else pcall(function() arr:ForEach(function(_, e) add(e:get()) end) end) end
-    return names
-end
-
+-- folder and file names in p (UE's BlueprintFileUtils, fs.lua; savefs is only for the save code)
 local function default_lister()
-    return { dirs = list_dirs, files = function(p) return require("mirror.fs").list_files(p) end }
+    local fs = require("mirror.fs")
+    return { dirs = fs.list_dirs, files = fs.list_files }
 end
 
 -- mods.txt: "Name : 1" per line
@@ -126,7 +108,9 @@ local function scan()
             local base, on
             if l:sub(-4) == ".pak" then base, on = f:sub(1, -5), true
             elseif l:sub(-8) == ".pak.off" then base, on = f:sub(1, -9), false end
-            if base and not seen[base:lower()] then
+            -- (SurrounSync's own paks - armory, glider, sounds - are part of it, like its Lua folder: never listed,
+            -- switched or matched with a host)
+            if base and not seen[base:lower()] and not base:match("^SurrounSync") then
                 seen[base:lower()] = true
                 out[#out + 1] = { id = "pak:" .. base .. ".pak", name = base, kind = "pak", sub = sub, base = base, on = on }
             end
@@ -237,6 +221,20 @@ function modlist.follow_reshade(on)
     if done == false then log.warn("modlist: couldn't switch ReShade for the next start: " .. tostring(err)) end
     if done then log.info("modlist: ReShade " .. done .. " from the next game start (follows SyncFX)") end
     return done
+end
+
+-- The gore mod is its Lua mod plus the pak of its blood assets (LogicMods: BPModLoaderMod loads them at every level
+-- load even with the Lua off), so both switch together; the Lua mod's state is the switch's. true = done.
+function modlist.set_gore(on)
+    scan()   -- (on the disk now: the listing can be 3 s old, and a pak renamed by hand since made the switch fail)
+    local lua, pak = find(modlist.GORE), find(modlist.GORE_PAK)
+    if not lua then return false end
+    if lua.on ~= on and not modlist.set(modlist.GORE, on) then return false end
+    if pak and pak.on ~= on and not modlist.set(modlist.GORE_PAK, on) then
+        log.warn("modlist: SurrounDeadGore.pak couldn't follow the gore switch")
+        return false
+    end
+    return true
 end
 
 function modlist.toggle(id)

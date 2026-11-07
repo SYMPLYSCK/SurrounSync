@@ -3,6 +3,20 @@
 
 # build output
 dist/
+# glider cook project (tools/glider/build-glider.ps1 makes all of these again)
+tools/glider/Build/
+tools/glider/Content/
+tools/glider/DerivedDataCache/
+tools/glider/Intermediate/
+tools/glider/Saved/
+tools/glider/out/
+# armory cook project (tools/armory/build-armory.ps1 makes all of these again)
+tools/armory/Build/
+tools/armory/Content/
+tools/armory/DerivedDataCache/
+tools/armory/Intermediate/
+tools/armory/Saved/
+tools/armory/out/
 mod/SurrounSync/bridge/
 
 # logs

@@ -16,6 +16,7 @@ local members = require("mirror.realmmembers")
 local link = require("mirror.link")
 local difficulty = require("mirror.difficulty")
 local worldset = require("mirror.worldset")
+local backups = require("mirror.backups")
 
 local realmplay = {}
 
@@ -188,11 +189,16 @@ function realmplay.model()
     for _, r in ipairs(realm.list()) do
         local info, open
         local here = (S and S.id == r.id) or joined == r.id
+        local pub = realm.pub(r.id)
+        local from_list = pub ~= nil and pub.from_list
         -- (short: one line of the handbook's wide capitals on the note)
         if r.offline then
             info, open = "Server out of reach - last copy kept", nil
         elseif r.host then
             info, open = "LIVE: " .. (r.host_name or "a member") .. " is playing", "JOIN"
+        elseif from_list then
+            -- (joined from the server list: only a game someone hosts - the server refuses anything else)
+            info, open = "Nobody's on - JOIN when someone hosts", nil
         elseif (r.gen or 0) < 1 then
             info = r.role == "owner" and "No world yet - START it" or "No world yet"
             open = r.role == "owner" and "START" or nil
@@ -207,8 +213,12 @@ function realmplay.model()
         -- unreachable copy only goes off this list
         local remove = r.offline and "REMOVE" or (r.role == "owner" and "DELETE" or "LEAVE")
         m.rows[#m.rows + 1] = { id = r.id, name = r.name, info = info, open = open, live = r.host ~= nil, here = here,
-                                owner = r.role == "owner", remove = remove }
+                                owner = r.role == "owner", remove = remove, from_list = from_list,
+                                listed = pub ~= nil and pub.listed, locked = pub ~= nil and pub.locked }
     end
+    -- the SERVERS tab: the last browse (realmmembers.browse)
+    m.servers, m.servers_at = realm.servers()
+    m.servers_failed = members.browse_failed
     if S then
         local r = S.id and realm.find(S.id)
         m.state = STEP_TEXT[S.step] or "One moment..."
@@ -369,6 +379,11 @@ function realmplay.start(id, retry)
     say("Opening " .. S.name .. "...", "info", "realm")
     realm.send("claim", id, function(ok, w, text)
         if not S or S.id ~= id then return end
+        if not ok and w[1] == "invited_only" then
+            -- joined from the public server list: only a game someone is hosting
+            abort("Nobody is playing " .. S.name .. " right now. You joined it from the server list, so you can play it while someone hosts it.")
+            return
+        end
         if not ok then abort("Couldn't reach the Realm (" .. text .. ")."); return end
         if w[1] == "hosted" then
             -- somebody already hosts it: join them like any co-op host (R4)
@@ -483,6 +498,7 @@ local function build()
     S.logged = true
     -- (first time here: the Realm's starter character, or a fresh one the game makes)
     realm.hold_character(S.id, nil)   -- (a held character comes back with its items now)
+    backups.take_realm(S.id, realm.char_dir(S.id), "before opening")   -- (the session's saves replace it)
     local mine = realm.character(S.id)
     S.had_char = mine ~= nil
     local character = mine or realm.starter(S.id)
@@ -658,7 +674,8 @@ local function upload(final, done)
     end
     if character then
         local ok, err = realm.store_character(id, character)
-        if not ok then log.error("realmplay: Realm character not stored: " .. tostring(err)) end
+        if not ok then log.error("realmplay: Realm character not stored: " .. tostring(err))
+        elseif final then backups.take_realm(id, realm.char_dir(id), "after leaving") end
     end
     if S.lost then if done then done(false) end; return end
     local side = realm.read_live(id)
@@ -852,7 +869,83 @@ local NEWGAME = "/Game/UI/Menus/Pages/NewGameDifficultySelectionPage.NewGameDiff
 local PLAY = NEWGAME .. ":BndEvt__DifficultySelectionPage_PlayButton_K2Node_ComponentBoundEvent_2_OnButtonClickedEvent__DelegateSignature"
 local NEW_WORLD_SETTLE = 5.0   -- s after the new world's player appears before its first save
 
-local function on_play()
+-- The character made on the New Game page. The page copies its looks into the Save_Player EMS holds under the current
+-- save name, and the world's player dresses from that object (SetSexMesh) and saves what it wears; the Journal's fields
+-- go to the controller instead. Play also moves that name to the co-op save, and a write landing in the own save's
+-- object left the Realm's character the default model with the right Journal (report 2026-11-03 16:38). So the looks
+-- are read from the page's settings actor here, and written to the co-op save's object at Play and before its first save.
+local SETTINGS = "/Game/Blueprints/BP_NewGameSettings.BP_NewGameSettings_C"
+local STATICS = "/Script/Engine.Default__GameplayStatics"
+local LOOKS = { -- Save_Player field, settings actor field
+    { "Sex", "Sex" }, { "EyebrowsType", "EyebrowsMesh" }, { "HairType", "HairMesh" }, { "HairColor", "HairColor" },
+    { "BeardType", "BeardMesh" }, { "BeardColor", "BeardColor" }, { "SkinColor", "SkinColor" }, { "MouthType", "MouthMesh" },
+    { "AccessoryType1", "Accessory1Mesh" }, { "AccessoryType2", "Accessory2Mesh" }, { "AccessoryType3", "Accessory3Mesh" },
+}
+
+local function settings_actor(page)
+    local gs, cls, a = util.cdo(STATICS), StaticFindObject(SETTINGS), nil
+    if page and gs and util.valid(cls) then pcall(function() a = gs:GetActorOfClass(page, cls) end) end
+    if util.valid(a) then return a end
+    for _, o in ipairs(FindAllOf("BP_NewGameSettings_C") or {}) do
+        local name = ""
+        pcall(function() name = o:GetFullName() end)
+        if util.valid(o) and not name:find("Default__", 1, true) then return o end
+    end
+    return nil
+end
+
+-- { field = "Male" / an asset's path / false for none }: paths, as nothing held from Lua lasts over the level load
+local function read_looks(page)
+    local st = settings_actor(page)
+    if not st then log.warn("realmplay: no New Game settings to read - the Realm's character keeps what the game gives it"); return nil end
+    local out = {}
+    for _, f in ipairs(LOOKS) do
+        local v
+        local ok = pcall(function() v = st[f[2]] end)
+        if f[1] == "Sex" then
+            pcall(function() v = v:ToString() end)
+            if type(v) == "string" then out.Sex = v end
+        elseif util.valid(v) then
+            pcall(function() out[f[1]] = v:GetFullName():match("^%S+ (.+)$") end)
+        elseif ok then
+            out[f[1]] = false
+        end
+    end
+    return out
+end
+
+-- Fields it couldn't write stay as they are (an asset gone from memory isn't loaded from here, L-014); returns how many
+local function write_looks(save, looks)
+    local missed = 0
+    for _, f in ipairs(LOOKS) do
+        local want, ok = looks[f[1]], true
+        if want == false then
+            ok = pcall(function() save[f[1]] = CreateInvalidObject() end)
+                or pcall(function() save[f[1]] = nil end)
+        elseif f[1] == "Sex" then
+            if want then ok = pcall(function() save.Sex = want end) end
+        elseif want then
+            local o = StaticFindObject(want)
+            ok = util.valid(o) and pcall(function() save[f[1]] = o end)
+        else
+            ok = false
+        end
+        if not ok then missed = missed + 1; log.warn("realmplay: new character's " .. f[1] .. " not written (" .. tostring(want) .. ")") end
+    end
+    return missed
+end
+
+local function dress_new_character()
+    if not S.looks then return end
+    local pl = game.player()
+    local save = session.player_save(pl)
+    if not save then log.warn("realmplay: no Save_Player for the new character's looks"); return end
+    local missed = write_looks(save, S.looks)
+    local ok, err = pcall(function() pl:SetSexMesh() end)
+    log.info(string.format("realmplay: new character dressed: %s, %d fields missed, %s", tostring(S.looks.Sex), missed, ok and "ok" or tostring(err)))
+end
+
+local function on_play(ctx)
     if not (S and S.step == "armed") then return end
     S.coop = session.next_coop_slot()
     if not S.coop then abort("Every co-op save was used this game run. Restart the game, then create the Realm's world again."); return end
@@ -863,10 +956,17 @@ local function on_play()
     if not slotguard.log_write(session_log("joined")) then abort("Couldn't record the Realm session."); return end
     S.logged, S.built = true, true
     step("new_game")
+    local page = util.obj(ctx)
+    S.looks = read_looks(page)
+    -- (should the game's write have gone to the own save's object, its file still has the player's character; the
+    -- page is the context, as the menu has no world of the mod's to give)
+    if page then session.forget_cached_player(S.own, page) end
     local ok = session.point_at(S.coop)
+    local save = S.looks and session.player_save(page)
+    if save then write_looks(save, S.looks) end
     log.info("realmplay: New Game started for " .. S.id .. " - its saves go to " .. S.coop .. " (" .. tostring(ok) .. ")")
 end
-local play_fn = function() util.safe(on_play, "realmplay.play") end
+local play_fn = function(ctx) util.safe(on_play, "realmplay.play", ctx) end
 local function hook_play() util.ensure_hook(PLAY, play_fn, nil, true) end
 
 local function arm(id, name)
@@ -947,51 +1047,43 @@ end
 
 -- at the main menu (no player ticks there): poll until the menu is up, then press its NEW GAME
 local function press_new_game()
-    if type(LoopAsync) ~= "function" or type(ExecuteInGameThread) ~= "function" then return end
-    local polls, up_since, done = 0, nil, false
+    local polls, up_since = 0, nil
     local key_since, key_done = nil, false
-    LoopAsync(250, function()
-        if done then return true end
-        ExecuteInGameThread(function()
-            util.safe(function()
-                if done then return end
-                polls = polls + 1
-                if not (S and S.step == "armed" and S.auto == "menu") then done = true; return end
-                if not key_done then
-                    local k = FindFirstOf(ANY_KEY)
-                    local shown = false
-                    if util.valid(k) then pcall(function() shown = k:IsInViewport() end) end
-                    if shown then key_since = key_since or polls else key_since = nil end
-                    if key_since and polls - key_since >= ANY_KEY_SETTLE then
-                        key_done = true
-                        local ok, err = pcall(function() k:ExecuteUbergraph_PressAnyKeyWidget(ANY_KEY_DONE) end)
-                        log.info("realmplay: past the main menu's PRESS ANY KEY -> " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
-                    end
-                end
-                -- the main menu on the screen. (In-game FindFirstOf found the one from the game's start - removed
-                -- when the save loaded, not freed yet - so every one is checked. session.loading() is no use here:
-                -- it clears only when a world's player appears, never at the main menu.)
-                local m
-                for _, w in ipairs(FindAllOf(MENU) or {}) do
-                    local on = false
-                    if util.valid(w) then pcall(function() on = w:IsInViewport() end) end
-                    if on then m = w; break end
-                end
-                if not m then up_since = nil elseif not up_since then up_since = polls end
-                if up_since and polls - up_since >= MENU_SETTLE then
-                    done = true
-                    S.auto = nil
-                    local ok, err = pcall(function() m[NEW_GAME](m) end)
-                    log.info("realmplay: pressed the main menu's NEW GAME -> " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
-                elseif polls >= MENU_GIVE_UP then
-                    done = true
-                    S.auto = nil
-                    log.warn("realmplay: the main menu didn't come up in 120 s - the player presses NEW GAME")
-                end
-            end, "realmplay.press_new_game")
-        end)
-        return false
-    end)
+    util.game_loop(250, function()
+        polls = polls + 1
+        if not (S and S.step == "armed" and S.auto == "menu") then return true end
+        if not key_done then
+            local k = FindFirstOf(ANY_KEY)
+            local shown = false
+            if util.valid(k) then pcall(function() shown = k:IsInViewport() end) end
+            if shown then key_since = key_since or polls else key_since = nil end
+            if key_since and polls - key_since >= ANY_KEY_SETTLE then
+                key_done = true
+                local ok, err = pcall(function() k:ExecuteUbergraph_PressAnyKeyWidget(ANY_KEY_DONE) end)
+                log.info("realmplay: past the main menu's PRESS ANY KEY -> " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
+            end
+        end
+        -- the main menu on the screen. (In-game FindFirstOf found the one from the game's start - removed
+        -- when the save loaded, not freed yet - so every one is checked. session.loading() is no use here:
+        -- it clears only when a world's player appears, never at the main menu.)
+        local m
+        for _, w in ipairs(FindAllOf(MENU) or {}) do
+            local on = false
+            if util.valid(w) then pcall(function() on = w:IsInViewport() end) end
+            if on then m = w; break end
+        end
+        if not m then up_since = nil elseif not up_since then up_since = polls end
+        if up_since and polls - up_since >= MENU_SETTLE then
+            S.auto = nil
+            local ok, err = pcall(function() m[NEW_GAME](m) end)
+            log.info("realmplay: pressed the main menu's NEW GAME -> " .. tostring(ok) .. (ok and "" or (" " .. tostring(err))))
+            return true
+        elseif polls >= MENU_GIVE_UP then
+            S.auto = nil
+            log.warn("realmplay: the main menu didn't come up in 120 s - the player presses NEW GAME")
+            return true
+        end
+    end, "realmplay.press_new_game")
 end
 
 local function free_to_start()
@@ -1092,6 +1184,7 @@ local function create_tick(dt)
         if session.loading() or not util.valid(game.player()) then S.t = 0.0; return end
         if S.t < NEW_WORLD_SETTLE then return end
         if session.current_name() ~= S.coop then session.point_at(S.coop) end
+        util.safe(dress_new_character, "realmplay.dress")
         if S.diff then
             local ok, n = util.safe(difficulty.apply, "realmplay.difficulty", S.diff)
             log.info("realmplay: the new Realm takes the creator's difficulty (" .. tostring(ok and n or 0) .. " settings)")
@@ -1264,6 +1357,7 @@ function realmplay.recover()
             return
         end
         if character then
+            backups.take_realm(id, realm.char_dir(id), "before crash recovery")   -- (the stored one is replaced next)
             local ok, err = realm.store_character(id, character)
             if not ok then return rescue_later(t, "Realm character not rescued yet: " .. tostring(err)) end
             -- (a CREATE that crashed before its first upload: the New Game character is the starter too)
@@ -1283,28 +1377,20 @@ end
 -- hands out the bridge's answers) rides the player's: left_by_menu's upload answer never came at the menu, so the
 -- Realm save stayed, the session log stayed and Continue could load the Realm's world (same as session.lua's
 -- menu exit, kit 2026-10-30). Only what the exit waits on (the bridge's answers, an upload waiting for a save) is
--- run from LoopAsync + the game thread while no game tick runs, until it's done.
+-- run from a game-thread loop (util.game_loop) while no game tick runs, until it's done.
 local last_tick = 0.0
 local function menu_ticks()
-    if type(LoopAsync) ~= "function" or type(ExecuteInGameThread) ~= "function" then return end
-    local done, polls = false, 0
-    LoopAsync(250, function()
-        if done then return true end
-        ExecuteInGameThread(function()
-            util.safe(function()
-                if done then return end
-                polls = polls + 1
-                -- (5 min: past every bridge timeout; the game's tick takes over once a world's player exists)
-                if not S or polls >= 1200 then done = true; return end
-                if os.clock() - last_tick > 0.5 then
-                    link.flush_cmds()
-                    realm.tick(0.25)
-                    if S then upload_wait_tick(0.25) end
-                end
-            end, "realmplay.menu_tick")
-        end)
-        return false
-    end)
+    local polls = 0
+    util.game_loop(250, function()
+        polls = polls + 1
+        -- (5 min: past every bridge timeout; the game's tick takes over once a world's player exists)
+        if not S or polls >= 1200 then return true end
+        if os.clock() - last_tick > 0.5 then
+            link.flush_cmds()
+            realm.tick(0.25)
+            if S then upload_wait_tick(0.25) end
+        end
+    end, "realmplay.menu_tick")
 end
 
 function realmplay.init(c)
@@ -1346,16 +1432,9 @@ function realmplay.init(c)
         last_tick = os.clock()
         util.safe(tick, "realmplay.tick", dt or 0)
     end)
-    if type(LoopAsync) == "function" and type(ExecuteInGameThread) == "function" then
-        LoopAsync(5000, function()
-            ExecuteInGameThread(function()
-                util.safe(function()
-                    if os.clock() - last_tick > 2 and confirm_hosting() then link.flush_cmds() end
-                end, "realmplay.hosting_watch")
-            end)
-            return false
-        end)
-    end
+    util.game_loop(5000, function()
+        if os.clock() - last_tick > 2 and confirm_hosting() then link.flush_cmds() end
+    end, "realmplay.hosting_watch")
     booted, list_wanted = os.time(), true   -- (the first list goes once the bridge is up)
     log.info("realmplay: Realms on")
 end

@@ -18,10 +18,16 @@ local SHARED = {
     version = true, notify = true, menu = true, menu_backups = true, journal_tab = true, fs = true, savefs = true,
     slotguard = true, backups = true, beds = true, bedtags = true, names = true, jig = true, instance = true,
     loader = true, hostrules = true, mysettings = true, modlist = true, localdir = true, uepath = true, status = true, itemclean = true, devtest = true, invdiag = true, probe = true, recorder = true,
-    phase0 = true, peers = true, xp = true, doorlock = true, difficulty = true, worldset = true,
+    phase0 = true, peers = true, xp = true, doorlock = true, vehlock = true, difficulty = true, worldset = true,
     -- one Realm per game: a copy's own realmplay was never started and said it hosted nothing, so every join after
     -- the first friend's was refused "isn't hosting that Realm right now" (player report 2026-10-29)
     realmplay = true,
+    -- one forest giant per world: a copy per guest each spawned, grew and mourned the same boss (audit 2026-11-02)
+    giant = true,
+    -- one animation gate per game: only main.lua inits it, so a copy's own gate never ticked - its first queued
+    -- destroy never ran and its hold kept the animation cvars at 0, while the main gate could put them back under
+    -- it (audit 2026-11-02)
+    animgate = true,
 }
 -- What a mate instance (another guest, seen from a guest) gets its own copy of; the rest is the host link's.
 local PRESENCE = {
@@ -29,7 +35,14 @@ local PRESENCE = {
     clockmap = true, anim = true, look = true, fire = true, lights = true, tactical = true, nametag = true,
     netq = true, pvp = true, save_guard = true, chat = true, voice = true, teleport = true, compat = true,
     throwables = true, vehicles = true, zombies = true, group = true, corpses = true, zfx = true,
+    -- another guest down: their copy hears it and sends my revive (downed.lua)
+    downed = true,
+    -- another guest's glider on their ghost (glider.lua)
+    glider = true,
+    -- another guest's FPV quad (drone.lua)
+    drone = true,
 }
+SHARED.dronegrant = true   -- who may fly the bundled FPV drone: one list per game (dronegrant.lua)
 
 local list = {}          -- out tag -> instance
 local cfg, role, last_role
@@ -200,6 +213,11 @@ local main_out = { host = "host", guest = "guest" }
 -- player slots (host 0, guests 1-3) from the roster; without one, the two-player layout
 local my_slot, main_slot
 function peers.my_slot() return my_slot or (role == "guest" and 1 or 0) end
+-- Steam ids from the roster: mine, the main link's player, and everyone in co-op with me ({ id=, name= })
+local my_id, main_id, players = nil, nil, {}
+function peers.my_id() return my_id end
+function peers.main_id() return main_id end
+function peers.players() return players end
 -- When a Realm's host leaves, only the guest in the lowest slot takes it over: with two guests both did, the server
 -- gave it to one and the other left and loaded back in (player report 2026-10-29 22:28). True if that's me, else
 -- false and the name of the guest who does.
@@ -265,15 +283,18 @@ local function read_roster()
             inst.started = false
         end
     end
+    local who = {}
     for line in s:gmatch("[^\n]+") do
-        local me = line:match("^me (%d+) ")
-        if me then my_slot = tonumber(me) end
+        local me, me_id = line:match("^me (%d+) (%d+)")
+        if me then my_slot, my_id = tonumber(me), me_id end
         local out, inn, slot, id, state, name = line:match("^peer (%S+) (%S+) (%d+) (%d+) (%S+) ?(.*)$")
-        if out and out == main_out[role] then main_slot = tonumber(slot) end
+        if out and out == main_out[role] then main_slot, main_id = tonumber(slot), id end
+        if out and state ~= "silent" then who[#who + 1] = { id = id, name = name ~= "" and name or id } end
         if out and out ~= main_out[role] and state ~= "silent" then
             start_instance({ out = out, inn = inn, slot = tonumber(slot), id = id, state = state, name = name ~= "" and name or id })
         end
     end
+    players = who
 end
 
 -- The bridge's player list -> instances. Called every frame by the main link (phase1) while co-op runs.
@@ -303,7 +324,7 @@ function peers.stop()
         if inst.started and inst.phase1 then pcall(inst.phase1.stop) end
         inst.started = false
     end
-    role = nil
+    role, players, main_id = nil, {}, nil
 end
 
 return peers

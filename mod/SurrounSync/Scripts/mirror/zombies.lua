@@ -338,6 +338,32 @@ local function loot_ready()
     return missing == 0, missing
 end
 
+-- For our own spawns where no ordinary AI is near (the forest giant): the game then has none of the tables loaded.
+-- The engine's latent LoadAsset only queues an async load and returns, and the game loads them itself the way it
+-- streams a level (kit 2026-11-02: 15 queued in 0.0 ms, none there yet, all 15 there 0.25 s later) - unlike
+-- LoadAsset or GetAsset from Lua, which wait for the load (L-014). Nothing holds them: they go again at a garbage
+-- collection once nothing uses them. Returns how many were asked for (0: all there, asked under 20 s ago, no world).
+function zombies.load_loot_tables()
+    local t = os.clock()
+    if loot_ready() or t < (loot_obj._asked or -100) + 20 then return 0 end
+    local K, w = util.cdo("/Script/Engine.Default__KismetSystemLibrary"), game.world()
+    if not (K and w) then return 0 end
+    loot_obj._asked = t
+    local n = 0
+    for i, name in ipairs(LOOT_TABLES) do
+        if not loot_obj[name] then
+            local path = "/Game/AI/AILootTables/DA_LootTable_" .. name .. ".DA_LootTable_" .. name
+            if pcall(function()
+                K:LoadAsset(w, K:Conv_SoftObjPathToSoftObjRef(K:MakeSoftObjectPath(path)), {},
+                    { Linkage = 0, UUID = 771100 + i, ExecutionFunction = FName("None"), CallbackTarget = w })
+            end) then n = n + 1 end
+        end
+    end
+    loot_obj._at, loot_obj._wait = t + 0.5, 1.0   -- (looked for again soon, not after the up-to-8 s wait)
+    log.info("zombies: asked the game to load " .. n .. " AI loot table(s)")
+    return n
+end
+
 -- Our own zombie spawns must never make the game load anything (DBG-20261027-016): the zombie BP's BeginPlay
 -- (Event_SetMeshAndMaterial) LoadAsset's a random Meshes_Soft / Materials_Soft entry of the class defaults. One
 -- whose package is still streaming in makes the engine flush async loading inside our SpawnActor, and the loading
@@ -348,6 +374,7 @@ end
 -- for the master zombie's family a list that can't be read is a failure, never "empty", and every entry must
 -- resolve to the loaded look afterwards (Conv_SoftObjectReferenceToObject never loads).
 local MZ = "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C"
+local BEGIN_EVENT = "/Game/Animations/Notifies/AnimNotify_BeginEvent.AnimNotify_BeginEvent_C:Received_NotifyBegin"
 local function pin_soft_looks(cdo, mesh, mat)
     if not cdo then return function() end end
     local K = util.cdo("/Script/Engine.Default__KismetSystemLibrary")
@@ -424,13 +451,15 @@ local function material_asset(m)
     return m
 end
 
--- Zombie archetypes: BP_MasterZombie rolls one in SelectArchetype 1.0-1.25 s after BeginPlay and crawlers
--- roll ToughenedCrawler (and which legs are missing) inside BeginPlay, so each game rolls its own. The host
--- sends its archetype, hidden bones and whether the eyes glow (EyesColour's dynamic material); copies match.
+-- Zombie archetypes: BP_MasterZombie rolls one in SelectArchetype 1.0-1.25 s after BeginPlay, so each game
+-- rolls its own. The host sends its archetype, hidden bones and whether the eyes glow (EyesColour's dynamic
+-- material); copies match. Since game build 26467602 a crawler is no class of its own (BP_Zombie_Crawler is
+-- gone): SelectArchetype's Archetype_Crawler gives any zombie the crawl blend space, a 40 cm capsule, missing
+-- legs, and sometimes ToughenedCrawler inside it. Crawler is the last number: the numbers are on the wire.
 -- (MZ: the master zombie class, above pin_soft_looks)
-local ARCH = { "Sprinter", "UltraRadiated", "Acidic", "Screamer", "Grenadier", "ToughenedCrawler" }
+local ARCH = { "Sprinter", "UltraRadiated", "Acidic", "Screamer", "Grenadier", "ToughenedCrawler", "Crawler" }
 local ARCH_CHANCES = { "SprinterArchetypeChance", "UltraRadiatedArchetypeChance", "AcidicArchetypeChance",
-    "ScreamerArchetypeChance", "GrenadierArchetypeChance" }
+    "ScreamerArchetypeChance", "GrenadierArchetypeChance", "CrawlerArchetypeChance" }
 local BONES = { "Jaw", "lowerarm_r", "lowerarm_l", "calf_l", "Foot_R", "calf_r", "Foot_L" }
 local BIT = { 1, 2, 4, 8, 16, 32, 64 }
 local bone_fnames = {}
@@ -446,6 +475,8 @@ for i, a in ipairs(ARCH) do
         local n
         pcall(function() n = util.fname(self:get()) end)
         if not n then return end
+        -- (Archetype_Crawler calls ToughenedCrawler: the crawler is what the copy has to run)
+        if a == "ToughenedCrawler" and ARCH[arch_seen[n] or 0] == "Crawler" then return end
         if arch_seen_n > 4000 then arch_seen, arch_seen_n = {}, 0 end
         if not arch_seen[n] then arch_seen_n = arch_seen_n + 1 end
         arch_seen[n] = i
@@ -463,6 +494,13 @@ end
 local function hook_archetypes()
     for i, a in ipairs(ARCH) do util.ensure_hook(MZ .. ":Archetype_" .. a, arch_hooks[i]) end
     util.ensure_hook(MZ .. ":Event_BloodMoon", arch_hooks.moon.hook)
+    util.ensure_hook(BEGIN_EVENT, function(self, mc) return arch_hooks.notify(self, mc) end)
+end
+-- Archetype_Crawler loads nothing (the blend space and Toughened's meshes are the class's own references):
+-- a copy runs it whether or not this game rolled a crawler lately. -> when this game is known to have it loaded
+local function arch_ready(i)
+    if ARCH[i] == "Crawler" then return os.clock() end
+    return arch_hooks.ready[i]
 end
 local function bone_fname(i)
     local f = bone_fnames[i]
@@ -492,7 +530,7 @@ local function arch_of(z, name)
         elseif util.valid(z.BloodSpitFX) then a = 3
         elseif (path_of(z.Mesh:GetSkinnedAsset()) or ""):find("Zombie_grenadier", 1, true) then a = 5
         elseif z.Mesh:IsBoneHiddenByName(bone_fname(1)) then a = 4
-        elseif (util.class_name(z) or ""):find("Crawler", 1, true) and z.DamageComponent["CanHeadshot1Shot?"] == false then a = 6 end
+        elseif z.CapsuleComponent:GetUnscaledCapsuleHalfHeight() < 60 then a = 7 end   -- (Archetype_Crawler: 40 cm)
     end)
     return a
 end
@@ -791,9 +829,7 @@ local pass_in = 0.0
 local active = false
 local secondary = false
 local active_at = 0.0
-local player_cls = nil
-local warned_ignore = false
-local stats = { spawned = 0, removed_native = 0, spawners = 0 }
+local stats = { spawned = 0, removed_native = 0, spawners = 0, swings_cut = 0 }
 local loot_ok = false
 local loot_wait_logged = 0
 local spawn_budget = 0
@@ -803,6 +839,12 @@ local spawned_class = {}
 -- by any of them is a copy here too (never swept as "own AI", never a damage source)
 local ANY_COPIES = require("mirror.peers").shared_table("zombie_copies")
 ANY_COPIES[zombies] = copy_addr
+-- a guest's copy of the host's zombie <id> (nil when there is none right now)
+function zombies.copy_actor(id)
+    local c = copies[id]
+    return c and util.valid(c.z) and c.z or nil
+end
+
 function zombies.is_copy(obj)
     local a = util.addr(obj) or 0
     if copy_addr[a] ~= nil then return true end
@@ -840,13 +882,26 @@ local function contain_copy(z)
         cm.BrakingFrictionFactor = 0.0
     end)
     pcall(function() z.DamageComponent["CanHeadshot1Shot?"] = false end)
-    if not util.valid(player_cls) then player_cls = StaticFindObject(PLAYER) end
-    if util.valid(player_cls) then
-        if family_of(z) == "zombie" then
-            local ok = pcall(function() local a = z.ClassesToIgnore; a[a:GetArrayNum() + 1] = player_cls end)
-            if not ok and not warned_ignore then warned_ignore = true; log.warn("zombies: couldn't add the player to a copy's ClassesToIgnore") end
-        end
-    end
+end
+
+-- A copy's own swing must not hit anyone here: the host's zombie does the hitting and sends it. The attack
+-- montages' AnimNotify_BeginEvent starts a looping timer by name on whatever plays them (AttackTrace, BiteTrace,
+-- LeftArmTrace, RightArmTrace), and its hit runs Event_OnHit. Copies play the host's montages. Up to game build
+-- 26303910 the traces skipped every class in the zombie's ClassesToIgnore, where the player class went; since
+-- 26467602 that list is gone and they skip only actors tagged Zombie (kit 2026-11-07: a copy's RightArmTrace
+-- ran its Event_OnHit on the guest). The hook runs after the notify set the timer, so the copy's is cleared
+-- before it first fires.
+arch_hooks.notify = function(self, mc)
+    local m, n, owner, ev
+    pcall(function() m = mc:get(); n = self:get() end)
+    if not (util.valid(m) and util.valid(n)) then return end
+    pcall(function() owner = m:GetOwner() end)
+    if not (util.valid(owner) and zombies.is_copy(owner)) then return end
+    pcall(function() ev = n.EventName:ToString() end)
+    if type(ev) ~= "string" or not ev:find("Trace$") then return end
+    pcall(function() util.cdo("/Script/Engine.Default__KismetSystemLibrary"):K2_ClearTimer(owner, ev) end)
+    stats.swings_cut = stats.swings_cut + 1
+    if stats.swings_cut <= 3 then log.info("zombies: a copy's " .. ev .. " stopped (the host's zombie hits)") end
 end
 
 -- (zg: the animation gate's state and zg.ready, defined above apply_hit)
@@ -1254,7 +1309,7 @@ local function sync_look(id, c, e)
     if x and x.arch > 0 and c.arch ~= x.arch then
         local mine
         pcall(function() mine = arch_of(z, util.fname(z)) end)
-        local seen = arch_hooks.ready[x.arch]
+        local seen = arch_ready(x.arch)
         if mine ~= x.arch and seen and os.clock() - seen < ARCH_READY_S then
             if not zg.ready() then c.look_at = 0; return end   -- (it can swap meshes: next snapshot)
             local ok, err
@@ -1262,7 +1317,8 @@ local function sync_look(id, c, e)
             perf.run("z.look.arch", function() ok, err = pcall(function() local f = z["Archetype_" .. ARCH[x.arch]]; f(z) end) end)
             arch_hooks.calling = false
             if not ok then log.warn("zombies: copy " .. id .. " archetype " .. ARCH[x.arch] .. ": " .. tostring(err))
-            else c.arch_ran = true end
+            -- (a Crawler hides a random leg pair: the bones pass below may unhide again, to the host's pair)
+            else c.arch_ran, c.bones_done = true, nil end
         elseif mine ~= x.arch then
             -- not run here: the archetype's looks only (zfx.lua)
             util.safe(zombies.fx.looks, "zombies.fx_looks", c, x.arch)
@@ -2137,20 +2193,38 @@ function p8.spawn_original(e)
         for _, k in ipairs(ARCH_CHANCES) do pcall(function() z[k] = 0 end) end
         pcall(function() if mesh and not util.same(z.Mesh:GetSkinnedAsset(), mesh) then z.Mesh:SetSkinnedAssetAndUpdate(mesh, false) end end)
         pcall(function() if mat then z.Mesh:SetMaterial(0, mat) end end)
-        local seen = e.arch > 0 and arch_hooks.ready[e.arch]
+        local seen = e.arch > 0 and arch_ready(e.arch)
+        local ran = false
         if seen and os.clock() - seen < ARCH_READY_S then
             arch_hooks.calling = true
-            pcall(function() local f = z["Archetype_" .. ARCH[e.arch]]; f(z) end)
+            ran = pcall(function() local f = z["Archetype_" .. ARCH[e.arch]]; f(z) end)
             arch_hooks.calling = false
         end
+        -- (a Crawler hides a random leg pair of its own: the other pair is shown again)
         for i = 1, #BONES do
-            if (e.bones // BIT[i]) % 2 == 1 then pcall(function() z.Mesh:HideBoneByName(bone_fname(i), 0) end) end
+            if (e.bones // BIT[i]) % 2 == 1 then pcall(function() z.Mesh:HideBoneByName(bone_fname(i), 0) end)
+            elseif ran then pcall(function() z.Mesh:UnHideBoneByName(bone_fname(i)) end) end
         end
         if e.eyes == 2 then pcall(function() z:Event_BloodMoon(true) end) end
         if e.h and e.h > 0 then pcall(function() z.DamageComponent.CurrentHealth = e.h end) end
     end)
     restore()
     if not ok then error(err, 0) end
+    return z
+end
+-- one of our own zombies of a loaded class, under the hand-back's no-load rules (DBG-20261027-016: a plain
+-- SpawnActor of a boss froze the kit host 2026-11-01); nil when it can't be spawned safely. The loot tables are
+-- checked here: loot_ok is only kept up to date in a guest's tick (a host's spawn_safe saw it false 2026-11-01).
+-- A refusal returns nil plus why.
+function zombies.spawn_safe(cls_path, loc, yaw)
+    local ready, missing = loot_ready()
+    if not ready then return nil, tostring(missing) .. " AI loot table(s) not loaded yet" end
+    local saved = loot_ok
+    loot_ok = true
+    local ok, z = pcall(p8.spawn_original, { cls = cls_path, loc = loc, yaw = yaw or 0, arch = 0, bones = 0 })
+    loot_ok = saved
+    if not ok then error(z, 0) end
+    if not z then return nil, "class not loaded, or no loaded look to pin" end
     return z
 end
 -- one spawn every 0.25 s at most (a spawn is 4-40 ms of engine work); true once every offered zombie has one
@@ -2227,6 +2301,7 @@ local selftest_in, selftest_copy = 0.0, nil
 local function selftest_file() return require("mirror.localdir").get() .. "\\mirror_selftest_" .. role .. ".txt" end
 
 local want_steamtest = false
+function zombies.key_status() want_steamtest = true end   -- (also /status, chatcmd.lua)
 
 local function bench()
     local c
@@ -2444,6 +2519,7 @@ zombies._test.read = read_snapshot
 zombies._test.zhit = function(p) return apply_zhit(p) end
 zombies._test.dmg = function(p) return apply_dmg(p) end
 zombies._test.loot_ready = function() return loot_ready() end
+zombies.loot_ready = function() return loot_ready() end   -- (giant.lua: the AI loot tables are loaded)
 
 function zombies.tick(dt)
     if not (cfg and cfg.zombies.enabled) then return end
@@ -2706,17 +2782,19 @@ local function forget_world()
     p8.handed, p8.handing, p8.offer, p8.pending, p8.reenable, p8.taken, p8.brainless, p8.bound = {}, nil, nil, {}, nil, nil, {}, {}
     arch_seen, arch_seen_n = {}, 0
     rad.comp, rad.seen, rad.retry = nil, nil, 0
-    cache, missed, appeared, loot_obj, fam_cls, fam_retry, player_cls = {}, {}, {}, {}, {}, {}, nil
+    cache, missed, appeared, loot_obj, fam_cls, fam_retry = {}, {}, {}, {}, {}, {}
 end
 
 -- opts.secondary: a copy for another player (group.lua) - the main copy does the sweeps, spawners and loading
 function zombies.init(c, r, s, opts)
     cfg, role, session = c, r, s
+    -- (built again below for this role: wrapping the last start's grew by one layer per co-op start on a guest)
+    install_host_hooks = function() end
     secondary = opts and opts.secondary or false
     zombies.fx.init(zombies, r)
     game.on_world_reset(forget_world)
     util.safe(watch_new_zombies, "zombies.watch")
-    game.keybind("F12", { ModifierKey.CONTROL }, function() want_steamtest = true end)
+    game.keybind("F12", { ModifierKey.CONTROL }, zombies.key_status)
     if not cfg.zombies.enabled then return end
     game.player_hook("ReceiveAnyDamage", function(self, Damage, DamageType, InstigatedBy, DamageCauser)
         local causer = util.obj(DamageCauser)
@@ -2749,6 +2827,7 @@ function zombies.init(c, r, s, opts)
             log.every("zombies.blocked", 30, "zombies: blocked damage from a zombie copy (the host decides its hits)")
         end
     end)
+    local function zero(...) for _, v in ipairs({ ... }) do pcall(function() v:set(0) end) end end
     if role == "host" then
         local DC = "/Game/Blueprints/Components/DamageComponent.DamageComponent_C"
         local function on_host_damage(self, DmgAmount, DmgType, DmgCauser)
@@ -2798,6 +2877,8 @@ function zombies.init(c, r, s, opts)
             return string.format("%d %.1f %.1f %.1f", id, l.X, l.Y, l.Z)
         end
         local function g(v) local r; pcall(function() r = v:get() end); return r end
+        -- (sent to the ghost's player, whose own game applies it; the ghost here kept it as well - bleeding, infection
+        -- and radiation on a character nobody plays - so its chances are set to 0 once sent, as a guest does for a copy)
         game.on_ready(function()
             util.hook(GFL .. ":ApplyMedicalEffect", function(self, Actor, Effects, CB, CHB, CBB, CI, Ctx)
                 local who = zinfo(Actor, Ctx)
@@ -2806,16 +2887,19 @@ function zombies.init(c, r, s, opts)
                 pcall(function() util.each(Effects:get(), function(_, e) names[#names + 1] = (e:get():ToString():gsub(" ", "_")) end) end)
                 meds:send(string.format("M %s %.3f %.3f %.3f %.3f %s", who, g(CB) or 0, g(CHB) or 0, g(CBB) or 0, g(CI) or 0,
                     #names > 0 and table.concat(names, ",") or "-"))
+                zero(CB, CHB, CBB, CI)
             end)
             util.hook(GFL .. ":ApplyRadiationDamage", function(self, Actor, Chance, Rad, Mask, Ctx)
                 local who = zinfo(Actor, Ctx)
                 if not who then return end
                 meds:send(string.format("R %s %.3f %.3f %d", who, g(Chance) or 0, g(Rad) or 0, g(Mask) and 1 or 0))
+                zero(Chance, Rad)
             end)
             util.hook(GFL .. ":ApplyBiteInfection", function(self, Actor, Chance, Crawler, Ctx)
                 local who = zinfo(Actor, Ctx)
                 if not who then return end
                 meds:send(string.format("B %s %.3f %d", who, g(Chance) or 0, g(Crawler) and 1 or 0))
+                zero(Chance)
             end)
         end)
     else
@@ -2825,11 +2909,16 @@ function zombies.init(c, r, s, opts)
             local p = game.player()
             return p ~= nil and util.addr(target) == util.addr(p)
         end
-        local function zero(...) for _, v in ipairs({ ... }) do pcall(function() v:set(0) end) end end
+        -- (the host's character here: a copy that reaches it hurts nobody - the host's own zombie does that in theirs)
+        local function on_ghost(actor_param)
+            local target = util.obj(actor_param)
+            return target ~= nil and ghost.is(target)
+        end
         local function g(v) local r; pcall(function() r = v:get() end); return r end
         game.on_ready(function()
             util.hook(GFL .. ":ApplyMedicalEffect", function(self, Actor, Effects, CB, CHB, CBB, CI, Ctx)
-                if from_copy(Actor, Ctx) then zero(CB, CHB, CBB, CI); log.info("zombies: blocked a copy's medical effect") end
+                if from_copy(Actor, Ctx) then zero(CB, CHB, CBB, CI); log.info("zombies: blocked a copy's medical effect")
+                elseif on_ghost(Actor) then zero(CB, CHB, CBB, CI) end
             end)
             util.hook(GFL .. ":ApplyRadiationDamage", function(self, Actor, Chance, Rad, Mask, Ctx)
                 if from_copy(Actor, Ctx) then
@@ -2837,10 +2926,13 @@ function zombies.init(c, r, s, opts)
                     zero(Chance, Rad)
                     rad.take_back(amount)
                     log.info("zombies: blocked a copy's radiation")
+                elseif on_ghost(Actor) then
+                    zero(Chance, Rad)
                 end
             end)
             util.hook(GFL .. ":ApplyBiteInfection", function(self, Actor, Chance, Crawler, Ctx)
-                if from_copy(Actor, Ctx) then zero(Chance); log.info("zombies: blocked a copy's bite infection") end
+                if from_copy(Actor, Ctx) then zero(Chance); log.info("zombies: blocked a copy's bite infection")
+                elseif on_ghost(Actor) then zero(Chance) end
             end)
         end)
     end

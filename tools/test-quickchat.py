@@ -1,10 +1,12 @@
-"""The quick chat (mirror/quickchat.lua) on stand-in UMG widgets: "/" with the handbook closed opens it in a co-op or
-Realm session only, Enter sends through the chat (commands included), Esc closes, the last lines and the command
-tip show. No game needed; UMG calls themselves are pcall-wrapped, so the logic around them is what's tested.
+"""The quick chat (mirror/quickchat.lua) on stand-in UMG widgets: "/" with the handbook closed opens it, Enter sends
+through the chat (commands included), Esc closes, the last lines and the command tip show; with nobody to talk to only
+commands go. And mirror/chatcmd.lua: every hotkey in the mod's source is a command, and runs what the key runs.
+No game needed; UMG calls themselves are pcall-wrapped, so the logic around them is what's tested.
 
     PYTHONPATH=tools/testpkg python tools/test-quickchat.py
 """
 import os
+import re
 import sys
 
 try:
@@ -79,7 +81,7 @@ package.preload["mirror.game"] = function()
         player = function() return PLAYER end,
         controller = function() return PC end,
         keybind = function(name, mods, fn, always) KEYS[name] = { fn = fn, always = always } end,
-        on_world_reset = function(fn) RESETS[#RESETS + 1] = fn end,
+        on_widgets_cleared = function() end, on_world_reset = function(fn) RESETS[#RESETS + 1] = fn end,
     }
 end
 
@@ -87,10 +89,12 @@ ACTIVE, SENT, SEND_OK, HISTORY = false, {}, true, {}
 qc = require("mirror.quickchat")
 qc.configure{
     active = function() return ACTIVE end,
-    send = function(t) SENT[#SENT + 1] = t; return SEND_OK end,
+    send = function(t) SENT[#SENT + 1] = t; if SEND_HOOK then SEND_HOOK() end; return SEND_OK end,
     recent = function(n) local o = {}; for i = math.max(1, #HISTORY - n + 1), #HISTORY do o[#o + 1] = HISTORY[i] end; return o end,
     tip = function(t) return t:sub(1, 1) == "/" and ("tip for " .. t) or nil end,
+    say = function(t) SAID[#SAID + 1] = t end,
 }
+SAID = {}
 function TICK(n) for _ = 1, n or 1 do qc.tick(0.1) end end
 function PRESS(k) KEYS[k].fn(); TICK(1) end
 -- the input box the quick chat made, and the text blocks in the order made
@@ -127,8 +131,6 @@ def opening():
     print("opening")
     L = make()
     check(L.eval('KEYS.OEM_TWO ~= nil and KEYS.RETURN ~= nil and KEYS.ESCAPE ~= nil') is True, "/, Enter and Esc are bound")
-    L.execute('PRESS("OEM_TWO")')
-    check(L.eval('qc.is_open()') is False, "not in a session: / does nothing")
     L.execute('ACTIVE = true; PLAYER["JournalOpen?"] = true; PRESS("OEM_TWO")')
     check(L.eval('qc.is_open()') is False, "handbook open: / does nothing (its own chat is there)")
     L.execute('PLAYER["JournalOpen?"] = false; PC.bShowMouseCursor = true; PRESS("OEM_TWO")')
@@ -148,6 +150,23 @@ def opening():
     check(errors(L) == [], "no warnings: %s" % errors(L))
 
 
+def alone():
+    print("alone")
+    L = make()
+    L.execute('PRESS("OEM_TWO")')
+    check(L.eval('qc.is_open()') is True, "not in a session: / opens it too, for the commands")
+    L.execute('INPUT().typed = "hello"; PRESS("RETURN")')
+    check(L.eval('#SENT') == 0 and L.eval('qc.is_open()') is True and L.eval('#SAID') == 1,
+          "a plain line isn't sent: it says why and the line stays")
+    L.execute('INPUT().typed = "/fly"; PRESS("RETURN")')
+    check(L.eval('SENT[1]') == "/fly" and L.eval('qc.is_open()') is False, "a command goes through the chat")
+    L.execute('PRESS("OEM_TWO"); TICK(3)')
+    check(L.eval('qc.is_open()') is True, "it stays open though no session runs")
+    L.execute('PRESS("ESCAPE")')
+    check(L.eval('qc.is_open()') is False, "Esc closes it")
+    check(errors(L) == [], "no warnings: %s" % errors(L))
+
+
 def sending():
     print("sending")
     L = make()
@@ -157,6 +176,11 @@ def sending():
     check(L.eval('SENT[1]') == "/goto Ann", "Enter sends the line through the chat (commands run there)")
     check(L.eval('qc.is_open()') is False and L.eval('COUNT("RemoveFromParent")') == 1, "and closes the box")
     check(L.eval('COUNT("SetInputMode_GameOnly")') == 1, "the keys go back to the game")
+    # (/messages opens a window with the mouse: closing the box after it took the keys from that window)
+    L.execute('PRESS("OEM_TWO"); INPUT().typed = "/messages"; '
+              'local mode = COUNT("SetInputMode_GameOnly"); MODE_AT_SEND = nil; SEND_HOOK = function() MODE_AT_SEND = COUNT("SetInputMode_GameOnly") - mode end; PRESS("RETURN"); SEND_HOOK = nil')
+    check(L.eval('MODE_AT_SEND') == 1, "a command runs after the box has given the keys back, so a window it opens keeps them")
+    L.execute('table.remove(SENT)')
     L.execute('PRESS("OEM_TWO"); INPUT().typed = "   "; PRESS("RETURN")')
     check(L.eval('#SENT') == 1 and L.eval('qc.is_open()') is False, "Enter on an empty line just closes")
     L.execute('SEND_OK = false; PRESS("OEM_TWO"); INPUT().typed = "too fast"; PRESS("RETURN")')
@@ -181,7 +205,160 @@ def ending():
     check(errors(L) == [], "no warnings: %s" % errors(L))
 
 
-for t in (opening, sending, ending):
+CMD_SETUP = r'''
+local scripts = ...
+package.path = scripts .. "\\?.lua;" .. scripts .. "\\mirror\\?.lua;" .. package.path
+RAN, SAID, LOGS = {}, {}, {}
+local function ran(name) return function(...) RAN[#RAN + 1] = name .. (select("#", ...) > 0 and (" " .. tostring((...))) or "") end end
+package.preload["mirror.log"] = function() return { info = function(m) LOGS[#LOGS + 1] = m end, warn = function() end } end
+package.preload["mirror.util"] = function()
+    return { safe = function(fn, _, ...) return fn(...) end }
+end
+package.preload["mirror.notify"] = function()
+    return { show = function(m) SAID[#SAID + 1] = m end, open_history = ran("history") }
+end
+OWNER, RIDING, ROLE, LEAVE = false, false, nil, true
+package.preload["mirror.adminfly"] = function() return { is_owner = function() return OWNER end, key_toggle = ran("fly") } end
+package.preload["mirror.phase1"] = function() return { started = function() return ROLE end } end
+package.preload["mirror.hoverbike"] = function()
+    return { riding = function() return RIDING end, key_make = ran("make"), key_lock = ran("lock"), key_view = ran("view"), key_tune = ran("tune"),
+             set_open = function(v) BIKE_OPEN = v end }
+end
+FPV_MODE = "unset"
+package.preload["mirror.dronegrant"] = function() return { set_mode = function(v) FPV_MODE = v end } end
+package.preload["mirror.menu"] = function() return { key_host = ran("host"), key_join = ran("join") } end
+package.preload["mirror.session"] = function() return setmetatable({}, { __index = function(_, k) if k == "key_leave" and LEAVE then return ran("leave") end end }) end
+package.preload["mirror.zombies"] = function() return { key_status = ran("status") } end
+package.preload["mirror.invdiag"] = function() return { key_report = ran("inventory") } end
+MINI = false
+package.preload["mirror.minimap"] = function() return { on = function() return MINI end, set = function(v) MINI = v; RAN[#RAN + 1] = "minimap " .. tostring(v) end } end
+package.preload["mirror.giant"] = function() return { place_here = ran("giant") } end
+package.preload["mirror.teleport"] = function()
+    return { known = function(w) return w == "goto" or w == "accept" end, command = function(t) RAN[#RAN + 1] = "teleport " .. t; return true end,
+             tip = function(t)
+                 local w = t:match("^/(%S*)")
+                 if ("goto"):sub(1, #w) == w then return "/goto <player> - teleport" end
+                 return "/" .. w .. " isn't a command. Commands: /goto"
+             end }
+end
+SHARED = {}
+ModRef = { GetSharedVariable = function(_, k) return SHARED[k] end, SetSharedVariable = function(_, k, v) SHARED[k] = v end }
+cc = require("mirror.chatcmd")
+function RUN(t) RAN, SAID = {}, {}; cc.run(t); return RAN[1] end
+'''
+
+
+def lua_str(s):
+    return '"%s"' % s.replace("\\", "\\\\")
+
+
+def commands():
+    print("commands")
+    L = lua54.LuaRuntime()
+    L.execute(CMD_SETUP, SCRIPTS)
+    run = lambda t: L.eval('RUN(%r)' % t)
+    said = lambda: L.eval('SAID[1]') or ""
+
+    for line, want in (("/host", "host"), ("/join 2", "join 2"), ("/leave", "leave"), ("/inventory", "inventory"),
+                       ("/giant", "giant"), ("/messages", "history"), ("/msgs", "history"), ("/HOST", "host")):
+        check(run(line) == want, "%s runs what its key runs (%s)" % (line, L.eval('RAN[1]')))
+    check(run("/minimap") == "minimap true" and run("/minimap") == "minimap false", "/minimap switches it each time, as M twice does")
+    for bad in ("/join", "/join 4", "/join x", "/join 1.5"):
+        check(run(bad) is None and "/join 1" in said(), "%s: nothing runs, it says how: %s" % (bad, said()))
+    L.execute('LEAVE = false')
+    check(run("/leave") is None and "aren't" in said(), "/leave with no guest's key bound: says so")
+    check(run("/status") is None and "No co-op" in said(), "/status out of a session: says so")
+    L.execute('ROLE = "host"')
+    check(run("/status") == "status" and "log" in said(), "/status in a session writes it to the log, and says so")
+
+    # the owner's stay the owner's: to anyone else they don't exist, in the list or the tips
+    for line in ("/fly", "/bike", "/bikelock"):
+        check(run(line) is None and "isn't a command" in said(), "%s for another player: not a command" % line)
+    check("/fly" not in L.eval('cc.tip("/")') and "/fly" not in (L.eval('cc.tip("/fl")') or ""), "and not in the tips")
+    for line in ("/lock", "/unlock", "/fpv lock", "\\\\FPV Unlock"):
+        check(L.eval('RUN(%s)' % lua_str(line)) is None and "isn't a command" in said(), "%s for another player: not a command" % line)
+    check(L.eval('FPV_MODE') == "unset" and L.eval('BIKE_OPEN') is None, "and it changed nothing")
+    L.execute('OWNER = true')
+    check(run("/fly") == "fly" and run("/bike") == "make" and run("/bikelock") == "lock", "the owner's game runs them")
+    # the lock commands, as the owner typed them
+    for line, want in (("/unlock", True), ("/lock", False), ("\\unlock", True), ("\\\\lock", False), ("\\\\UNLOCK", True)):
+        L.eval('RUN(%s)' % lua_str(line))
+        check(L.eval('BIKE_OPEN') is want, "%s: the bike is %s for everyone (set, not switched)" % (line, "open" if want else "locked"))
+    L.eval('RUN("/lock")')
+    L.eval('RUN("/lock")')
+    check(L.eval('BIKE_OPEN') is False, "/lock twice: still locked")
+    for line, want in (("/fpv unlock", "open"), ("/fpv lock", "locked"), ("\\\\FPV Unlock", "open"), ("\\\\FPV Lock", "locked"),
+                       ("\\fpv unlock", "open"), ("/FPV LIST", None)):
+        L.eval('RUN(%s)' % lua_str(line))
+        check(L.eval('FPV_MODE') == want, "%s: the FPV drone is %s" % (line, want))
+    check(L.eval('RUN("/fpv")') is None and "/fpv lock" in said(), "/fpv with no word: says how")
+    check("/lock" in L.eval('cc.tip("\\\\lo")') and "/fpv" in L.eval('cc.tip("\\\\FP")'), "the \\\\ form gets the tip too")
+    check(L.eval('cc.is_command("\\\\lock")') is True and L.eval('cc.is_command("hello \\\\")') is False, "the \\\\ form is a command, a \\\\ later on isn't")
+    check("/fly" in L.eval('cc.tip("/")') and "F7" in L.eval('cc.tip("/fl")'), "and lists them, with the key")
+
+    check(run("/bikeview") is None or "Only while" in said(), "/bikeview off the bike: says so")
+    L.execute('RIDING = true')
+    check(run("/bikeview") == "view" and run("/bikeseat up") == "tune 1" and run("/bikeseat down") == "tune -1", "on the bike: view, seat up and down")
+    check(run("/bikeseat") is None and "up" in said(), "/bikeseat with no word: says how")
+
+    check(run("/goto Ann") == "teleport /goto Ann" and run("/accept") == "teleport /accept", "teleport commands still go to teleport.lua")
+    check(run("/nonsense") is None and "/nonsense isn't a command" in said(), "an unknown command says so")
+    check(run("/") is None and said() != "", "a bare / says something")
+    check(L.eval('cc.tip("hello")') is None, "a plain line has no tip")
+    check("isn't a command" in L.eval('cc.tip("/zz")'), "a tip for what isn't one")
+    tip = L.eval('cc.tip("/g")')
+    check("/goto" in tip and "/giant" in tip and "\n" in tip, "/g: every command it could be, a line each: %r" % tip)
+    check("\n" not in L.eval('cc.tip("/g", true)') and "\n" not in L.eval('cc.tip("/", true)'), "one line for the handbook's chat")
+    check("Ctrl+F10" in L.eval('cc.tip("/le")'), "a tip names the hotkey")
+
+    # the other mods, over their shared variable
+    check(run("/drone fly") is None and "isn't a command" in said() and L.eval('SHARED["FPVDrone.cmd"]') is None, "/drone with no FPVDrone listening: not offered")
+    L.execute('SHARED["FPVDrone.commands"] = true; SHARED["SyncFX.commands"] = true')
+    run("/drone FLY")
+    check(L.eval('SHARED["FPVDrone.cmd"]') == "fly", "/drone fly: the word goes to FPVDrone")
+    L.execute('SHARED["FPVDrone.cmd"] = ""')
+    run("/drone nonsense")
+    check(L.eval('SHARED["FPVDrone.cmd"]') == "" and "fly" in said(), "/drone nonsense: not sent, lists the words: %s" % said())
+    run("/syncfx toggle")
+    check(L.eval('SHARED["SyncFX.cmd"]') == "toggle", "/syncfx toggle: the word goes to SyncFX")
+    check("Ctrl+Shift+O" in L.eval('cc.tip("/drone fo")'), "/drone fo: the tip narrows to the word, with its key")
+    check("F8" in L.eval('cc.tip("/syncfx t")'), "/syncfx t: too")
+    check("/drone" in L.eval('cc.tip("/")') and "/syncfx" in L.eval('cc.tip("/")'), "the list has them while they listen")
+
+    # every hotkey in the source has its command, so a new key can't be forgotten
+    src = {}
+    mirror = os.path.join(SCRIPTS, "mirror")
+    for f in os.listdir(mirror):
+        if f.endswith(".lua"):
+            with open(os.path.join(mirror, f), encoding="utf-8") as h:
+                src[f] = h.read()
+    keys = set()
+    for f, text in src.items():
+        if f == "game.lua" or f == "phase0.lua":    # (game.keybind itself; phase0: a development mode, off in a release)
+            continue
+        for m in re.finditer(r'game\.keybind\(\s*("?[\w.]+"?|k)\s*,\s*(nil|\{[^}]*\})', text):
+            mods = "+".join(re.findall(r"ModifierKey\.(\w+)", m.group(2)))
+            keys.add((f, m.group(1).strip('"'), mods))
+    command_for = {
+        ("adminfly.lua", "HOTKEY", ""): "/fly", ("giant.lua", "G", "CONTROL"): "/giant",
+        ("hoverbike.lua", "V", "CONTROL+SHIFT"): "/bike", ("hoverbike.lua", "P", "CONTROL+SHIFT"): "/bikelock",
+        ("hoverbike.lua", "G", ""): "/bikeview", ("hoverbike.lua", "U", ""): "/bikeseat", ("hoverbike.lua", "I", ""): "/bikeseat",
+        ("invdiag.lua", "F11", "CONTROL"): "/inventory", ("menu.lua", "H", "CONTROL"): "/host", ("menu.lua", "k", "CONTROL"): "/join",
+        ("minimap.lua", "M", ""): "/minimap", ("notify.lua", "F9", "CONTROL"): "/messages", ("session.lua", "F10", "CONTROL"): "/leave",
+        ("zombies.lua", "F12", "CONTROL"): "/status",
+    }
+    # (no command, on purpose: Enter and Esc of a box or menu that is open, "/" itself, and F2, which renames the item
+    # under the mouse where no chat box opens)
+    left_out = {("journal_tab.lua", "RETURN", ""), ("names.lua", "RETURN", ""), ("names.lua", "F2", ""),
+                ("quickchat.lua", "OEM_TWO", ""), ("quickchat.lua", "RETURN", ""), ("quickchat.lua", "ESCAPE", "")}
+    unknown = keys - set(command_for) - left_out
+    check(not unknown, "every hotkey in the source has a command or is left out on purpose: %s" % sorted(unknown))
+    check(len(keys) >= 20, "(the scan found them: %d keys)" % len(keys))
+    missing = [c for c in set(command_for.values()) if ("name = \"%s\"" % c[1:]) not in src["chatcmd.lua"]]
+    check(not missing, "every one of those commands exists: %s" % missing)
+
+
+for t in (opening, alone, sending, ending, commands):
     t()
 print()
 print("%d failure(s)" % len(fails))

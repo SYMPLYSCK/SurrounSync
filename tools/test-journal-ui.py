@@ -70,6 +70,7 @@ MT.__call = function(f, self, ...)
     if type(self) == "table" and getmetatable(self) == MT and f.__method then
         self.props[f.__method] = { ... }
         if f.__method == "SetContent" or f.__method:match("^AddChild") then self.kids[#self.kids + 1] = (...) end
+        if f.__method == "AddChildToCanvas" then local sl = fake("ret"); rawset((...), "slot_", sl); return sl end
     end
     return fake("ret")
 end
@@ -83,7 +84,7 @@ PLAYER = fake("Player")
 RESETS = {}
 function WORLD_RESET() for _, fn in ipairs(RESETS) do fn() end end
 package.preload["mirror.game"] = function()
-    return setmetatable({ player = function() return PLAYER end, on_world_reset = function(fn) RESETS[#RESETS + 1] = fn end },
+    return setmetatable({ player = function() return PLAYER end, on_widgets_cleared = function() end, on_world_reset = function(fn) RESETS[#RESETS + 1] = fn end },
         { __index = function() return function() end end })
 end
 
@@ -336,13 +337,14 @@ def realms_paging():
     L.execute('for _, o in ipairs(ALL) do if o.cls == "/Script/UMG.Button" and LABEL(o) == "REALMS" then TAB = o end end')
     L.execute('CLICK(TAB); TICK(6)')
     check(L.eval('TEXT_SHOWN("1 / 2")') is True, "4 Realms: 2 pages of 3")
-    check(L.eval('SHOWN(BUTTON("NEXT >", 2))') is True, "NEXT shown")
-    L.execute('CLICK(BUTTON("NEXT >", 2)); TICK(6)')
+    # (the 3rd NEXT: the pad bindings screen's and the MODS tab's are built before it)
+    check(L.eval('SHOWN(BUTTON("NEXT >", 3))') is True, "NEXT shown")
+    L.execute('CLICK(BUTTON("NEXT >", 3)); TICK(6)')
     check(L.eval('TEXT_SHOWN("2 / 2")') is True and L.eval('TEXT_SHOWN("Four")') is True, "page 2 shows the 4th")
     L.execute('CLICK(BUTTON("OPEN", 1))')
     check(L.eval('LAST_ACT("realm_open")[2]') == "4AAAAAAAAA", "OPEN on page 2 opens the 4th")
     L.execute('MODEL.rows[4] = nil; TICK(6)')
-    check(L.eval('TEXT_SHOWN("1 / 1")') is True and L.eval('SHOWN(BUTTON("NEXT >", 2))') is False, "3 Realms: one page, no NEXT")
+    check(L.eval('TEXT_SHOWN("1 / 1")') is True and L.eval('SHOWN(BUTTON("NEXT >", 3))') is False, "3 Realms: one page, no NEXT")
     check(errors(L) == [], "no errors: %s" % errors(L))
 
 
