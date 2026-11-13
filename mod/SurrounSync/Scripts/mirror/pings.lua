@@ -110,11 +110,13 @@ end
 local function on_remove(actor)
     local d = dying
     dying = nil
-    if busy.on or not d or not share_mine() then return end
+    if not d then return end
     local a
     pcall(function() a = actor:GetAddress() end)
     if a and a ~= d.a then return end
+    -- (forgotten whether it's shared or not: after GC its address can be another object's)
     known[d.a] = nil
+    if busy.on or not share_mine() then return end
     channel:send(string.format("R %.0f %.0f %.0f", d.l.X, d.l.Y, d.l.Z))
     stats.removed = stats.removed + 1
     log.info(string.format("pings: removed the one at %.0f %.0f - sent", d.l.X, d.l.Y))

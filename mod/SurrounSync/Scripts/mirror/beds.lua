@@ -70,6 +70,7 @@ end
 local function clean(s) return (tostring(s or "?"):gsub("[|=\r\n]", "_")) end
 
 function beds.world_key(host, host_slot, own_slot) return "world|" .. clean(host) .. "|" .. clean(host_slot) .. "|" .. clean(own_slot) end
+function beds.realm_key(realm_id) return "realm|" .. clean(realm_id) end
 function beds.home_key(own_slot) return "home|" .. clean(own_slot) end
 
 function beds.get(key) return load()[key] end

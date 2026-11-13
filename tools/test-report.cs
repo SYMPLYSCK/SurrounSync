@@ -107,6 +107,27 @@ static class TestReport
         Check(g.Missing.Any(m => m.Contains("other player") && m.Contains("Dilucaa")), "asks for the other player's report");
     }
 
+    static void BridgeThatNeverCameUpIsNamed()
+    {
+        Console.WriteLine("bridge_that_never_came_up_is_named");
+        foreach (var why in new[] { "nosteam", "nolog" })
+        {
+            string d = Dir("bridge-" + why);
+            Log(d, "mirror_log.txt", new List<string> {
+                L("11:00:00", "INFO", "link: started SurrounSyncBridge (auto) - Steam P2P; its log: mirror_bridge.log"),
+                L("11:00:16", "WARN", "menu: SurrounSyncBridge isn't running (no lobby/status file for 15 s), its log says: " + why) }, DateTime.Now);
+            var g = Run(d);
+            var f = Find(g, why == "nosteam" ? "couldn't reach Steam" : "never started");
+            Check(f != null && f.Severity == "ERROR" && f.Confidence == "confirmed" && f.Affects.Contains("joining"),
+                  why + ": the connector failure is an ERROR finding that names joining");
+        }
+        string u = Dir("bridge-unknown");
+        Log(u, "mirror_log.txt", new List<string> {
+            L("11:00:16", "WARN", "menu: SurrounSyncBridge isn't running (no lobby/status file for 15 s), its log says: nothing known") }, DateTime.Now);
+        var gu = Run(u);
+        Check(Find(gu, "couldn't reach Steam") == null && Find(gu, "never started") == null, "no cause from the log: neither is claimed");
+    }
+
     static void LeftoverCoopSaveIsNotCritical()
     {
         Console.WriteLine("leftover_coop_save_is_not_critical");
@@ -558,6 +579,27 @@ static class TestReport
         }
     }
 
+    // the full report goes to the Realm server's store: never from a test build unless a local store is named
+    // (SURROUNSYNC_TEST_REPORT_STORE, a `wrangler dev` of realms-backend: test-report.py --store <url>)
+    static void FullReportIsStored()
+    {
+        Console.WriteLine("FullReportIsStored");
+        string store = Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_REPORT_STORE");
+        string d = Dir("store"), zip = Path.Combine(d, "r.zip"), err;
+        using (var z = ZipFile.Open(zip, ZipArchiveMode.Create))
+        using (var w = new StreamWriter(z.CreateEntry("report.txt").Open())) w.Write("hello");
+        Environment.SetEnvironmentVariable("SURROUNSYNC_TEST_REPORT_STORE", null);
+        Check(Report.Store(zip, "ERROR", out err) == null && err == "no report store", "a test build without a local store stores nowhere (" + err + ")");
+        if (string.IsNullOrEmpty(store)) { Console.WriteLine("  (no local store given: the upload itself not run)"); return; }
+        Environment.SetEnvironmentVariable("SURROUNSYNC_TEST_REPORT_STORE", store);
+        string name = Report.Store(zip, "ERROR", out err);
+        Check(name != null && name.Contains("-ERROR-"), "the zip is stored and named (" + (name ?? err) + ")");
+        string bad = Path.Combine(d, "bad.zip");
+        File.WriteAllBytes(bad, Encoding.ASCII.GetBytes("this is not a zip file at all, really not"));
+        Check(Report.Store(bad, "ERROR", out err) == null && err == "the report store answered 400", "a file that isn't a zip is refused (" + err + ")");
+        Check(Report.Store(zip, "WHATEVER", out err) != null, "an unknown level goes as INFO (" + err + ")");
+    }
+
     static int Main(string[] args)
     {
         if (args.Length > 0 && args[0] == "--sleep") { System.Threading.Thread.Sleep(20000); return 0; }
@@ -572,9 +614,9 @@ static class TestReport
         Directory.CreateDirectory(root);
         noHangs = Path.Combine(Dir("nohangs"), "hangs");
         GameWatch.HangDirOverride = noHangs;
-        var tests = new Action[] { RepeatedErrorsAreGroupedAndExplained, VersionMismatchSaveSafetyAndConnection, LeftoverCoopSaveIsNotCritical, CrashesAreExplainedWithTheModStep,
+        var tests = new Action[] { RepeatedErrorsAreGroupedAndExplained, VersionMismatchSaveSafetyAndConnection, BridgeThatNeverCameUpIsNamed,LeftoverCoopSaveIsNotCritical, CrashesAreExplainedWithTheModStep,
                                    TheCrashedRunIsTheOneExplained, MissingLogsAndQuietRuns, SensitiveDataIsFiltered, ReportPackageAndDuplicates,
-                                   PerformanceIsBounded, FrozenGameGetsAHangDump, GameWatchCatchesAFreeze, StallWhileTheGameStarts, PeerFreezeLoadAndPeerName, PeerFreezeWithSeveralPlayers, OwnGameIsTheOneFromItsInstall, CrashCopyIsNotTheGame };
+                                   PerformanceIsBounded, FrozenGameGetsAHangDump, GameWatchCatchesAFreeze, StallWhileTheGameStarts, PeerFreezeLoadAndPeerName, PeerFreezeWithSeveralPlayers, OwnGameIsTheOneFromItsInstall, CrashCopyIsNotTheGame, FullReportIsStored };
         foreach (var t in tests)
         {
             try { t(); }

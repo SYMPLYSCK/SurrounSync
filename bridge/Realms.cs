@@ -45,13 +45,13 @@ class Realms
     readonly Dictionary<string, string> listed = new Dictionary<string, string>();  // id -> "realm ..." line
     readonly Dictionary<string, string> leases = new Dictionary<string, string>();  // id -> held|lost
     readonly Dictionary<string, string> rulesOf = new Dictionary<string, string>(); // id -> the owner's rules (none = not set)
-    long lastBeat = Environment.TickCount;
+    long lastBeat = Clock.Ms();
     // The mod says "hosting <id>" about every 30 s while it holds a Realm (game tick, or a timer while paused). A lease
     // it stopped confirming isn't heartbeated any more, so the server frees it within its 2 min: a hung game, or a
     // host who left without a release (0.14.2: the game's MAIN MENU), kept the Realm "hosted" for as long as the game
     // stayed open. A mod that never sent one (older) keeps the old behaviour. A late confirmation picks it up again.
     public static int HostingStaleMs = 150000;      // --hosting-stale <ms> (tests)
-    readonly Dictionary<string, int> hostingAt = new Dictionary<string, int>();   // id -> TickCount of the last one
+    readonly Dictionary<string, long> hostingAt = new Dictionary<string, long>();   // id -> Clock.Ms() of the last one
     readonly HashSet<string> staleLogged = new HashSet<string>();
     // The public server list (REALMS page, SERVERS): "server ..." lines from the last browse. The host's heartbeat
     // tells the server its player count and Steam ping location; browsing estimates each live host's ping from it.
@@ -164,7 +164,7 @@ class Realms
             {
                 lock (state)
                 {
-                    hostingAt[j.args[0]] = Environment.TickCount;
+                    hostingAt[j.args[0]] = Clock.Ms();
                     if (staleLogged.Remove(j.args[0])) log("realms: " + j.args[0] + " confirmed again - heartbeats go on");
                 }
                 result = "ok";
@@ -201,7 +201,7 @@ class Realms
                 }
                 Write();
             }
-            if (Environment.TickCount - lastBeat >= HeartbeatMs) { lastBeat = Environment.TickCount; Heartbeats(); }
+            if (Clock.Ms() - lastBeat >= HeartbeatMs) { lastBeat = Clock.Ms(); Heartbeats(); }
         }
     }
 
@@ -448,7 +448,7 @@ class Realms
         if (!TOKEN.IsMatch(token)) throw new Api("bad_reply", "the server sent a bad lease");
         WriteFile(LeaseFile(id), token + "\n");
         lock (state) leases[id] = "held";
-        lastBeat = Environment.TickCount;
+        lastBeat = Clock.Ms();
         log("realms: hosting " + id + " (newest world " + Str(r, "head_gen") + ")");
         return "ok won " + Str(r, "head_gen");
     }
@@ -469,7 +469,7 @@ class Realms
         try { TakeRules(id, Call("POST", "/realms/" + id + "/lease/heartbeat", id, null, Lease(token))); }
         catch (Api e) { if (e.Code == "lease_lost") DropLease(id, "lost"); throw; }
         lock (state) leases[id] = "held";
-        lastBeat = Environment.TickCount;
+        lastBeat = Clock.Ms();
         return "ok";
     }
 
@@ -507,8 +507,8 @@ class Realms
         {
             string token = Token(id);
             if (token == null) { DropLease(id, "lost"); continue; }
-            int at; bool stale;
-            lock (state) stale = hostingAt.TryGetValue(id, out at) && unchecked(Environment.TickCount - at) > HostingStaleMs;
+            long at; bool stale;
+            lock (state) stale = hostingAt.TryGetValue(id, out at) && Clock.Ms() - at > HostingStaleMs;
             if (stale)
             {
                 bool first; lock (state) first = staleLogged.Add(id);
@@ -561,7 +561,7 @@ class Realms
         h["X-Sha256"] = Sha(data);
         try { CallRaw("PUT", "/realms/" + id + "/world/" + gen, id, data, "application/octet-stream", h); }
         catch (Api e) { if (e.Code == "lease_lost") DropLease(id, "lost"); throw; }
-        lastBeat = Environment.TickCount;   // an upload extends the lease
+        lastBeat = Clock.Ms();   // an upload extends the lease
         return "ok " + gen + " " + data.Length;
     }
 

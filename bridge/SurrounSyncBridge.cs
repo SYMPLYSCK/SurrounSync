@@ -128,6 +128,8 @@ interface INet
     long Queued(ulong id);
     // the session's state in one line, for the log when its reliable lane dies (DBG-20261030-005: cause still unknown)
     string Session(ulong id);
+    // why the last try to reach id failed (Steam's P2P session error, 1-4), 0 once anything came from id since
+    int Failed(ulong id);
     void SetPresence(string role);
     // hosting a Realm (a held lease): friends must not see it as a co-op game to join
     void SetRealm(bool realm);
@@ -155,9 +157,11 @@ class SteamNet : INet
     ulong me;
     string myName = "";
     readonly byte[] buf = new byte[1 << 21];
+    readonly Dictionary<ulong, int> failed = new Dictionary<ulong, int>();   // (loop thread only: Pump and Read)
 
     public ulong Me { get { return me; } }
     public string MyName { get { return myName; } }
+    public int Failed(ulong id) { int c; return failed.TryGetValue(id, out c) ? c : 0; }
 
     public bool Init(Action<string> log)
     {
@@ -189,6 +193,7 @@ class SteamNet : INet
         byte[] dest = size <= buf.Length ? buf : new byte[size];
         uint got;
         if (!Steam.SteamAPI_ISteamNetworking_ReadP2PPacket(net, dest, (uint)dest.Length, out got, out from, channel)) return null;
+        if (failed.Count > 0) failed.Remove(from);
         var outp = new byte[got];
         Buffer.BlockCopy(dest, 0, outp, 0, (int)got);
         return outp;
@@ -211,8 +216,11 @@ class SteamNet : INet
                 else if (msg.Callback == CB_CALL_COMPLETED && msg.ParamSize >= 16) CallDone(msg.Param);
                 else if (msg.Callback == CB_P2P_SESSION_FAIL && msg.ParamSize >= 9)
                 {
-                    BumpConn((ulong)Marshal.ReadInt64(msg.Param));
-                    log("P2P session failed, error " + Marshal.ReadByte(msg.Param, 8)
+                    ulong id = (ulong)Marshal.ReadInt64(msg.Param);
+                    int code = Marshal.ReadByte(msg.Param, 8);
+                    BumpConn(id);
+                    failed[id] = code > 0 ? code : 4;
+                    log("P2P session failed, error " + code
                         + " (1 = target not running the bridge, 2 = no rights, 3 = Steam not connected, 4 = timeout)");
                 }
                 else if (smokeLog) log("callback " + msg.Callback + " size " + msg.ParamSize);
@@ -462,6 +470,9 @@ class TestNet : INet
     readonly Dictionary<ulong, Conn> conns = new Dictionary<ulong, Conn>();   // host: by guest id; guest: 1001 = the host
     readonly Dictionary<ulong, int> connGens = new Dictionary<ulong, int>();
     public int ConnGen(ulong id) { lock (qlock) { int g; connGens.TryGetValue(id, out g); return g; } }
+    // (a guest's refused connect is Steam's "1 = target not running the bridge"; loop thread only)
+    int hostFailed;
+    public int Failed(ulong id) { return id == 1001UL ? hostFailed : 0; }
     void BumpConn(ulong id) { int g; connGens.TryGetValue(id, out g); connGens[id] = g + 1; }
     public long Queued(ulong id)
     {
@@ -661,7 +672,7 @@ class TestNet : INet
 
     public void Pump(Func<ulong, bool> onSessionRequest, Action<string> log)
     {
-        long t = Environment.TickCount;
+        long t = Clock.Ms();
         if (trace && t - traceAt > 2000)
         {
             traceAt = t;
@@ -703,11 +714,12 @@ class TestNet : INet
                         var c = new Conn { client = tc, stream = tc.GetStream(), id = 1001UL };
                         lock (c.outq) c.outq.Enqueue(Frame(BitConverter.GetBytes(guestId), 9));
                         lock (qlock) { conns[1001UL] = c; BumpConn(1001UL); }
+                        hostFailed = 0;
                         log("testnet: connected from " + tc.Client.LocalEndPoint + " in " + (t - connectStarted) + " ms as " + guestId);
                         StartWriter(c);
                         StartReader(c, 1001UL);
                     }
-                    catch { try { tc.Close(); } catch { } nextConnect = t + 1000; }
+                    catch { try { tc.Close(); } catch { } nextConnect = t + 1000; hostFailed = 1; }
                 }
                 else if (t - connectStarted > 15000)
                 {
@@ -812,6 +824,27 @@ static class Win
     [DllImport("winmm.dll")] public static extern int waveOutClose(IntPtr h);
 }
 
+// Milliseconds that only ever go up. Environment.TickCount is an int: it turns negative after 24.9 days of uptime
+// (Fast Startup keeps the uptime across shutdowns), and every "t - last > N" gate in the loop then stayed false - no
+// commands read, no lobby or status file, the bridge looked dead with Steam up (audit 2026-11-10).
+// It counts from the PC's start like TickCount did (the loop's "0 = long ago" fields rely on that: a clock from 0 at
+// the bridge's start made them "just now" for its first seconds), in 64 bits. SURROUNSYNC_TEST_CLOCK_MS is added to
+// it (test-bridge: past the int's end).
+static class Clock
+{
+    static readonly long offset = TestOffset();
+    static long TestOffset()
+    {
+        long v;
+        return long.TryParse(Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_CLOCK_MS"), out v) ? v : 0;
+    }
+    public static long Ms()
+    {
+        long ts = Stopwatch.GetTimestamp(), f = Stopwatch.Frequency;
+        return offset + ts / f * 1000 + ts % f * 1000 / f;
+    }
+}
+
 // One player we hear: their own wave output (Windows mixes several), loudness by their distance.
 class VoiceOut
 {
@@ -819,8 +852,8 @@ class VoiceOut
     public bool Walkie;              // both of us carry a handheld radio (mirror_voice.txt "walkie", voice.lua)
     public double hpIn, hpOut, lpOut; // the radio sound's filters, carried from one packet to the next
     public uint hiss = 2463534242;
-    public long HeardAt = -100000;   // when their last voice packet arrived (TickCount)
-    public bool Talking { get { return Environment.TickCount - HeardAt < 400; } }
+    public long HeardAt = long.MinValue / 2;   // when their last voice packet arrived (Clock.Ms)
+    public bool Talking { get { return Clock.Ms() - HeardAt < 400; } }
     IntPtr wave = IntPtr.Zero;
     readonly List<IntPtr> queued = new List<IntPtr>();
 
@@ -899,7 +932,7 @@ class Voice
     public byte[] Tick()
     {
         if (!Available) return null;
-        long t = Environment.TickCount;
+        long t = Clock.Ms();
         if (t - focusAt > 300) { focusAt = t; focused = GameFocused(); }
         bool want = On && focused && (Win.GetAsyncKeyState(Key) & 0x8000) != 0;
         if (want != Talking)
@@ -952,7 +985,7 @@ class Voice
 
     public void Play(VoiceOut who, byte[] data, int offset)
     {
-        who.HeardAt = Environment.TickCount;
+        who.HeardAt = Clock.Ms();
         if (!Available || !On) return;
         bool radio;
         double g = Level(who.Distance, who.Walkie, out radio) * Volume;
@@ -1009,6 +1042,7 @@ class PeerLink
     public int rxFragId = -1, rxFragHave; public byte[][] rxFrags;
     public readonly Dictionary<string, long> blobGen = new Dictionary<string, long>();
     public readonly HashSet<string> epochNames = new HashSet<string>();   // blob names of the peer's current session
+    public readonly Dictionary<string, int> blobChars = new Dictionary<string, int>(); public long blobCharsTotal;   // ... and the size of each one's file
     public readonly string indexRun = DateTime.UtcNow.Ticks.ToString();
     public double pktTokens = -1, byteTokens; public long tokensAt;
     public readonly Queue<long> drops = new Queue<long>();
@@ -1073,6 +1107,13 @@ class Bridge
     volatile string reportLine = null;
     const long REQUEST_TIMEOUT = 60000;
     const int MAX_POSE = 2048, MAX_HELLO = 256, MAX_PART = CHUNK + 1024, MAX_PARTS = 32, MAX_BLOB_NAMES = 256;
+    // (SURROUNSYNC_TEST_BLOB_CAP: a lower cap for the tests, never a higher one)
+    static readonly long MAX_BLOB_CHARS = BlobCap(Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_BLOB_CAP"));
+    static long BlobCap(string s)
+    {
+        long cap = 64L * 1024 * 1024, v;
+        return long.TryParse(s, out v) && v > 0 && v < cap ? v : cap;
+    }
     // a deflated blob may unpack to more than one piece: the world files at a join (~550 KB of text) go
     // compressed in one message instead of raw in pieces (~30% less over a slow Steam relay)
     const int MAX_INFLATE = CHUNK * MAX_PARTS;
@@ -1081,7 +1122,7 @@ class Bridge
     // probe every PROBE_EVERY ms; a probe unanswered for stallMs while heartbeats arrive and nothing waits to go out
     // means the reliable lane is dead: restart the session (MAX_RESETS times), then the unreliable fallback
     // (a joining guest gives up after 120 s without the world: the fallback must be on well before that, ~32 s)
-    const long PROBE_EVERY = 3000; const int MAX_RESETS = 1;
+    const long PROBE_EVERY = 3000; const int MAX_RESETS = 1; const long BACKLOG_BYTES = 16 * 1024;
     long stallMs = 15000;
     // fallback parts: G_BUDGET per pump pass every G_PUMP ms (~400 packets/s, under the peer's PKT_RATE of 600)
     const int G_PARTS_MAX = 8000, G_BUDGET = 12, G_IN_MAX = 16; const long G_PUMP = 30, G_IN_BYTES = 24L * 1024 * 1024;
@@ -1090,6 +1131,7 @@ class Bridge
     byte[] joinKey = null;
     readonly Dictionary<ulong, string> challenges = new Dictionary<ulong, string>();
     readonly Dictionary<ulong, long> challengedAt = new Dictionary<ulong, long>();
+    readonly Dictionary<ulong, long> challengeMadeAt = new Dictionary<ulong, long>();
     readonly Dictionary<ulong, int> badTries = new Dictionary<ulong, int>();
     readonly HashSet<ulong> passOk = new HashSet<ulong>();
     string joinError = null;
@@ -1098,18 +1140,19 @@ class Bridge
     readonly Voice voice = new Voice();
     long voiceCfgAt = 0;
     bool answered = false;
+    long answerDelayMs, lateAnswerAt; string lateAnswer; PeerLink lateAnswerLink;   // (test net only)
     Realms realms;
     string realmsUrl = null;
 
-    static long Now() { return Environment.TickCount; }
+    static long Now() { return Clock.Ms(); }
 
     // Watchdog: the loop is single-threaded, so one call that blocks (Steam, a file) froze the whole link
     // (2026-10-24: guest bridge silent ~40 s; the mod's restart then quit because this one still held the
     // mutex). Each loop step is named; stuck > STALL_EXIT ms -> log the step and exit so the restart works.
     volatile string step = "start";
-    long beat = Environment.TickCount;
+    long beat = Clock.Ms();
     const int STALL_LOG = 4000, STALL_EXIT = 12000;
-    void Step(string s) { step = s; Interlocked.Exchange(ref beat, Environment.TickCount); }
+    void Step(string s) { step = s; Interlocked.Exchange(ref beat, Clock.Ms()); }
     void StartWatchdog()
     {
         var th = new Thread(() =>
@@ -1118,7 +1161,7 @@ class Bridge
             while (true)
             {
                 Thread.Sleep(500);
-                long stuck = Environment.TickCount - Interlocked.Read(ref beat);
+                long stuck = Clock.Ms() - Interlocked.Read(ref beat);
                 if (stuck < STALL_LOG) { logged = false; continue; }
                 if (!logged) { logged = true; Log("loop stuck in " + step + " for " + stuck / 1000.0 + " s"); }
                 if (stuck >= STALL_EXIT)
@@ -1165,9 +1208,9 @@ class Bridge
         d["surrounsync"] = "1"; d["name"] = "smoke"; d["proto"] = "0"; d["locked"] = "0"; d["players"] = "1/2"; d["host"] = sn.Me.ToString();
         sn.SetPublic(true, false, d);
         Console.WriteLine("SMOKE: " + sn.Debug());
-        long t0 = Environment.TickCount;
+        long t0 = Clock.Ms();
         Console.WriteLine("SMOKE: friends " + sn.FriendCount() + ", hosting friends " + sn.FriendsWithPresence("host").Count);
-        while (sn.PublicState == "creating" && Environment.TickCount - t0 < 30000) { sn.Pump(id => false, m => Console.WriteLine("SMOKE log: " + m)); Thread.Sleep(50); }
+        while (sn.PublicState == "creating" && Clock.Ms() - t0 < 30000) { sn.Pump(id => false, m => Console.WriteLine("SMOKE log: " + m)); Thread.Sleep(50); }
         Console.WriteLine("SMOKE: callbacks seen " + sn.callbacksSeen);
         string st = sn.PublicState;
         sn.SetPublic(false, false, null);
@@ -1185,16 +1228,16 @@ class Bridge
         var d = new Dictionary<string, string>();
         d["surrounsync"] = "1"; d["name"] = "listing test - ignore"; d["proto"] = "0"; d["locked"] = "1"; d["players"] = "1/4"; d["host"] = sn.Me.ToString();
         sn.SetPublic(true, true, d);
-        long t0 = Environment.TickCount;
-        while (sn.PublicState == "creating" && Environment.TickCount - t0 < 30000) { sn.Pump(id => false, m => { }); Thread.Sleep(50); }
+        long t0 = Clock.Ms();
+        while (sn.PublicState == "creating" && Clock.Ms() - t0 < 30000) { sn.Pump(id => false, m => { }); Thread.Sleep(50); }
         Console.WriteLine("SMOKE: lobby " + sn.PublicState);
         int found = -1; bool mine = false;
         if (sn.PublicState == "on")
         {
             Thread.Sleep(1500);
             sn.RequestServers();
-            t0 = Environment.TickCount;
-            while (sn.Servers == null && Environment.TickCount - t0 < 30000) { sn.Pump(id => false, m => { }); Thread.Sleep(50); }
+            t0 = Clock.Ms();
+            while (sn.Servers == null && Clock.Ms() - t0 < 30000) { sn.Pump(id => false, m => { }); Thread.Sleep(50); }
             if (sn.Servers != null)
             {
                 found = sn.Servers.Count;
@@ -1220,8 +1263,8 @@ class Bridge
         v.Init(sn.SteamUser, m => Console.WriteLine("SMOKE log: " + m));
         Steam.SteamAPI_ISteamUser_StartVoiceRecording(sn.SteamUser);
         int ok = 0, nodata = 0, other = 0, lastOther = 0;
-        long t0 = Environment.TickCount;
-        while (Environment.TickCount - t0 < 2000)
+        long t0 = Clock.Ms();
+        while (Clock.Ms() - t0 < 2000)
         {
             sn.Pump(id => false, m => { });
             uint avail;
@@ -1281,9 +1324,7 @@ class Bridge
         other = role == "host" ? "guest" : "host";
         logPath = Path.Combine(dir, auto ? "mirror_bridge.log" : "mirror_bridge_" + role + ".log");
         mutexName = "SurrounSyncBridge_" + (auto ? "auto" : role) + "_" + (dir.GetHashCode() & 0x7fffffff);
-        try { File.WriteAllText(logPath, ""); } catch { }
-        if (auto) { try { File.Delete(CmdFile()); } catch { } }
-
+        DateTime startedUtc = DateTime.UtcNow;
         bool created;
         using (var mutex = new Mutex(true, mutexName, out created))
         {
@@ -1295,9 +1336,21 @@ class Bridge
                 if (!created) { Log("the other bridge is still running - exiting"); return 0; }
                 Log("the old bridge is gone - taking over");
             }
+            // only the bridge that owns the folder starts a log and clears commands: a second one started next to a
+            // running bridge emptied its log (the reason it stopped went with it) and dropped the game's queued command.
+            // The last run's log stays as mirror_bridge.1.log (reports pack mirror_bridge*.log).
+            string keepErr = null;
+            lock (logLock)
+                try { string old = Path.ChangeExtension(logPath, ".1.log"); File.Delete(old); if (File.Exists(logPath)) File.Move(logPath, old); }
+                catch (Exception e) { keepErr = e.Message; }
+            try { File.WriteAllText(logPath, ""); } catch { }
+            if (keepErr != null) Log("couldn't keep the last run's log: " + keepErr);
+            // (only a command older than this bridge: one the game wrote while it waited for the old bridge is for it)
+            if (auto) { try { if (File.GetLastWriteTimeUtc(CmdFile()) < startedUtc) File.Delete(CmdFile()); } catch { } }
             net = testPort > 0 ? (INet)new TestNet(testPort, testId) : new SteamNet();
             long sm;
             if (testPort > 0 && long.TryParse(Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_STALL_MS"), out sm) && sm > 0) stallMs = sm;
+            if (testPort > 0 && long.TryParse(Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_ANSWER_DELAY_MS"), out sm) && sm > 0) answerDelayMs = sm;
             if (!net.Init(Log)) return 2;
             me = net.Me;
             voice.Init(net.SteamUser, Log);
@@ -1425,6 +1478,11 @@ class Bridge
                 continue;
             }
             if (role == "guest" && HostLink() == null && t - lastScan > 3000) { Step("friend scan"); lastScan = t; Discover(); }
+            if (lateAnswer != null && t >= lateAnswerAt)
+            {
+                if (links.Contains(lateAnswerLink)) SendRaw(lateAnswerLink, 'A', lateAnswer, true);
+                lateAnswer = null; lateAnswerLink = null;
+            }
             foreach (var l in new List<PeerLink>(links))
             {
                 if (t - l.lastHello > 1000 && Reachable(l))
@@ -1549,17 +1607,26 @@ class Bridge
         byte[] data = Encoding.UTF8.GetBytes(type + body);
         return net.Send(to, data, true, 1);
     }
+    // Sent again every 3 s until answered, with the same code: a new one each time made an answer slower than 3 s (a
+    // slow relay) count against a newer code - a right password was "wrong", three of those blocked the guest (audit
+    // 2026-11-10). A new code only after a minute.
     void Challenge(ulong from)
     {
-        var rnd = new byte[16];
-        using (var r = RandomNumberGenerator.Create()) r.GetBytes(rnd);
-        var sb = new StringBuilder();
-        foreach (var x in rnd) sb.Append(x.ToString("x2"));
-        challenges[from] = sb.ToString();
+        long made;
+        bool fresh = !challenges.ContainsKey(from) || !challengeMadeAt.TryGetValue(from, out made) || Now() - made > 60000;
+        if (fresh)
+        {
+            var rnd = new byte[16];
+            using (var r = RandomNumberGenerator.Create()) r.GetBytes(rnd);
+            var sb = new StringBuilder();
+            foreach (var x in rnd) sb.Append(x.ToString("x2"));
+            challenges[from] = sb.ToString();
+            challengeMadeAt[from] = Now();
+        }
         challengedAt[from] = Now();
         net.Accept(from);
         SendTo(from, 'C', challenges[from]);
-        Log("password check sent to " + from);
+        if (fresh) Log("password check sent to " + from);
     }
     void CheckAnswer(ulong from, string body)
     {
@@ -1581,6 +1648,21 @@ class Bridge
         SendTo(from, 'R', why);
     }
 
+    // someone asking to join while this player is in another's game: told so (R busy), at most every 10 s - unanswered,
+    // the joiner waited out its 60 s with no reason (DBG-20261111-001). Not a player of the game we're in: during a
+    // Realm host switch they dial the new host before its role is host, and a refusal would end their reconnect.
+    readonly Dictionary<ulong, long> busyTold = new Dictionary<ulong, long>();
+    void TellBusy(ulong from)
+    {
+        long at;
+        if (from == 0 || HostLink() == null || Mate(from) != null || from == HostLink().id) return;
+        if (busyTold.TryGetValue(from, out at) && Now() - at < 10000) return;
+        if (busyTold.Count > 200) busyTold.Clear();
+        busyTold[from] = Now();
+        SendTo(from, 'R', "busy");
+        Log("told " + from + " this player is in " + HostLink().name + "'s game, not hosting");
+    }
+
     bool OnSessionRequest(ulong from)
     {
         if (role == "idle")
@@ -1598,6 +1680,7 @@ class Bridge
         }
         if (HostLink() == null && from == configuredPeer && from != 0) { SetHost(from, "it connected to us"); return true; }
         Log("ignored a session request from " + from + (HostLink() != null ? " (in " + HostLink().name + "'s game)" : ""));
+        TellBusy(from);
         return false;
     }
 
@@ -1800,6 +1883,13 @@ class Bridge
         sb.Append("time ").Append(Unix()).Append('\n');
         var pl = Primary();
         if (pl != null) sb.Append("peer ").Append(pl.id).Append(' ').Append(Clean(pl.name)).Append(' ').Append(pl.Connected ? "connected" : "connecting").Append('\n');
+        // a guest whose host can't be reached at all (Steam's P2P session error): the game says so instead of
+        // "waiting for them to accept" for two minutes (audit 2026-11-10)
+        if (pl != null && !pl.Connected && role == "guest")
+        {
+            int why = net.Failed(pl.id);
+            if (why > 0) sb.Append("reach fail ").Append(why).Append('\n');
+        }
         // every other player: "player <slot> <id> <state> <outTag> <name>" (slot 0 = the host)
         foreach (var l in links)
             sb.Append("player ").Append(l.slot).Append(' ').Append(l.id).Append(' ')
@@ -2224,6 +2314,15 @@ class Bridge
         }
     }
 
+    // a peer's packet unpacked: what it unpacks to counts against that peer's byte rate as well (only the packed
+    // size did: 2 MB of zeros unpacked to 2 GB of files)
+    string InflateFrom(PeerLink l, byte[] z, int offset, int cap)
+    {
+        string s = Inflate(z, offset, cap);
+        l.byteTokens -= s.Length;
+        return s;
+    }
+
     // capped, so a bad packet can't unpack into something huge
     static string Inflate(byte[] z, int offset, int cap)
     {
@@ -2264,7 +2363,7 @@ class Bridge
         int at = 0;
         foreach (var f in l.rxFrags) { Buffer.BlockCopy(f, 0, z, at, f.Length); at += f.Length; }
         l.rxFrags = null;
-        Handle(l, 'B', Inflate(z, 0, MAX_PART));
+        Handle(l, 'B', InflateFrom(l, z, 0, MAX_PART));
     }
 
     bool SendRaw(PeerLink l, char type, string body, bool reliable)
@@ -2348,14 +2447,14 @@ class Bridge
                         path = writeOrder[0]; writeOrder.RemoveAt(0);
                         content = pendingWrites[path]; pendingWrites.Remove(path);
                     }
-                    long t0 = Environment.TickCount;
+                    long t0 = Clock.Ms();
                     bool ok = false;
                     for (int i = 0; i < 3 && !ok; i++) { ok = TryWrite(path, content); if (!ok) Thread.Sleep(1); }
                     if (ok) try { var at = File.GetLastWriteTimeUtc(path); lock (writeLock) wroteAt[path] = at; } catch { }
-                    long took = Environment.TickCount - t0;
-                    if (took > 500 && Environment.TickCount - slowWriteLogAt > 60000)
+                    long took = Clock.Ms() - t0;
+                    if (took > 500 && Clock.Ms() - slowWriteLogAt > 60000)
                     {
-                        slowWriteLogAt = Environment.TickCount;
+                        slowWriteLogAt = Clock.Ms();
                         Log("slow disk: writing " + Path.GetFileName(path) + " took " + took + " ms (antivirus or a busy disk?) - the link keeps running, only file updates wait");
                     }
                     if (!ok)
@@ -2374,8 +2473,8 @@ class Bridge
     // the last queued writes before the bridge stops (up to 2 s)
     void FlushWrites()
     {
-        long t0 = Environment.TickCount;
-        while (Environment.TickCount - t0 < 2000)
+        long t0 = Clock.Ms();
+        while (Clock.Ms() - t0 < 2000)
         {
             lock (writeLock) if (writeOrder.Count == 0) return;
             writeSignal.Set();
@@ -2527,8 +2626,10 @@ class Bridge
             if (SendRaw(l, 'Q', "p " + epoch + " " + l.probeN, true) && l.probeWaitSince == 0) l.probeWaitSince = t;
         }
         if (!l.peerEchoes || l.probeWaitSince == 0) return;
-        // a backlog still going out (the world files at a join over a slow relay) is a slow lane, not a dead one
-        if (net.Queued(l.id) > 0) { l.probeWaitSince = t; return; }
+        // a backlog still going out (the world files at a join over a slow relay) is a slow lane, not a dead one. Only a
+        // backlog: the poses and heartbeats just handed over sit in the queue for a moment after every send, and "> 0"
+        // restarted the wait whenever it looked then - a dead lane was seen after 24 s instead of 7, under load never
+        if (net.Queued(l.id) > BACKLOG_BYTES) { l.probeWaitSince = t; return; }
         if (t - l.probeWaitSince < stallMs || t - l.lastRx > 3000) return;
         l.probeWaitSince = 0;
         if (l.resets < MAX_RESETS)
@@ -2639,7 +2740,7 @@ class Bridge
         int at = 0;
         for (int i = 0; i < count; i++) { Buffer.BlockCopy(g.parts[i], 0, z, at, g.parts[i].Length); at += g.parts[i].Length; g.parts[i] = null; }
         l.gInBytes -= g.bytes; g.bytes = 0; g.done = true;
-        string msg = Inflate(z, 0, MAX_INFLATE);
+        string msg = InflateFrom(l, z, 0, MAX_INFLATE);
         int n1 = msg.IndexOf('\n'), n2 = n1 < 0 ? -1 : msg.IndexOf('\n', n1 + 1);
         if (n2 < 0) return;
         BlobEpoch(l, msg.Substring(0, n1));
@@ -2846,7 +2947,7 @@ class Bridge
         }
         if (t == (byte)'Z' || t == (byte)'F')
         {
-            try { if (t == (byte)'Z') Handle(l, 'B', Inflate(data, o + 1, MAX_INFLATE)); else TakeFragment(l, data, o); }
+            try { if (t == (byte)'Z') Handle(l, 'B', InflateFrom(l, data, o + 1, MAX_INFLATE)); else TakeFragment(l, data, o); }
             catch (Exception e) { Dropped(l, "bad " + (char)t + " " + e.Message); }
             return;
         }
@@ -2882,6 +2983,7 @@ class Bridge
         if (l.blobEpoch != null) Log(l.name + "'s game restarted - cleared its old data");
         l.blobEpoch = ep;
         l.epochNames.Clear();
+        l.blobChars.Clear(); l.blobCharsTotal = 0;
         l.gNewestIn.Clear();
         try
         {
@@ -2904,6 +3006,16 @@ class Bridge
             if (l.loggedRx.Add(" refused")) Log("ignored blob '" + Clean(name) + "' from " + l.name + " (bad name or over " + MAX_BLOB_NAMES + " names)");
             return;
         }
+        // ... nor with a few huge ones: all of a peer's blob files together stay under MAX_BLOB_CHARS (the mod's
+        // biggest, the world files at a join, are ~550 KB in all)
+        int had;
+        l.blobChars.TryGetValue(name, out had);
+        if (l.blobCharsTotal - had + body.Length > MAX_BLOB_CHARS)
+        {
+            if (l.loggedRx.Add(" too big")) Log("ignored blob '" + Clean(name) + "' from " + l.name + " (" + body.Length + " chars: over " + MAX_BLOB_CHARS + " chars of blobs in all)");
+            return;
+        }
+        l.blobChars[name] = body.Length; l.blobCharsTotal += body.Length - had;
         l.epochNames.Add(name);
         WriteAtomic(Path.Combine(dir, "mirror_" + name + "_" + l.inTag + ".txt"), body);
         BumpIndex(l, name);
@@ -2987,7 +3099,10 @@ class Bridge
         {
             if (answered) return;
             answered = true;
-            SendRaw(l, 'A', joinKey == null ? "none" : Answer(joinKey, body.Trim(), me), true);
+            string a = joinKey == null ? "none" : Answer(joinKey, body.Trim(), me);
+            // (test net: SURROUNSYNC_TEST_ANSWER_DELAY_MS holds the answer back, as a slow relay does)
+            if (answerDelayMs > 0) { lateAnswer = a; lateAnswerLink = l; lateAnswerAt = Now() + answerDelayMs; }
+            else SendRaw(l, 'A', a, true);
             Log("answered the host's password check" + (joinKey == null ? " (no password typed)" : ""));
         }
         else if (type == 'R' && role == "guest" && l.slot == 0 && !l.mate)

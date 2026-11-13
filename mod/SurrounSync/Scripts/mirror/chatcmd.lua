@@ -1,10 +1,9 @@
 -- Every hotkey as a chat command too (user 2026-11-04: "all the Hotkeys we have for stuff can also be / commands in
--- chat"). A command runs what its key runs, so the same checks hold: the owner's stay the owner's, and the keys of a
--- thing that isn't here (a bike nobody flies) answer the same way. chat.lua sends every "/" line here; the teleport
+-- chat"). A command runs what its key runs, so the same checks hold. chat.lua sends every "/" line here; the teleport
 -- commands stay in teleport.lua. Left out: F2 (renames the item under the mouse, and no chat box opens over the
 -- inventory), the game's own keys, Enter and Esc in the menus.
--- FPVDrone and SyncFX are other Lua states: a command goes over their UE4SS shared variable <mod>.cmd, which they read
--- from their tick and clear. <mod>.commands is set when such a mod is loaded and listening.
+-- SyncFX is another Lua state: a command goes over its UE4SS shared variable SyncFX.cmd, which it reads from its tick
+-- and clears. SyncFX.commands is set when it is loaded and listening.
 
 local log = require("mirror.log")
 local util = require("mirror.util")
@@ -14,11 +13,6 @@ local chatcmd = {}
 
 local function m(name) return require("mirror." .. name) end
 local function say(text, kind) notify.show(text, kind or "info") end
-
-local function is_owner()
-    local ok, yes = pcall(function() return m("adminfly").is_owner() end)
-    return ok and yes == true
-end
 
 local function in_session()
     local ok, role = pcall(function() return m("phase1").started() end)
@@ -31,17 +25,7 @@ local function shared(k)
     return nil
 end
 
-local function riding()
-    local ok, yes = pcall(function() return m("hoverbike").riding() end)
-    return ok and yes == true
-end
-
 -- what's asked of another mod: the words after the command, in the order the tip lists them
-local DRONE = {
-    { "menu", "settings menu", "Ctrl+Shift+M" }, { "fly", "fly it", "Ctrl+Shift+D" }, { "follow", "follow you", "Ctrl+Shift+O" },
-    { "upright", "set it upright", "Ctrl+Shift+F" }, { "reset", "back on you", "Ctrl+Shift+X" }, { "bindings", "bindings window", "Ctrl+Shift+B" },
-    { "radio", "show the radio", "Ctrl+Shift+R" }, { "charge", "charge it", "G" }, { "pickup", "pick it up", "H" },
-}
 local SYNCFX = {
     { "toggle", "on or off", "F8" }, { "menu", "its menu", "F6" }, { "quality", "next quality", "Shift+F8" },
     { "night", "skip to night", "Alt+F8" }, { "wrecks", "test wrecks", "Ctrl+F8" }, { "bench", "benchmark", "Ctrl+F9" },
@@ -61,13 +45,6 @@ local function mail(mod, list, arg)
     if not found then say(cmd .. " " .. words_of(list), "warn"); return end
     if not shared(mod .. ".commands") then say(mod .. " isn't running.", "warn"); return end
     pcall(function() ModRef:SetSharedVariable(mod .. ".cmd", arg) end)
-end
-
-local function bike_only(fn)
-    return function(arg)
-        if not riding() then say("Only while you fly the hover bike.", "warn"); return end
-        fn(arg)
-    end
 end
 
 -- group: its line in the "/" list. show: nil = everyone. Someone it isn't shown to gets "isn't a command".
@@ -94,43 +71,12 @@ local COMMANDS = {
       end },
     { name = "inventory", group = "Co-op", key = "Ctrl+F11", what = "write an inventory report to the log",
       run = function() m("invdiag").key_report(); say("Inventory report written to the log.") end },
-    { name = "minimap", group = "World", key = "M twice", what = "minimap on or off",
+    { name = "minimap", group = "World", key = "F4", what = "minimap on or off",
       run = function() local mini = m("minimap"); mini.set(not mini.on()) end },
-    { name = "giant", group = "World", key = "Ctrl+G", what = "the forest giant guards this spot",
-      run = function() m("giant").place_here() end },
-    { name = "bikeview", group = "Bike", show = riding, key = "G", what = "the bike's other camera",
-      run = bike_only(function() m("hoverbike").key_view() end) },
-    { name = "bikeseat", args = "<up|down>", group = "Bike", show = riding, key = "U / I", what = "the rider's height",
-      run = bike_only(function(arg)
-          arg = arg:lower()
-          if arg ~= "up" and arg ~= "down" then say("/bikeseat up or /bikeseat down", "warn"); return end
-          m("hoverbike").key_tune(arg == "up" and 1 or -1)
-      end) },
-    { name = "fly", group = "Owner", show = is_owner, key = "F7", what = "admin fly on or off",
-      run = function() m("adminfly").key_toggle() end },
-    { name = "bike", group = "Owner", show = is_owner, key = "Ctrl+Shift+V", what = "make the hover bike or bring it",
-      run = function() m("hoverbike").key_make() end },
-    { name = "bikelock", group = "Owner", show = is_owner, key = "Ctrl+Shift+P", what = "lock or unlock the bike for everyone",
-      run = function() m("hoverbike").key_lock() end },
-    { name = "lock", group = "Owner", show = is_owner, what = "only you can ride your hover bike",
-      run = function() m("hoverbike").set_open(false) end },
-    { name = "unlock", group = "Owner", show = is_owner, what = "anyone can ride your hover bike",
-      run = function() m("hoverbike").set_open(true) end },
-    { name = "fpv", args = "<lock|unlock|list>", group = "Owner", show = is_owner, what = "who flies the FPV drone: nobody but you, everyone, or your PERMISSIONS list",
-      run = function(arg)
-          arg = arg:lower()
-          local g = m("dronegrant")
-          if arg == "lock" then g.set_mode("locked")
-          elseif arg == "unlock" then g.set_mode("open")
-          elseif arg == "list" then g.set_mode(nil)
-          else say("/fpv lock, /fpv unlock or /fpv list", "warn") end
-      end },
-    { name = "drone", args = "<what>", group = "FPVDrone", words = DRONE, show = function() return shared("FPVDrone.commands") ~= nil end,
-      what = "the FPV drone", run = function(arg) mail("FPVDrone", DRONE, arg) end },
     { name = "syncfx", args = "<what>", group = "SyncFX", words = SYNCFX, show = function() return shared("SyncFX.commands") ~= nil end,
       what = "the graphics mod", run = function(arg) mail("SyncFX", SYNCFX, arg) end },
 }
-local GROUPS = { "Players", "Co-op", "World", "Bike", "Owner", "FPVDrone", "SyncFX" }
+local GROUPS = { "Players", "Co-op", "World", "SyncFX" }
 local MAX_TIP_LINES = 6
 
 local function shown(c) return c.show == nil or c.show() end
@@ -152,7 +98,7 @@ local function teleport_known(word)
     return t.known ~= nil and t.known(word)
 end
 
--- \lock and \\FPV Unlock are /lock and /fpv unlock
+-- \host and \\SyncFX Toggle are /host and /syncfx toggle
 function chatcmd.is_command(text) return tostring(text or ""):match("^%s*[/\\]") ~= nil end
 local function normal(text) return (tostring(text or ""):gsub("^%s*[/\\]+", "/", 1)) end
 
@@ -192,7 +138,7 @@ function chatcmd.tip(text, one_line)
             end
         end
     end
-    -- "/drone f": the words that fit
+    -- "/syncfx m": the words that fit
     if past and found[1] and found[1].words then
         local part = (text:match("^/%S+%s+(.-)%s*$") or ""):lower()
         local fit = {}

@@ -24,11 +24,11 @@ local KNOWN = {
     SurrounDeadMP = "gameplay", SurrounDeadMPInput = "gameplay",
     -- ships with SurrounSync: the glider model and the Hang Glider item; a game without it has no such item
     ["pak:SurrounSyncGlider.pak"] = "gameplay",
-    -- ships with SurrounSync: the Double Drum Magazine item and the diamond finish; a game without it has no such item
+    -- ships with SurrounSync: the Double Drum Magazine item; a game without it has no such item
     ["pak:SurrounSyncArmory.pak"] = "gameplay",
-    -- ships with SurrounSync: the FPV drone's models, only to show another player's quad (drone.lua)
+    -- older SurrounSync releases shipped the FPV drone's models; looks only, and Setup removes it on update
     ["pak:SurrounSyncDrone.pak"] = "client",
-    -- the FPV drone mod and its model pak: a camera flown on this screen, its quad shown to others through drone.lua
+    -- the FPV drone mod (sold on its own) and its model pak: a camera flown on this screen only
     FPVDrone = "client", ["pak:FPVDrone_P.pak"] = "client",
 }
 
@@ -38,7 +38,11 @@ local probe_addr, probe_at, probe_warned = nil, nil, false
 local JIG = "/Game/JigSInventory/Jigsaw/Components/BP_JigComponent.BP_JigComponent_C"
 
 -- once per player, 10 s in (the inventory is filled by then): does this game build still have what item sync uses?
+local probe_next = 0
 local function probe_game()
+    -- (asked once a second, not every frame: the answer only changes when the player character does)
+    if os.clock() < probe_next then return end
+    probe_next = os.clock() + 1.0
     local player = game.player()
     local addr = util.valid(player) and util.addr(player) or nil
     if not addr or addr == probe_addr then return end

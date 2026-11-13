@@ -48,7 +48,6 @@ local voice = require("mirror.voice")
 local pvp = require("mirror.pvp")
 local downed = require("mirror.downed")
 local glider = require("mirror.glider")
-local drone = require("mirror.drone")
 local perf = require("mirror.perf")
 local crumb = require("mirror.crumb")
 local devtest = require("mirror.devtest")
@@ -197,7 +196,7 @@ local function status()
         role, rx_count / cfg.phase1.status_interval, age,
         ghost.exists() and ghost.kind() or "none",
         ((gl and pl) and string.format(" %.0f m from you", util.dist(gl, pl) / 100) or "")
-        .. " | zombies: " .. zombies.status() .. " | " .. fire.status() .. " | " .. drops.status() .. " | " .. world.status() .. " | " .. require("mirror.camps").status() .. " | " .. require("mirror.airdrops").status() .. " | " .. require("mirror.prefabs").status() .. " | " .. doors.status() .. " | " .. infest.status() .. " | " .. horde.status() .. " | " .. split.status() .. " | " .. power.status() .. " | " .. require("mirror.towing").status() .. " | " .. require("mirror.startgps").status() .. " | " .. audio.status() .. " | " .. loot.status() .. " | " .. looted.status() .. " | " .. downed.status() .. " | " .. glider.status() .. " | " .. drone.status() .. " | " .. require("mirror.hoverbike").status() .. " | " .. builds.status() .. " | " .. pings.status() .. " | " ..corpses.status() .. " | " .. deathbags.status() .. " | " .. tactical.status() .. " | " .. throwables.status() .. " | " .. vehicles.status() .. " | " .. harvest.status() .. " | " .. pvp.status() .. " | " .. require("mirror.personalspace").status() .. " | " .. require("mirror.dogs").status() .. " | " .. require("mirror.itemclean").status() .. " | " .. require("mirror.bodycap").status() .. " | find misses " .. util.find_misses))
+        .. " | zombies: " .. zombies.status() .. " | " .. fire.status() .. " | " .. drops.status() .. " | " .. world.status() .. " | " .. require("mirror.camps").status() .. " | " .. require("mirror.airdrops").status() .. " | " .. require("mirror.prefabs").status() .. " | " .. doors.status() .. " | " .. infest.status() .. " | " .. horde.status() .. " | " .. split.status() .. " | " .. power.status() .. " | " .. require("mirror.towing").status() .. " | " .. require("mirror.startgps").status() .. " | " .. audio.status() .. " | " .. loot.status() .. " | " .. looted.status() .. " | " .. downed.status() .. " | " .. glider.status() .. " | " .. builds.status() .. " | " .. pings.status() .. " | " ..corpses.status() .. " | " .. deathbags.status() .. " | " .. tactical.status() .. " | " .. throwables.status() .. " | " .. vehicles.status() .. " | " .. harvest.status() .. " | " .. pvp.status() .. " | " .. require("mirror.personalspace").status() .. " | " .. require("mirror.dogs").status() .. " | " .. require("mirror.itemclean").status() .. " | " .. require("mirror.bodycap").status() .. " | find misses " .. util.find_misses))
     rx_count = 0
 end
 
@@ -226,11 +225,18 @@ local function step(name)
     if not tags then perf.glue(name) end
 end
 
+-- this link's sleeping systems (perf.naps; keepalive, camps, airdrops, prefabs, voice); arriving in or leaving a
+-- world wakes them all (the guests' settle timers count only in-world time)
+local naps, naps_world = perf.naps(), nil
+local function napped(name, ctx, fn, dt) naps.run(name, dt, util.safe, fn, ctx) end
+local function wake_naps() naps.wake() end
+
 local started = false
 local cur_peer = nil
 function phase1.started() return started and role or nil end
 local bye_seen = nil
 local opened_at = nil          -- os.time() when this link opened (phase1.init)
+local function read_dead(p) return p["PlayerDead?"] == true end
 local function on_tick(dt)
     if not started then return end
     if not tags then perf.run("peers", peers.tick, dt) end   -- (the perf frame is game.lua's, around every handler)
@@ -248,12 +254,10 @@ local function on_tick(dt)
             local ps = perf.start()
             seq = seq + 1
             -- The car we're driving travels with the pose: same rate, same redundancy. Or the car we stand on.
-            -- And the FPV quad we fly (drone.lua, "Q ..."). Segments after the pose, each its own "|".
+            -- Segments after the pose, each its own "|".
             local car = vehicles.drive_line() or vehicles.base_line(player)
-            local quad = drone.line()
             local line = pose_line
             if car then line = line .. "|" .. car end
-            if quad then line = line .. "|" .. quad end
             link.send(seq, pose_out:pack(seq, line))
             perf.stop("pose.send", ps)
         end
@@ -271,9 +275,9 @@ local function on_tick(dt)
             pose_gaps.seq = e.seq
             if e.live then pose_gaps.got = pose_gaps.got + 1 else pose_gaps.recovered = (pose_gaps.recovered or 0) + 1 end
             local body, rest = e.line:match("^([^|]*)|?(.*)$")
-            local base, quad, car = poseline.segments(rest)
+            -- (an FPV quad segment from an older SurrounSync is read and left alone)
+            local base, _, car = poseline.segments(rest)
             if car then vehicles.drive_sample(car) end
-            if e.live then drone.sample(quad) end
             local pose = poseline.parse(body)
             if pose then
                 pose.base = base
@@ -333,7 +337,7 @@ local function on_tick(dt)
                 -- a joined guest always goes home, whatever the two PCs' clocks say)
                 log.info("phase1: an old goodbye from " .. link.peer_name() .. " - ignored")
             else
-                notify.show(link.peer_name() .. " stopped hosting.", "info")
+                notify.show(link.peer_name() .. " stopped hosting." .. (session.host_stopped() and " You stay in your world." or ""), "info")
             end
         end
     end
@@ -393,8 +397,8 @@ local function on_tick(dt)
         log.info("phase1: the other game is back")
     end
     step("life")
-    local dead = false
-    pcall(function() dead = player["PlayerDead?"] == true end)
+    local okd, dead = pcall(read_dead, player)
+    dead = okd and dead
     if dead ~= my_dead then
         my_dead = dead
         if dead then
@@ -473,9 +477,7 @@ local function on_tick(dt)
         look_in = now < look_fast_until and 0.15 or cfg.phase1.look_interval
         local ads = false
         pcall(function() ads = player["IsADS?"] == true end)
-        local bike = package.loaded["mirror.hoverbike"]
-        local unseen = bike and bike.rider_out_of_sight and bike.rider_out_of_sight()
-        local mine = (not ads and not unseen) and look.capture(player) or my_look
+        local mine = not ads and look.capture(player) or my_look
         if mine and mine ~= my_look then
             my_look = mine
             link.put_blob("look", mine)
@@ -562,7 +564,6 @@ local function on_tick(dt)
         perf.run("pvp", util.safe, pvp.tick, "pvp.tick", dt)
         perf.run("downed", util.safe, downed.tick, "downed.tick", dt)
         perf.run("glider", util.safe, glider.tick, "glider.tick", dt)
-        perf.run("drone", util.safe, drone.tick, "drone.tick", dt)
         perf.run("nametag", util.safe, nametag.tick, "nametag.tick", dt)
         perf.run("lights", util.safe, lights.tick, "lights.tick", dt, remote:newest())
         perf.run("tactical", util.safe, tactical.tick, "tactical.tick", dt)
@@ -576,16 +577,18 @@ local function on_tick(dt)
         if status_in <= 0 then status_in = cfg.phase1.status_interval; status() end
         return
     end
-    perf.run("keepalive", util.safe, keepalive.tick, "keepalive.tick", dt)
+    local iw = session.in_world()
+    if iw ~= naps_world then naps_world = iw; wake_naps() end
+    napped("keepalive", "keepalive.tick", keepalive.tick, dt)
     perf.run("session", util.safe, session.tick, "session.tick", dt)
     perf.run("anim", util.safe, anim.tick, "anim.tick")
     perf.run("zombies", util.safe, zombies.tick, "zombies.tick", dt)
     perf.run("fire", util.safe, fire.tick, "fire.tick", dt)
     perf.run("drops", util.safe, drops.tick, "drops.tick", dt)
     perf.run("world", util.safe, world.tick, "world.tick", dt)
-    perf.run("camps", util.safe, require("mirror.camps").tick, "camps.tick", dt)
-    perf.run("airdrops", util.safe, require("mirror.airdrops").tick, "airdrops.tick", dt)
-    perf.run("prefabs", util.safe, require("mirror.prefabs").tick, "prefabs.tick", dt)
+    napped("camps", "camps.tick", require("mirror.camps").tick, dt)
+    napped("airdrops", "airdrops.tick", require("mirror.airdrops").tick, dt)
+    napped("prefabs", "prefabs.tick", require("mirror.prefabs").tick, dt)
     perf.run("doors", util.safe, doors.tick, "doors.tick", dt)
     perf.run("infest", util.safe, infest.tick, "infest.tick", dt)
     perf.run("horde", util.safe, horde.tick, "horde.tick", dt)
@@ -603,11 +606,10 @@ local function on_tick(dt)
     perf.run("chat", util.safe, chat.tick, "chat.tick")
     perf.run("teleport", util.safe, teleport.tick, "teleport.tick", dt)
     perf.run("compat", util.safe, compat.tick, "compat.tick")
-    perf.run("voice", util.safe, voice.tick, "voice.tick", dt)
+    napped("voice", "voice.tick", voice.tick, dt)
     perf.run("pvp", util.safe, pvp.tick, "pvp.tick", dt)
     perf.run("downed", util.safe, downed.tick, "downed.tick", dt)
     perf.run("glider", util.safe, glider.tick, "glider.tick", dt)
-    perf.run("drone", util.safe, drone.tick, "drone.tick", dt)
     perf.run("corpses", util.safe, corpses.tick, "corpses.tick", dt)
     perf.run("deathbags", util.safe, deathbags.tick, "deathbags.tick", dt)
     perf.run("nametag", util.safe, nametag.tick, "nametag.tick", dt)
@@ -636,6 +638,7 @@ function phase1.can_switch()
 end
 
 local function reset_link_state()
+    wake_naps()
     if ghost.exists() then ghost.destroy("co-op restarted in another role") end
     peer_protocol, peer_build, quiet_logged, hello_missing_logged = nil, nil, false, false
     my_dead, peer_dead, connected, revived_at = nil, false, false, nil
@@ -699,7 +702,6 @@ function phase1.stop()
     log.info("phase1: co-op stopped (" .. tostring(role) .. ")")
     util.safe(downed.stop, "downed.stop")
     util.safe(glider.stop, "glider.stop")
-    util.safe(drone.stop, "drone.stop")
     reset_link_state()
     if not tags then peers.stop(); link.bridge_cmd("stop") end
     started, cur_peer = false, nil
@@ -743,7 +745,7 @@ function phase1.init(c, r, peer_id, t)
         fire.init(cfg, role)
         game.on_world_reset(function() ghost.forget(); look.forget() end)
         tactical.init(cfg)
-        throwables.init(cfg)
+        throwables.init(cfg, same_world)
         nuke.init()
         vehicles.init(cfg, role, session, true)
         group.init(cfg, session)
@@ -752,7 +754,6 @@ function phase1.init(c, r, peer_id, t)
         pvp.init(role, same_world)
         downed.init(cfg, same_world, false)
         glider.link_init(same_world)
-        drone.link_init(same_world, peer_id)
         game.on_ready(function() save_guard.install() end)
         game.on_tick(on_tick)
         log.info(string.format("phase1: another guest (%s), sending %s, reading %s", tostring(peer_id), mine, theirs))
@@ -787,13 +788,12 @@ function phase1.init(c, r, peer_id, t)
     looted.init(cfg, role, session)
     downed.init(cfg, same_world, not tags)
     glider.link_init(same_world)
-    drone.link_init(same_world, peer_id)
     builds.init(cfg, role, session)
     pings.init(cfg, role, session)
     corpses.init(cfg, role, zombies, session)
     game.on_world_reset(function() ghost.forget(); look.forget(); keepalive.forget(); world.forget() end)
     tactical.init(cfg)
-    throwables.init(cfg)
+    throwables.init(cfg, same_world)
     nuke.init()
     debugmenu.init()
     vehicles.init(cfg, role, session)
@@ -821,7 +821,5 @@ end
 
 -- The body limit ticks on its own, also outside co-op (when this file loads, which the menu does early).
 util.safe(function() require("mirror.bodycap").init(phase1.started) end, "bodycap.init")
--- The forest giant too (a solo world has one as well; a guest only resizes the host's).
-util.safe(function() require("mirror.giant").init(phase1.started) end, "giant.init")
 
 return phase1

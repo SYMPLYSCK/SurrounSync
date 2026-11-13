@@ -12,9 +12,22 @@ function track:push(t, pose)
     self.head = self.head + 1
     self.s[self.head] = pose
     while self.tail < self.head and t - self.s[self.tail].t > self.keep do
+        local old = self.s[self.tail]
+        -- (a pose push_copy made is its own: kept for the next push_copy)
+        if old.own then self.spare = self.spare or {}; self.spare[#self.spare + 1] = old end
         self.s[self.tail] = nil
         self.tail = self.tail + 1
     end
+end
+
+-- push a copy of loc / yaw / vel (the caller may reuse its tables); the copy's tables come back once it's dropped
+function track:push_copy(t, loc, yaw, vel)
+    local sp = self.spare
+    local p = sp and sp[#sp]
+    if p then sp[#sp] = nil else p = { loc = {}, vel = {}, own = true } end
+    p.loc.X, p.loc.Y, p.loc.Z, p.yaw = loc.X, loc.Y, loc.Z, yaw
+    p.vel.X, p.vel.Y, p.vel.Z = vel.X, vel.Y, vel.Z
+    self:push(t, p)
 end
 
 function track:empty() return self.head < self.tail end

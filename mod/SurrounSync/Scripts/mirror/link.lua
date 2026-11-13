@@ -343,6 +343,9 @@ function link.lobby()
             end
         elseif k == "joinerror" then
             l.joinerror = rest
+        elseif k == "reach" then
+            -- the host can't be reached at all: Steam's P2P session error (1-4, SurrounSyncBridge.cs WriteLobby)
+            l.reach_fail = tonumber(rest:match("^fail (%d+)"))
         elseif k == "update" then
             l.update = rest
         elseif k == "report" then
@@ -402,8 +405,23 @@ function link.bridge_alive()
     if not f then return false end
     local s = f:read("*a") or ""
     f:close()
-    local t = tonumber(s:match(" at (%d+)") or s:match("\ntime (%d+)") or "")
+    -- the lobby's own "time" line first: it also holds Steam and server names, and one like "Base at 2" read as
+    -- the time made a running bridge look dead and restarted it every 30 s (players' "connection program stopped")
+    local t = tonumber(s:match("\ntime (%d+)\n") or s:match(".* peer_game %S+ at (%d+)") or "")
     return t ~= nil and os.time() - t < 15
+end
+
+-- why the bridge isn't up, from its log: "nosteam" (Steam didn't answer it), "busy" (an old copy kept the folder),
+-- "nolog" (it never ran: blocked or removed), else nil
+function link.bridge_problem()
+    if kind ~= "steam" then return nil end
+    local f = io.open(app_dir() .. "\\" .. ((auto or not bridge_role) and "mirror_bridge.log" or ("mirror_bridge_" .. bridge_role .. ".log")), "rb")
+    if not f then return "nolog" end
+    local s = f:read("*a") or ""
+    f:close()
+    if s:find("SteamAPI_Init FAILED", 1, true) then return "nosteam" end
+    if s:find("the other bridge is still running", 1, true) then return "busy" end
+    return nil
 end
 
 local ps_at, ps_val = -100, nil

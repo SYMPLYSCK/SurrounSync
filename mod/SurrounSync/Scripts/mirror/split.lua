@@ -421,6 +421,7 @@ local function forget_world()
     host_want, was_in = "m", false
     -- (zombies.lua drops its hand-back state itself: nothing of the old world is touched here)
     merge_why, offered, offered_epoch, handed_epoch = nil, false, nil, {}
+    leader = nil   -- (else the old leader's ghost stayed out of the distance check: two guests side by side split)
 end
 
 -- revived_age / tp_busy (phase1, teleport of this link): seconds since the guest came back alive, a teleport open

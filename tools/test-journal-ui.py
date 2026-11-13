@@ -383,7 +383,24 @@ def realms_remove_button():
     check(errors(L) == [], "no errors: %s" % errors(L))
 
 
-for t in (realms_off_keeps_mods, realms_page, realms_paging, world_reset_inside_a_call, realms_remove_button):
+def built_when_first_opened():
+    # kit 2026-11-11: the build took 47-53 ms and ran three times around one join; it waits for the handbook now
+    print("built_when_first_opened")
+    L = lua54.LuaRuntime()
+    L.execute('REALMS_ON = true')
+    L.execute(SETUP, SCRIPTS)
+    L.execute('TICK(30)')
+    added = lambda: sum(1 for l in L.eval('LOG').values() if "tabs added to the handbook" in l)
+    check(added() == 0, "a handbook nobody opened: no tabs built (%d builds in 30 frames)" % added())
+    L.execute('PLAYER["JournalOpen?"] = true; TICK(1)')
+    check(added() == 1, "opened: built at once, before it shows (%d)" % added())
+    L.execute('PLAYER["JournalOpen?"] = false; TICK(5)')
+    check(added() == 1, "closed again: kept, not built again (%d)" % added())
+    check(errors(L) == [], "no warnings (%s)" % errors(L))
+
+
+for t in (realms_off_keeps_mods, realms_page, realms_paging, world_reset_inside_a_call, realms_remove_button,
+          built_when_first_opened):
     t()
 print()
 print("%d failure(s)" % len(fails))

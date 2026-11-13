@@ -305,13 +305,15 @@ local function guest_tick()
         -- the same preset name with a different live state showed rain + snow here under the host's clear sky.
         local g = global_state(w)
         local have = g and values_of(g) or nil
-        local same_jump = jump and not differ_live(jump.vals, host.live)
         if have and not differ_live(have, host.live) then
             matched, jump = "live", nil
-        elseif matched == "live" and have and jumped(have, host.live) and not (same_jump and now - jump.since >= JUMP_CONFIRM) then
+        elseif matched == "live" and have and jumped(have, host.live) and not (jump and now - jump.since >= JUMP_CONFIRM) then
             -- (a sudden jump away from the host's weather we matched waits for a second look: the host read zeros while
-            -- it stalled - rain gone and back 2 s later on the guest, live 2026-10-30 00:29:19)
-            if not same_jump then jump = { vals = host.live, since = now } end
+            -- it stalled - rain gone and back 2 s later on the guest, live 2026-10-30 00:29:19. The wait runs from the
+            -- first look that jumped: it started again at each new value, so while the host's weather was still
+            -- blending every look was new and the guest kept its old sky until the host's stopped moving - torrential
+            -- rain on one screen and clear on the other for ~20 s, user 2026-11-10.)
+            if not jump then jump = { vals = host.live, since = now } else jump.vals = host.live end
         elseif not want or differ_live(want.vals, host.live) or now - want.at > RETRY then
             jump = nil
             want = { vals = host.live, at = now }

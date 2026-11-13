@@ -13,7 +13,7 @@ except ImportError:
     sys.exit(2)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPTS = os.path.join(ROOT, "mod", "SurrounSync", "Scripts")
+SCRIPTS = os.environ.get("SURROUNSYNC_TEST_SCRIPTS") or os.path.join(ROOT, "mod", "SurrounSync", "Scripts")
 fails = []
 
 
@@ -51,7 +51,7 @@ end
 package.preload["mirror.notify"] = function() return { show = function(m, k) SAID[#SAID + 1] = m end, clear = function() end } end
 LOGFILE = nil
 package.preload["mirror.slotguard"] = function()
-    return fake("slotguard", { log_read = function() return nil end, log_write = function(t) LOGFILE = t; return true end,
+    return fake("slotguard", { log_read = function() return nil end, log_write = function(t) if NOLOG then return false end; LOGFILE = t; return true end,
         log_clear = function() LOGFILE = nil end, log_exists = function() return LOGFILE ~= nil end,
         is_own = function(s) return s == "MySave" end,
         read_realm = function() return { ["Level.sav"] = "w" }, { ["Player.sav"] = "p" } end })
@@ -287,6 +287,59 @@ def leaving_saves_once_coop_and_the_first_save_are_over():
     L.execute('n0 = count("session.save_now"); SAVING = true; ROLE = nil; run(20.5)')
     check(L.eval('st()') == "ending_save" and L.eval('count("session.save_now") - n0') == 0,
           "a save still running after 20 s: on with what it writes, no second save into it")
+    # audit 2026-11-10: that second wait had no end - "Saving the Realm..." for good, the Realm still hosted
+    # (then the upload's own wait for the save, UPLOAD_WAIT_MAX 60 s)
+    L.execute('run(31); ST1 = st(); run(61)')
+    check(L.eval('ST1') == "ending_upload" and L.eval('last("upload") ~= nil'),
+          "a save that never finishes: the leave still uploads what is on disk (%s)" % L.eval('ST1'))
+
+
+def a_realm_save_that_cant_be_read_on_leaving_is_kept():
+    # audit 2026-11-10: the final upload couldn't read the session's save, nothing was stashed, and going home purged
+    # it with the session log: the session's character and world were gone
+    print("a_realm_save_that_cant_be_read_on_leaving_is_kept")
+    L = fresh()
+    L.execute('realmplay.promote(RID, "76561100"); run(1.0); READY = true; run(0.1); run(1.3)')
+    L.execute('package.loaded["mirror.slotguard"].read_realm = function() return nil, "locked by another program" end')
+    L.execute('p0 = count("slotguard.purge"); realmplay.leave(); ROLE = nil; run(0.6); run(2.0); run(1.0)')
+    check(L.eval('count("slotguard.purge") - p0') == 0, "the save it couldn't read is not purged")
+    check(L.eval('LOGFILE') is not None, "...and the session log stays for recover()")
+    check(L.eval('last("release") ~= nil'), "the Realm is let go")
+    # Sentinel R10: the takeover's log write had failed, so nothing named the kept slot and the next start purged it
+    L = fresh()
+    L.execute('NOLOG = true; realmplay.promote(RID, "76561100"); run(1.0); READY = true; run(0.1); run(1.3); NOLOG = false')
+    check(L.eval('LOGFILE') is None, "(the takeover's session log wasn't written)")
+    L.execute('package.loaded["mirror.slotguard"].read_realm = function() return nil, "locked by another program" end')
+    L.execute('p0 = count("slotguard.purge"); realmplay.leave(); ROLE = nil; run(0.6); run(2.0); run(1.0)')
+    check(L.eval('count("slotguard.purge") - p0') == 0 and L.eval('LOGFILE ~= nil and LOGFILE.step == "joined"')
+          and L.eval('LOGFILE and LOGFILE.realm') == L.eval('RID') and L.eval('LOGFILE and LOGFILE.coop') == "Coop_2",
+          "with no session log yet: one naming the kept save is written for recover()")
+    # the same leave through the game's own menu (another save loaded)
+    L = fresh()
+    L.execute('realmplay.promote(RID, "76561100"); run(1.0); READY = true; run(0.1); run(1.3)')
+    L.execute('package.loaded["mirror.slotguard"].read_realm = function() return nil, "locked by another program" end')
+    L.execute('p0 = count("slotguard.purge"); CUR = "MySave"; ROLE = nil; run(2.5); run(1.0)')
+    check(L.eval('count("slotguard.purge") - p0') == 0 and L.eval('LOGFILE ~= nil') and L.eval('last("release") ~= nil'),
+          "left through the game's menu: the unread save and its log stay too, the Realm is let go")
+
+
+def a_realm_open_with_a_save_that_never_finishes_lets_the_realm_go():
+    # audit 2026-11-10: opening waited for the player's own save with no end, the Realm leased and kept hosted by nobody
+    print("a_realm_open_with_a_save_that_never_finishes_lets_the_realm_go")
+    L = fresh()
+    L.execute('''
+        package.loaded["mirror.session"].current_slot = function() return "MySave" end
+        package.loaded["mirror.session"].load_slot = function(s) LOADED = s; return true end
+        ROLE = nil
+        realmplay.start(RID); answer("claim", true, { "won", "5" })
+        SAVING = true
+        run(10)
+        STILL = realmplay.active()
+        run(25)
+    ''')
+    check(L.eval('STILL') == True, "a slow save is waited for")
+    check(L.eval('realmplay.active()') == False and L.eval('last("release") ~= nil') and L.eval('LOADED') is None,
+          "one that never finishes: the Realm isn't opened and is let go")
 
 
 def a_second_guest_follows_the_one_who_takes_over():
@@ -410,7 +463,8 @@ def coop_started_meanwhile_stops_the_realm():
 for t in (clean_end_takes_over_in_place, no_upload_reads_the_realm_save_while_the_game_writes_it, another_member_won_the_realm,
           a_host_that_leaves_while_a_member_took_over_is_told_calmly, no_old_host_known_waits_out_the_lease,
           old_host_known_by_its_lease_id, session_gone_falls_back_home, handover_times_out,
-          leaving_saves_once_coop_and_the_first_save_are_over, a_second_guest_follows_the_one_who_takes_over,
+          leaving_saves_once_coop_and_the_first_save_are_over, a_realm_save_that_cant_be_read_on_leaving_is_kept,
+          a_realm_open_with_a_save_that_never_finishes_lets_the_realm_go, a_second_guest_follows_the_one_who_takes_over,
           the_old_host_is_known_from_when_it_left, nobody_takes_it_over_then_open_it_myself,
           realm_load_that_never_runs_goes_back_home, realm_load_that_runs_is_not_given_up,
           load_call_refused_goes_back_home, coop_started_meanwhile_stops_the_realm):

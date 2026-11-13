@@ -271,19 +271,23 @@ local function play(m)
     stats.played = stats.played + 1
 end
 
+local got = {}
+local function take(p) got[#got + 1] = p end
+
 function audio.tick(dt)
     if role == "off" then return end
     util.safe(hook_all, "audio.hook")
-    local now, keep = os.clock(), {}
-    for _, q in ipairs(queue) do
-        if now - q.at < 0.1 then keep[#keep + 1] = q
+    local now, n = os.clock(), 0
+    for i = 1, #queue do   -- (kept in place: no new table every frame)
+        local q = queue[i]
+        queue[i] = nil
+        if now - q.at < 0.1 then n = n + 1; queue[n] = q
         elseif math.abs((fire.last_shot or -100) - q.at) > 0.3 then send(q.path, q.l, q.vol, q.pitch) end
     end
-    queue = keep
     local hear = require("mirror.mysettings").on("sounds")
     -- the whole batch first: its newest sound sets the smallest delay before any of the batch is judged
-    local got = {}
-    channel:pump(function(p) got[#got + 1] = p end)
+    for i = #got, 1, -1 do got[i] = nil end
+    channel:pump(take)
     if #got == 0 then return end
     local ms, msgs = now * 1000, {}
     for _, p in ipairs(got) do

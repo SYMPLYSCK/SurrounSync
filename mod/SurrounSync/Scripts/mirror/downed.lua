@@ -106,14 +106,39 @@ local function lie_down(p)
 end
 
 -- what the game's stand-up does (IA_SitDown: StopAnimMontage + SetMovementMode walking), and the rest put back
-local function get_up(p)
+local function get_up(p, again)
     local m = util.find(SIT_FLOOR)
     if m then pcall(function() p:StopAnimMontage(m) end) end
     pcall(function() p["Sitting?"] = false end)
     pcall(function() p.CharacterMovement:SetMovementMode(1, 0) end)
     pcall(function() p:EnableInput(game.controller()) end)
+    if again then return end
     pcall(function() med(p)["CanTakeDamage?"] = sh.cantake ~= false end)
     sh.cantake = nil
+end
+
+-- User 2026-11-12: a revived player "cannot do anything" for a while, then can. Looked at AFTER_S after getting up:
+-- what still holds them is logged and they're got up again (the cause isn't known yet: the log says which it is)
+local AFTER_S = { 0.5, 2.0, 5.0 }
+local function check_up(p, secs)
+    local mode, cur, sit
+    pcall(function() mode = p.CharacterMovement.MovementMode end)
+    pcall(function() cur = p:GetCurrentMontage() end)
+    pcall(function() sit = p["Sitting?"] end)
+    local m = util.find(SIT_FLOOR)
+    local held = {}
+    if mode == 0 then held[#held + 1] = "can't move (no movement mode)" end
+    if m and util.valid(cur) and util.same(cur, m) then held[#held + 1] = "still in the floor sit" end
+    if sit == true then held[#held + 1] = "Sitting? still set" end
+    local what = util.valid(cur) and util.fname(cur) or "none"
+    if held[1] then
+        log.warn(string.format("downed: %.1f s after getting up still held: %s (montage %s, movement mode %s) - getting up again",
+            secs, table.concat(held, ", "), what, tostring(mode)))
+        get_up(p, true)
+    else
+        log.info(string.format("downed: %.1f s after getting up: movement mode %s, montage %s", secs, tostring(mode), what))
+        pcall(function() p:EnableInput(game.controller()) end)
+    end
 end
 
 local function end_down()
@@ -132,6 +157,7 @@ local function revive_me()
     pcall(function() p:SendHealthToClient(hp) end)
     pcall(function() p:SetPostProcessHealth(false) end)
     stats.got_up = stats.got_up + 1
+    sh.after = { t0 = os.clock(), i = 1 }
     notify.show((by or "A teammate") .. " got you up.", "good", "downed.me", true)
     log.info("downed: revived by " .. tostring(by))
 end
@@ -170,11 +196,17 @@ local function own_tick(dt)
     pcall(function() dead = p["PlayerDead?"] == true end)
     if dead then
         if sh.down then sh.down, sh.revive = false, nil; notify.clear("downed.me") end
-        sh.dying = nil
+        sh.dying, sh.after = nil, nil
         return
     end
-    if not sh.down then return end
     local t = os.clock()
+    local a = sh.after
+    if a and not sh.down and t - a.t0 >= AFTER_S[a.i] then
+        a.i = a.i + 1
+        if a.i > #AFTER_S then sh.after = nil end
+        check_up(p, t - a.t0)
+    end
+    if not sh.down then return end
     sh.apply_in = sh.apply_in - dt
     if sh.apply_in <= 0 then sh.apply_in = 1.0; lie_down(p) end
     if sh.revive == sh.ep then revive_me(); return end
@@ -247,6 +279,8 @@ local function peer_tick(dt, here)
     end
 end
 
+local function apply_safe(p) util.safe(apply, "downed.apply", p) end
+
 function downed.tick(dt)
     if not on then return end
     local here = same_world() == true
@@ -254,7 +288,7 @@ function downed.tick(dt)
     if not e then e = {}; sh.links[key] = e end
     e.t, e.here = os.clock(), here
     -- (messages first: a revive that came in this frame gets me up this frame)
-    channel:pump(function(p) util.safe(apply, "downed.apply", p) end)
+    channel:pump(apply_safe)
     if main then util.safe(own_tick, "downed.own", dt) end
     local st = (sh.down and "D " or "U ") .. sh.ep
     resend_in = resend_in - dt
@@ -282,7 +316,7 @@ end
 local function forget()
     -- (down when the world went: its card goes too, else "you're down" stays up in the next world)
     if main and sh.down then notify.clear("downed.me") end
-    if main then sh.down, sh.revive, sh.dying, sh.cantake = false, nil, nil, nil end
+    if main then sh.down, sh.revive, sh.dying, sh.cantake, sh.after = false, nil, nil, nil, nil end
     peer, hold, sent = { down = false }, 0.0, nil
 end
 

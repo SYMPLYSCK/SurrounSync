@@ -143,19 +143,38 @@ static class SetupTest
             Ok(Find(Doctor.Check(game), "wrong Steam branch") == null, "on Experimental: no branch problem");
             string acf = Path.Combine(root, "steamapps", "appmanifest_1645820.acf");
             string acfText = File.ReadAllText(acf);
-            // game 0.8 is on the normal branch too since 2026-11-05: no problem, a line about matching friends' branch
+            // only the game version it was made for (user 2026-11-10): the other 0.8 branch is the wrong one too now
+            // (this test setup has no payload: made on "experimental", no build recorded)
             File.WriteAllText(acf, acfText.Replace("experimental", ""));
-            var onNormal = Doctor.Check(game);
-            Ok(Find(onNormal, "wrong Steam branch") == null && Find(onNormal, "Both are game 0.8") != null,
-               "normal branch (0.8) -> no branch problem, told both 0.8 branches work");
-            Ok(Find(onNormal, "OLDER version") == null && Find(onNormal, "NEWER (build") == null,
-               "normal branch -> its build isn't compared with the experimental one this was made on");
+            var onNormal = Find(Doctor.Check(game), "wrong Steam branch");
+            Ok(onNormal != null && onNormal.Kind == "problem" && onNormal.Fix.Contains("\"Experimental 0.8\""),
+               "made on Experimental, game on the normal branch -> wrong branch, told to pick Experimental 0.8");
+            var refused = new List<string>();
+            Ok(!new Installer { Log = refused.Add }.Install(game) && refused.Count > 0 && refused[0].StartsWith("NOT INSTALLED: Your SurrounDead is on the wrong Steam branch")
+               && refused.Exists(l => l.StartsWith("What to do: In Steam")), "...and Install refuses it, saying why and what to do");
             // "previous" is the old 0.7.1
             File.WriteAllText(acf, acfText.Replace("experimental", "previous"));
             var br = Find(Doctor.Check(game), "wrong Steam branch");
-            Ok(br != null && br.What.Contains("0.7.1") && br.Fix.Contains("\"None\" (the normal branch)"),
-               "previous branch -> wrong branch, told it is 0.7.1 and to pick None");
+            Ok(br != null && br.What.Contains("0.7.1") && br.Fix.Contains("\"Experimental 0.8\""),
+               "previous branch -> wrong branch, told it is 0.7.1 and which branch to pick");
             File.WriteAllText(acf, acfText);
+            var allowed = new List<string>();
+            new Installer { Log = allowed.Add }.Install(game);
+            Ok(!allowed.Exists(l => l.StartsWith("NOT INSTALLED")), "the right branch: Install goes past the version check (" + (allowed.Count > 0 ? allowed[0] : "") + ")");
+            // the rule itself, with a recorded build (as a real release has)
+            Func<string[], string> kind = p => p == null ? "ok" : p[2];
+            Ok(kind(Doctor.VersionProblem("26471822", "", "26471822", null, true, "5.6")) == "ok", "the build and branch it was made for: installs");
+            var old = Doctor.VersionProblem("26471822", "", "26467602", null, true, "5.6");
+            Ok(kind(old) == "older" && old[0].Contains("26467602") && old[0].Contains("26471822") && old[0].Contains("won't install"),
+               "an older game build: refused, both builds named");
+            var nw = Doctor.VersionProblem("26471822", "", "26480000", null, true, "5.6");
+            Ok(kind(nw) == "newer" && nw[0].Contains("NEWER") && nw[1].Contains("SurrounSync update"), "a newer game build: refused, told to wait for the SurrounSync update");
+            var wb = Doctor.VersionProblem("26471822", "", "26471822", "experimental", true, "5.6");
+            Ok(kind(wb) == "branch" && wb[1].Contains("\"None\" (the normal branch)"), "made on the normal branch, game on Experimental: refused, told to pick None");
+            Ok(kind(Doctor.VersionProblem("26471822", "", null, null, true, "5.6")) == "unknown", "the game's build can't be read: refused");
+            Ok(kind(Doctor.VersionProblem("", "", "123", null, false, "5.3.2")) == "engine", "an old game program (Unreal 5.3): refused");
+            Ok(kind(Doctor.VersionProblem("", "", "123", null, false, "0.0.0")) == "ok", "a program version that can't be read alone doesn't refuse");
+            Ok(kind(Doctor.VersionProblem("", "", "123", null, true, "5.6")) == "ok", "no build recorded (an old setup): only the branch is checked");
 
             // the updater: a download whose connection closes early is a failure, never a cut-off setup to run
             string dl = Path.Combine(root, "dl.exe"), err;
@@ -163,6 +182,17 @@ static class SetupTest
                "cut-off download fails and leaves no file (" + err + ")");
             Ok(SurrounSyncShared.Release.Download(Serve(1000, 1000), dl, null, out err) && new FileInfo(dl).Length == 1000,
                "complete download succeeds (" + err + ")");
+            // the setup a GitHub release names is run: only this repo's own release files are taken
+            if (SurrounSyncShared.Release.SourceUrl().StartsWith("https://api.github.com/"))
+            {
+                string own = "https://github.com/" + SurrounSyncShared.Release.Repo + "/releases/download/v1.2.0/SurrounSyncSetup.exe";
+                Ok(SurrounSyncShared.Release.SetupUrlOk(own), "this repo's release setup is taken");
+                Ok(!SurrounSyncShared.Release.SetupUrlOk("https://example.com/SurrounSyncSetup.exe")
+                   && !SurrounSyncShared.Release.SetupUrlOk("http://github.com/" + SurrounSyncShared.Release.Repo + "/releases/download/v1/SurrounSyncSetup.exe")
+                   && !SurrounSyncShared.Release.SetupUrlOk("https://github.com/someone/else/releases/download/v1/SurrounSyncSetup.exe"),
+                   "another host, plain http or another repo's setup is not");
+            }
+            else Console.WriteLine("  (skipped the setup-url check: update_source.txt points somewhere else)");
 
             // SyncFX in the setup: a new install has it loaded (switched off by SyncFX's own default); an update keeps
             // the player's on/off and settings, and a SyncFX that ran before 0.14.1 (always on when loaded) stays on
@@ -262,61 +292,31 @@ static class SetupTest
             Ok(!Directory.Exists(Path.Combine(gmods, "SurrounDeadGore")) && !File.Exists(gpak) && !File.Exists(gpak + ".off")
                && !File.ReadAllText(Path.Combine(gmods, "mods.txt")).Contains("SurrounDeadGore : 1"), "gore, uninstall: mod and pak gone, not loaded");
 
-            // The FPV drone's SurrounSync copy (bundled.txt): installed on, the player's FPVDrone.ini kept on an update,
-            // removed on uninstall; a separately installed FPVDrone (no bundled.txt) is never touched
+            // The FPV drone's copy that came with SurrounSync 1.1.0 (bundled.txt): an update or uninstall removes it;
+            // a bought copy over it (owned.txt) or a separately installed FPVDrone (no bundled.txt) is never touched
             string dg = Path.Combine(root, "dgame"), dmods = Path.Combine(dg, "Mods"), ddir = Path.Combine(dmods, "FPVDrone");
             Directory.CreateDirectory(dmods);
-            var dms = new MemoryStream();
-            using (var za = new System.IO.Compression.ZipArchive(dms, System.IO.Compression.ZipArchiveMode.Create, true))
-                foreach (var n in new[] { "game/ue4ss/Mods/FPVDrone/Scripts/main.lua", "game/ue4ss/Mods/FPVDrone/FPVDrone.ini",
-                                          "game/ue4ss/Mods/FPVDrone/bundled.txt" })
-                    using (var w = new StreamWriter(za.CreateEntry(n).Open())) w.Write("new");
-            var drec = new Dictionary<string, string>();
-            Action dinst = () =>
-            {
-                dms.Position = 0;
-                using (var za = new System.IO.Compression.ZipArchive(dms, System.IO.Compression.ZipArchiveMode.Read, true))
-                    inst.InstallDrone(za, dmods, drec);
-            };
-            File.WriteAllText(Path.Combine(dmods, "mods.txt"), "SurrounSync : 1\r\n");
-            dinst();
-            Ok(File.Exists(Path.Combine(ddir, "Scripts", "main.lua")) && File.Exists(Path.Combine(ddir, "bundled.txt"))
-               && File.ReadAllText(Path.Combine(dmods, "mods.txt")).Contains("FPVDrone : 1") && drec["fpvdrone"] == "ours",
-               "drone, new install: unpacked with its mark, switched on");
-            W(Path.Combine(ddir, "FPVDrone.ini"), "roll_axis = X");
-            W(Path.Combine(ddir, "Scripts", "gone.lua"), "old");
-            dinst();
-            Ok(File.ReadAllText(Path.Combine(ddir, "FPVDrone.ini")) == "roll_axis = X" && !File.Exists(Path.Combine(ddir, "Scripts", "gone.lua")),
-               "drone, update: the player's FPVDrone.ini kept, old scripts replaced");
-            Ok(!Directory.Exists(Path.Combine(dmods, ".FPVDrone.new")), "drone, update: no staging folder left");
-            // an update whose unpack fails (here its staging folder can't be made) leaves the installed mod as it was
-            string dstage = Path.Combine(dmods, ".FPVDrone.new");
-            W(dstage, "in the way");
-            bool dthrew = false;
-            try { dinst(); } catch (IOException) { dthrew = true; }
-            Ok(dthrew && File.Exists(Path.Combine(ddir, "Scripts", "main.lua")) && File.ReadAllText(Path.Combine(ddir, "FPVDrone.ini")) == "roll_axis = X",
-               "drone, update that fails to unpack: the installed scripts and ini stay");
-            File.Delete(dstage);
-            // FPVDrone bought and unpacked over the SurrounSync copy: bundled.txt left behind, owned.txt says it's theirs
+            // FPVDrone bought and unpacked over the 1.1.0 copy: bundled.txt left behind, owned.txt says it's theirs
+            File.WriteAllText(Path.Combine(dmods, "mods.txt"), "SurrounSync : 1\r\nFPVDrone : 1\r\n");
+            W(Path.Combine(ddir, "Scripts", "main.lua"), "bought");
+            W(Path.Combine(ddir, "bundled.txt"), "");
             W(Path.Combine(ddir, "owned.txt"), "");
-            W(Path.Combine(ddir, "Scripts", "main.lua"), "bought");
-            dinst();
-            Ok(File.ReadAllText(Path.Combine(ddir, "Scripts", "main.lua")) == "bought", "drone: a bought copy over the bundled one (owned.txt) is not replaced");
+            var drec = new Dictionary<string, string> { { "fpvdrone", "ours" } };
             inst.RemoveDrone(dmods, drec);
-            Ok(File.ReadAllText(Path.Combine(ddir, "Scripts", "main.lua")) == "bought", "drone, uninstall: a bought copy over the bundled one is never removed");
+            Ok(File.ReadAllText(Path.Combine(ddir, "Scripts", "main.lua")) == "bought" && !drec.ContainsKey("fpvdrone"),
+               "drone, update: a bought copy over the bundled one is never removed, and no longer counted as ours");
+            // the 1.1.0 copy as it came (bundled.txt, no owned.txt)
             File.Delete(Path.Combine(ddir, "owned.txt"));
+            drec["fpvdrone"] = "ours";
             inst.RemoveDrone(dmods, drec);
-            Ok(!Directory.Exists(ddir) && !File.ReadAllText(Path.Combine(dmods, "mods.txt")).Contains("FPVDrone : 1"), "drone, uninstall: gone, not loaded");
-            W(Path.Combine(ddir, "Scripts", "main.lua"), "bought");
-            var orec = new Dictionary<string, string>();
-            dms.Position = 0;
-            using (var za = new System.IO.Compression.ZipArchive(dms, System.IO.Compression.ZipArchiveMode.Read, true))
-                inst.InstallDrone(za, dmods, orec);
-            Ok(File.ReadAllText(Path.Combine(ddir, "Scripts", "main.lua")) == "bought" && !File.Exists(Path.Combine(ddir, "bundled.txt"))
-               && !orec.ContainsKey("fpvdrone"), "drone: a separately installed FPVDrone is left as it is");
-            orec["fpvdrone"] = "ours";
+            Ok(!Directory.Exists(ddir) && !File.ReadAllText(Path.Combine(dmods, "mods.txt")).Contains("FPVDrone : 1") && !drec.ContainsKey("fpvdrone"),
+               "drone, update: the copy 1.1.0 brought is gone, not loaded");
+            W(Path.Combine(ddir, "Scripts", "main.lua"), "theirs");
+            var orec = new Dictionary<string, string> { { "fpvdrone", "ours" } };
             inst.RemoveDrone(dmods, orec);
-            Ok(File.Exists(Path.Combine(ddir, "Scripts", "main.lua")), "drone, uninstall: a separately installed FPVDrone is never removed");
+            Ok(File.Exists(Path.Combine(ddir, "Scripts", "main.lua")), "drone: a separately installed FPVDrone is never removed");
+            inst.RemoveDrone(dmods, new Dictionary<string, string>());
+            Ok(File.Exists(Path.Combine(ddir, "Scripts", "main.lua")), "drone: no record, nothing touched");
 
             // SurrounSync's content: the intro (the player's own kept and put back), the sound pak, BPModLoaderMod
             string cg = Path.Combine(root, "cgame"), cmods = Path.Combine(cg, "Mods");
@@ -328,21 +328,25 @@ static class SetupTest
             using (var za = new System.IO.Compression.ZipArchive(cms, System.IO.Compression.ZipArchiveMode.Create, true))
                 foreach (var n in new[] { "content/Movies/UE5 Intro.mp4", "content/Paks/LogicMods/SurrounSyncSounds.pak",
                                           "content/Paks/LogicMods/SurrounSyncGlider.pak", "content/Paks/LogicMods/SurrounSyncArmory.pak",
-                                          "content/Paks/LogicMods/SurrounSyncDrone.pak",
                                           "game/ue4ss/Mods/BPModLoaderMod/Scripts/main.lua" })
                     using (var w = new StreamWriter(za.CreateEntry(n).Open())) w.Write("ours");
             var crec = new Dictionary<string, string>();
+            string pak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncSounds.pak");
+            string glpak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncGlider.pak");
+            string arpak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncArmory.pak");
+            string drpak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncDrone.pak");
+            // (a SurrounSyncDrone.pak there before any SurrounSync setup ran is not ours: the first install keeps it)
+            W(drpak, "1.1.0");
+            bool drKeptFirst = false;
             for (int i = 0; i < 2; i++)
             {
                 cms.Position = 0;
                 using (var za = new System.IO.Compression.ZipArchive(cms, System.IO.Compression.ZipArchiveMode.Read, true))
                     inst.InstallContent(za, cg, cmods, crec);
+                if (i == 0) drKeptFirst = File.Exists(drpak);
             }
-            string pak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncSounds.pak");
-            string glpak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncGlider.pak");
-            string arpak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncArmory.pak");
-            string drpak = Path.Combine(cg, "SurrounDead", "Content", "Paks", "LogicMods", "SurrounSyncDrone.pak");
-            Ok(File.Exists(glpak) && File.Exists(arpak) && File.Exists(drpak), "content: the glider, armory and drone paks in LogicMods");
+            Ok(File.Exists(glpak) && File.Exists(arpak), "content: the glider and armory paks in LogicMods");
+            Ok(drKeptFirst && !File.Exists(drpak), "content, update: 1.1.0's SurrounSyncDrone.pak removed (only once an earlier setup put the paks in)");
             Ok(File.ReadAllText(intro) == "ours" && File.ReadAllText(intro + ".surrounsync-original") == "theirs",
                "content: our intro in, the player's own kept (also after an update)");
             Ok(File.Exists(pak) && File.Exists(Path.Combine(cmods, "BPModLoaderMod", "Scripts", "main.lua"))
@@ -361,6 +365,27 @@ static class SetupTest
             Ok(File.ReadAllText(Path.Combine(cmods, "BPModLoaderMod", "Scripts", "main.lua")) == "their loader"
                && File.ReadAllText(Path.Combine(cmods, "mods.txt")).Contains("BPModLoaderMod : 0"),
                "a player's own BPModLoaderMod and its on/off are never touched");
+            // the Hang Glider installed on its own too (make-glidermod.py's zip): uninstalling SurrounSync leaves it its
+            // pak and the loader that loads it
+            {
+                string gcg = Path.Combine(root, "glgame"), gmods2 = Path.Combine(gcg, "Mods");
+                Directory.CreateDirectory(gmods2);
+                Directory.CreateDirectory(Path.Combine(gcg, "SurrounDead", "Content"));   // (InstallContent needs the game's Content)
+                File.WriteAllText(Path.Combine(gmods2, "mods.txt"), "SurrounSync : 1\r\n");
+                var glrec = new Dictionary<string, string>();
+                cms.Position = 0;
+                using (var za = new System.IO.Compression.ZipArchive(cms, System.IO.Compression.ZipArchiveMode.Read, true))
+                    inst.InstallContent(za, gcg, gmods2, glrec);
+                W(Path.Combine(gmods2, "SurrounSyncGlider", "Scripts", "main.lua"), "glider");
+                inst.RemoveContent(gcg, gmods2, glrec);
+                string lm = Path.Combine(gcg, "SurrounDead", "Content", "Paks", "LogicMods");
+                Ok(File.Exists(Path.Combine(lm, "SurrounSyncGlider.pak")), "uninstall with the glider mod there: its pak kept");
+                Ok(!File.Exists(Path.Combine(lm, "SurrounSyncSounds.pak")) && !File.Exists(Path.Combine(lm, "SurrounSyncArmory.pak")),
+                   "uninstall with the glider mod there: our other paks gone");
+                Ok(File.Exists(Path.Combine(gmods2, "BPModLoaderMod", "Scripts", "main.lua"))
+                   && File.ReadAllText(Path.Combine(gmods2, "mods.txt")).Contains("BPModLoaderMod : 1"),
+                   "uninstall with the glider mod there: BPModLoaderMod kept, still on");
+            }
             // a game without an intro of its own: ours goes again at uninstall (nothing of the player's to put back)
             File.Delete(intro);
             var nrec = new Dictionary<string, string>();

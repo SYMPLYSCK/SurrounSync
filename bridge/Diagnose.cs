@@ -540,6 +540,21 @@ namespace SurrounSyncShared
                 f.DevLook = "mirror/backups.lua.";
                 return f;
             }
+            if (s.Contains("SurrounSyncBridge isn't running") && (s.Contains("says: nosteam") || s.Contains("says: nolog")))
+            {
+                bool noSteam = s.Contains("says: nosteam");
+                f.Title = noSteam ? "The Steam connector couldn't reach Steam" : "The Steam connector never started";
+                f.Category = "Connection"; f.Severity = "ERROR"; f.Confidence = "confirmed";
+                f.What = noSteam ? "SurrounSyncBridge.exe started but Steam didn't answer it (SteamAPI_Init failed), so hosting and joining can't work."
+                    : "SurrounSyncBridge.exe never wrote its log, so it didn't run - something stopped it from starting.";
+                f.Affects = "Hosting, joining and Realms.";
+                f.Cause = noSteam ? "Steam wasn't running or signed in when the connector started, or it refused this program."
+                    : "Antivirus or Windows (Smart App Control) blocked or removed SurrounSyncBridge.exe, or the mod's bridge folder is missing.";
+                f.PlayerTry = noSteam ? "Start Steam and sign in; SurrounSync tries again on its own. If it keeps failing, restart Steam, then the game."
+                    : "Allow ue4ss\\Mods\\SurrounSync\\bridge\\SurrounSyncBridge.exe in your antivirus, then repair with SurrounSync Setup.";
+                f.DevLook = "connector/mirror_bridge.log; mirror/menu.lua bridge retry, mirror/link.lua bridge_problem.";
+                return f;
+            }
             if (s.Contains("Steam connection (SurrounSyncBridge) stopped"))
             {
                 f.Title = "The Steam connector stopped"; f.Category = "Connection"; f.Severity = "ERROR"; f.Confidence = "confirmed";

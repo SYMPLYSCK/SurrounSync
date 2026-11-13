@@ -22,4 +22,9 @@ if b.returncode != 0:
     print(b.stdout, b.stderr)
     print("BUILD FAILED")
     sys.exit(1)
-sys.exit(subprocess.run([exe]).returncode)
+env = dict(os.environ)
+if "--store" in sys.argv:   # --store http://127.0.0.1:<port>: a local realms-backend (wrangler dev) for the full-report upload
+    env["SURROUNSYNC_TEST_REPORT_STORE"] = sys.argv[sys.argv.index("--store") + 1]
+else:
+    env.pop("SURROUNSYNC_TEST_REPORT_STORE", None)
+sys.exit(subprocess.run([exe], env=env).returncode)

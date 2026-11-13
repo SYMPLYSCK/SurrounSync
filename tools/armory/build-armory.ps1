@@ -10,10 +10,6 @@ $Mod = 'SurrounSyncArmory'
 
 python (Join-Path $Here 'make_drummag.py')
 if ($LASTEXITCODE -ne 0) { throw 'make_drummag.py failed' }
-python (Join-Path $Here 'make_diamond.py')     # the Colonel's Revenge diamond finish's shards
-if ($LASTEXITCODE -ne 0) { throw 'make_diamond.py failed' }
-python (Join-Path $Here 'make_bike_sounds.py')  # the hover bike's motors and wind
-if ($LASTEXITCODE -ne 0) { throw 'make_bike_sounds.py failed' }
 
 # DefaultEngine.ini is the game's own (tools/glider/Config): the same shader permutations as the game renders with
 $Cfg = Join-Path $Here 'Config'
@@ -28,8 +24,7 @@ if (Test-Path $Cooked) { Remove-Item -Recurse -Force $Cooked }
 # versioned (no -unversioned): DA_CRDoubleDrumMag is cooked against a stub of the game's item class, so its values
 # must be tagged by name for the game's real class to read them
 & (Join-Path $Ue 'UnrealEditor-Cmd.exe') $Proj -run=cook -targetplatform=Windows -unattended -nopause -stdout -NoLogTimes | Out-Null
-foreach ($a in 'SM_CRDoubleDrumMag', 'M_CRDoubleDrumMag', 'M_ColonelsDiamond', 'T_DiamondFacets', 'DA_CRDoubleDrumMag', 'ModActor',
-    'BikeMotor', 'BikeWind', 'BikeAttenuation', 'SK_HoverBike', 'M_HoverBike', 'M_HoverBike_Props', 'M_HoverBike_Glow', 'T_HoverBike_BaseColor', 'T_HoverBike_ORM', 'A_Rider_Sit', 'A_Rider_Drive') {
+foreach ($a in 'SM_CRDoubleDrumMag', 'M_CRDoubleDrumMag', 'DA_CRDoubleDrumMag', 'ModActor') {
     if (-not (Test-Path (Join-Path $Cooked "$a.uasset"))) { throw "cook made no $a ($Cooked)" }
 }
 

@@ -1876,8 +1876,39 @@ def settings():
     check([w for w in L.eval("LOG").values() if w.startswith("WARN") or w.startswith("ERROR")] == [], "no warnings")
 
 
+def idle():
+    """Keyboard/mouse in use (CommonInputSubsystem's input type 0): the per-frame pad reads pause, a pad wakes them."""
+    print("idle")
+    L = booted("""
+        DEVTYPE, ANALOG = 0, 0
+        DEV = MKOBJ("CommonInputSubsystem")
+        function DEV.GetCurrentInputType(self) return DEVTYPE end
+        local ff = FindFirstOf
+        function FindFirstOf(cls) if cls == "CommonInputSubsystem" then return DEV end; return ff(cls) end
+        local ga = PC.GetInputAnalogKeyState
+        PC.GetInputAnalogKeyState = function(self, k) ANALOG = ANALOG + 1; return ga(self, k) end""")
+    L.execute("RUN(0.5, 0.1); ANALOG, CYCLES = 0, {}; RUN(1.0, 0.1)")
+    n = L.eval("ANALOG")
+    check(n <= 4, "keyboard/mouse last: the sticks are read only at the twice-a-second check (%d reads in 10 frames)" % n)
+    L.execute("RUN(0.5, 0.1); DOWN.Gamepad_RightShoulder = true; RUN(0.2, 0.1); DOWN.Gamepad_RightShoulder = false")
+    check(L.eval("#CYCLES") == 0, "...and the hotbar buttons aren't read every frame")
+    L.execute("DOWN.Gamepad_RightShoulder = true; RUN(0.6, 0.1); DOWN.Gamepad_RightShoulder = false; RUN(0.1, 0.1); CYCLES = {}")
+    L.execute("DOWN.Gamepad_RightShoulder = true; RUN(0.1, 0.1); DOWN.Gamepad_RightShoulder = false")
+    check(L.eval("#CYCLES") == 1, "a hotbar button held through a check wakes them: the next press steps at once")
+    L.execute("RUN(10.5, 0.1); ANALOG = 0; RUN(1.0, 0.1)")
+    check(L.eval("ANALOG") <= 4, "the pad quiet for 10 s: paused again (%d reads in 10 frames)" % L.eval("ANALOG"))
+    L.execute("AXES.Gamepad_RightX = 1; YAW = {}; RUN(0.6, 0.1)")
+    check(L.eval("#YAW") >= 1, "the camera stick pushed: the reads wake within the check time, even with keyboard/mouse last")
+    L.execute("AXES.Gamepad_RightX = 0; RUN(0.6, 0.1); DEVTYPE = 1; RUN(0.6, 0.1); ANALOG = 0; RUN(1.0, 0.1)")
+    check(L.eval("ANALOG") >= 20, "a pad last used: the sticks are read every frame (%d reads in 10 frames)" % L.eval("ANALOG"))
+    L.execute("DEVTYPE = nil; RUN(0.6, 0.1); ANALOG = 0; RUN(1.0, 0.1)")
+    check(L.eval("ANALOG") >= 20, "no answer from the device: the reads stay on")
+    check(any("last input device type 0" in l for l in L.eval("LOG").values()), "the device type is logged when it changes")
+    check(warnings(L) == [], "no warnings")
+
+
 for t in (plan, stick, lifecycle, missing, look, init_cfg, bindings, full_bindings, playstation, controls, sensitivity, padinv,
-          settings):
+          settings, idle):
     t()
 print()
 print("%d checks, %d failure(s)" % (count, len(fails)))

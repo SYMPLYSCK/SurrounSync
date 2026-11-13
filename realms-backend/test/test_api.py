@@ -303,6 +303,58 @@ def security_checks():
     check("stale: hosting it brings it back", (listed(x["realm_id"])[1] or {}).get("live") is True)
 
 
+def report_checks():
+    """Full bug reports: anyone stores a zip (limited); only the admin (REALMS_ADMIN_TOKEN = the server's MOTD_TOKEN)
+    lists, reads and deletes them."""
+    zipb = b"PK\x03\x04" + os.urandom(200_000) + b"PK\x05\x06" + b"\0" * 18
+    ip = {"cf-connecting-ip": "198.51.100.%d" % (int(time.time()) % 200 + 20)}
+
+    def put(data, level="CRITICAL", extra=None):
+        h = dict(ip, **{"x-report-level": level})
+        h.update(extra or {})
+        return call("POST", "/v1/reports", raw=data, headers=h)
+
+    # security review R12: refused uploads give their share of the day's budget back (else a few that declare 90 MB
+    # and send junk used it up). Meaningful with a small budget: run the server with --var REPORT_MB_PER_DAY:50 and
+    # set REALMS_REPORT_BUDGET=50 here.
+    if os.environ.get("REALMS_REPORT_BUDGET") == "50":
+        junk = b"MZ" + bytes(30 * 1024 * 1024)
+        tries = [call("POST", "/v1/reports", raw=junk, headers={"cf-connecting-ip": "198.51.100.%d" % (210 + i), "x-report-level": "INFO"})[0]
+                 for i in range(2)]
+        ok = call("POST", "/v1/reports", raw=zipb, headers={"cf-connecting-ip": "198.51.100.230", "x-report-level": "INFO"})
+        # (wrangler dev's proxy turns a body the worker stops reading into a 500: either way it's refused)
+        check("refused junk doesn't use up the day's report budget", all(t in (400, 500) for t in tries) and ok[0] == 200, (tries, ok[0]))
+        if ok[0] == 200 and os.environ.get("REALMS_ADMIN_TOKEN"):
+            call("DELETE", "/v1/admin/reports/" + j(ok).get("name", "x"), headers={"authorization": "Admin " + os.environ["REALMS_ADMIN_TOKEN"]})
+    s = put(zipb)
+    name = j(s).get("name", "")
+    check("a report zip is stored", s[0] == 200 and name.endswith(".zip") and "-CRITICAL-" in name and j(s).get("size") == len(zipb), s)
+    check("not a zip: refused", put(b"MZ" + b"\0" * 100)[0] == 400)
+    check("no level: refused", call("POST", "/v1/reports", raw=zipb, headers=ip)[0] == 400)
+    check("a made-up level: refused", put(zipb, "HACKED")[0] == 400)
+    # (wrangler dev reads the whole body before the worker runs, so this sends a real one)
+    try:
+        big = put(b"PK\x03\x04" + bytes(91 * 1024 * 1024), "INFO")[0]
+    except OSError as e:
+        big = str(e)
+    check("over 90 MB: refused", big == 413, big)
+    check("nobody lists reports without the token", call("GET", "/v1/admin/reports")[0] in (403, 404))
+    check("nobody reads one without the token", call("GET", "/v1/admin/reports/" + (name or "x"))[0] in (403, 404))
+    token = os.environ.get("REALMS_ADMIN_TOKEN", "")
+    if token:
+        adm = dict(ip, authorization="Admin " + token)
+        ls = call("GET", "/v1/admin/reports", headers=adm)
+        names = [r["name"] for r in j(ls).get("reports", [])]
+        check("the admin lists the stored report", ls[0] == 200 and name in names, ls)
+        g = call("GET", "/v1/admin/reports/" + name, headers=adm)
+        check("...and downloads it byte for byte", g[0] == 200 and g[1] == zipb, (g[0], len(g[1])))
+        check("a path in the name is refused", call("GET", "/v1/admin/reports/..%2Frealms%2Fx", headers=adm)[0] in (400, 404))
+        d = call("DELETE", "/v1/admin/reports/" + name, headers=adm)
+        check("...and deletes it", d[0] == 200 and call("GET", "/v1/admin/reports/" + name, headers=adm)[0] == 404, d)
+    codes = [put(zipb, "INFO")[0] for _ in range(6)]
+    check("one address stores at most 6 a day", 429 in codes, codes)
+
+
 def main():
     s = call("GET", "/v1")
     check("service answers", s[0] == 200, s)
@@ -416,6 +468,7 @@ def main():
 
     public_server_list()
     security_checks()
+    report_checks()
 
     # rate limit on invite guessing (20 an hour per IP)
     codes = [call("POST", "/v1/invites/redeem", {"invite": "0000-0000-0000-0000", "steam_id": STEAM_C, "player_name": "Eve"})[0]

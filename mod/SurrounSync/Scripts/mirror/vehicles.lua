@@ -277,6 +277,23 @@ local function fuel_health(car)
     pcall(function() h = car.VehicleHealthComponent.CurrentHealth end)
     return tonumber(f), tonumber(h)
 end
+-- The dashboard of the car this game's player sits in (its VehicleUI): the game fills it once on getting in and then
+-- only through the fuel component's Vehicle, which its ExitVehicle clears, so it could stand still while the tank ran
+-- dry (user 2026-11-10: a guest ran out of fuel with the gauge still showing some). Filled here from the fuel that
+-- counts: this world's tank for the driver, the driver's tank for a passenger.
+local dash = { in_ = 0.0, shown = nil, car = nil }
+local DASH_EVERY = 0.5
+local function dashboard(car, f)
+    if not (car and f) then return end
+    if not util.same(dash.car, car) then dash.car, dash.shown = car, nil end
+    if dash.shown and math.abs(dash.shown - f) < 0.1 then return end
+    pcall(function()
+        local ui = car.VehicleUI
+        if not util.valid(ui) then return end
+        ui:UpdateFuel(f, car.FuelComponent.MaxFuel)
+        dash.shown = f
+    end)
+end
 
 local known_state, told, applied_state, waiting_state = {}, {}, {}, {}
 -- Fuel/health/colour changes are watched on the cars near the player 4x a second (a refuel shows live on the
@@ -551,6 +568,9 @@ local function send_drive(dt)
             ride_fix, ride_at = ride_fix - 1, now
             local pt = seat_point(car, s)
             if pt then pcall(function() p:K2_SetActorLocation(pt, false, {}, true) end) end
+            -- this game's getting in started the car's fuel use as if we drove it: the driver's game spends it and
+            -- its park brings what it used here, so the ride was spent twice in this world
+            pcall(function() car.FuelComponent:StopSpendFuel() end)
         end
         return
     elseif car and util.same(riding, car) then
@@ -603,6 +623,8 @@ local function send_drive(dt)
         if car then log.info("vehicles: driving " .. tostring(peer_name(car)) .. " - the other game follows") end
     end
     if not driving then return end
+    dash.in_ = dash.in_ - dt
+    if dash.in_ <= 0 then dash.in_ = DASH_EVERY; dashboard(driving, (fuel_health(driving))) end
     -- The car's movement rides in the pose packets (vehicles.drive_line); this reliable copy, with the
     -- car's class, is only for a car the other game doesn't have yet.
     send_in = send_in - dt
@@ -643,6 +665,9 @@ function vehicles.drive_line()
         local tn = peer_name(towed)
         if tl and tn then line = line .. string.format(" T %s %.0f %.0f %.0f %.1f %.1f %.1f", tn, tl.X, tl.Y, tl.Z, tr.Pitch, tr.Yaw, tr.Roll) end
     end
+    -- the driver's tank, for a passenger's dashboard (an older game reads past it)
+    local f = fuel_health(driving)
+    if f then line = line .. string.format(" F %.1f", f) end
     return line
 end
 
@@ -926,6 +951,7 @@ local function apply_drive(body)
     peer.samples = q
     local ist, ith, ibr = rest:match(" I (%S+) (%S+) (%S+)")
     peer.input = ist and { st = tonumber(ist) or 0, th = tonumber(ith) or 0, br = tonumber(ibr) or 0 } or nil
+    if riding and util.same(riding, peer.car) then dashboard(peer.car, tonumber(rest:match(" F (%S+)"))) end
     local tn, tx, ty, tz, tp, tyw, tro = rest:match(" T (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+)")
     local tow
     if tn then

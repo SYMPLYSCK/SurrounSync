@@ -217,10 +217,13 @@ function airdrops.tick(dt)
     if role == "guest" and session and session.in_world() then joined_for = joined_for + dt
     elseif role == "guest" then joined_for = 0.0 end
     tick_in = tick_in - dt
-    if tick_in > 0 then return end
-    tick_in = CHECK_EVERY
-    if role == "host" then util.safe(host_tick, "airdrops.host")
-    elseif role == "guest" and session and session.in_world() then util.safe(guest_tick, "airdrops.guest") end
+    if tick_in <= 0 then
+        tick_in = CHECK_EVERY
+        if role == "host" then util.safe(host_tick, "airdrops.host")
+        elseif role == "guest" and session and session.in_world() then util.safe(guest_tick, "airdrops.guest") end
+    end
+    -- (phase1 naps until the next check, as camps.tick)
+    if role ~= "guest" or (session and session.in_world()) then return tick_in end
 end
 
 function airdrops.status()

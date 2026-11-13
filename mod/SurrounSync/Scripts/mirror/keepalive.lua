@@ -46,9 +46,10 @@ end
 
 function keepalive.tick(dt)
     wait = wait - dt
-    if wait > 0 then return end
+    if wait > 0 then return wait end
     wait = every
     pass()
+    return wait   -- (phase1 naps until then)
 end
 
 -- old-world zombies are gone: drop them untouched (writing their Mesh would touch freed objects)

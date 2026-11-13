@@ -164,10 +164,14 @@ function util.utf8_cut(s, n)
     return s:sub(1, n)
 end
 
+-- (called through pcall without a new function each time: these run hundreds of times a frame)
+local function get_addr(o) return o:GetAddress() end
+local function get_fname(o) return o:GetFName():ToString() end
+
 -- Object addresses get reused after GC: don't use them as long-lived ids.
 function util.addr(obj)
     if not util.valid(obj) then return nil end
-    local ok, a = pcall(function() return obj:GetAddress() end)
+    local ok, a = pcall(get_addr, obj)
     return ok and a or nil
 end
 
@@ -180,7 +184,7 @@ end
 -- (UE4SS GetNamePrivate on NULL, AV 0x18: six crashes in tick code 2026-10-24) - always check first.
 function util.fname(obj)
     if not util.valid(obj) then return nil end
-    local ok, n = pcall(function() return obj:GetFName():ToString() end)
+    local ok, n = pcall(get_fname, obj)
     return ok and n or nil
 end
 
@@ -207,7 +211,7 @@ function util.class_name(obj)
     if not util.valid(obj) then return nil end
     local ok, c = pcall(obj.GetClass, obj)
     if not (ok and util.valid(c)) then return nil end
-    local ok2, n = pcall(function() return c:GetFName():ToString() end)
+    local ok2, n = pcall(get_fname, c)
     return ok2 and n or nil
 end
 
@@ -356,6 +360,18 @@ local function def_key(f)
     if not i or i.what == "C" then return tostring(f) end
     return tostring(i.source) .. ":" .. tostring(i.linedefined)
 end
+-- pre -> path -> post -> hk, kept while the handlers live: a standing hook's check (~20 a frame from zombies alone)
+-- built a debug.getinfo table and two long strings each time (kit 2026-11-11: ~485 B a check)
+local hk_of, NO_FN = setmetatable({}, { __mode = "k" }), {}
+local function hook_key(path, pre, post)
+    local by_path = hk_of[pre or NO_FN]
+    if not by_path then by_path = {}; hk_of[pre or NO_FN] = by_path end
+    local by_post = by_path[path]
+    if not by_post then by_post = setmetatable({}, { __mode = "k" }); by_path[path] = by_post end
+    local hk = by_post[post or NO_FN]
+    if not hk then hk = path .. "|" .. def_key(pre) .. "|" .. def_key(post); by_post[post or NO_FN] = hk end
+    return hk
+end
 function util.starved_lookups() return starved_n, #starved_q end
 function util.recheck_hooks() next_check, backoff, class_miss, class_hit = {}, {}, {}, {}; starved_q, starved_in = {}, {} end
 function util.frame() return frame_no end
@@ -376,7 +392,7 @@ function util.ensure_hook(path, pre, post, urgent)
     -- not by the closure: a module that makes its handlers again on each co-op start (zombies.init) used to add
     -- another hook every time, and the old ones kept firing - each hit sent once more per restart. Now the new
     -- handler takes the old one's place.
-    local hk = path .. "|" .. def_key(pre) .. "|" .. def_key(post)
+    local hk = hook_key(path, pre, post)
     local e = ens[hk]
     if not e then
         e = { pre = pre, post = post }
@@ -750,8 +766,10 @@ function util.rot(pitch, yaw, roll)
     return rot
 end
 
+-- (no new function per call: zombie copies move through here every frame)
+local function teleport(actor, loc, yaw) return actor:K2_TeleportTo(loc, util.rot(0, yaw, 0)) end
 function util.move(actor, loc, yaw)
-    local ok, moved = pcall(function() return actor:K2_TeleportTo(loc, util.rot(0, yaw, 0)) end)
+    local ok, moved = pcall(teleport, actor, loc, yaw)
     return ok and moved ~= false
 end
 

@@ -3,6 +3,7 @@
 local log = require("mirror.log")
 local util = require("mirror.util")
 local events = require("mirror.events")
+local fs = require("mirror.fs")
 
 local loot = {}
 
@@ -369,28 +370,94 @@ end
 local later, later_in = {}, 0.0
 local LATER_S = 600
 local LATER_MAX = 200
+-- Kept changes are on disk too (mirror_coop_loot_kept.txt in the mod's own folder, "<world>\t<kind>\t<id>\t<payload>"
+-- lines): only in memory, a put-in for a container the host hadn't loaded went with the session - out of the guest's
+-- bag and never in the host's container. A later game applies the lines of the world it plays when their container
+-- shows up (the main copy, the guest needn't be here). Car trunks stay memory-only: a car's name is new each load.
+-- A put-in is handed back (R) only once the host stood at the container's place and it isn't in this world.
+local KEPT_FILE = "mirror_coop_loot_kept.txt"
+local NEAR_R, NEAR_S, LOAD_R = 3000, 20, 30000   -- (cm, s, cm)
+local kept = nil     -- shared by the 3-4 player copies: { lists = { [loot module] = its later }, left = {}, loaded }
+local orphan = nil   -- set while a change from an earlier game is applied: { failed } (no acks, no R to today's guest)
+local function kept_t()
+    if kept then return kept end
+    local init = { lists = {}, left = {}, loaded = false }
+    local ok, p = pcall(require, "mirror.peers")
+    kept = ok and type(p) == "table" and p.shared and p.shared("loot_kept", init) or init
+    return kept
+end
+local function world_key()
+    local rp = package.loaded["mirror.realmplay"]
+    local rid = type(rp) == "table" and rp.hosting_id and rp.hosting_id()
+    if rid then return "realm:" .. tostring(rid) end
+    local w = session and session.world_save and session.world_save()
+    return w and w ~= "" and w or nil
+end
+local function kept_file()
+    local ok, d = pcall(function() return require("mirror.localdir").get() end)
+    return ok and d and (d .. "\\" .. KEPT_FILE) or nil
+end
+local function lasting(x) return x.w ~= nil and x.id:sub(1, 4) ~= "car:" and not x.p:find("[\t\r\n]") end
+local function load_kept()
+    local k = kept_t()
+    if k.loaded then return end
+    local path = kept_file()
+    if not path then return end
+    k.loaded = true
+    for line in (fs.read(path) or ""):gmatch("[^\r\n]+") do
+        local w, kind, id, p = line:match("^([^\t]+)\t([ATN])\t([^\t]+)\t(.+)$")
+        -- (no cap: a line left out here was gone from the file at the next save - each game adds at most LATER_MAX)
+        if p then k.left[#k.left + 1] = { k = kind, id = id, p = p, t = now, w = w } end
+    end
+    if k.left[1] then log.info(string.format("loot: %d kept container change(s) from an earlier game - applied when their container shows up", #k.left)) end
+end
+local function save_kept()
+    local k, path = kept_t(), kept_file()
+    k.lists[loot] = later
+    if not (path and k.loaded) then return end
+    local out = {}
+    local function put(x) if lasting(x) then out[#out + 1] = x.w .. "\t" .. x.k .. "\t" .. x.id .. "\t" .. x.p end end
+    for _, x in ipairs(k.left) do put(x) end
+    for _, list in pairs(k.lists) do for _, x in ipairs(list) do put(x) end end
+    if not fs.write(path, #out > 0 and (table.concat(out, "\n") .. "\n") or "") then
+        log.error("loot: couldn't write " .. path .. " - kept container changes are only in memory until the game closes")
+    end
+end
 -- a kept put-in this world won't apply: the guest keeps the item in its own copy (R), never neither of us
 local function refund_put(payload)
     local id, uid, da, s = payload:match("^A (%S+) (%S+) (%S+) %S+ %S+ %S+ (%d+)")
     if id then channel:send("R " .. id .. " " .. uid .. " " .. da .. " " .. s) end
 end
+-- the host couldn't take a put-in: today's guest is told (R); one from an earlier game stays kept for the next try
+local function refuse(id, uid, da, s)
+    if role ~= "host" then return end
+    if orphan then orphan.failed = true; return end
+    channel:send("R " .. id .. " " .. uid .. " " .. da .. " " .. s)
+end
 local function keep_for_later(kind, id, payload)
     if role ~= "host" then return false end
     for _, x in ipairs(later) do if x.p == payload then return true end end
     if #later >= LATER_MAX then
-        local x = table.remove(later, 1)
+        -- a take goes first: dropped it leaves a copy behind, a dropped put-in or stack-up loses the guest's item
+        local drop = 1
+        for i, y in ipairs(later) do if y.k == "T" then drop = i; break end end
+        local x = table.remove(later, drop)
         log.warn(string.format("loot: too many kept changes - dropped the oldest %s for %s%s", x.k == "A" and "put-in" or "take", x.id,
             x.k == "A" and " (the other player keeps that item)" or ""))
         if x.k == "A" then refund_put(x.p) end
     end
-    later[#later + 1] = { k = kind, id = id, p = payload, t = now }
+    local x = { k = kind, id = id, p = payload, t = now, w = world_key() }
+    later[#later + 1] = x
     log.info(string.format("loot: %s for %s - container not found here yet, kept to apply when it is", kind == "A" and "put-in" or "take", id))
+    if lasting(x) then load_kept(); save_kept() end
     return true
 end
 
 local function acked(id, s, comp)
     s = tonumber(s)
     if role ~= "host" or not s then return end
+    -- (an earlier game's action number means nothing to today's guest: acked, it took over lists too early)
+    if orphan then mark_dirty(id, comp); return end
     if s > (ack[id] or 0) then ack[id] = s end
     mark_dirty(id, comp)
 end
@@ -478,14 +545,24 @@ local function apply(payload)
         ok and "" or (" FAILED: " .. tostring(err))))
 end
 
+-- Why an item put into a shared container wasn't sent, by uid: said if the host's next list then removes it here
+-- (DBG-20261112-001: a guest's put into a car trunk was never sent and vanished, with no line saying why)
+loot._add_skip, loot._add_skip_n = {}, 0
+function loot._skipped(uid, why)
+    if loot._add_skip_n >= 2000 then loot._add_skip, loot._add_skip_n = {}, 0 end
+    if not loot._add_skip[uid] then loot._add_skip_n = loot._add_skip_n + 1 end
+    loot._add_skip[uid] = why
+end
 local function on_added(self, ItemUID, ItemInfo)
     if applying or not shared() then return end
     local actor = self:get()
-    local comp = comp_of(actor)
-    if not comp then return end
     local uid, da, count, dur
     pcall(function() uid = uid_str(ItemUID:get()) end)
-    if not uid or rev[uid] or now - (put_sent[uid] or -10) < 1.0 then return end
+    local comp = comp_of(actor)
+    if not comp then if uid then loot._skipped(uid, "its container had no inventory component") end; return end
+    if not uid then return end
+    if rev[uid] then loot._skipped(uid, "taken for the other game's item " .. tostring(rev[uid])); return end
+    if now - (put_sent[uid] or -10) < 1.0 then return end
     if ItemInfo then
         pcall(function()
             local info = ItemInfo:get()[INFO]
@@ -499,11 +576,11 @@ local function on_added(self, ItemUID, ItemInfo)
             if it.uid == uid then da, count, dur = it.da, it.count, { X = it.dx, Y = it.dy }; break end
         end
     end
-    if not da then return end
+    if not da then loot._skipped(uid, "no item data in the add event"); return end
     da_of[uid], count_seen[uid] = da, tonumber(count) or 1
     put_sent[uid] = now
     local ok, id = pcall(id_of, actor)
-    if not ok then return end
+    if not ok then loot._skipped(uid, "its container has no id: " .. tostring(id)); return end
     -- Sent next frame: moving an item inside the container fires this "added" event too - the move hook
     -- (on_moved, same frame) cancels it, so a rearrange never adds a copy on the other side.
     add_q[#add_q + 1] = { uid = uid, id = id, comp = comp, da = da, count = count, dur = dur }
@@ -514,6 +591,7 @@ local function flush_adds()
     add_q = {}
     for _, e in ipairs(q) do
         if moved[e.uid] then
+            loot._skipped(e.uid, "taken for a move inside the container")
             put_sent[e.uid] = nil
         elseif util.valid(e.comp) then
             local id, uid, da, count, dur = e.id, e.uid, e.da, e.count, e.dur
@@ -765,7 +843,7 @@ local function apply_add(payload)
     local asset = util.find(da)
     if not asset then
         log.info("loot: the other player put " .. (da:match("[^%.]+$") or da) .. " into " .. id .. " - not loaded here")
-        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da .. " " .. s) end
+        refuse(id, uid, da, s)
         return
     end
     local slots = 0
@@ -797,7 +875,7 @@ local function apply_add(payload)
     applying = false
     if not mine then
         log.warn("loot: couldn't add the other player's " .. (da:match("[^%.]+$") or da) .. " to " .. id .. ": " .. tostring(err))
-        if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da .. " " .. s) end
+        refuse(id, uid, da, s)
         return
     end
     acked(id, s, comp)
@@ -853,7 +931,7 @@ local function apply_count(payload)
         applying = false
         if not made then
             log.warn("loot: couldn't add the other player's stacked " .. (da:match("[%w_]+$") or da) .. " to " .. id .. ": " .. tostring(err))
-            if role == "host" then channel:send("R " .. id .. " " .. uid .. " " .. da .. " " .. s) end
+            refuse(id, uid, da, s)
             return
         end
         acked(id, s, comp)
@@ -878,10 +956,24 @@ local function sync_from_host(id, quiet)
     if held[id] then return end
     local first = not synced[id]
     synced[id] = true
+    -- items this game never told the host about (no put sent, not from a host list): the list below removes them
+    local unknown = {}
+    if not first then
+        for _, it in ipairs(jig.contents_of(comp)) do
+            if not it.parent and not rev[it.uid] and not count_seen[it.uid] then unknown[it.uid] = it.da end
+        end
+    end
     applying = true
     local ok, set, added, removed, missing, pairs_ = pcall(jig.apply_contents, comp, list)
     applying = false
     if not ok then log.warn("loot: couldn't take over the host's contents of " .. id .. ": " .. tostring(set)); return end
+    if next(unknown) then
+        for _, it in ipairs(jig.contents_of(comp)) do unknown[it.uid] = nil end
+        for uid, da in pairs(unknown) do
+            log.warn(string.format("loot: %s - the host's list removed %s that was never sent to it (%s)", id,
+                (da or "?"):match("[%w_]+$") or "?", loot._add_skip[uid] or "no add event seen for it"))
+        end
+    end
     note_items(comp)
     for _, p in ipairs(pairs_) do
         if p.want.uid then alias[p.want.uid], rev[p.uid] = p.uid, p.want.uid end
@@ -1188,23 +1280,97 @@ local function repair_player_stats()
     end
 end
 
-local function retry_later()
-    local list = later
-    later = {}
-    for _, x in ipairs(list) do
-        local actor = find(x.id)
-        if actor and comp_of(actor) then
-            log.info("loot: the container for a kept " .. (x.k == "A" and "put-in" or "take") .. " is here now (" .. x.id .. ") - applying it")
-            if x.k == "A" then apply_add(x.p) elseif x.k == "N" then apply_count(x.p) else apply(x.p) end
-        elseif x.k == "A" and now - x.t > LATER_S then
-            log.warn(string.format("loot: gave up on a kept put-in for %s after %d s - that container never showed up here", x.id, LATER_S))
+local function spot_of(x)
+    if x.spot == nil then
+        local a, b, c = x.id:match("@(%-?%d+),(%-?%d+),(%-?%d+)$")
+        x.spot = a and { X = tonumber(a) * 10, Y = tonumber(b) * 10, Z = tonumber(c) * 10 } or false
+    end
+    return x.spot or nil
+end
+local function main_copy()
+    local ok, m = pcall(function() return require("mirror.peers").main("mirror.loot") end)
+    return not ok or m == nil or m == loot
+end
+-- one kept change (old: from an earlier game); true when it's done with: applied, handed back or moot
+local function retry_one(x, at, dt, old)
+    local spot = spot_of(x)
+    local d = at and spot and util.dist(at, spot)
+    if d and d > LOAD_R then return false end   -- that far its container isn't loaded here: no lookup
+    local actor = find(x.id)
+    if actor and comp_of(actor) then
+        log.info("loot: the container for a kept " .. (x.k == "A" and "put-in" or "take") .. (old and " from an earlier game" or "")
+            .. " is here now (" .. x.id .. ") - applying it")
+        orphan = old and {} or nil
+        local o = orphan
+        if x.k == "A" then util.safe(apply_add, "loot.kept_add", x.p) elseif x.k == "N" then util.safe(apply_count, "loot.kept_count", x.p)
+        else util.safe(apply, "loot.kept_take", x.p) end
+        orphan = nil
+        if o and o.failed then x.gone = true; return false end   -- (no room / not loaded: tried again next game)
+        return true
+    end
+    if d and d < NEAR_R then x.near = (x.near or 0) + dt end
+    if (x.near or 0) >= NEAR_S then
+        -- the host stood at its place and the container isn't there: it isn't in this world
+        if old then
+            x.gone = true
+            log.warn("loot: a kept change from an earlier game is for " .. x.id .. ", not in this world - kept on disk, tried again next game")
+            return false
+        end
+        if x.k == "A" then
+            log.warn("loot: a kept put-in is for " .. x.id .. ", not in this world - the other player keeps the item")
             refund_put(x.p)
         else
+            log.warn("loot: a kept " .. (x.k == "N" and "stack-up" or "take") .. " is for " .. x.id .. ", not in this world - dropped")
+        end
+        return true
+    end
+    if x.k == "A" and not lasting(x) and now - x.t > LATER_S then
+        -- memory-only (a car trunk): a session's end loses it, so it's handed back after LATER_S as before
+        log.warn(string.format("loot: gave up on a kept put-in for %s after %d s - that container never showed up here", x.id, LATER_S))
+        refund_put(x.p)
+        return true
+    end
+    return false
+end
+
+local function retry_later(dt)
+    local w = world_key()
+    if w then load_kept() end
+    local at
+    pcall(function() at = util.vec(game.player():K2_GetActorLocation()) end)
+    local list, changed = later, false
+    later = {}
+    for _, x in ipairs(list) do
+        if (x.w and x.w ~= w) or not retry_one(x, at, dt, false) then
             local dup = false
             for _, y in ipairs(later) do if y.p == x.p then dup = true end end
             if not dup then later[#later + 1] = x end
+        else
+            changed = true
         end
     end
+    local k = kept
+    if w and k and k.left[1] and main_copy() then
+        -- in order per container: one still waiting holds the ones after it (a take run past a put-in that failed
+        -- removed another item of that kind, and the put-in done next game was a copy)
+        local left, stuck = {}, {}
+        for _, x in ipairs(k.left) do
+            if x.w ~= w or x.gone or stuck[x.id] or not retry_one(x, at, dt, true) then
+                if x.w == w then stuck[x.id] = true end
+                left[#left + 1] = x
+            else
+                changed = true
+            end
+        end
+        k.left = left
+    end
+    if changed then save_kept() end
+end
+-- (host: kept changes to retry, or an earlier game's not read yet)
+local function kept_due()
+    if later[1] then return true end
+    if not (kept and kept.loaded) then return world_key() ~= nil end
+    return kept.left[1] ~= nil
 end
 
 function loot.tick(dt)
@@ -1214,9 +1380,12 @@ function loot.tick(dt)
     end
     if role == "off" then return end
     now = now + dt
-    if role == "host" and later[1] then
+    if role == "host" then
         later_in = later_in - dt
-        if later_in <= 0 then later_in = 1.0; crumb.at("loot: kept"); util.safe(retry_later, "loot.later") end
+        if later_in <= 0 then
+            later_in = 1.0
+            if kept_due() then crumb.at("loot: kept"); util.safe(retry_later, "loot.later", 1.0) end
+        end
     end
     crumb.at("loot: ui")
     util.safe(jig.flush_ui, "jig.ui")

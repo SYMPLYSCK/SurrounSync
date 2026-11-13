@@ -1,6 +1,5 @@
 """The minimap (mirror/minimap.lua) on stand-in UMG widgets: the map placement puts the player's point in the middle
-with north up whatever the view, the compass letters stay put and only the arrow turns, M twice switches it (remembered on this PC,
-typing ignored), and it shows only with a GPS worn, the big map closed and no cursor. No game needed; UMG calls
+with north up whatever the view, the compass letters stay put and only the arrow turns, F4 switches it (remembered on this PC), and it shows only with a GPS worn, the big map closed and no cursor. No game needed; UMG calls
 themselves are pcall-wrapped, so the logic around them is what's tested.
 
     PYTHONPATH=tools/testpkg python tools/test-minimap.py
@@ -63,9 +62,11 @@ local SPECIAL = {
     GetVisibility = function(o) return o.vis end,
     GetRenderOpacity = function(o) return o.props.SetRenderOpacity and o.props.SetRenderOpacity[1] or 1 end,
     GetControlRotation = function() return { Pitch = 0, Yaw = YAW, Roll = 0 } end,
+    GetDesiredSize = function(o) return o.size end,
     -- MapWidget's own placement: a stand-in scale (world / 100) so the test can tell where it put a marker
     ["Calculate Actor Position"] = function(o, actor, out)
         CALC = (CALC or 0) + 1
+        if CALC_FN then return CALC_FN(o, actor, out) end
         local l = actor.loc or LOC
         out.Location = { X = l.Y / 100, Y = -l.X / 100 }
     end,
@@ -133,7 +134,7 @@ end
 mm = require("mirror.minimap")
 mm.init()
 function TICK(n, dt) for _ = 1, n or 1 do mm.tick(dt or 0.1) end end
-function PRESS() KEYS.M() end
+function PRESS() KEYS.F4() end
 function ROOT() return mm._test.view.root end
 function ROOT_VIS() local r = ROOT(); return r and r.props.SetVisibility and r.props.SetVisibility[1] end
 function OF(cls) local t = {}; for _, o in ipairs(ALL) do if o.cls == "/Script/UMG." .. cls then t[#t + 1] = o end end; return t end
@@ -178,26 +179,16 @@ def maths():
 
 
 def toggling():
-    print("M twice")
+    print("F4")
     L, d = make()
-    L.execute("TICK(1); PRESS(); TICK(10)")   # one press, then 1 s later another single one
-    L.execute("PRESS(); TICK(10)")
-    check(not L.eval("mm.on()"), "two presses 1 s apart don't switch it")
-    L.execute("PRESS(); TICK(2); PRESS(); TICK(1)")
-    check(L.eval("mm.on()"), "two presses 0.2 s apart switch it on")
+    check(L.eval("KEYS.M") is None and L.eval("KEYS.F4") is not None, "F4 is bound, M is left to the game's big map")
+    L.execute("TICK(1); PRESS(); TICK(1)")
+    check(L.eval("mm.on()"), "one F4 press switches it on")
     check(open(os.path.join(d, "mirror_minimap.txt")).read().strip() == "on", "remembered on this PC (file says on)")
-    check(L.eval("SHOWN[#SHOWN]") == "Minimap on. M twice turns it off.", "says so (%s)" % L.eval("SHOWN[#SHOWN]"))
-    L.execute("PRESS(); TICK(2); PRESS(); TICK(2); PRESS(); TICK(1)")
-    check(not L.eval("mm.on()"), "a third press right after doesn't count twice (off after the 2nd pair start)")
+    check(L.eval("SHOWN[#SHOWN]") == "Minimap on. F4 turns it off.", "says so (%s)" % L.eval("SHOWN[#SHOWN]"))
     L.execute("PRESS(); TICK(1)")
-    check(L.eval("mm.on()"), "...and pairs with the next press")
-    L.execute("QC_OPEN = true; PRESS(); TICK(1); PRESS(); TICK(1); QC_OPEN = false")
-    check(L.eval("mm.on()"), "typing in the quick chat doesn't switch it")
-    L.execute("rawset(PC, 'bShowMouseCursor', true); PRESS(); TICK(1); PRESS(); TICK(1)")
-    check(L.eval("mm.on()"), "cursor up without the big map (a text box) doesn't switch it")
-    L.execute("rawset(COMP, 'MapToggled', true); PRESS(); TICK(1); PRESS(); TICK(1)")
-    check(not L.eval("mm.on()"), "cursor up with the big map open (the game's own M) does")
-    L.execute("rawset(COMP, 'MapToggled', false); rawset(PC, 'bShowMouseCursor', false)")
+    check(not L.eval("mm.on()"), "the next press switches it off")
+    check(L.eval("SHOWN[#SHOWN]") == "Minimap off. F4 turns it on again.", "says so (%s)" % L.eval("SHOWN[#SHOWN]"))
     # a new game start reads the file
     L2 = lua54.LuaRuntime()
     with open(os.path.join(d, "mirror_minimap.txt"), "w") as f:
@@ -317,10 +308,10 @@ def compass_marks():
     # the game's fade animation puts the compass's opacity back: hidden again on the next frame
     L.execute("CW:SetRenderOpacity(0.7); TICK(1)")
     check(L.eval("CW.props.SetRenderOpacity[1]") == 0, "a fade-in on the compass is undone while the minimap shows")
-    # compass taken off: its widget collapsed -> no markers on the minimap
-    L.execute("CW.vis = 1; TICK(1)")
+    # compass taken off: its widget collapsed -> no markers on the minimap (its visibility is read every 0.25 s)
+    L.execute("CW.vis = 1; TICK(3)")
     check(not any(slots[i]["on"] for i in range(1, 25)), "no compass worn: no markers")
-    L.execute("CW.vis = 4; TICK(1)")
+    L.execute("CW.vis = 4; TICK(3)")
     check(sum(1 for i in range(1, 25) if slots[i]["on"]) == 2, "compass worn again: markers back")
     # a marker removed (ping deleted): gone within the rescan time
     L.execute("M1.dead = true; FOUND['BP_CompassMarker_C'] = { M2 }; TICK(6)")
@@ -333,7 +324,7 @@ def compass_marks():
     L.execute("GPS = true; TICK(6)")
     check(L.eval("CW.props.SetRenderOpacity[1]") == 0, "minimap back: compass hidden again")
     L.execute("mm.set(false); TICK(1)")
-    check(L.eval("CW.props.SetRenderOpacity[1]") == 1, "M twice off: the compass is back")
+    check(L.eval("CW.props.SetRenderOpacity[1]") == 1, "switched off: the compass is back")
     L.execute("mm.set(true); TICK(2); for _, f in ipairs(RESETS) do f() end")
     check(L.eval("CW.props.SetRenderOpacity[1]") == 1, "world reset: the compass is given back first")
     check(any("minimap: built - map" in str(x) for x in L.eval("LOG").values()), "the build logs what the map is drawn from")
@@ -513,6 +504,38 @@ def other_players():
     check(L.eval("next(mm._test.big.by)") is None and w1.calls["RemoveFromParent"] is None,
           "world reset: markers forgotten, the freed widgets not touched")
     check(not any("WARN" in str(x) for x in L.eval("LOG").values()), "no warnings")
+
+    # the dot placed by the map's own maths (its Map Data and canvas size), never left at the overlay's centre
+    # (user 2026-11-10: the big map showed the other player mid-map on both games)
+    L, _ = make()
+    L.execute("""
+        local mt = getmetatable(PLAYER)
+        G1 = setmetatable({ __name = 'Ghost', __id = 7001, props = {}, calls = {}, loc = { X = 5000, Y = 300, Z = 0 } }, mt)
+        GHOSTS = { G1 }
+        MW = COMP.MapWidget
+        rawset(MW, 'Map Data', MD)
+        MW.InnerCanvas.size = { X = 2000, Y = 2000 }
+        rawset(COMP, 'MapToggled', true); TICK(1)
+    """)
+    w1 = L.eval("mm._test.big.by[7001]")
+    t = w1.props["SetRenderTranslation"][1]
+    # side 2000, World Size 800000, middle (1000, -2000): (5000, 300) -> (2300 / 400, -4000 / 400); the graph
+    # divides by World Size / side, not / half side (user 2026-11-12: mates' dots in the wrong spots)
+    check(abs(t["X"] - 5.75) < 1e-6 and abs(t["Y"] + 10) < 1e-6, "placed by the map's own maths: %r" % dict(t))
+    L.execute("G1.loc = { X = 5000000, Y = -9000000, Z = 0 }; TICK(1)")
+    t = w1.props["SetRenderTranslation"][1]
+    check(t["X"] == -1000 and t["Y"] == -1000, "...a player off the map held on its edge, as the game clamps it")
+    # no map data: the game's call, with the out parameter written into the table itself
+    L.execute("""
+        rawset(MW, 'Map Data', nil); MW.InnerCanvas.size = nil
+        CALC_FN = function(o, actor, out) out.X, out.Y = 11, -22 end
+        TICK(1)
+    """)
+    t = w1.props["SetRenderTranslation"][1]
+    check(t["X"] == 11 and t["Y"] == -22, "the game's call, its struct written into the table: still placed")
+    L.execute("CALC_FN = function() error('no') end; TICK(1)")
+    check(w1.props["SetRenderTranslation"][1]["X"] == 11, "neither way: the dot keeps its last place")
+    check(sum("big map couldn't place" in str(x) for x in L.eval("LOG").values()) == 1, "...and says so once")
 
 
 maths()

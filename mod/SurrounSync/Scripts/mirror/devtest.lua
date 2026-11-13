@@ -403,7 +403,6 @@ function devtest.watch(cfg)
         elseif cmd:find("^power toggle") then require("mirror.power").dev_toggle(arg and arg:match("^toggle (%a+)$"))
         elseif cmd:find("^act ") then require("mirror.menu").dev_act(arg)
         elseif cmd == "pw" or cmd:find("^pw ") then require("mirror.menu").dev_password(arg or "")
-        elseif cmd == "bike" then require("mirror.hoverbike").make(); log.info("devtest: bike asked")
         elseif cmd == "save" then pcall(function() game.controller():SaveGameToSlot() end)
         elseif cmd == "savetest" then
             cfg.save.destroy_ghost_on_save = false
@@ -507,10 +506,6 @@ function devtest.watch(cfg)
             local l = game.player():K2_GetActorLocation()
             beds.apply(string.format("1 %.1f %.1f %.1f 0 0 0 1", l.X, l.Y, l.Z))
             log.info("devtest: bedhere -> " .. tostring(beds.read()))
-        elseif cmd == "giant here" or cmd == "giant clear" or cmd == "giant status" then
-            local g = require("mirror.giant")
-            if cmd == "giant here" then g.place_here() elseif cmd == "giant clear" then g.clear_here() end
-            log.info("devtest: " .. cmd .. " -> " .. g.status())
         elseif cmd:find("^buildtest ") then
             local p = game.player()
             local comp, ok, err

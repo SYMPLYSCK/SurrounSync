@@ -23,6 +23,7 @@ local realmplay = {}
 local cfg, session, menu
 local UPLOAD_EVERY = 60.0      -- s between uploads after saves (the last one at the end always goes)
 local SETTLE = 3.0             -- s in the loaded Realm before it counts as arrived
+local SAVE_WAIT_S = 30.0       -- s a save that never finishes is waited for (opening: stop; leaving: go on)
 local S = nil                  -- the Realm session: { id, name, step, ... }
 
 local left_by_menu
@@ -58,6 +59,18 @@ end, function(id, rules, cb) realm.send("rules", id .. " " .. rules, cb) end)
 local function session_log(st)
     return { step = st, own = S.own, coop = S.coop, own_stamp = S.own_stamp, realm = S.id, gen = tostring(S.gen or 0),
              time = os.date("%Y-%m-%d %H:%M:%S"), version = V.VERSION }
+end
+
+-- leaving, the session's save couldn't be read to keep it anywhere: it stays where it is with a session log, so the
+-- next start's recover() stores the character and the world as after a crash here (an unlogged co-op slot is purged
+-- at start, and purged unread the session's character and world were gone). False: not even the log could be written.
+local function keep_unread()
+    local logged = S.logged or slotguard.log_write(session_log("joined"))
+    log.error("realmplay: couldn't read this session's save to keep it - left in " .. tostring(S.coop)
+        .. (logged and "" or " without a session log"))
+    say(logged and "Couldn't save this Realm session yet. Its save stays on this PC and is kept the next time the game starts."
+        or "Couldn't save this Realm session: tell the mod's maker.", "bad")
+    return logged
 end
 
 local function abort(msg)
@@ -778,7 +791,8 @@ function realmplay.leave()
     if menu.role() == "host" then menu.realm_stop("You left " .. S.name .. ". The Realm is saved.") end
 end
 
-function go_home()
+-- keep: the session's save and log stay for recover() (keep_unread)
+function go_home(keep)
     local own, coop = S.own, S.coop
     close_live()
     step("going_home")
@@ -789,8 +803,10 @@ function go_home()
     S.left_player = {}
     util.mark(S.left_player, game.player())
     session.load_slot(own)
-    slotguard.purge(coop)
-    slotguard.log_clear()
+    if not keep then
+        slotguard.purge(coop)
+        slotguard.log_clear()
+    end
     S.logged, S.built = false, false
 end
 
@@ -809,18 +825,26 @@ local function ending_tick(dt)
             session.save_now()
         end
     elseif S.step == "ending_save" then
-        if S.t < 1.5 or session.saving() then return end
+        if S.t < 1.5 then return end
+        -- (a save that never finishes: after SAVE_WAIT_S the leave goes on with what is on disk)
+        if session.saving() and S.t < SAVE_WAIT_S then return end
+        if session.saving() then log.warn("realmplay: the leave's save still runs after " .. SAVE_WAIT_S .. " s - uploading what is on disk") end
         step("ending_upload")
         upload(true, function(ok)
             if not S then return end
+            local keep = false
             if not ok and not S.lost and not S.refused then
                 -- the world stays on this PC and goes up the next time I host this Realm
                 local world = slotguard.read_realm(S.coop)
-                if world then realm.stash_pending(S.id, S.gen, world, realm.read_live(S.id)) end
-                say("Couldn't reach the Realm's server. Your session is kept on this PC and sent next time you open the Realm.", "bad")
+                if world then
+                    realm.stash_pending(S.id, S.gen, world, realm.read_live(S.id))
+                    say("Couldn't reach the Realm's server. Your session is kept on this PC and sent next time you open the Realm.", "bad")
+                else
+                    keep = keep_unread()
+                end
             end
             realm.send("release", S.id)
-            go_home()
+            go_home(keep)
         end)
     elseif S.step == "going_home" then
         local p = game.player()
@@ -847,15 +871,19 @@ function left_by_menu()
     step("ending_upload")
     upload(true, function(ok)
         if not S then return end
+        local keep = false
         if not ok and not S.lost and not S.refused then
             local world = slotguard.read_realm(S.coop)
-            if world then realm.stash_pending(S.id, S.gen, world, realm.read_live(S.id)) end
+            if world then realm.stash_pending(S.id, S.gen, world, realm.read_live(S.id))
+            else keep = keep_unread() end
         end
         realm.send("release", S.id)
-        -- the game's Continue must not point at the emptied Realm save
+        -- the game's Continue must not point at the Realm save (emptied, or kept for recover())
         if session.current_name() == S.coop then session.point_at(S.own) end
-        slotguard.purge(S.coop)
-        slotguard.log_clear()
+        if not keep then
+            slotguard.purge(S.coop)
+            slotguard.log_clear()
+        end
         S = nil
     end)
 end
@@ -1269,7 +1297,11 @@ local function tick(dt)
     if S.step == "armed" or S.step == "new_game" or S.step == "capturing" then
         create_tick(dt)
     elseif S.step == "saving_own" then
-        if S.t > 1.5 and not session.saving() then build() end
+        if S.t > 1.5 and not session.saving() then build()
+        elseif S.t > SAVE_WAIT_S then
+            -- (a save that never finishes: nothing is built yet - let the Realm go, don't hold it leased for nobody)
+            abort("Your game didn't finish saving, so the Realm didn't open. Save once (or sleep), then open it again.")
+        end
     elseif S.step == "loading" then
         S.wait = (S.wait or 0) + dt
         if S.wait > 180 and not S.slow_told then S.slow_told = true; log.error("realmplay: the Realm didn't load in 3 min") end

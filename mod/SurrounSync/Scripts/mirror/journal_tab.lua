@@ -35,7 +35,6 @@ local SET_FONT, SET_HINT_FONT = 22, 14   -- a settings row's tag/label/buttons, 
 -- the settings' tab row: up to 4 tabs (HOST RULES, MY SETTINGS, BINDINGS, MODS) in the 580 wide box (28 held 3;
 -- 22 for 4 worked out from that, not measured)
 local SET_TAB_FONT, SET_TAB_GAP = 22, 22
-local SET_TAB_FONT_PERM, SET_TAB_GAP_PERM = 18, 16   -- (with PERMISSIONS: build_settings)
 local TAG_COLOR = { R = 0.6, G = 0.13, B = 0.0, A = 1.0 }   -- burnt orange tag in front of a label (a row's tag_color wins)
 local MOD_ROWS = 9
 local REALM_ROWS = 3   -- per page on the lined note (more Realms: < PREV / NEXT >)
@@ -385,11 +384,7 @@ local function build_settings(page)
     u.set_title = text("SETTINGS", 46, DARK_RED); vadd(u.set_box, u.set_title)
     -- the host's rules for the shared world, this PC's own settings, the controller bindings, the mods
     local tabs = new("HorizontalBox", S.tree, "SettingTabs"); vadd(u.set_box, tabs, 2)
-    -- (the FPV drone's owner gets a PERMISSIONS tab too: 5 tabs at 22 ran to ~710 of the 580 by the 28-held-3 rule,
-    -- so on that game the row is 18 with 16 gaps, ~575 by the same rule - worked out, not measured)
-    local perm = require("mirror.dronegrant").owner()
     local tf, tg = SET_TAB_FONT, SET_TAB_GAP
-    if perm then tf, tg = SET_TAB_FONT_PERM, SET_TAB_GAP_PERM end
     u.set_tab_font = tf
     u.set_tab_host, u.set_tab_host_t = button("HOST RULES", tf, DARK_RED); hadd(tabs, u.set_tab_host)
     u.set_tab_mine, u.set_tab_mine_t = button("MY SETTINGS", tf, GREY); hadd(tabs, u.set_tab_mine, tg)
@@ -397,9 +392,6 @@ local function build_settings(page)
     -- (with Realms on, the REALMS tab takes the MODS ribbon: the mods list opens from here)
     if S.realms_on then
         u.set_tab_mods, u.set_tab_mods_t = button("MODS", tf, GREY); hadd(tabs, u.set_tab_mods, tg)
-    end
-    if perm then
-        u.set_tab_perm, u.set_tab_perm_t = button("PERMISSIONS", tf, GREY); hadd(tabs, u.set_tab_perm, tg)
     end
     u.set_tab = "host"
     u.set_sub = text("", 16, GREY, 560); vadd(u.set_box, u.set_sub, 4)
@@ -1270,31 +1262,27 @@ end
 
 local function settings_list(m)
     if S.ui.set_tab == "mine" then return m.my_settings or {} end
-    if S.ui.set_tab == "perm" then return m.permissions or {} end
     return m.settings or {}
 end
 
 local function refresh_settings(m)
     local u = S.ui
     if u.set_tab == "mods" and not u.set_tab_mods then u.set_tab = "host" end
-    if u.set_tab == "perm" and not (u.set_tab_perm and m.drone_owner) then u.set_tab = "host" end
     local tab = u.set_tab
     for _, t in ipairs({ { "host", u.set_tab_host_t }, { "mine", u.set_tab_mine_t }, { "binds", u.set_tab_binds_t },
-                         { "mods", u.set_tab_mods_t }, { "perm", u.set_tab_perm_t } }) do
+                         { "mods", u.set_tab_mods_t } }) do
         if t[2] then style_text(t[2], u.set_tab_font or SET_TAB_FONT, t[1] == tab and DARK_RED or GREY) end
     end
     -- in a Realm session the host's rules are the Realm's
     set(u.set_tab_host_t, m.realm_session == true and "REALM RULES" or "HOST RULES")
-    local rules = tab == "host" or tab == "mine" or tab == "perm"
+    local rules = tab == "host" or tab == "mine"
     vis_hit(u.set_list, rules); vis(u.set_sub, rules)
     vis_hit(u.bind_box, tab == "binds")
     if u.mods_in_settings then vis_hit(u.mods_box, tab == "mods") end
     if tab == "binds" then refresh_binds(); return end
     if tab == "mods" then refresh_mods(); return end
     local host = tab == "host"
-    local dg = tab == "perm" and require("mirror.dronegrant")
-    set(u.set_sub, dg and (#(m.permissions or {}) > 0 and dg.SUB or dg.EMPTY)
-        or not host and "Only for your own game - saved on this PC."
+    set(u.set_sub, not host and "Only for your own game - saved on this PC."
         or m.settings_note
         or m.settings_editable and "Your rules. Friends in your world play by them too."
         or "The host's rules - only the host can change them.")
@@ -1656,6 +1644,9 @@ local function tick_body(dt)
         enter_bound = true
         game.keybind("RETURN", nil, chat_enter, chat_focused)
     end
+    -- built when the handbook first opens on a new widget, not when the game makes one: a build took 47-53 ms
+    -- and came three times around one join (load, arrival, 9 s later), kit 2026-11-11 (journal_tab.open builds too)
+    if not (S and util.same(S.jui, journal())) and not is_open() then return end
     if not ensure() then return end
     local open = is_open()
     if open ~= S.was_open then
@@ -1872,7 +1863,6 @@ local function tick_body(dt)
         if clicked(u.set_tab_mine) then tab("mine") end
         if clicked(u.set_tab_binds) then tab("binds") end
         if u.set_tab_mods and clicked(u.set_tab_mods) then tab("mods") end
-        if u.set_tab_perm and clicked(u.set_tab_perm) then tab("perm") end
         if u.set_tab == "binds" then
             tick_binds(a)
         elseif u.set_tab == "mods" then

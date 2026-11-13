@@ -217,22 +217,14 @@ end
 package.preload["mirror.notify"] = function()
     return { show = function(m) SAID[#SAID + 1] = m end, open_history = ran("history") }
 end
-OWNER, RIDING, ROLE, LEAVE = false, false, nil, true
-package.preload["mirror.adminfly"] = function() return { is_owner = function() return OWNER end, key_toggle = ran("fly") } end
+ROLE, LEAVE = nil, true
 package.preload["mirror.phase1"] = function() return { started = function() return ROLE end } end
-package.preload["mirror.hoverbike"] = function()
-    return { riding = function() return RIDING end, key_make = ran("make"), key_lock = ran("lock"), key_view = ran("view"), key_tune = ran("tune"),
-             set_open = function(v) BIKE_OPEN = v end }
-end
-FPV_MODE = "unset"
-package.preload["mirror.dronegrant"] = function() return { set_mode = function(v) FPV_MODE = v end } end
 package.preload["mirror.menu"] = function() return { key_host = ran("host"), key_join = ran("join") } end
 package.preload["mirror.session"] = function() return setmetatable({}, { __index = function(_, k) if k == "key_leave" and LEAVE then return ran("leave") end end }) end
 package.preload["mirror.zombies"] = function() return { key_status = ran("status") } end
 package.preload["mirror.invdiag"] = function() return { key_report = ran("inventory") } end
 MINI = false
 package.preload["mirror.minimap"] = function() return { on = function() return MINI end, set = function(v) MINI = v; RAN[#RAN + 1] = "minimap " .. tostring(v) end } end
-package.preload["mirror.giant"] = function() return { place_here = ran("giant") } end
 package.preload["mirror.teleport"] = function()
     return { known = function(w) return w == "goto" or w == "accept" end, command = function(t) RAN[#RAN + 1] = "teleport " .. t; return true end,
              tip = function(t)
@@ -260,9 +252,9 @@ def commands():
     said = lambda: L.eval('SAID[1]') or ""
 
     for line, want in (("/host", "host"), ("/join 2", "join 2"), ("/leave", "leave"), ("/inventory", "inventory"),
-                       ("/giant", "giant"), ("/messages", "history"), ("/msgs", "history"), ("/HOST", "host")):
+                       ("/messages", "history"), ("/msgs", "history"), ("/HOST", "host")):
         check(run(line) == want, "%s runs what its key runs (%s)" % (line, L.eval('RAN[1]')))
-    check(run("/minimap") == "minimap true" and run("/minimap") == "minimap false", "/minimap switches it each time, as M twice does")
+    check(run("/minimap") == "minimap true" and run("/minimap") == "minimap false", "/minimap switches it each time, as F4 does")
     for bad in ("/join", "/join 4", "/join x", "/join 1.5"):
         check(run(bad) is None and "/join 1" in said(), "%s: nothing runs, it says how: %s" % (bad, said()))
     L.execute('LEAVE = false')
@@ -271,59 +263,35 @@ def commands():
     L.execute('ROLE = "host"')
     check(run("/status") == "status" and "log" in said(), "/status in a session writes it to the log, and says so")
 
-    # the owner's stay the owner's: to anyone else they don't exist, in the list or the tips
-    for line in ("/fly", "/bike", "/bikelock"):
-        check(run(line) is None and "isn't a command" in said(), "%s for another player: not a command" % line)
-    check("/fly" not in L.eval('cc.tip("/")') and "/fly" not in (L.eval('cc.tip("/fl")') or ""), "and not in the tips")
-    for line in ("/lock", "/unlock", "/fpv lock", "\\\\FPV Unlock"):
-        check(L.eval('RUN(%s)' % lua_str(line)) is None and "isn't a command" in said(), "%s for another player: not a command" % line)
-    check(L.eval('FPV_MODE') == "unset" and L.eval('BIKE_OPEN') is None, "and it changed nothing")
-    L.execute('OWNER = true')
-    check(run("/fly") == "fly" and run("/bike") == "make" and run("/bikelock") == "lock", "the owner's game runs them")
-    # the lock commands, as the owner typed them
-    for line, want in (("/unlock", True), ("/lock", False), ("\\unlock", True), ("\\\\lock", False), ("\\\\UNLOCK", True)):
-        L.eval('RUN(%s)' % lua_str(line))
-        check(L.eval('BIKE_OPEN') is want, "%s: the bike is %s for everyone (set, not switched)" % (line, "open" if want else "locked"))
-    L.eval('RUN("/lock")')
-    L.eval('RUN("/lock")')
-    check(L.eval('BIKE_OPEN') is False, "/lock twice: still locked")
-    for line, want in (("/fpv unlock", "open"), ("/fpv lock", "locked"), ("\\\\FPV Unlock", "open"), ("\\\\FPV Lock", "locked"),
-                       ("\\fpv unlock", "open"), ("/FPV LIST", None)):
-        L.eval('RUN(%s)' % lua_str(line))
-        check(L.eval('FPV_MODE') == want, "%s: the FPV drone is %s" % (line, want))
-    check(L.eval('RUN("/fpv")') is None and "/fpv lock" in said(), "/fpv with no word: says how")
-    check("/lock" in L.eval('cc.tip("\\\\lo")') and "/fpv" in L.eval('cc.tip("\\\\FP")'), "the \\\\ form gets the tip too")
-    check(L.eval('cc.is_command("\\\\lock")') is True and L.eval('cc.is_command("hello \\\\")') is False, "the \\\\ form is a command, a \\\\ later on isn't")
-    check("/fly" in L.eval('cc.tip("/")') and "F7" in L.eval('cc.tip("/fl")'), "and lists them, with the key")
-
-    check(run("/bikeview") is None or "Only while" in said(), "/bikeview off the bike: says so")
-    L.execute('RIDING = true')
-    check(run("/bikeview") == "view" and run("/bikeseat up") == "tune 1" and run("/bikeseat down") == "tune -1", "on the bike: view, seat up and down")
-    check(run("/bikeseat") is None and "up" in said(), "/bikeseat with no word: says how")
+    # a command typed with \ or \\ in front, as /
+    for line in ("\\host", "\\\\HOST"):
+        check(L.eval('RUN(%s)' % lua_str(line)) == "host", "%s: runs /host" % line)
+    check("/host" in L.eval('cc.tip("\\\\ho")'), "the \\\\ form gets the tip too")
+    check(L.eval('cc.is_command("\\\\host")') is True and L.eval('cc.is_command("hello \\\\")') is False, "the \\\\ form is a command, a \\\\ later on isn't")
+    # the commands of the features taken out of SurrounSync (2026-11-10) are gone
+    for line in ("/fly", "/bike", "/bikelock", "/lock", "/unlock", "/fpv lock", "/giant", "/bikeview", "/drone fly"):
+        check(run(line) is None and "isn't a command" in said(), "%s: not a command any more" % line)
 
     check(run("/goto Ann") == "teleport /goto Ann" and run("/accept") == "teleport /accept", "teleport commands still go to teleport.lua")
     check(run("/nonsense") is None and "/nonsense isn't a command" in said(), "an unknown command says so")
     check(run("/") is None and said() != "", "a bare / says something")
     check(L.eval('cc.tip("hello")') is None, "a plain line has no tip")
     check("isn't a command" in L.eval('cc.tip("/zz")'), "a tip for what isn't one")
-    tip = L.eval('cc.tip("/g")')
-    check("/goto" in tip and "/giant" in tip and "\n" in tip, "/g: every command it could be, a line each: %r" % tip)
+    tip = L.eval('cc.tip("/m")')
+    check("/messages" in tip and "/minimap" in tip and "\n" in tip, "/m: every command it could be, a line each: %r" % tip)
     check("\n" not in L.eval('cc.tip("/g", true)') and "\n" not in L.eval('cc.tip("/", true)'), "one line for the handbook's chat")
     check("Ctrl+F10" in L.eval('cc.tip("/le")'), "a tip names the hotkey")
 
-    # the other mods, over their shared variable
-    check(run("/drone fly") is None and "isn't a command" in said() and L.eval('SHARED["FPVDrone.cmd"]') is None, "/drone with no FPVDrone listening: not offered")
-    L.execute('SHARED["FPVDrone.commands"] = true; SHARED["SyncFX.commands"] = true')
-    run("/drone FLY")
-    check(L.eval('SHARED["FPVDrone.cmd"]') == "fly", "/drone fly: the word goes to FPVDrone")
-    L.execute('SHARED["FPVDrone.cmd"] = ""')
-    run("/drone nonsense")
-    check(L.eval('SHARED["FPVDrone.cmd"]') == "" and "fly" in said(), "/drone nonsense: not sent, lists the words: %s" % said())
-    run("/syncfx toggle")
+    # the other mod, over its shared variable
+    check(run("/syncfx toggle") is None and "isn't a command" in said() and L.eval('SHARED["SyncFX.cmd"]') is None, "/syncfx with no SyncFX listening: not offered")
+    L.execute('SHARED["SyncFX.commands"] = true')
+    run("/syncfx TOGGLE")
     check(L.eval('SHARED["SyncFX.cmd"]') == "toggle", "/syncfx toggle: the word goes to SyncFX")
-    check("Ctrl+Shift+O" in L.eval('cc.tip("/drone fo")'), "/drone fo: the tip narrows to the word, with its key")
-    check("F8" in L.eval('cc.tip("/syncfx t")'), "/syncfx t: too")
-    check("/drone" in L.eval('cc.tip("/")') and "/syncfx" in L.eval('cc.tip("/")'), "the list has them while they listen")
+    L.execute('SHARED["SyncFX.cmd"] = ""')
+    run("/syncfx nonsense")
+    check(L.eval('SHARED["SyncFX.cmd"]') == "" and "toggle" in said(), "/syncfx nonsense: not sent, lists the words: %s" % said())
+    check("F8" in L.eval('cc.tip("/syncfx t")'), "/syncfx t: the tip narrows to the word, with its key")
+    check("/syncfx" in L.eval('cc.tip("/")'), "the list has it while it listens")
 
     # every hotkey in the source has its command, so a new key can't be forgotten
     src = {}
@@ -340,11 +308,8 @@ def commands():
             mods = "+".join(re.findall(r"ModifierKey\.(\w+)", m.group(2)))
             keys.add((f, m.group(1).strip('"'), mods))
     command_for = {
-        ("adminfly.lua", "HOTKEY", ""): "/fly", ("giant.lua", "G", "CONTROL"): "/giant",
-        ("hoverbike.lua", "V", "CONTROL+SHIFT"): "/bike", ("hoverbike.lua", "P", "CONTROL+SHIFT"): "/bikelock",
-        ("hoverbike.lua", "G", ""): "/bikeview", ("hoverbike.lua", "U", ""): "/bikeseat", ("hoverbike.lua", "I", ""): "/bikeseat",
         ("invdiag.lua", "F11", "CONTROL"): "/inventory", ("menu.lua", "H", "CONTROL"): "/host", ("menu.lua", "k", "CONTROL"): "/join",
-        ("minimap.lua", "M", ""): "/minimap", ("notify.lua", "F9", "CONTROL"): "/messages", ("session.lua", "F10", "CONTROL"): "/leave",
+        ("minimap.lua", "F4", ""): "/minimap", ("notify.lua", "F9", "CONTROL"): "/messages", ("session.lua", "F10", "CONTROL"): "/leave",
         ("zombies.lua", "F12", "CONTROL"): "/status",
     }
     # (no command, on purpose: Enter and Esc of a box or menu that is open, "/" itself, and F2, which renames the item
@@ -353,7 +318,7 @@ def commands():
                 ("quickchat.lua", "OEM_TWO", ""), ("quickchat.lua", "RETURN", ""), ("quickchat.lua", "ESCAPE", "")}
     unknown = keys - set(command_for) - left_out
     check(not unknown, "every hotkey in the source has a command or is left out on purpose: %s" % sorted(unknown))
-    check(len(keys) >= 20, "(the scan found them: %d keys)" % len(keys))
+    check(len(keys) >= 12, "(the scan found them: %d keys)" % len(keys))
     missing = [c for c in set(command_for.values()) if ("name = \"%s\"" % c[1:]) not in src["chatcmd.lua"]]
     check(not missing, "every one of those commands exists: %s" % missing)
 

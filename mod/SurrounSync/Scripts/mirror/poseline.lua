@@ -64,8 +64,9 @@ function poseline.parse_base(seg)
     return { name = n, X = x, Y = y, Z = z, yaw = yaw }
 end
 
--- What follows the pose, each after its own "|": the car I stand on ("B ..."), the FPV quad I fly ("Q ...",
--- drone.lua) and the car I drive (the rest: "D ..."). Returns the base (parsed), the quad's segment, the car's.
+-- What follows the pose, each after its own "|": the car I stand on ("B ...") and the car I drive (the rest:
+-- "D ..."). Returns the base (parsed), an FPV quad segment ("Q ...", sent by releases up to 1.1.0, unused now) and
+-- the car's.
 function poseline.segments(rest)
     local base, quad, car = nil, nil, nil
     for seg in (rest or ""):gmatch("[^|]+") do

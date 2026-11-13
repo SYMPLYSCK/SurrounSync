@@ -950,6 +950,116 @@ def session_join_builds_coop_save(L, tmp):
     check(L.eval('LOADS[#LOADS]') == COOP, "the co-op save was loaded")
 
 
+# the game's save starts and never ends (EMS's IsSavingOrLoading stays true)
+STUCK_SAVE = 'local g = GAME_SAVE; GAME_SAVE = function() g(); SAVING = 1000000 end; '
+
+
+@test
+def session_stuck_save_gives_up_the_join(L, tmp):
+    """The game never finishes saving (IsSavingOrLoading stays true): the join gives up instead of 'One moment, please'
+    to every key press until the game is restarted (audit 2026-11-10)."""
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.init(CFG, "guest", function() return true end)')
+    L.execute(STUCK_SAVE + 'session.request_toggle()')
+    L.execute('TICK(30)')
+    check(L.eval('session.state()') == "saving_own", "15 s of saving: still waiting (%s)" % L.eval('session.state()'))
+    L.execute('TICK(40)')
+    check(L.eval('session.state()') == "idle", "35 s of saving: the join gave up (%s)" % L.eval('session.state()'))
+    check(L.eval('BLOBS_OUT["req"]') is None, "...no join request went out")
+    check(L.eval('note_has("still saving")'), "...and the player is told why")
+
+
+@test
+def session_stuck_save_keeps_the_player_in_coop(L, tmp):
+    """Leaving while the game never finishes saving: stay in co-op (copying a half-written save home could lose the
+    character) and say so, so Leave can be tried again (audit 2026-11-10)."""
+    before = joined_session(L, tmp)
+    L.execute(STUCK_SAVE + 'session.request_toggle()')
+    L.execute('TICK(70)')
+    check(L.eval('session.state()') == "joined", "35 s of saving at Leave: still in co-op, Leave works again (%s)" % L.eval('session.state()'))
+    check(L.eval('note_has("still saving")'), "...and the player is told why")
+    check(snapshot(tmp, "S1") == before, "own save untouched")
+
+
+def requested_session(L, tmp):
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('session.init(CFG, "guest", function() return true end)')
+    L.execute('session.request_toggle()')
+    L.execute('TICK(6)')
+    check(L.eval('session.state()') == "requested", "(setup) join requested (%s)" % L.eval('session.state()'))
+
+
+@test
+def session_request_ends_when_the_hosts_game_closes(L, tmp):
+    """Waiting for the host's world while its game closes: stop waiting after a few seconds, not after 120 (audit 2026-11-10)."""
+    requested_session(L, tmp)
+    L.execute('PS = "gone"; session.set_peer_state(function() return PS end)')
+    L.execute('TICK(4)')
+    check(L.eval('session.state()') == "requested", "2 s of 'gone' (a blip): still waiting")
+    L.execute('TICK(8)')
+    check(L.eval('session.state()') == "idle", "6 s of 'gone': stopped waiting (%s)" % L.eval('session.state()'))
+    check(L.eval('note_has("closed before sending")'), "...and the player is told why")
+    host_answers(L)
+    L.execute('TICK(4)')
+    check(L.eval('session.state()') == "idle" and L.eval('#LOADS') == 0, "a world that arrives afterwards loads nothing")
+
+
+@test
+def session_request_ends_at_the_hosts_goodbye(L, tmp):
+    """The host stops hosting (its goodbye) while the guest waits for its world: the wait ends there (audit 2026-11-10)."""
+    requested_session(L, tmp)
+    check(L.eval('session.host_stopped()') is True, "the goodbye ends the wait")
+    check(L.eval('session.state()') == "idle", "...back to idle (%s)" % L.eval('session.state()'))
+    check(L.eval('session.host_stopped()') is False, "...and is nothing to a guest not waiting")
+
+
+@test
+def session_failed_level_load_is_retried_then_told(L, tmp):
+    """The level load errors after the player's world was torn down (actors destroyed): tried again, and if it keeps
+    failing the player is told what to do instead of standing in a broken world marked joined (audit 2026-11-10)."""
+    requested_session(L, tmp)
+    L.execute('TRIES, FAIL_N = 0, 1; local real = GI.Event_LoadLevel; '
+              'GI.Event_LoadLevel = function(...) TRIES = TRIES + 1; if TRIES <= FAIL_N then error("no level") end return real(...) end')
+    host_answers(L)
+    L.execute('TICK(80)')
+    check(L.eval('TRIES') == 2 and L.eval('LOADS[#LOADS]') == COOP, "one failed load: tried again, the co-op save loaded (%s tries)" % L.eval('TRIES'))
+    check(not L.eval('note_has("Restart the game")'), "...without a warning")
+
+    L2 = fresh(tmp)
+    requested_session(L2, tmp)
+    L2.execute('TRIES = 0; GI.Event_LoadLevel = function() TRIES = TRIES + 1; error("no level") end')
+    host_answers(L2)
+    L2.execute('TICK(120)')
+    check(L2.eval('TRIES') == 3, "a load that keeps failing: three tries (%s)" % L2.eval('TRIES'))
+    check(L2.eval('note_has("Restart the game")'), "...then the player is told to restart (the trip is finished at start-up)")
+
+
+@test
+def session_join_without_a_spot_to_go_to_still_finishes(L, tmp):
+    """Loaded into the host's world, nowhere to teleport to (no host position, no ghost: the fakes give none): the join
+    finishes in place after a while instead of staying 'joining' for good (audit 2026-11-10)."""
+    joined_session(L, tmp)
+    L.execute('TICK(20)')
+    check(L.eval('session.in_world()') is False, "10 s in: still trying to place the player")
+    L.execute('TICK(50)')
+    check(L.eval('session.in_world()') is True, "35 s in: the join finished without the teleport")
+    check(L.eval('note_has("couldn\'t place you next to")'), "...and says so")
+
+
+@test
+def session_join_pressed_at_home_keeps_the_link(L, tmp):
+    """Join pressed again right after coming home: the menu's 'home, disconnect' (home_since) must not end the link
+    the new join is about to use, in the frame between the press and the session reading it (audit 2026-11-10)."""
+    joined_session(L, tmp)
+    L.execute('session.request_toggle(); TICK(80)')
+    check(L.eval('session.state()') == "idle" and L.eval('session.home_since()') is not None,
+          "(setup) home after leaving (%s, home_since %s)" % (L.eval('session.state()'), L.eval('session.home_since()')))
+    L.execute('session.request_toggle()')
+    check(L.eval('session.home_since()') is None, "a join waiting to start: not 'home' for the menu, the link stays")
+
+
 @test
 def session_firewall_save_menu_while_joined(L, tmp):
     """The game's Save menu / new-slot autosave while joined points EMS at another slot: the save goes to the co-op save."""
@@ -1289,6 +1399,44 @@ def session_respawn_points(L, tmp):
     check(bed_now(L) == HOME_BED, "home bed on the character at home")
     join_and_arrive(L)
     check(L.eval('session.in_world()') and bed_now(L) == WORLD_BED, "rejoin: the bed I set there (%s)" % bed_now(L))
+
+
+@test
+def session_bed_set_just_before_leaving_is_remembered(L, tmp):
+    # 2026-11-10: a new respawn point was only read every 2 s - set one and press Leave at once, and it was lost
+    bed_session(L, tmp)
+    L.execute('PC.RespawnLoc = { Translation = { X = 8000, Y = 9000, Z = 100 }, Rotation = { X = 0, Y = 0, Z = 0, W = 1 } }')
+    # (one 10 ms frame: the Leave key is handled there, the 2 s read doesn't come round)
+    L.execute('session.request_toggle(); TICK(1, 0.01)')
+    check(("world|Host|QuickSave1_Host|S1=" + WORLD_BED) in beds_file(tmp),
+          "the bed set right before Leave is remembered for the next visit (%s)" % beds_file(tmp).replace("\n", " "))
+    check(bed_now(L) == HOME_BED, "the leave save still carries the home bed (%s)" % bed_now(L))
+
+
+@test
+def realm_bed_stays_whoever_hosts(L, tmp):
+    # 2026-11-10: a Realm's beds were kept under the host's name - another member hosting, the Realm character's own
+    # respawn point was replaced by that host's bed (or a random start)
+    realm_guest_session(L, tmp, realm_character(b"member"), home_bed=True)
+    L.execute('session.set_peer_locator(function() return { X = 0, Y = 0, Z = 0 } end)')
+    L.eval('(function(s) BLOBS_IN["hostbed"] = s end)(...)', HOST_BED)
+    # (the load brought the Realm character's PlayerInfo, its respawn point with it)
+    L.execute('PC.RespawnPointEnabled = true; PC.RespawnLoc = { Translation = { X = 8000, Y = 9000, Z = 100 }, '
+              'Rotation = { X = 0, Y = 0, Z = 0, W = 1 } }')
+    L.execute('TICK(40)')
+    check(L.eval('session.state()') == "joined" and bed_now(L) == WORLD_BED,
+          "the Realm character keeps the bed it set here, not the host's (%s)" % bed_now(L))
+    realm_bed = "1 300.0 400.0 50.0 0.000000 0.000000 0.000000 1.000000"
+    L.execute('PC.RespawnLoc = { Translation = { X = 300, Y = 400, Z = 50 }, Rotation = { X = 0, Y = 0, Z = 0, W = 1 } }')
+    L.execute('TICK(6)')
+    check(("realm|" + REALM + "=" + realm_bed) in beds_file(tmp),
+          "a bed set in the Realm is kept under the Realm, not its host (%s)" % beds_file(tmp).replace("\n", " "))
+    # Sentinel R6: the Leave save is the stored Realm character - with the home bed put on before it, every later
+    # visit loaded the home world's spot as "the Realm character's bed"
+    L.execute('session.request_toggle(); TICK(1, 0.01)')
+    check(bed_now(L) == realm_bed, "the Realm's Leave save keeps the Realm bed, not the home one (%s)" % bed_now(L))
+    # (home: the own save isn't written by a Realm visit - realm_guest_plays_realm_character - so its own respawn
+    # point comes back with it)
 
 
 @test
@@ -2540,10 +2688,13 @@ def realm_add_to_realm_over_the_link(L, tmp):
     check(n == 1, "redeemed once, not every poll (%d)" % n)
 
 
-def realm_guest_session(L, tmp, character=None):
+def realm_guest_session(L, tmp, character=None, home_bed=False):
     """own save S1, Realm member (with this stored Realm character or none), joins the Realm's host"""
     make_slot(tmp, "S1")
     session_rt(L, tmp)
+    if home_bed:
+        L.execute('PC.RespawnPointEnabled = true; PC.RespawnLoc = { Translation = { X = 100, Y = 200, Z = 300 }, '
+                  'Rotation = { X = 0, Y = 0, Z = 0, W = 1 } }')
     link_dir = os.path.join(tmp, "SurrounDead")
     L.execute(REALM_FAKES, link_dir)
     rdir = os.path.join(link_dir, "Saved", "SurrounSyncRealms", REALM)
@@ -2934,6 +3085,7 @@ def host_state(L, s):
 @test
 def hostgone_countdown_then_home(L, tmp):
     joined_session(L, tmp)
+    L.execute('TICK(62)')   # (the trip finishes first: the fakes have no spot to teleport to, its note comes at 30 s)
     host_state(L, "gone")
     L.execute('LOGGED_NOTES = 0; TICK(1)')
     check(L.eval('note_has(...)', "Host's game closed. You go home with your character in 30 seconds."), "countdown message")
@@ -3305,6 +3457,40 @@ def join_kind_must_match_the_hosts_world(L, tmp):
     check(L2.eval('BLOBS_OUT["joinwhy"]') == "102 notrealm", "a Realm join to a host not running that Realm is refused")
     L2.execute('BLOBS_OUT = {}; BLOBS_IN["req"] = "join 103"; TICK(1)')
     check(L2.eval('BLOBS_OUT["world"]') is None, "an older guest's plain co-op request still joins a co-op host")
+
+
+@test
+def join_refusals_are_answered_and_their_reason_waited_for(L, tmp):
+    # audit 2026-11-10: the reason was read only in the tick the "fail" came (two blobs, no order between them: a
+    # reason a moment later said "couldn't send their world"), and a stale request was dropped without an answer
+    # (the guest waited the whole 120 s)
+    make_slot(tmp, "S1")
+    session_rt(L, tmp)
+    L.execute('package.loaded["mirror.phase1"] = { stop = function() STOPPED = true end }')
+    L.execute('session.init(CFG, "guest", function() return true end); session.request_toggle(); TICK(6)')
+    nonce = (L.eval('BLOBS_OUT["req"]') or "").split(" ")[1]
+    L.eval('(function(n) BLOBS_IN["world"] = "fail " .. n end)(...)', nonce)
+    L.execute('TICK(1)')
+    L.eval('(function(n) BLOBS_IN["joinwhy"] = n .. " realm" end)(...)', nonce)
+    L.execute('TICK(2)')
+    check(L.eval('session.state()') == "idle" and L.eval('note_has(...)', "is playing a Realm right now"),
+          "the reason a moment after the refusal is still the one shown")
+    check(not L.eval('note_has(...)', "couldn't send their world"), "...not 'couldn't send their world'")
+    L.execute('session.request_toggle(); TICK(6)')
+    nonce = (L.eval('BLOBS_OUT["req"]') or "").split(" ")[1]
+    L.eval('(function(n) BLOBS_IN["joinwhy"] = n .. " stale"; BLOBS_IN["world"] = "fail " .. n end)(...)', nonce)
+    L.execute('TICK(2)')
+    check(L.eval('session.state()') == "idle" and L.eval('note_has(...)', "too old"), "the guest is told its request looked too old")
+
+    L2 = fresh(tmp)
+    session_rt(L2, tmp)
+    L2.execute('package.loaded["mirror.link"].peer_age = function(s) return os.time() - s end')
+    L2.execute('session.init(CFG, "host", function() return true end)')
+    old = L2.eval('os.time()') - 1000
+    L2.eval('(function(n) BLOBS_IN["req"] = "join " .. n .. " coop" end)(...)', old)
+    L2.execute('TICK(1)')
+    check(L2.eval('BLOBS_OUT["world"]') == "fail %d" % old and L2.eval('BLOBS_OUT["joinwhy"]') == "%d stale" % old,
+          "a stale request is answered, with why (%s / %s)" % (L2.eval('BLOBS_OUT["world"]'), L2.eval('BLOBS_OUT["joinwhy"]')))
 
 
 @test

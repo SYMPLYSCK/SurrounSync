@@ -5,10 +5,7 @@ param(
     # the SyncFX graphics mod (its own repo); packed in and installed off
     [string]$SyncFX = (Join-Path $env:USERPROFILE 'Desktop\DreadFX\mod\SyncFX'),
     # the gore mod (its own repo): its Lua mod and cooked pak; installed off, switched in MY SETTINGS
-    [string]$Gore = (Join-Path $env:USERPROFILE 'Desktop\SurrounDeadGore'),
-    # the FPV drone mod (its own repo, sold on its own): its committed files, marked bundled.txt, fly only for a
-    # player its owner allows (mirror/dronegrant.lua)
-    [string]$Drone = (Join-Path $env:USERPROFILE 'Desktop\FPVDrone')
+    [string]$Gore = (Join-Path $env:USERPROFILE 'Desktop\SurrounDeadGore')
 )
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path $PSScriptRoot -Parent
@@ -66,25 +63,6 @@ Copy-Committed $Gore 'mod/SurrounDeadGore' (Join-Path $Ue 'Mods\SurrounDeadGore'
 Get-ChildItem (Join-Path $Ue 'Mods\SurrounDeadGore') -Recurse -Include 'enabled.txt', '*.tmp', '*.bak*', '*.log' | Remove-Item -Force
 New-Item -ItemType Directory -Force (Join-Path $P 'gore') | Out-Null
 Copy-Item $GorePak (Join-Path $P 'gore')
-# the FPV drone mod: what its repo has committed (never the developer's own FPVDrone.ini or logs), its radio helper
-# built fresh, bundled.txt so it flies only once its owner allows the player; switched on by Setup (InstallDrone)
-if (-not (Test-Path (Join-Path $Drone 'mod\FPVDrone\Scripts\main.lua'))) { throw "FPVDrone not found in $Drone" }
-$DroneTmp = Join-Path $Stage 'fpvdrone'
-New-Item -ItemType Directory -Force $DroneTmp | Out-Null
-git -C $Drone archive --format=tar -o (Join-Path $DroneTmp 'fpvdrone.tar') HEAD mod/FPVDrone
-if ($LASTEXITCODE -ne 0) { throw "git archive of FPVDrone failed" }
-tar -xf (Join-Path $DroneTmp 'fpvdrone.tar') -C $DroneTmp
-if ($LASTEXITCODE -ne 0) { throw "unpacking FPVDrone failed" }
-$Dr = Join-Path $Ue 'Mods\FPVDrone'
-Copy-Item (Join-Path $DroneTmp 'mod\FPVDrone') $Dr -Recurse
-Get-ChildItem $Dr -Recurse -Include 'enabled.txt' | Remove-Item -Force
-# (owned.txt marks the copy sold on its own, which always flies: never in the SurrounSync copy)
-Remove-Item (Join-Path $Dr 'owned.txt') -Force -ErrorAction SilentlyContinue
-if (Test-Path (Join-Path $Dr 'owned.txt')) { throw "owned.txt is still in the bundled FPVDrone" }
-& (Join-Path $Drone 'tools\build-helper.ps1')
-New-Item -ItemType Directory -Force (Join-Path $Dr 'helper') | Out-Null
-Copy-Item (Join-Path $Drone 'mod\FPVDrone\helper\FPVRadio.exe') (Join-Path $Dr 'helper')
-Set-Content (Join-Path $Dr 'bundled.txt') 'This FPVDrone came with SurrounSync: it flies once its owner allows you (their SETTINGS -> PERMISSIONS).' -Encoding ascii
 # SurrounSync's game content (Setup puts content\ into SurrounDead\Content): the startup intro and the dog sounds pak,
 # with UE4SS's BPModLoaderMod that loads Paks\LogicMods (Setup adds it only where it is missing)
 $Content = Join-Path $P 'content'
@@ -93,10 +71,8 @@ Copy-Item (Join-Path $Repo 'mod\Movies\UE5 Intro.mp4') (Join-Path $Content 'Movi
 Copy-Item (Join-Path $Repo 'mod\LogicMods\SurrounSyncSounds.pak') (Join-Path $Content 'Paks\LogicMods')
 # the hang glider's model (mirror/glider.lua; tools/glider builds it)
 Copy-Item (Join-Path $Repo 'mod\LogicMods\SurrounSyncGlider.pak') (Join-Path $Content 'Paks\LogicMods')
-# the Double Drum Magazine and the diamond Colonel's Revenge (mirror/armory.lua; tools/armory builds it)
+# the Double Drum Magazine (mirror/armory.lua; tools/armory builds it)
 Copy-Item (Join-Path $Repo 'mod\LogicMods\SurrounSyncArmory.pak') (Join-Path $Content 'Paks\LogicMods')
-# the FPV drone's models, so every player sees another's quad (mirror/drone.lua; a copy of FPVDrone's FPVDrone_P.pak)
-Copy-Item (Join-Path $Repo 'mod\LogicMods\SurrounSyncDrone.pak') (Join-Path $Content 'Paks\LogicMods')
 $Bp = Join-Path $Ue 'Mods\BPModLoaderMod\Scripts'
 New-Item -ItemType Directory -Force $Bp | Out-Null
 Copy-Item (Join-Path $Win64 'ue4ss\Mods\BPModLoaderMod\Scripts\main.lua') $Bp
@@ -133,6 +109,12 @@ $Out = Join-Path $Dist 'SurrounSyncSetup.exe'
     /r:System.IO.Compression.FileSystem.dll /r:Microsoft.VisualBasic.dll `
     (Join-Path $Repo 'installer\Setup.cs') (Join-Path $Repo 'bridge\Common.cs') (Join-Path $Repo 'bridge\Diagnose.cs') $ReportTarget
 if ($LASTEXITCODE -ne 0) { throw "csc failed (setup)" }
+# the same files as a plain zip + version.json, for other installers (tools/make-modzip.py)
+python -I (Join-Path $PSScriptRoot 'make-modzip.py') $P $Dist
+if ($LASTEXITCODE -ne 0) { throw "make-modzip failed" }
+# the Hang Glider on its own, for players without SurrounSync (tools/make-glidermod.py)
+python -I (Join-Path $PSScriptRoot 'make-glidermod.py') $P $Dist
+if ($LASTEXITCODE -ne 0) { throw "make-glidermod failed" }
 Remove-Item $Stage -Recurse -Force
 $hash = (Get-FileHash $Out -Algorithm SHA256).Hash
 Set-Content (Join-Path $Dist 'SurrounSyncSetup.exe.sha256') "$hash  SurrounSyncSetup.exe" -Encoding ascii

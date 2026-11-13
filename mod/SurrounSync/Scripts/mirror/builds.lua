@@ -37,7 +37,7 @@ local move_from = nil   -- { actor, id }: the piece the game's Move option (Buil
 local last_obj = nil
 local last_da = nil
 local applying = false
-local expect_gone = {}
+local expect_gone, EXPECT_GONE_S = {}, 2.0
 local stats = { placed = 0, moved = 0, removed = 0, renamed = 0, made = 0, applied_moves = 0, applied_removes = 0,
                 applied_renames = 0, missing = 0 }
 
@@ -158,7 +158,11 @@ local function on_gone(self, why)
     if not ok or id:find("@0,0,0$") then ok, id = known_ids[addr] ~= nil, known_ids[addr] end
     known_ids[addr] = nil
     if not ok then log.info("builds: one of our builds went (" .. why .. ") - its place unknown, not sent"); return end
-    if expect_gone[id] then expect_gone[id] = nil; return end
+    -- (the other game's removal, applied here a moment ago, isn't told back; a mark older than that is an old one
+    -- whose hook never came: a later real removal at the same spot is told)
+    local marked = expect_gone[id]
+    expect_gone[id] = nil
+    if marked and os.clock() - marked < EXPECT_GONE_S then return end
     pcall(function() bedtags.gone(util.vec(b:K2_GetActorLocation())) end)
     util.safe(function() doorlock.gone(doorlock.loc_of_id(id)) end, "builds.doorlock")
     channel:send("R " .. id)
@@ -311,11 +315,29 @@ local function rename(payload)
     if name == "" then return end
     local b = find(id, 100)
     if not b then stats.missing = stats.missing + 1; log.info("builds: " .. id .. " renamed - not here"); return end
-    -- (the property, not OverrideBuildName: that also opens the hover menu on this screen)
+    -- The hover and the inventory panel show ContainerName as it is when looked at (decompiled), so a write that
+    -- didn't take is how a live rename stayed unseen until a rejoin brought the host's save (user 2026-11-10). Read
+    -- back; if it didn't take, the game's own Rename (decompiled: OverrideBuildName only sets ContainerName).
+    local function now_name()
+        local s
+        pcall(function() s = b.ContainerName:ToString() end)
+        return s
+    end
     local ok, err = pcall(function() b.ContainerName = FText(name) end)
-    if not ok then log.warn("builds: couldn't rename " .. id .. ": " .. tostring(err)); return end
+    local how = "set"
+    if now_name() ~= name then
+        applying = true
+        local ok2, err2 = pcall(function() b:OverrideBuildName(FText(name)) end)
+        applying = false
+        how = "the game's Rename"
+        if now_name() ~= name then
+            log.warn("builds: couldn't rename " .. id .. ": " .. tostring(ok and "the name didn't take" or err)
+                .. (ok2 and "" or (" / " .. tostring(err2))))
+            return
+        end
+    end
     stats.applied_renames = stats.applied_renames + 1
-    log.info("builds: the other player renamed " .. id)
+    log.info("builds: the other player renamed " .. id .. " (" .. how .. ")")
 end
 local rename_fn = function(self, Name) util.safe(on_rename, "builds.rename", self, Name) end
 
@@ -325,7 +347,7 @@ local function remove(payload)
     local b = find(id, 100)
     if not b then stats.missing = stats.missing + 1; log.info("builds: " .. id .. " removed - not here"); return end
     local ok_id, our_id = pcall(id_of, b)
-    expect_gone[ok_id and our_id or id] = true
+    expect_gone[ok_id and our_id or id] = os.clock()
     pcall(function() bedtags.gone(util.vec(b:K2_GetActorLocation())) end)
     util.safe(function() doorlock.gone(util.vec(b:K2_GetActorLocation())) end, "builds.doorlock")
     applying = true

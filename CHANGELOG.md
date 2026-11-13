@@ -2,6 +2,70 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 1.1.1 (2026-11-12)
+
+**SurrounSync 1.1.1: the glider and its recipe for everyone, the other players in the right spot on the big map, the minimap on F4, cheaper zombies and many co-op, Realm and joining fixes.** Everyone needs 1.1.1: it doesn't play with 1.1.0.
+
+**Hang Glider**
+- The glider opens with one jump. Carrying a Hang Glider, jump off an edge with 5 m or more of drop, or jump while running down a hill, and it opens by itself once the drop is under you; no second press in the air. A jump on flat ground or down a low wall stays a normal jump, and walking off an edge without jumping doesn't open it (press Jump in the air then, as before).
+- The Hang Glider also comes as its own mod for single player without SurrounSync: SurrounSyncGlider-<version>.zip (unzip it into the game's folder) with a version-glider.json for mod installers. It holds the glider's pak, its scripts, UE4SS and the loader the pak needs. With SurrounSync installed it stays off by itself, since SurrounSync has the glider already.
+- Uninstalling SurrounSync keeps the glider's pak and the loader when the standalone glider mod is installed.
+- The Hang Glider, its workbench recipe and the Double Drum Magazine load from their paks as soon as you are in a world, without waiting for the mod loader (BPModLoaderMod). A player whose loader was off, missing or slow had no glider and no recipe, and was told the glider's files weren't loaded.
+
+**Minimap**
+- F4 switches the minimap on or off, instead of pressing M twice, so opening and closing the big map quickly no longer switches it by mistake. M is the game's big map again and nothing else. /minimap in chat switches it too.
+
+**Containers**
+- An item a guest puts into a container the host's game hasn't loaded (far from the host) is no longer lost when the session ends. The host's game keeps it on disk and puts it into the container when the host comes near, in a later game of that world too. It is only handed back to the guest when the host has been at that spot and the container isn't in its world.
+
+**Combat**
+- When you get hurt, the other players see blood on you again. A change in this update had stopped the hit from being sent, and each hit wrote a warning to the log.
+
+**Bug reports**
+- A bug report now also sends the full report to the mod's makers, crash dumps included (the Discord copy has no room for them), so a crash can be looked into without asking you for files. The report box says so. Reports are kept 30 days and only the mod's makers can read them.
+
+**Other installers**
+- Each release also comes as SurrounSync-<version>.zip (unzip it into the game's folder) with a version.json that names the version, the zip's address, size and SHA-256, so mod installers can install and update SurrounSync. The newest one is always at https://github.com/SYMPLYSCK/SurrounSync/releases/latest/download/version.json.
+
+**Joining**
+- A running Steam connection no longer looks stopped. A Steam, friend or server name with "at" and a number in it (like "Base at 2") made the game think the connection had died and restart it every 30 seconds.
+- A Steam connection that stopped outside co-op is started again by itself (after 8 seconds, then less and less often), and the card says what its log knows: Steam didn't answer, or it never ran (often an antivirus).
+- A second connection program started next to a running one no longer empties its log or drops the command the game had just sent it.
+- The connection program keeps working on a PC that has been up for more than 24.9 days (Windows Fast Startup keeps that count across shutdowns). It used to stop reading the game's commands, so the card said "THE STEAM CONNECTION ISN'T RUNNING" with Steam up.
+- Asking to join a host Steam can't reach now says why (they aren't answering, Steam won't let this PC connect, Steam isn't connected, or a firewall, VPN or antivirus), instead of "waiting for them to accept" for 2 minutes.
+- A connection whose reliable data stops arriving is noticed and restarted after about 7 seconds instead of 24 or more; on a busy PC it could go unnoticed until the join timed out.
+- A game save that never finishes no longer locks joining and leaving ("One moment, please." to every key press until a restart): after 30 seconds the join is called off, or you stay in co-op and can press Leave again.
+- When the host stops hosting or their game closes while you wait for their world, you're told at once and stay in your world, instead of waiting the full 2 minutes.
+- The right password, answered over a slow connection, is no longer counted as a wrong one (three of those blocked you until the host hosted again).
+- A world load that fails is tried twice more; if it still fails you're told to restart the game (your saves are safe) instead of standing in a broken world.
+- A join with no spot to place you next to the host now finishes after 30 seconds where you stand, instead of staying "joining" for good.
+- Another player can no longer fill your disk or memory through the connection: what their data unpacks to counts against their speed limit, and all of their files together stay under 64 MB.
+- The updater only takes a setup from SurrounSync's own GitHub releases.
+- A host that can't take a join request (it looks too old) now says so instead of letting you wait 2 minutes, and a refusal's reason (the host is playing a Realm, for one) is no longer lost when it arrives a moment after the refusal.
+
+**Co-op and Realms**
+- The big map shows the other players where they are. Their dot used to sit between Whitewood and the truck stop for everyone, and then at only half their real distance from the middle of the map; the minimap was right.
+- A player who gets up after a revive and is still held on the floor (sitting, or unable to move) is got up again after half a second, 2 and 5 seconds, and the log says what held them.
+- Asking to join a player who is in someone else's game (a Realm member, say) gets an answer at once, "That player is in someone else's game right now, not hosting", instead of waiting with no reason.
+- A passenger's fuel gauge follows the driver's tank, and riding along no longer spends this game's fuel as well (the car could run dry while the gauge still showed fuel).
+- The police station's garage shutter, the keycard hangar doors and the towns' air raid sirens are shared: one player opens or sounds them, everyone sees and hears it.
+- Renaming a container shows the new name on every player's screen at once, not only after leaving and joining again.
+- Rocket launcher rockets and launcher grenades fly and explode on every player's screen. Explosive barrels blow up for everyone too.
+- A bed you set in a Realm stays your respawn point whoever hosts it; it used to be swapped for the host's bed or a random start when another member hosted. A bed set just before pressing Leave is remembered for your next visit.
+- Leaving a Realm when the game's save never finishes no longer leaves you stuck: after 30 s it goes home with what is on disk. Opening a Realm the same way gives up after 30 s and lets the Realm go, instead of holding it for nobody.
+- A Realm session whose save couldn't be read on leaving (another program had it open, say) is no longer deleted: it stays on this PC and is kept the next time the game starts, as after a crash.
+- Weather that jumps (a storm rolling in) reaches every player within a few seconds instead of about 20.
+- The hang glider now says why a Jump in the air didn't open it: its pak isn't installed or the game started without it (it names which), you don't carry a Hang Glider (made at the crafting workbench), or there wasn't enough air under you.
+- An explosive barrel, grenade or noise maker set off by a player who is in another world (their own, or still loading) no longer goes off in yours.
+- A build piece picked up or destroyed where another player had removed one earlier now goes for everyone; it could stay on the other screens.
+- A ping removed while pings weren't shared can no longer be mixed up with another object later.
+- With load split on, a world reset no longer leaves a guest thinking it still follows a player it left.
+- A little less work every frame: shots, the drum magazine check, the update check of the inventory layout and every object lookup make no new Lua functions or engine calls they didn't need.
+- Zombies cost less with many of them around: the host sends only what changed since a full update every 1.5 seconds, about a quarter of the data it sent before, and both games make far less Lua garbage for them (in our test with 100 zombies: 114 KB down to 18 KB a send on the host, 211 KB down to 17 KB on the guest). Everyone needs this version to play together.
+
+**Taken out**
+- The FPV drone link, the hover bike, the diamond Colonel's Revenge, the forest giant and admin fly (F7) are no longer part of SurrounSync. The setup removes the copy of the FPV drone mod that came with 1.1.0 and its models; an FPV drone mod you installed yourself is left alone. The Double Drum Magazine, the hang glider, the gore mod and SyncFX stay.
+
 ## 1.1.0 (2026-11-07)
 
 **SurrounSync 1.1: downed and revive, a minimap, vehicle locks, the hang glider, the forest giant, working radios and a fix for memory that kept climbing in long sessions.** Everyone needs 1.1.0: it doesn't play with 1.0.0.

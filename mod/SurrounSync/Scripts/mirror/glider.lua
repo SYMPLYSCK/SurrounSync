@@ -34,10 +34,19 @@ local MIN_DROP_CM = 500       -- air under the feet needed to open it (a jump on
 -- (300: a 20 degree hill opens it from 1 m up; a 10 degree one, flatter than the glide, doesn't)
 local AHEAD_CM, AHEAD_DROP_CM = 600, 300
 local CLOSE_AFTER_S = 0.4     -- a second Jump closes it, not the press that opened it
--- Jump in the air (a quick double tap: the first jumps) arms it for ARM_S; it opens the moment there is MIN_DROP_CM of
--- air under the feet, so a tap at a cliff's edge opens it once over the edge (user 2026-11-02: "a double space click
--- quickly will activate it, i notice its hard to activate sometimes" - a press counted only with the drop already under).
+-- Jump arms it for ARM_S; it opens the moment there is MIN_DROP_CM of air under the feet (or the hill below, above), so
+-- a tap at a cliff's edge opens it once over the edge (user 2026-11-02: "a double space click quickly will activate it,
+-- i notice its hard to activate sometimes" - a press counted only with the drop already under). The jump itself arms
+-- it too (user 2026-11-10: "make it so it's automatic instead of pressing space twice? It will deploy if your on a hill
+-- or jump with nothing under you"): a Jump on the ground, carrying one, arms it for the jump it starts (the game lifts
+-- off a frame or two later, within LIFTOFF_S); a jump on flat ground stays a jump, landing ends the arming.
 local ARM_S = 1.5
+local LIFTOFF_S = 0.3
+-- A Jump in the air that opens nothing says why (user 2026-11-10: a friend "can't get the glider to open at all"): the
+-- glider's files not loaded in this game, no Hang Glider carried, or (after a real drop since the press, so a double tap
+-- on flat ground stays quiet) not enough air under. Each reason at most once per TELL_S.
+local TOO_LOW_TOLD_CM = 300
+local TELL_S = { not_loaded = 60, no_item = 300, too_low = 30 }
 -- Flight is speed traded for height: looking down (a dive) gains speed and sinks faster, looking up (a flare) spends
 -- the speed - above trim speed that becomes a short climb, below STALL_SPEED the glider sinks harder.
 local SPEED = 1100            -- cm/s forward the glider settles at, level
@@ -99,8 +108,12 @@ local UDW_LOOK_S = 5.0        -- no weather actor: looked for again this often
 
 -- my glide (main copy flies it, every copy sends it): on, ep (counts my glides), heading, speed, vz
 local sh = peers.shared("glider", { on = false, ep = 0 })
-local stats = peers.shared("glider.stats", { opened = 0, landed = 0, closed = 0, water = 0, no_model = 0, no_item = 0 })
-local key_was, opened_at, armed_until = false, 0.0, 0.0
+local stats = peers.shared("glider.stats", { opened = 0, landed = 0, closed = 0, water = 0, no_model = 0, no_item = 0,
+    not_loaded = 0, too_low = 0 })
+local key_was, opened_at, armed_until, armed_at = false, 0.0, 0.0, 0.0
+local arm_z = nil             -- my height at the press that armed it (the drop since, for "too low")
+local arm_asked = false       -- armed by a press in the air (asked for the glider: "too low" is said); a jump's own arming is quiet
+local told = {}               -- reason -> os.clock() it was last said
 local mine = nil              -- shown on my player: { actor, glider, mesh_rot, mesh_at, arm, gravity }
 local theirs = nil            -- shown on this copy's ghost: { actor, glider, mesh_rot, mesh_at, yaw }
 local peer_on = false
@@ -108,6 +121,7 @@ local same_world = function() return false end
 local channel = nil
 local sent, resend_in = nil, 0.0
 local model_told = false
+local reinstall = "reinstall SurrounSync"   -- (the glider on its own, mod/SurrounSyncGlider, names itself: glider.init)
 -- the air my glide flies through (main copy only): w the weather actor (look_at: when to look for it again), next_at
 -- when the wind and the ground are looked at again; dx, dy where the wind blows, speed (cm/s, before gusts and
 -- height), low (the near-ground share), ridge (cm/s up per cm/s of wind); wx, wy the wind on me last frame
@@ -142,13 +156,6 @@ local function dead(p)
     local d = false
     pcall(function() d = p["PlayerDead?"] == true end)
     return d
-end
-
--- admin fly flying: Jump is its climb, and opening over it would keep its zero gravity, camera and lean as the
--- game's own when the glider closes (required late: adminfly.lua requires this file the same way)
-local function adminfly_lit()
-    local ok, af = pcall(require, "mirror.adminfly")
-    return ok and type(af) == "table" and type(af.lit) == "function" and af.lit() == true
 end
 
 -- true when the line a-b hits something (or the trace fails)
@@ -475,6 +482,58 @@ local function fly(p, dt)
     place(p, mine, sh.turn, dive, dt)
 end
 
+local function tell(why, text)
+    stats[why] = (stats[why] or 0) + 1
+    local now = os.clock()
+    if told[why] and now - told[why] < TELL_S[why] then return end
+    told[why] = now
+    log.info("glider: not opened, " .. why .. " (" .. text .. ")")
+    pcall(function() require("mirror.notify").show(text, "info", "glider." .. why) end)
+end
+
+local function height(p)
+    local z
+    pcall(function() z = p:K2_GetActorLocation().Z end)
+    return z
+end
+
+local function arm(p, now, in_air)
+    if now >= armed_until then arm_z, arm_asked = height(p), false end   -- (a press while armed keeps the first press's height)
+    armed_until, armed_at = now + ARM_S, now
+    arm_asked = arm_asked or in_air
+end
+
+-- armed, and it ran out or I landed without opening: asked for it in the air and fell a real drop since the press? then
+-- say it was too low (a plain jump down a wall, armed by the jump alone, says nothing)
+local function disarm(p)
+    local z = armed_until > 0 and arm_asked and arm_z and height(p)
+    if z and arm_z - z >= TOO_LOW_TOLD_CM then
+        tell("too_low", "Hang Glider: not enough air under you to open it (" .. MIN_DROP_CM / 100 .. " m of drop, or a slope going down ahead)")
+    end
+    armed_until, arm_z, arm_asked = 0, nil, false
+end
+
+-- a press in the air without a Hang Glider: none carried, or the glider's item isn't in this game at all
+-- why: its pak missing, as the game reads it (the game runs in Binaries\Win64). BPModLoaderMod isn't needed for it:
+-- modrecipe loads the item from the pak itself (2026-11-12); a pak there but not loaded was put in after the game
+-- started (the engine mounts the Paks folder at start only)
+local function missing_files()
+    local f = io.open("..\\..\\Content\\Paks\\LogicMods\\SurrounSyncGlider.pak", "rb")
+    if not f then return "SurrounSyncGlider.pak isn't in Content\\Paks\\LogicMods" end
+    f:close()
+    return "SurrounSyncGlider.pak is there but this game started without it - restart the game"
+end
+
+local function no_glider()
+    if not util.valid(util.find(glideritem.ITEM)) then
+        local why = missing_files()
+        log.warn("glider: the glider's item isn't loaded - " .. why)
+        tell("not_loaded", "Hang Glider: the glider's files aren't loaded in this game (" .. why .. ") - " .. reinstall)
+    else
+        tell("no_item", "Hang Glider: you don't carry one - make it at the crafting workbench")
+    end
+end
+
 -- main.lua's copy only (every frame, co-op or not)
 local function own_tick(dt)
     local p = game.player()
@@ -491,15 +550,20 @@ local function own_tick(dt)
         return
     end
     local now = os.clock()
-    if not falling(p) then armed_until = 0; return end   -- (on the ground a press is the game's jump; landing disarms)
-    if adminfly_lit() then armed_until = 0; return end    -- (its climbs never arm it either)
+    local air = falling(p)
+    if armed_until > 0 and now >= armed_until then disarm(p) end
     if pressed and now >= armed_until then
-        -- (the inventory is walked on a press in the air only, never per frame)
-        if glideritem.carried(p) then armed_until = now + ARM_S else stats.no_item = stats.no_item + 1 end
+        -- (the inventory is walked on a Jump press only, never per frame; a jump without one carried is just a jump)
+        if glideritem.carried(p) then arm(p, now, air) elseif air then no_glider() end
     elseif pressed then
-        armed_until = now + ARM_S
+        arm(p, now, air)
     end
-    if now < armed_until and not swimming(p) and not dead(p) and high_enough(p) then armed_until = 0; open(p) end
+    if not air then
+        -- (on the ground the press is the game's jump: it stays armed while the jump lifts off; landing disarms)
+        if armed_until > 0 and now - armed_at >= LIFTOFF_S then disarm(p) end
+        return
+    end
+    if now < armed_until and not swimming(p) and not dead(p) and high_enough(p) then armed_until, arm_z = 0, nil; open(p) end
 end
 
 local function apply(msg)
@@ -546,10 +610,11 @@ end
 function glider.active() return sh.on == true end
 
 function glider.status()
-    return string.format("glider: %s, opened %d, landed %d, let go %d, water %d, no item %d, wind %.1f m/s, recipe %s",
+    return string.format("glider: %s, opened %d, landed %d, let go %d, water %d, no item %d, too low %d, wind %.1f m/s, recipe %s, item %s",
         sh.on and "GLIDING" or (peer_on and "they're gliding" or "closed"),
-        stats.opened, stats.landed, stats.closed, stats.water, stats.no_item, air.speed / 100,
-        glideritem.stats.added > 0 and "added" or "not yet")
+        stats.opened, stats.landed, stats.closed, stats.water, stats.no_item, stats.too_low, air.speed / 100,
+        glideritem.stats.added > 0 and "added" or "not yet",
+        util.valid(util.find(glideritem.ITEM)) and "loaded" or "NOT LOADED")
 end
 
 -- co-op stops: the other player's glider goes (mine flies on, it's my own movement)
@@ -564,13 +629,15 @@ local function forget()
     theirs, peer_on, sent = nil, false, nil
 end
 
--- main.lua: my own glide, every frame (co-op or not); c: config (glider = false turns it off)
+-- main.lua: my own glide, every frame (co-op or not); c: config (glider = false turns it off; reinstall: what the
+-- "files aren't loaded" notice tells the player to reinstall)
 function glider.init(c)
     if c and c.glider == false then log.info("glider: off"); return end
+    if c and c.reinstall then reinstall = c.reinstall end
     game.on_world_reset(forget)
     game.on_tick(function(dt) util.safe(own_tick, "glider.own", dt) end)
     game.on_tick(function(dt) util.safe(glideritem.tick, "glideritem", dt) end)
-    log.info("glider: ready (carrying a Hang Glider, Jump while falling from " .. MIN_DROP_CM / 100 .. " m or higher, or down a hill)")
+    log.info("glider: ready (carrying a Hang Glider, a jump with " .. MIN_DROP_CM / 100 .. " m or more under you, or down a hill, opens it)")
 end
 
 -- phase1, each link's copy: send my state on it, show its player's

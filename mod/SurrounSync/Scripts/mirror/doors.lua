@@ -1,4 +1,4 @@
--- Doors, gates and container lids open and close on both screens.
+-- Doors, gates and container lids open and close on both screens (and the town sirens sound on both).
 
 local log = require("mirror.log")
 local util = require("mirror.util")
@@ -55,6 +55,20 @@ local KINDS = {
     BP_KeycardDoor_C               = { flag = "Open?", closed_when = false, toggle = "MC_OpenDoor", open_only = true, by_actor = true },
     BP_KeycardDoor_Child_C         = { flag = "Open?", closed_when = false, toggle = "MC_OpenDoor", open_only = true, by_actor = true },
     BP_KeypadDoor_C                = { flag = "Open?", closed_when = false, toggle = "MC_OpenDoor", open_only = true, by_actor = true },
+    -- The police station's garage shutter and the keycard hangar gates (decompiled; user 2026-11-10: "Police station
+    -- shutter doesn't sync", "Prison door is not syncd"). The shutter's Event_OpenDoor plays its folding montage up or
+    -- down by Open? (set at the montage's end; a press while it moves does nothing). The hangar's MC_OpenDoor(actor)
+    -- opens it away from that actor, or closes it when open (Open? at the timeline's end; it shuts itself 30 min on).
+    BP_PoliceStationGarageDoor_C   = { flag = "Open?", closed_when = false, toggle = "Event_OpenDoor" },
+    BP_HangarDoor_C                = { flag = "Open?", closed_when = false, toggle = "MC_OpenDoor", by_actor = true },
+    -- Town air raid sirens (decompiled; user 2026-11-10: only the host heard them): each game's siren goes off on its
+    -- own random timer, or by hand. ActivateSiren fades its sound in and sets Playing (and its noise for zombies),
+    -- DeactivateSiren fades it out; Event_Siren only sets the next random time. Copied as a state ("open" = playing).
+    BP_Siren_C                     = {
+        flag = "Playing", closed_when = false,
+        open = function(o) o:ActivateSiren() end,
+        close = function(o) o:DeactivateSiren() end,
+    },
     -- The lab's secure doors (decompiled): Event_Door on a closed one always wants a keycard (Unlocked is set but never
     -- read there), so copying Unlocked alone opened nothing (report 2026-11-01). Re-traced 2026-11-01 (a9719e5 had the
     -- two timelines the wrong way round): the keycard opening is IsClosed = false + TL_Mechanism (its end plays TL_Doors,
@@ -121,8 +135,8 @@ for cls in pairs(KINDS) do
 end
 -- Children of one master (kit 2026-10-31, every class FindAllOf(BP_MasterDoor_C) returned in the world): one walk of
 -- the master finds them all. Each class was its own 30-60 ms walk, one a frame, right after a join ("perf: doors took
--- 63 ms"). The hangar and police garage doors aren't synced but are listed: a child outside the list puts
--- util.instances back to one walk per class. The others' masters (BP_MasterObject_C, Buildable_MASTER_C,
+-- 63 ms"). Every child is listed: a child outside the list puts util.instances back to one walk per class. The
+-- others' masters (BP_MasterObject_C, Buildable_MASTER_C,
 -- BP_LaboratoryMaster_C with its cables) hold many other classes.
 local GROUP = {}
 local MASTER_DOOR = { "BP_WarehouseDoors_C", "BP_ContainerDoors_C", "BP_BarrierGate_C", "BP_KeycardDoor_C",

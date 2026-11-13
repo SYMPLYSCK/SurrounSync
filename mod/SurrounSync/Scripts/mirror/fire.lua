@@ -326,10 +326,18 @@ local function ensure_hooks()
     util.ensure_hook(FIREARM .. ":FireSurfaceHit", surface_hook)
     util.ensure_hook(FIREARM .. ":Svr_SpawnTrail", trail_hook)
 end
-local function pump_trails() trails:pump(function(payload) util.safe(play_trail, "fire.trail", payload) end) end
-local function pump_shots() shots:pump(function(payload) util.safe(play, "fire.play", payload) end) end
-local function pump_impacts() impacts:pump(function(payload) util.safe(play_impact, "fire.impact", payload) end) end
-local function pump_hurts() hurts:pump(function(payload) util.safe(play_hurt, "fire.hurt", payload) end) end
+-- (one timer and no new functions for the four every frame: each timer is two crash-step writes)
+local function on_trail_msg(payload) util.safe(play_trail, "fire.trail", payload) end
+local function on_shot(payload) util.safe(play, "fire.play", payload) end
+local function on_impact(payload) util.safe(play_impact, "fire.impact", payload) end
+-- (not on_hurt / on_trail: those names are the hooks', and fire.init below took the later one - 0bf7a36)
+local function on_hurt_msg(payload) util.safe(play_hurt, "fire.hurt", payload) end
+local function pump_all()
+    trails:pump(on_trail_msg)
+    shots:pump(on_shot)
+    impacts:pump(on_impact)
+    hurts:pump(on_hurt_msg)
+end
 
 function fire.tick(dt)
     if cfg and cfg.fix_stuck_lasers then perf.run("f.lasers", util.safe, fix_lasers, "fire.lasers", dt) end
@@ -340,10 +348,7 @@ function fire.tick(dt)
         check_in = 2.0
         perf.run("f.hooks", ensure_hooks)
     end
-    perf.run("f.trails", pump_trails)
-    perf.run("f.shots", pump_shots)
-    perf.run("f.impacts", pump_impacts)
-    perf.run("f.hurts", pump_hurts)
+    perf.run("f.events", pump_all)
 end
 
 local LASERS = { "BP_SmallTacticalLaserSightLocalAttachment_C", "BP_TacticalLaserLightComboLocalAttachment_C" }

@@ -324,13 +324,16 @@ function prefabs.tick(dt)
     if role == "guest" and session and session.in_world() then joined_for = joined_for + dt
     elseif role == "guest" then joined_for, pending = 0.0, nil end
     tick_in = tick_in - dt
-    if tick_in > 0 then return end
-    tick_in = CHECK_EVERY
-    if role == "host" then util.safe(host_tick, "prefabs.host")
-    elseif role == "guest" and session and session.in_world() then
-        util.safe(guest_tick, "prefabs.guest")
-        if busy then tick_in = BUSY_EVERY end
+    if tick_in <= 0 then
+        tick_in = CHECK_EVERY
+        if role == "host" then util.safe(host_tick, "prefabs.host")
+        elseif role == "guest" and session and session.in_world() then
+            util.safe(guest_tick, "prefabs.guest")
+            if busy then tick_in = BUSY_EVERY end
+        end
     end
+    -- (phase1 naps until the next check, as camps.tick)
+    if role ~= "guest" or (session and session.in_world()) then return tick_in end
 end
 
 function prefabs.status()

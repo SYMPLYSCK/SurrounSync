@@ -10,6 +10,7 @@ local page = require("mirror.menu_backups")
 local journal_tab = require("mirror.journal_tab")
 local quickchat = require("mirror.quickchat")
 local instance = require("mirror.instance")
+local perf = require("mirror.perf")
 
 local menu = {}
 
@@ -19,6 +20,7 @@ local cfg
 local want_host, want_join = false, nil
 local pending_join = false
 local wait_since, wait_told, wait_who = nil, nil, nil
+local wait_why = nil   -- the "can't reach the host" reason last shown (reach_why)
 local request_nag = {}
 local request_seen_at = {}
 
@@ -99,7 +101,7 @@ local function join(steamid, who, realm_name)
             link.set_join_password(password)
             link.bridge_cmd("join " .. tostring(joined_peer or 0) .. (password ~= "" and (" " .. password) or ""))
             pending_join = true
-            wait_since, wait_told = os.clock(), nil
+            wait_since, wait_told, wait_why = os.clock(), nil, nil
             notify.show("Asking " .. (who or link.peer_name()) .. " again...", "info", "join_wait")
             return
         end
@@ -110,7 +112,7 @@ local function join(steamid, who, realm_name)
     link.set_join_password(password)
     p1().init(cfg, "guest", steamid)
     pending_join = true
-    wait_since, wait_told, wait_who = os.clock(), nil, who
+    wait_since, wait_told, wait_who, wait_why = os.clock(), nil, who, nil
     notify.show(realm_name and ("Asked " .. (who or "the host") .. " to let you into " .. realm_name .. " - waiting...")
         or ("Asked " .. (who or "the host") .. " to join - waiting for them to accept..."), "info", "join_wait")
 end
@@ -168,7 +170,7 @@ end
 local function cancel_join(message)
     if my_role() ~= "guest" or session.state() ~= "idle" then return end
     p1().stop()
-    pending_join, wait_since, wait_told = false, nil, nil
+    pending_join, wait_since, wait_told, wait_why = false, nil, nil, nil
     session.realm_guest(nil)
     log.info("menu: stopped asking to join" .. (message and " (no answer)" or ""))
     notify.show(message or "You stopped asking to join.", "info", "join_wait")
@@ -176,6 +178,19 @@ end
 -- A request nobody answers stops by itself: a host who comes back much later must not take us in unasked
 -- (a co-op request still waiting after 13 min was accepted into a Realm, 2026-10-28)
 local JOIN_EXPIRE = 120
+-- the host can't be reached at all (the bridge's "reach fail <n>": Steam's P2P session error): said at once and in
+-- the reminders, instead of "waiting for them to accept" (audit 2026-11-10)
+local REACH_WHY = {
+    [1] = "%s's game isn't answering - they may have stopped hosting or closed the game",
+    [2] = "Steam won't let this PC connect to %s",
+    [3] = "Steam isn't connected on one of the two PCs - check both are online in Steam",
+    [4] = "Steam couldn't reach %s in time - a firewall, VPN or antivirus can block it",
+}
+local function reach_why(who)
+    local code = (link.lobby() or {}).reach_fail
+    local text = code and (REACH_WHY[code] or REACH_WHY[4])
+    return text and text:format(who) or nil
+end
 
 local function copy_code(code)
     if not code then return end
@@ -286,10 +301,6 @@ local function model()
     m.my_settings = require("mirror.mysettings").rows()
     m.settings_editable = require("mirror.hostrules").can_edit()
     m.settings_note = require("mirror.hostrules").note()
-    -- (the FPV drone's owner: SETTINGS -> PERMISSIONS, who may fly the copy that comes with SurrounSync)
-    local dg = require("mirror.dronegrant")
-    m.drone_owner = dg.owner()
-    m.permissions = m.drone_owner and dg.setting_rows() or nil
     if steam then
         m.me = l and ("Signed in as " .. (l.name or "?")) or
             "The Steam connection isn't running. Make sure Steam is running and your antivirus isn't blocking SurrounSyncBridge."
@@ -372,7 +383,7 @@ end
 -- asks what went wrong first; SEND makes and sends the report with that message
 local function report()
     if not require("mirror.names").ask({ title = "BUG REPORT - ANYTHING ELSE TO ADD?", multiline = true, ok = "SEND", clear = false,
-                                         hint = "What happened, and what were you doing just before? (optional)",
+                                         hint = "What happened, and what were you doing just before? (optional - logs and any crash dump go with it)",
                                          done = send_report }) then
         send_report("")
     end
@@ -421,6 +432,16 @@ end
 
 local bridge_dead_for, bridge_warned, bridge_check_in = 0.0, false, 0.0
 local bridge_restarted_at = nil
+-- out of co-op a bridge that stopped (Steam not up yet at the game's start) is started again too, less often each
+-- time: it used to come back only in a session, so the CO-OP tab said "isn't running" until the game restarted
+local IDLE_RETRY_S, IDLE_RETRY_MAX_S = 30, 240
+local idle_tries = 0
+local function idle_wait(tries) return tries == 0 and 0 or math.min(IDLE_RETRY_S * 2 ^ (tries - 1), IDLE_RETRY_MAX_S) end
+local BRIDGE_WHY = {
+    nosteam = "SurrounSyncBridge couldn't reach Steam. Make sure Steam is running and signed in - SurrounSync keeps trying.",
+    nolog = "SurrounSyncBridge didn't start - your antivirus may have blocked or removed it. Allow "
+        .. "ue4ss\\Mods\\SurrounSync\\bridge\\SurrounSyncBridge.exe or repair with SurrounSync Setup.",
+}
 
 local function answer(cmd, id, name)
     if not link.bridge_cmd(cmd .. " " .. id) then notify.show("Couldn't reach the Steam connection.", "bad"); return end
@@ -454,6 +475,7 @@ local JOIN_ERRORS = {
     declined = "The host declined your request to join.",
     full = "That game is full (four players). Try again when someone leaves.",
     kicked = "The host removed you from their game.",
+    busy = "That player is in someone else's game right now, not hosting. Join again once they host.",
 }
 local function watch_requests()
     local l = link.lobby()
@@ -537,38 +559,54 @@ local function watch_requests()
     last_kick = k
 end
 
+local function warn_twice()
+    notify.show("This game is already running from the same folder. Run a second game from a separate install.", "bad")
+end
+
 local function tick(dt)
-    util.safe(require("mirror.hostrules").tick, "hostrules.tick")
-    util.safe(require("mirror.mysettings").tick, "mysettings.tick", dt)
+    -- (each part timed on its own: "glue tick menu.lua" was 0.10-0.17 ms/frame and 45-74 ms at loads and joins,
+    -- kit 2026-11-11, with nothing to say which part)
+    perf.run("m.hostrules", util.safe, require("mirror.hostrules").tick, "hostrules.tick")
+    perf.run("m.mysettings", util.safe, require("mirror.mysettings").tick, "mysettings.tick", dt)
     -- the rename / bug report box runs in single player too (it used to tick only in a co-op session,
     -- so SEND in a solo game did nothing)
-    util.safe(require("mirror.names").tick, "names.tick", dt)
-    instance.tick(dt, function()
-        notify.show("This game is already running from the same folder. Run a second game from a separate install.", "bad")
-    end)
+    perf.run("m.names", util.safe, require("mirror.names").tick, "names.tick", dt)
+    perf.run("m.instance", instance.tick, dt, warn_twice)
     bridge_check_in = bridge_check_in - dt
     local alive = nil
     if bridge_check_in <= 0 then bridge_check_in = 1.0; alive = link.bridge_alive() end
     if alive == false then
         bridge_dead_for = bridge_dead_for + 1.0
-        if my_role() and bridge_dead_for >= 8 and (bridge_restarted_at or -100) < os.clock() - 30 then
+        local wait = my_role() and 30 or idle_wait(idle_tries)
+        if bridge_dead_for >= 8 and (bridge_restarted_at or -1e9) < os.clock() - wait then
             bridge_restarted_at = os.clock()
             local extra = (my_role() == "host" and password ~= "") and { "password " .. password } or nil
             if link.restart_bridge(extra) then
-                log.warn("menu: the Steam connection (SurrounSyncBridge) stopped - restarted it")
-                notify.show("The connection program stopped - restarted it, reconnecting...", "info")
+                if my_role() then
+                    log.warn("menu: the Steam connection (SurrounSyncBridge) stopped - restarted it")
+                    notify.show("The connection program stopped - restarted it, reconnecting...", "info")
+                else
+                    idle_tries = idle_tries + 1
+                    log.warn(string.format("menu: SurrounSyncBridge isn't running out of co-op - started it again (next try in %d s)",
+                        idle_wait(idle_tries)))
+                end
             end
         end
         if bridge_dead_for > 15 and not bridge_warned then
             bridge_warned = true
-            log.warn("menu: SurrounSyncBridge isn't running (no lobby/status file for 15 s)")
-            notify.show("The Steam connection (SurrounSyncBridge) isn't running. Make sure Steam is running and your antivirus "
-                .. "isn't blocking it, then restart the game.", "bad")
+            local why = link.bridge_problem()
+            log.warn("menu: SurrounSyncBridge isn't running (no lobby/status file for 15 s), its log says: " .. tostring(why or "nothing known"))
+            notify.show(BRIDGE_WHY[why] or ("The Steam connection (SurrounSyncBridge) isn't running. Make sure Steam is running "
+                .. "and your antivirus isn't blocking it - SurrounSync keeps trying."), "bad")
         end
     elseif alive then
-        bridge_dead_for = 0.0
+        if bridge_warned then
+            log.info("menu: SurrounSyncBridge is running again")
+            notify.show("The Steam connection is back.", "good")
+        end
+        bridge_dead_for, bridge_warned, idle_tries = 0.0, false, 0
     end
-    if not my_role() then link.idle_tick(dt); notify.tick(dt) end
+    if not my_role() then perf.run("m.idle_link", link.idle_tick, dt); perf.run("m.notify", notify.tick, dt) end
     if bridge_check_in == 1.0 then watch_requests(); watch_release() end
     if want_host then want_host = false; host() end
     stopping_tick(dt)
@@ -580,12 +618,20 @@ local function tick(dt)
     end
     if pending_join and wait_since and my_role() == "guest" and not p1().connected() then
         local t = os.clock()
+        local who = wait_who or link.peer_name()
+        local why = reach_why(who)
         if t - wait_since >= JOIN_EXPIRE then
-            cancel_join((wait_who or link.peer_name()) .. " didn't answer within 2 minutes - stopped asking. Ask again any time.")
+            cancel_join(why and ("Couldn't reach " .. who .. " within 2 minutes (" .. why .. "). Stopped trying - join again any time.")
+                or (who .. " didn't answer within 2 minutes - stopped asking. Ask again any time."))
+        elseif why and why ~= wait_why then
+            wait_why, wait_told = why, t
+            log.warn("menu: can't reach " .. who .. " (Steam P2P error " .. tostring((link.lobby() or {}).reach_fail) .. ")")
+            notify.show(why .. ". Still trying...", "bad", "join_wait")
         elseif t - (wait_told or wait_since) >= 20 then
             wait_told = t
-            notify.show("Still waiting for " .. (wait_who or link.peer_name()) .. " to " .. (joining_realm and "let you in"
-                or "accept your request") .. " (" .. math.floor(t - wait_since) .. " s)...", "info", "join_wait")
+            notify.show(why and (why .. ". Still trying (" .. math.floor(t - wait_since) .. " s)...")
+                or ("Still waiting for " .. who .. " to " .. (joining_realm and "let you in"
+                or "accept your request") .. " (" .. math.floor(t - wait_since) .. " s)..."), why and "bad" or "info", "join_wait")
         end
     end
     if pending_join and my_role() == "guest" and p1().connected() then
@@ -598,8 +644,8 @@ local function tick(dt)
         pending_join = false
         if session.state() == "idle" then session.request_toggle() end
     end
-    util.safe(quickchat.tick, "quickchat.tick", dt)
-    journal_tab.tick(dt)
+    perf.run("m.quickchat", util.safe, quickchat.tick, "quickchat.tick", dt)
+    perf.run("m.journal", journal_tab.tick, dt)
 end
 
 -- Realms (realmplay.lua) host, join and stop through the same paths as the CO-OP tab
@@ -710,7 +756,6 @@ function menu.init(c)
                     notify.show("Gore goes " .. (on and "off" or "on") .. " from your next game start.", "info", nil, true)
                     if ml.restart_needed() then mods_restart_note() end
                 elseif tab == "mine" then require("mirror.mysettings").toggle(key)
-                elseif tab == "perm" then require("mirror.dronegrant").toggle(key)
                 else require("mirror.hostrules").toggle(key) end
             end,
             refresh = function()

@@ -17,7 +17,9 @@ local NEEDS = {   -- (cloth for the sail, rope for the rigging, rods for the fra
     { RES .. "DA_MetalRods.DA_MetalRods", 4 },
 }
 
-local recipe = modrecipe.new({ item = ITEM, needs = NEEDS, label = "Hang Glider", tag = "glideritem" })
+-- (the model glider.lua shows in flight: loaded with the item when nothing else loaded them)
+local recipe = modrecipe.new({ item = ITEM, needs = NEEDS, label = "Hang Glider", tag = "glideritem",
+                               also = { "/Game/Mods/SurrounSyncGlider/SM_Glider.SM_Glider" } })
 glideritem.stats = recipe.stats
 
 -- does this player carry a Hang Glider (any container, the backpack's too)?

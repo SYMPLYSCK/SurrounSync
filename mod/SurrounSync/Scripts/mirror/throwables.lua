@@ -16,6 +16,10 @@ local KINDS = {
     BP_Throwable_NoiseMaker = "noise",
     BP_ProjectileGrenade = "boom", BP_ProjectileRocket = "boom", BP_FlareRoundProjectile = "fly", BP_ProjectileArrow = "fly",
 }
+-- The launcher rounds have no BeginPlay of their own, nor has their master (decompiled 2026-11-10): the hook on it
+-- never stood, so a rocket or grenade-launcher shot was never told (user 2026-11-10: only the shooter saw it and its
+-- explosion). Their construction script runs inside SpawnActor, with the owner and the place already set.
+local BEGIN = { BP_ProjectileRocket = "UserConstructionScript", BP_ProjectileGrenade = "UserConstructionScript" }
 local function class_path(cls)
     local d = cls:find("^BP_Throwable") and DIR or PDIR
     return d .. cls .. "." .. cls .. "_C"
@@ -280,8 +284,54 @@ local function follow(dt)
     end
 end
 
+-- Explosive barrels (user 2026-11-10: "Explosions in general only seem visible for the player that's caused them"):
+-- a barrel shot here blew up here only and stood whole on the other screen. Its Event_Explode (decompiled: once,
+-- the fire, sound, zombie noise, scorch, blast damage, then gone) is told by place; the other game blows up its own
+-- barrel standing there, so its blast, damage and loss match. One that is gone already (a chain) is left alone.
+local BARREL_CLS = "BP_ExplosiveBarrelMaster_C"
+local BARREL = "/Game/Blueprints/Other/ExplosiveBarrel/BP_ExplosiveBarrelMaster." .. BARREL_CLS
+local BARREL_REACH, BARREL_WAIT = 150, 3.0
+local barrels = { blowing = false, due = {}, sent = 0, blown = 0 }
+-- (both players in the same world? Till init says: no. A blast or a throw in another world is not this one's)
+local same_world = function() return false end
+local function on_barrel(a)
+    if barrels.blowing or not same_world() or not util.valid(a) then return end
+    local l = loc_of(a)
+    if not l then return end
+    channel:send("B " .. fmt(l))
+    barrels.sent = barrels.sent + 1
+    log.info("throwables: a barrel blew up here - telling the other game")
+end
+local function blow_barrels()
+    if #barrels.due == 0 then return end
+    local list, walked = util.instances(BARREL_CLS)
+    for i = #barrels.due, 1, -1 do
+        local d = barrels.due[i]
+        local best, best_d = nil, BARREL_REACH
+        for _, b in ipairs(list or {}) do
+            local gone = not util.valid(b)
+            if not gone then pcall(function() gone = b:IsActorBeingDestroyed() end) end
+            local bl = not gone and loc_of(b)
+            local dist = bl and util.dist(bl, d.loc)
+            if dist and dist < best_d then best, best_d = b, dist end
+        end
+        if best then
+            barrels.blowing = true
+            -- (no instigator: the game's is a controller, and the other player has none here)
+            local ok, err = pcall(function() best:Event_Explode(nil) end)
+            barrels.blowing = false
+            barrels.blown = barrels.blown + 1
+            log.info("throwables: the other player's barrel blew up" .. (ok and "" or (" - FAILED: " .. tostring(err))))
+            table.remove(barrels.due, i)
+        elseif walked or now > d["until"] then
+            table.remove(barrels.due, i)
+        end
+    end
+end
+
 local hook_in = 0.0
 local begin_fn = function(self) util.safe(function() on_begin(self:get()) end, "throwables.begin") end
+local barrel_fn = function(self) util.safe(function() on_barrel(self:get()) end, "throwables.barrel") end
 
 function throwables.tick(dt)
     if not (cfg and cfg.mirror_throwables) then return end
@@ -289,10 +339,22 @@ function throwables.tick(dt)
     hook_in = hook_in - dt
     if hook_in <= 0 then
         hook_in = 1.0
-        for cls in pairs(KINDS) do util.ensure_hook(class_path(cls) .. ":ReceiveBeginPlay", begin_fn) end
+        for cls in pairs(KINDS) do util.ensure_hook(class_path(cls) .. ":" .. (BEGIN[cls] or "ReceiveBeginPlay"), begin_fn) end
+        util.ensure_hook(BARREL .. ":Event_Explode", barrel_fn)
     end
-    util.safe(send_tick, "throwables.send", dt)
-    channel:pump(function(p) util.safe(apply, "throwables.apply", p) end)
+    local together = same_world()
+    if together then util.safe(send_tick, "throwables.send", dt) end
+    channel:pump(function(p)
+        if not together then return end   -- (read and dropped: it happened in a world this game isn't in)
+        local x, y, z = p:match("^B (%S+) (%S+) (%S+)$")
+        if x then
+            local loc = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
+            if loc.X and loc.Y and loc.Z then barrels.due[#barrels.due + 1] = { loc = loc, ["until"] = now + BARREL_WAIT } end
+            return
+        end
+        util.safe(apply, "throwables.apply", p)
+    end)
+    util.safe(blow_barrels, "throwables.barrels")
     util.safe(follow, "throwables.follow", dt)
 end
 
@@ -308,6 +370,6 @@ end
 
 -- Respawn/reload: the old world's objects are freed - drop them without touching them.
 local function forget_world() mine, copies, made, fires, lures = {}, {}, {}, {}, {} end
-function throwables.init(c) cfg = c; game.on_world_reset(forget_world) end
+function throwables.init(c, sw) cfg = c; same_world = sw or same_world; game.on_world_reset(forget_world) end
 
 return throwables

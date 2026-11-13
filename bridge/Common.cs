@@ -64,7 +64,8 @@ namespace SurrounSyncShared
                 info.PageUrl = Field(json, "html_url");
                 info.Notes = Field(json, "body");
                 var m = Regex.Match(json, "\"browser_download_url\"\\s*:\\s*\"([^\"]*" + Regex.Escape(SetupName) + ")\"");
-                if (m.Success) info.SetupUrl = m.Groups[1].Value;
+                // (the setup it names is downloaded and run: from GitHub, only this repo's own release files)
+                if (m.Success && SetupUrlOk(m.Groups[1].Value)) info.SetupUrl = m.Groups[1].Value;
                 if (string.IsNullOrEmpty(info.Version)) { error = "no version in the release"; return null; }
                 return info;
             }
@@ -75,6 +76,15 @@ namespace SurrounSyncShared
                 return null;
             }
             catch (Exception e) { error = e.Message; return null; }
+        }
+
+        public static bool SetupUrlOk(string url)
+        {
+            if (url == null) return false;
+            if (SourceUrl().StartsWith("https://api.github.com/"))
+                return url.StartsWith("https://github.com/" + Repo + "/releases/download/", StringComparison.OrdinalIgnoreCase);
+            // a source of its own in update_source.txt (a local test server): the same rule as for the source
+            return url.StartsWith("https://") || url.StartsWith("http://127.0.0.1") || url.StartsWith("http://localhost");
         }
 
         static string Field(string json, string key)
@@ -915,8 +925,57 @@ namespace SurrounSyncShared
         }
 
         public const long MaxUpload = 9L * 1024 * 1024;
+        public const long MaxStore = 90L * 1024 * 1024;   // the Realm server's report store (realms-backend MAX_REPORT)
 
         public static bool CanSend { get { return ReportTarget.Webhook.StartsWith("https://") || ReportTarget.Webhook.StartsWith("http://127.0.0.1:"); } }
+
+        // The full report (crash and hang dumps the Discord post can't carry) also goes to the Realm server, where the
+        // mod's makers read every one (tools/reports.py). A build with a local test webhook stores only where
+        // SURROUNSYNC_TEST_REPORT_STORE says (a local server), so tests never reach the real one; null: not stored.
+        static string StoreUrl()
+        {
+            string t = Environment.GetEnvironmentVariable("SURROUNSYNC_TEST_REPORT_STORE") ?? "";
+            if (t.StartsWith("http://127.0.0.1:")) return t.TrimEnd('/');
+            return ReportTarget.Webhook.StartsWith("https://") ? "https://surrounsync-realms.surrounsync-realms.workers.dev" : null;
+        }
+
+        // the stored report's name, or null (error says why)
+        public static string Store(string file, string level, out string error)
+        {
+            error = null;
+            string url = StoreUrl();
+            if (url == null) { error = "no report store"; return null; }
+            try
+            {
+                long len = new FileInfo(file).Length;
+                if (len > MaxStore) { error = "over " + MaxStore / (1024 * 1024) + " MB"; return null; }
+                ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
+                var req = (HttpWebRequest)WebRequest.Create(url + "/v1/reports");
+                req.Method = "POST";
+                req.ContentType = "application/zip";
+                req.ContentLength = len;
+                req.AllowWriteStreamBuffering = false;   // (streamed from the file: up to 90 MB never sits in memory)
+                req.Timeout = req.ReadWriteTimeout = 600000;
+                req.UserAgent = "SurrounSync";
+                req.Headers["X-Report-Level"] = Diagnose.Rank(level) > 0 ? level : "INFO";
+                using (var fs = File.OpenRead(file))
+                using (var rs = req.GetRequestStream()) fs.CopyTo(rs, 81920);
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                using (var rd = new StreamReader(resp.GetResponseStream()))
+                {
+                    var m = Regex.Match(rd.ReadToEnd(), "\"name\"\\s*:\\s*\"(\\d{10}-[A-Z]{4,8}-[0-9A-Z]{8}\\.zip)\"");
+                    if (!m.Success) { error = "the report store sent no name"; return null; }
+                    return m.Groups[1].Value;
+                }
+            }
+            catch (WebException we)
+            {
+                var r = we.Response as HttpWebResponse;
+                error = r != null ? "the report store answered " + (int)r.StatusCode : we.Message;
+                return null;
+            }
+            catch (Exception e) { error = e.Message; return null; }
+        }
 
         public static bool Send(string zip, string win64, out string error)
         {
@@ -947,13 +1006,18 @@ namespace SurrounSyncShared
                 var tri = Classify(win64);
                 string level = Diagnose.Rank(tri.Level) > Diagnose.Rank(dg.Level) ? tri.Level : dg.Level;
                 if (Duplicate(dg.Fingerprint, message, out error)) return false;
+                // the full one when the store takes it, else the smaller copy the post carries
+                string storeFile = new FileInfo(zip).Length <= MaxStore ? zip : file, storeErr;
+                string stored = Store(storeFile, level, out storeErr);
+                string storeLine = stored != null ? "\nFull report: `" + stored + "`" + (storeFile != zip ? " (the small copy: the full one is over 90 MB)" : "")
+                    : storeErr == "no report store" ? "" : "\nFull report not stored: " + Trunc(storeErr ?? "?", 100);
                 string icon = level == "CRITICAL" ? "🔴" : level == "ERROR" ? "🟠" : level == "MINOR" ? "🟡" : "🟢";
                 string desc = Diagnose.Scrub(Post(dg, message));
                 string who = Reporter();
                 // one click to the player's Steam profile, to message them about the report
                 var sid = Regex.Match(who, @"\((7656\d{13})\)$");
                 string reply = sid.Success ? "\n[Message them on Steam](<https://steamcommunity.com/profiles/" + sid.Groups[1].Value + ">)" : "";
-                string json = "{\"content\":" + JsonString(icon + " **" + level + "** bug report" + (who != "" ? " from " + who : "") + reply)
+                string json = "{\"content\":" + JsonString(icon + " **" + level + "** bug report" + (who != "" ? " from " + who : "") + reply + storeLine)
                     + ",\"embeds\":[{\"title\":" + JsonString(Trunc(icon + " " + dg.Top.Title, 250))
                     + ",\"description\":" + JsonString(Trunc(desc, 4000)) + ",\"color\":" + Diagnose.ColorOf(level) + "}]}";
                 string uploadName = "SurrounSync-" + level + "-" + Path.GetFileName(zip).Replace("SurrounSync-report-", "");

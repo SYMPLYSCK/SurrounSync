@@ -708,6 +708,56 @@ end
 
 local state = { world = nil, wait = 0, on = nil, check = 0, look_left = 0 }
 
+-- No pad in use: the game's current input type (CommonUI's CommonInputSubsystem on the local player) is mouse and
+-- keyboard. The per-frame reads below (cursor, look target, sticks, hotbar: ~7 engine calls a frame, 0.08-0.10 ms,
+-- kit 2026-11-11) then wait; the type is asked twice a second instead. Any other answer, or none, keeps them on:
+-- a pad must never go dead on a guess. (The game's own rows - walk, jump, buttons - are in its context either way;
+-- what waits up to IDLE_ASK s is the camera stick, the hotbar step and the menu focus.)
+-- (kit 2026-11-11: GetCurrentInputType answers 0 with keyboard/mouse; InputDeviceSubsystem's
+-- GetMostRecentlyUsedHardwareDevice wants its struct as an out parameter through UE4SS and gave nothing back)
+local KBM = 0                    -- ECommonInputType::MouseAndKeyboard
+local IDLE_ASK, SUB_RETRY, AWAKE_S = 0.5, 30.0, 10.0
+local dev = { sub = nil, ask = 0, find_at = 0, idle = false, said = nil, awake_until = 0 }
+local function pad_idle(dt)
+    dev.ask = dev.ask - dt
+    if dev.ask > 0 then return dev.idle end
+    dev.ask = IDLE_ASK
+    if not util.valid(dev.sub) and clock >= dev.find_at then
+        dev.find_at = clock + SUB_RETRY   -- (FindFirstOf walks every object: not again for a while when it isn't there)
+        dev.sub = nil
+        pcall(function() dev.sub = FindFirstOf("CommonInputSubsystem") end)
+        if not util.valid(dev.sub) then dev.sub = nil end
+    end
+    local kind
+    if dev.sub then pcall(function() kind = tonumber(dev.sub:GetCurrentInputType()) end) end
+    local idle = kind == KBM
+    if idle and clock < dev.awake_until then idle = false end
+    if idle then
+        -- (and the camera stick at rest: should a pad not count as "used" on this engine, it still wakes them, for
+        -- AWAKE_S; down()'s per-frame answers are the tick's, which doesn't run while idle: cleared first)
+        frame_down = {}
+        local pc, k, sw, x, y = game.controller(), keys(), gamepad.OPT.swap, 0, 0
+        if util.valid(pc) then
+            pcall(function() x, y = pc:GetInputAnalogKeyState(sw and k.lx or k.rx), pc:GetInputAnalogKeyState(sw and k.ly or k.ry) end)
+        end
+        idle = math.abs(tonumber(x) or 0) < gamepad.LOOK.dz and math.abs(tonumber(y) or 0) < gamepad.LOOK.dz
+        -- (the buttons the reads below drive - hotbar step, menu focus, option step - held: awake too)
+        for _, list in ipairs({ gamepad.ACTIONS, gamepad.CONTROLS }) do
+            for _, a in ipairs(list) do
+                if idle and util.valid(pc) and a.pad and (a.cycle ~= nil or a.dir or a.ctx == "look") and down(pc, a.pad) then idle = false end
+            end
+        end
+        if not idle then dev.awake_until = clock + AWAKE_S end
+    end
+    if kind ~= dev.said then
+        dev.said = kind
+        log.info("gamepad: last input device type " .. tostring(kind) .. (idle and " (keyboard/mouse: pad reads paused)" or " (pad reads on)"))
+    end
+    if idle and not dev.idle then padinv.leave() end
+    dev.idle = idle
+    return idle
+end
+
 local function tick(dt)
     clock = clock + dt
     state.check = state.check - dt
@@ -735,6 +785,7 @@ local function tick(dt)
         end
         return
     end
+    if not capture and pad_idle(dt) then return end   -- (SET waits for a pad press: never paused)
     frame_down = {}
     local pc = game.controller()
     if util.valid(pc) then

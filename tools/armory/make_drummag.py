@@ -13,7 +13,7 @@ import math
 import os
 import sys
 
-from lowpoly import GLOSS, METAL, Mesh, srgb, write_png
+from lowpoly import GLOSS, METAL, Mesh, srgb
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
 
@@ -132,7 +132,6 @@ def build():
 if __name__ == "__main__":
     mesh = build()
     mesh.write(OUT, "DoubleDrum")
-    write_png(os.path.join(OUT, "White.png"), [(1.0, 1.0, 1.0, 0.0)])   # M_ColonelsDiamond's stand-in Detail texture
     if "--preview" in sys.argv:
         mesh.preview(os.path.join(OUT, "preview.png"), [
             (15, -60, "front quarter (muzzle side)"), (15, 120, "rear quarter (winding keys)"),

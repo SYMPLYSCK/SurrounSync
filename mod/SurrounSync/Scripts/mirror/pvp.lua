@@ -227,6 +227,8 @@ local function cover_tick(dt)
     if cover.poll <= 0 then cover.poll = COVER_POLL; cover_poll() end
 end
 
+local function apply_hit_safe(payload) util.safe(apply_hit, "pvp.apply", payload) end
+
 function pvp.tick(dt)
     util.safe(sync_ghost, "pvp.sync")
     util.safe(cover_tick, "pvp.cover", dt)
@@ -242,7 +244,7 @@ function pvp.tick(dt)
             log.warn("pvp: a bullet hit the ghost but the game dealt it no damage (surface not flesh?)")
         end
     end
-    hits:pump(function(payload) util.safe(apply_hit, "pvp.apply", payload) end)
+    hits:pump(apply_hit_safe)
 end
 
 function pvp.status()

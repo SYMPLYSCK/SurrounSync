@@ -103,403 +103,573 @@ def hammer(path, stop):
         time.sleep(0.002)
 
 
+# each group starts from empty folders, so the groups run side by side, each in its own process on its own port
+# (one after another the suite took 163 s, ~30 of it the longest group). --group 11 (or 11,12b) runs only those.
+GROUPS = ("1", "3", "6", "6b", "8", "11", "11b", "11c", "12", "12b")
+
+
+def run_all():
+    t0 = time.time()
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    kids = [(g, subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), "--group", g],
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)) for g in GROUPS]
+    failed = []
+    for g, p in kids:
+        out = p.communicate()[0].decode("utf-8", "replace").replace("\r\n", "\n")
+        if p.returncode != 0:
+            failed.append(g)
+        else:
+            out = out.split("\nbridge logs:")[0]   # the logs only when the group failed
+        sys.stdout.write(out.rstrip() + "\n")
+    n = sum(1 for g in failed)
+    print("\n%s (%.0f s)" % ("ALL PASSED" if not failed else "%d of %d groups FAILED: %s" % (n, len(GROUPS), " ".join(failed)),
+                             time.time() - t0))
+    return 1 if failed else 0
+
+
 def main():
     if not os.path.exists(EXE):
         print("build the bridge first: tools\\build-bridge.ps1")
         return 2
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+    if "--group" not in sys.argv:
+        return run_all()
+    picked = sys.argv[sys.argv.index("--group") + 1].split(",")
+    bad = [g for g in picked if g not in GROUPS]
+    if bad:
+        print("no group %s (groups: %s)" % (" ".join(bad), " ".join(GROUPS)))
+        return 2
+
+    def want(g):
+        return g in picked
     base = tempfile.mkdtemp(prefix="mirror_bridge_test_")
-    A, B = os.path.join(base, "host"), os.path.join(base, "guest")
-    os.makedirs(A); os.makedirs(B)
+    A, B, C = os.path.join(base, "host"), os.path.join(base, "guest"), os.path.join(base, "third")
+    os.makedirs(A); os.makedirs(B); os.makedirs(C)
+    fast = dict(os.environ, SURROUNSYNC_TEST_STALL_MS="4000")
+    world = "".join(random.choice(string.ascii_letters + string.digits + "+/") for _ in range(1_500_000))
     procs = []
     try:
-        print("1. fixed roles, both directions")
-        put_blob(A, "hello", "host", "SurrounSync protocol 26 role host")
-        put_blob(B, "hello", "guest", "SurrounSync protocol 26 role guest")
-        put_blob(B, "req", "guest", "join 1792119879")
-        world = "".join(random.choice(string.ascii_letters + string.digits + "+/") for _ in range(1_500_000))
-        put_blob(A, "file_world_Level.sav", "host", "1792119879:1125000:" + world)
-        procs.append(start("host", A))
-        procs.append(start("guest", B, ["--peer", "1001"]))
-        lua_write(os.path.join(A, "mirror_link_host.txt"), "7 %d 1.0 2.0 3.0 END\n" % int(time.time()))
-        lua_write(os.path.join(B, "mirror_link_guest.txt"), "9 %d 4.0 5.0 6.0 END\n" % int(time.time()))
+        if want("1"):
+            print("1. fixed roles, both directions")
+            put_blob(A, "hello", "host", "SurrounSync protocol 26 role host")
+            put_blob(B, "hello", "guest", "SurrounSync protocol 26 role guest")
+            put_blob(B, "req", "guest", "join 1792119879")
+            put_blob(A, "file_world_Level.sav", "host", "1792119879:1125000:" + world)
+            procs.append(start("host", A))
+            # (the guest's cap on a peer's blob files lowered to 4 MB for 1e)
+            procs.append(start("guest", B, ["--peer", "1001"], env=dict(os.environ, SURROUNSYNC_TEST_BLOB_CAP=str(4 * 1024 * 1024))))
+            lua_write(os.path.join(A, "mirror_link_host.txt"), "7 %d 1.0 2.0 3.0 END\n" % int(time.time()))
+            lua_write(os.path.join(B, "mirror_link_guest.txt"), "9 %d 4.0 5.0 6.0 END\n" % int(time.time()))
 
-        check(wait_for(lambda: get_blob(B, "hello", "host")) == "SurrounSync protocol 26 role host", "host hello reached the guest (\\r\\n file)")
-        check(wait_for(lambda: get_blob(A, "hello", "guest")) == "SurrounSync protocol 26 role guest", "guest hello reached the host")
-        check(wait_for(lambda: get_blob(A, "req", "guest")) == "join 1792119879", "guest join request reached the host")
-        got = wait_for(lambda: get_blob(B, "file_world_Level.sav", "host"), 20)
-        check(got == "1792119879:1125000:" + world, "1.5 MB world file arrived intact (chunked)")
-        pose = wait_for(lambda: log_of(B, "mirror_link_host.txt"))
-        check(pose.startswith("7 ") and pose.rstrip().endswith("1.0 2.0 3.0 END"), "host pose reached the guest")
-        check(wait_for(lambda: log_of(A, "mirror_link_guest.txt")).startswith("9 "), "guest pose reached the host")
-        check(wait_for(lambda: os.path.exists(os.path.join(B, "mirror_clock_offset.txt"))), "clock offset written")
+            check(wait_for(lambda: get_blob(B, "hello", "host")) == "SurrounSync protocol 26 role host", "host hello reached the guest (\\r\\n file)")
+            check(wait_for(lambda: get_blob(A, "hello", "guest")) == "SurrounSync protocol 26 role guest", "guest hello reached the host")
+            check(wait_for(lambda: get_blob(A, "req", "guest")) == "join 1792119879", "guest join request reached the host")
+            got = wait_for(lambda: get_blob(B, "file_world_Level.sav", "host"), 20)
+            check(got == "1792119879:1125000:" + world, "1.5 MB world file arrived intact (chunked)")
+            pose = wait_for(lambda: log_of(B, "mirror_link_host.txt"))
+            check(pose.startswith("7 ") and pose.rstrip().endswith("1.0 2.0 3.0 END"), "host pose reached the guest")
+            check(wait_for(lambda: log_of(A, "mirror_link_guest.txt")).startswith("9 "), "guest pose reached the host")
+            check(wait_for(lambda: os.path.exists(os.path.join(B, "mirror_clock_offset.txt"))), "clock offset written")
 
-        put_blob(A, "life", "host", "alive")
-        check(wait_for(lambda: get_blob(B, "life", "host")) == "alive", "a new blob arrives")
-        put_blob(A, "life", "host", "dead")
-        check(wait_for(lambda: get_blob(B, "life", "host") == "dead"), "a changed blob arrives again")
-        # the writer thread writes a blob before its index line (the game reads the index to find changed blobs),
-        # so the index can trail the blob by a moment
-        def index_ok():
-            idx = get_blob(B, "index", "host") or ""
-            gens = dict(l.split(" ", 1) for l in idx.splitlines()[1:] if " " in l)
-            return idx.startswith("v1 ") and int(gens.get("life", "0")) >= 2 and "hello" in gens
-        check(wait_for(index_ok), "the change index counts every blob write")
+            put_blob(A, "life", "host", "alive")
+            check(wait_for(lambda: get_blob(B, "life", "host")) == "alive", "a new blob arrives")
+            put_blob(A, "life", "host", "dead")
+            check(wait_for(lambda: get_blob(B, "life", "host") == "dead"), "a changed blob arrives again")
+            # the writer thread writes a blob before its index line (the game reads the index to find changed blobs),
+            # so the index can trail the blob by a moment
+            def index_ok():
+                idx = get_blob(B, "index", "host") or ""
+                gens = dict(l.split(" ", 1) for l in idx.splitlines()[1:] if " " in l)
+                return idx.startswith("v1 ") and int(gens.get("life", "0")) >= 2 and "hello" in gens
+            check(wait_for(index_ok), "the change index counts every blob write")
 
-        print("1b. the game reading the file non-stop while updates arrive")
-        import threading
-        stop = [False]
-        th = threading.Thread(target=hammer, args=(os.path.join(B, "mirror_life_host.txt"), stop), daemon=True)
-        th.start()
-        for i in range(40):
-            put_blob(A, "life", "host", "state %d" % i)
-            time.sleep(0.04)
-        check(wait_for(lambda: get_blob(B, "life", "host") == "state 39", 10), "the last update lands although the file is busy")
-        stop[0] = True
-        th.join()
+            print("1b. the game reading the file non-stop while updates arrive")
+            import threading
+            stop = [False]
+            th = threading.Thread(target=hammer, args=(os.path.join(B, "mirror_life_host.txt"), stop), daemon=True)
+            th.start()
+            for i in range(40):
+                put_blob(A, "life", "host", "state %d" % i)
+                time.sleep(0.04)
+            check(wait_for(lambda: get_blob(B, "life", "host") == "state 39", 10), "the last update lands although the file is busy")
+            stop[0] = True
+            th.join()
 
-        print("1b2. heartbeat: each connector reports the other's game and how long ago it was heard")
+            print("1b2. heartbeat: each connector reports the other's game and how long ago it was heard")
 
-        def status(d, role):
-            return log_of(d, "mirror_bridge_status_%s.txt" % role) or ""
+            def status(d, role):
+                return log_of(d, "mirror_bridge_status_%s.txt" % role) or ""
 
-        def hb(d, role):
-            m = re.search(r"peer_hb (-?[\d.]+)", status(d, role))
-            return float(m.group(1)) if m else None
-        check(wait_for(lambda: "peer_game alive" in status(B, "guest") and "peer_game alive" in status(A, "host"), 10),
-              "both status files say the other game is alive")
-        h = hb(B, "guest")
-        check(h is not None and 0 <= h < 5, "guest heard the host's connector recently (%s s)" % h)
-        procs[0].kill(); procs[0].wait()
-        check(wait_for(lambda: (hb(B, "guest") or 0) > 15, 25), "host connector gone -> peer_hb passes 15 s (%s)" % hb(B, "guest"))
+            def hb(d, role):
+                m = re.search(r"peer_hb (-?[\d.]+)", status(d, role))
+                return float(m.group(1)) if m else None
+            check(wait_for(lambda: "peer_game alive" in status(B, "guest") and "peer_game alive" in status(A, "host"), 10),
+                  "both status files say the other game is alive")
+            h = hb(B, "guest")
+            check(h is not None and 0 <= h < 5, "guest heard the host's connector recently (%s s)" % h)
+            procs[0].kill(); procs[0].wait()
+            check(wait_for(lambda: (hb(B, "guest") or 0) > 15, 25), "host connector gone -> peer_hb passes 15 s (%s)" % hb(B, "guest"))
 
-        print("1c. a file left over from an earlier session is not sent")
-        stale = os.path.join(A, "mirror_oldreq_host.txt")
-        lua_write(stale, "join 1\nEND\n")
-        old = time.time() - 600
-        os.utime(stale, (old, old))
-        procs[0].kill(); procs[0].wait()
-        procs[0] = start("host", A)
-        put_blob(A, "fresh", "host", "fresh after restart")
-        check(wait_for(lambda: get_blob(B, "fresh", "host"), 15) == "fresh after restart", "fresh blob after the restart arrives")
-        check(get_blob(B, "oldreq", "host") is None, "the 10-minute-old leftover was not sent")
+            print("1c. a file left over from an earlier session is not sent")
+            stale = os.path.join(A, "mirror_oldreq_host.txt")
+            lua_write(stale, "join 1\nEND\n")
+            old = time.time() - 600
+            os.utime(stale, (old, old))
+            procs[0].kill(); procs[0].wait()
+            procs[0] = start("host", A)
+            put_blob(A, "fresh", "host", "fresh after restart")
+            check(wait_for(lambda: get_blob(B, "fresh", "host"), 15) == "fresh after restart", "fresh blob after the restart arrives")
+            check(get_blob(B, "oldreq", "host") is None, "the 10-minute-old leftover was not sent")
 
-        print("1d. a peer can't create endless blob files: at most 256 names per link, the link stays up")
-        for i in range(300):
-            put_blob(A, "flood%03d" % i, "host", "x")
-        check(wait_for(lambda: "ignored blob" in log_of(B, "mirror_bridge_guest.log"), 20), "names over the cap are refused (logged)")
-        got = [f for f in os.listdir(B) if f.startswith("mirror_flood")]
-        check(0 < len(got) <= 256, "guest holds at most 256 names' files (%d flood files)" % len(got))
-        put_blob(A, "fresh", "host", "still connected")
-        check(wait_for(lambda: get_blob(B, "fresh", "host") == "still connected", 15), "a known name still arrives after the flood")
-        for i in range(300):
-            os.remove(os.path.join(A, "mirror_flood%03d_host.txt" % i))
+            print("1d. a peer can't create endless blob files: at most 256 names per link, the link stays up")
+            for i in range(300):
+                put_blob(A, "flood%03d" % i, "host", "x")
+            check(wait_for(lambda: "ignored blob" in log_of(B, "mirror_bridge_guest.log"), 20), "names over the cap are refused (logged)")
+            got = [f for f in os.listdir(B) if f.startswith("mirror_flood")]
+            check(0 < len(got) <= 256, "guest holds at most 256 names' files (%d flood files)" % len(got))
+            put_blob(A, "fresh", "host", "still connected")
+            check(wait_for(lambda: get_blob(B, "fresh", "host") == "still connected", 15), "a known name still arrives after the flood")
+            for i in range(300):
+                os.remove(os.path.join(A, "mirror_flood%03d_host.txt" % i))
 
-        print("2. host restarts: its old files must vanish on the guest")
-        procs[0].kill(); procs[0].wait()
-        os.remove(os.path.join(A, "mirror_life_host.txt"))
-        time.sleep(1.2)
-        procs[0] = start("host", A)
-        put_blob(A, "look", "host", "new session look")
-        check(wait_for(lambda: get_blob(B, "look", "host"), 15) == "new session look", "new session's blob arrives")
-        check(wait_for(lambda: not os.path.exists(os.path.join(B, "mirror_life_host.txt"))), "old session's 'life' file is gone")
+            print("1e. a peer can't fill the disk with a few huge blobs: its blob files stay under the cap (4 MB here)")
+            # (names 1d already got through: new ones would meet the 256-name cap first)
+            fat = ["".join(random.choice(string.ascii_letters) for _ in range(1_200_000)) for _ in range(3)]
+            for i, body in enumerate(fat):
+                put_blob(A, "flood%03d" % i, "host", body)
+            check(wait_for(lambda: "over 4194304 chars of blobs" in log_of(B, "mirror_bridge_guest.log"), 20),
+                  "a blob over the cap is refused (logged)")
+            total = sum(os.path.getsize(os.path.join(B, f)) for f in os.listdir(B) if f.startswith("mirror_") and f.endswith("_host.txt"))
+            check(total <= 4 * 1024 * 1024 + 64 * 1024, "the host's blob files on the guest stay under the cap (%d KB)" % (total // 1024))
+            put_blob(A, "fresh", "host", "still connected after fat")
+            check(wait_for(lambda: get_blob(B, "fresh", "host") == "still connected after fat", 15), "a small blob still arrives after it")
+            for i in range(3):
+                os.remove(os.path.join(A, "mirror_flood%03d_host.txt" % i))
 
-        for p in procs:
-            p.kill(); p.wait()
-        procs.clear()
+            print("2. host restarts: its old files must vanish on the guest")
+            procs[0].kill(); procs[0].wait()
+            os.remove(os.path.join(A, "mirror_life_host.txt"))
+            time.sleep(1.2)
+            procs[0] = start("host", A)
+            put_blob(A, "look", "host", "new session look")
+            check(wait_for(lambda: get_blob(B, "look", "host"), 15) == "new session look", "new session's blob arrives")
+            check(wait_for(lambda: not os.path.exists(os.path.join(B, "mirror_life_host.txt"))), "old session's 'life' file is gone")
 
-        print("3. menu flow: guest joins before the host presses Host")
-        for d in (A, B):
-            for f in os.listdir(d):
-                os.remove(os.path.join(d, f))
-        procs.append(start("auto", A))
-        procs.append(start("auto", B))
-        lobby = wait_for(lambda: "END" in log_of(A, "mirror_lobby.txt") and log_of(A, "mirror_lobby.txt"))
-        check(bool(lobby) and "role idle" in lobby, "idle bridge writes the lobby for the menu")
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
-        put_blob(B, "hello", "guest", "guest hello")
-        put_blob(B, "req", "guest", "join 1")
-        time.sleep(2.0)
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
-        put_blob(A, "hello", "host", "host hello")
-        check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 15), "the guest shows up as a join request in the host's lobby")
-        check(get_blob(A, "req", "guest") is None, "nothing from the guest arrives before the host accepts")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "accept 1002")
-        check(wait_for(lambda: get_blob(A, "req", "guest"), 15) == "join 1", "join request sent while the host was idle still arrives")
-        check(wait_for(lambda: get_blob(B, "hello", "host"), 15) == "host hello", "host hello reaches the guest after hosting")
-        lob = wait_for(lambda: "connected" in log_of(B, "mirror_lobby.txt") and log_of(B, "mirror_lobby.txt"), 10)
-        check(bool(lob), "guest lobby shows the peer as connected")
+            for p in procs:
+                p.kill(); p.wait()
+            procs.clear()
 
-        print("4. the guest joins again in the same run: the host's earlier state arrives again")
-        put_blob(A, "look", "host", "host look")
-        check(wait_for(lambda: get_blob(B, "look", "host"), 15) == "host look", "(setup) host look arrived")
-        gone = watch_gone(os.path.join(B, "mirror_look_host.txt"))
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
-        check(gone.wait(10), "the switch cleared the host's files on the guest")
-        check(wait_for(lambda: get_blob(B, "look", "host"), 15) == "host look", "...and the host resent its look")
-        check(wait_for(lambda: get_blob(B, "hello", "host"), 15) == "host hello", "...and its hello")
-        # a world file at a join: bigger than one piece, sent deflated in one message
-        import base64
-        world = base64.b64encode(bytes(random.Random(5).choice(b"EMSH save data \x00\x01") for _ in range(420000))).decode()
-        put_blob(A, "file_world_Level.sav", "host", world)
-        check(wait_for(lambda: get_blob(B, "file_world_Level.sav", "host"), 20) == world, "a %d KB world file arrives whole" % (len(world) // 1024))
-        check("file_world_Level.sav to" in log_of(A, "mirror_bridge.log") and "B compressed" in
-              [l for l in log_of(A, "mirror_bridge.log").splitlines() if "file_world_Level.sav to" in l][0],
-              "...sent compressed, not raw in pieces")
-
-        print("5. security: limits, kick, block, always-allow, decline")
-        big = "x" * (9 * 1024 * 1024)
-        put_blob(B, "huge", "guest", big)
-        check(wait_for(lambda: "kicked 1002" in log_of(A, "mirror_lobby.txt"), 30), "an oversized message gets the guest kicked")
-        check(get_blob(A, "huge", "guest") is None, "...and none of it was written")
-        put_blob(B, "after", "guest", "after kick")
-        time.sleep(3)
-        check(get_blob(A, "after", "guest") is None, "a kicked guest gets nothing through")
-        os.remove(os.path.join(B, "mirror_huge_guest.txt"))
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
-        check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 20), "after hosting again the guest can ask again")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "allow 1002")
-        check(wait_for(lambda: get_blob(A, "after", "guest"), 15) == "after kick", "always allow: the guest's data flows")
-        check("1002" in log_of(A, "mirror_allow.txt"), "always allow: on the allow list")
-        procs[0].kill(); procs[0].wait()
-        for f in os.listdir(A):
-            if f != "mirror_allow.txt":
-                os.remove(os.path.join(A, f))
-        procs[0] = start("auto", A)
-        time.sleep(1.5)
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
-        put_blob(B, "again", "guest", "allowed")
-        check(wait_for(lambda: get_blob(A, "again", "guest"), 20) == "allowed", "an always-allowed guest joins a restarted host without a prompt")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "clearallow")
-        time.sleep(1)
-        check(not os.path.exists(os.path.join(A, "mirror_allow.txt")), "clearallow empties the list")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
-        check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 20), "(setup) the guest asks again")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "decline 1002")
-        put_blob(B, "declined", "guest", "no")
-        time.sleep(4)
-        check(get_blob(A, "declined", "guest") is None, "a declined guest gets nothing through")
-        check("request 1002" not in log_of(A, "mirror_lobby.txt"), "...and doesn't show as a request again")
-        check("joinerror declined" in log_of(B, "mirror_lobby.txt"), "...and is told it was declined (no endless waiting)")
-
-        print("6. password: challenge-response, wrong / missing / right, 3 tries")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "password open sesame")
-        time.sleep(0.6)
-        check("password on" in log_of(A, "mirror_lobby.txt"), "the host's lobby says a password is on")
-        check("open sesame" not in log_of(A, "mirror_bridge.log"), "the password itself is never logged")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
-        time.sleep(0.6)
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
-        check(wait_for(lambda: "joinerror needpass" in log_of(B, "mirror_lobby.txt"), 20), "no password: the guest is told the host needs one")
-        check("request 1002" not in log_of(A, "mirror_lobby.txt"), "...and no join request reached the host")
-        time.sleep(1.0)
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0 open says me")
-        check(wait_for(lambda: "joinerror badpass" in log_of(B, "mirror_lobby.txt"), 20), "wrong password: told so")
-        check("request 1002" not in log_of(A, "mirror_lobby.txt"), "...no join request")
-        time.sleep(1.0)
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0 open sesame")
-        check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 20), "right password: an ordinary join request")
-        check("open sesame" not in log_of(B, "mirror_bridge.log"), "the guest doesn't log it either")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "accept 1002")
-        put_blob(B, "pw", "guest", "in")
-        check(wait_for(lambda: get_blob(A, "pw", "guest"), 15) == "in", "...accepted: data flows")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
-        time.sleep(0.6)
-        # each try waits for the host's answer: a fixed 4 s sleep let a slow try overlap the next join
-        def wrongs():
-            return log_of(A, "mirror_bridge.log").count("password wrong from 1002")
-        before = wrongs()
-        for i in range(1, 4):
-            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0 nope")
-            check(wait_for(lambda i=i: wrongs() >= before + i, 20), "(setup) wrong password try %d answered" % i)
-        check(wait_for(lambda: "joinerror blocked" in log_of(B, "mirror_lobby.txt"), 10), "three wrong passwords (three tries): blocked")
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0 open sesame")
-        time.sleep(5)
-        check("request 1002" not in log_of(A, "mirror_lobby.txt"), "...even the right one is refused until hosting again")
-
-        print("7. server browser (test net stand-in for Steam lobbies)")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "password")
-        time.sleep(0.6)
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
-        time.sleep(0.6)
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "public on 33 Arkis base camp")
-        check(wait_for(lambda: "public on" in log_of(A, "mirror_lobby.txt"), 10), "the host's lobby says it's listed")
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "browse")
-        check(wait_for(lambda: "server 1001 0 " in log_of(B, "mirror_lobby.txt"), 10), "the guest's search finds the host")
-        lob = log_of(B, "mirror_lobby.txt")
-        check("33 Arkis_base_camp" in lob or "33 Arkis base camp" in lob, "...with its version and name")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "password pw1")
-        time.sleep(0.8)
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "browse")
-        check(wait_for(lambda: "server 1001 1 " in log_of(B, "mirror_lobby.txt"), 10), "a password shows in the listing")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "public off")
-        time.sleep(0.8)
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "browse")
-        check(wait_for(lambda: "server 1001" not in log_of(B, "mirror_lobby.txt"), 10), "public off: gone from the search")
-
-        print("8. players who aren't Steam friends: each side sends its own name")
-        for p in procs:
-            p.kill(); p.wait()
-        procs.clear()
-        for d in (A, B):
-            for f in os.listdir(d):
-                if f.endswith(".name"):
+        if want("3"):
+            print("3. menu flow: guest joins before the host presses Host")
+            for d in (A, B):
+                for f in os.listdir(d):
                     os.remove(os.path.join(d, f))
-        env = dict(os.environ, SURROUNSYNC_TEST_STRANGERS="1")
-        procs.append(start("host", A, env=env))
-        time.sleep(1.0)
-        procs.append(start("guest", B, env=env))
-        check(wait_for(lambda: log_of(B, "mirror_peer_guest.name").strip() == "Test-host", 15),
-              "the guest shows the host's name, not [unknown] (got %r)" % log_of(B, "mirror_peer_guest.name").strip())
-        check(wait_for(lambda: log_of(A, "mirror_peer_host.name").strip() == "Test-guest", 15),
-              "the host shows the guest's name (got %r)" % log_of(A, "mirror_peer_host.name").strip())
+            procs.append(start("auto", A))
+            procs.append(start("auto", B))
+            lobby = wait_for(lambda: "END" in log_of(A, "mirror_lobby.txt") and log_of(A, "mirror_lobby.txt"))
+            check(bool(lobby) and "role idle" in lobby, "idle bridge writes the lobby for the menu")
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
+            put_blob(B, "hello", "guest", "guest hello")
+            put_blob(B, "req", "guest", "join 1")
+            time.sleep(2.0)
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+            put_blob(A, "hello", "host", "host hello")
+            check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 15), "the guest shows up as a join request in the host's lobby")
+            check(get_blob(A, "req", "guest") is None, "nothing from the guest arrives before the host accepts")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "accept 1002")
+            check(wait_for(lambda: get_blob(A, "req", "guest"), 15) == "join 1", "join request sent while the host was idle still arrives")
+            check(wait_for(lambda: get_blob(B, "hello", "host"), 15) == "host hello", "host hello reaches the guest after hosting")
+            lob = wait_for(lambda: "connected" in log_of(B, "mirror_lobby.txt") and log_of(B, "mirror_lobby.txt"), 10)
+            check(bool(lob), "guest lobby shows the peer as connected")
 
-        # The game writes its hello right after queuing the role command, and only once: a bridge that clears
-        # the files of its new role's suffix loses it, and every guest then says "it runs an OLDER SurrounSync"
-        # (player report 2026-10-28 20:38:32: the host's every blob arrived but hello).
-        print("9. a guest who becomes the host keeps the game's own hello")
-        for p in procs:
-            p.kill(); p.wait()
-        procs.clear()
-        for d in (A, B):
-            for f in os.listdir(d):
-                os.remove(os.path.join(d, f))
-        procs.append(start("auto", B))
-        time.sleep(1.0)
-        procs.append(start("auto", A))
-        check(wait_for(lambda: "role idle" in log_of(A, "mirror_lobby.txt"), 10), "(setup) both bridges idle")
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "host")
-        put_blob(B, "look", "host", "old host look")
-        check(wait_for(lambda: "role host" in log_of(B, "mirror_lobby.txt"), 10), "(setup) B hosts")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "join 0")
-        check(wait_for(lambda: "request" in log_of(B, "mirror_lobby.txt"), 15), "(setup) A asks to join")
-        req = [l for l in log_of(B, "mirror_lobby.txt").splitlines() if l.startswith("request ")][0].split()[1]
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "accept " + req)
-        check(wait_for(lambda: get_blob(A, "look", "host"), 15) == "old host look", "(setup) the old host's look reached A")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
-        put_blob(A, "hello", "host", "A hosts now")
-        check(wait_for(lambda: "role host" in log_of(A, "mirror_lobby.txt"), 10), "(setup) A switched to host")
-        time.sleep(1.0)
-        check(get_blob(A, "hello", "host") == "A hosts now", "guest -> host: the game's new hello is kept")
-        check(get_blob(A, "look", "host") is None, "guest -> host: the old host's look is cleared (not sent on as A's own)")
-        # (a bridge restart while hosting still clears "_host" at start: link.lua puts the game's blobs again)
+            print("4. the guest joins again in the same run: the host's earlier state arrives again")
+            put_blob(A, "look", "host", "host look")
+            check(wait_for(lambda: get_blob(B, "look", "host"), 15) == "host look", "(setup) host look arrived")
+            gone = watch_gone(os.path.join(B, "mirror_look_host.txt"))
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
+            check(gone.wait(10), "the switch cleared the host's files on the guest")
+            check(wait_for(lambda: get_blob(B, "look", "host"), 15) == "host look", "...and the host resent its look")
+            check(wait_for(lambda: get_blob(B, "hello", "host"), 15) == "host hello", "...and its hello")
+            # a world file at a join: bigger than one piece, sent deflated in one message
+            import base64
+            world = base64.b64encode(bytes(random.Random(5).choice(b"EMSH save data \x00\x01") for _ in range(420000))).decode()
+            put_blob(A, "file_world_Level.sav", "host", world)
+            check(wait_for(lambda: get_blob(B, "file_world_Level.sav", "host"), 20) == world, "a %d KB world file arrives whole" % (len(world) // 1024))
+            check("file_world_Level.sav to" in log_of(A, "mirror_bridge.log") and "B compressed" in
+                  [l for l in log_of(A, "mirror_bridge.log").splitlines() if "file_world_Level.sav to" in l][0],
+                  "...sent compressed, not raw in pieces")
 
-        print("10. the host's goodbye written right before 'stop' still reaches the guest")
-        # (kit 2026-10-30 12:54: a host's MAIN MENU wrote mirror_bye_* and then the stop command; the bridge
-        # dropped every link first, so guests only lost the connection instead of being taken home)
-        for p in procs:
-            p.kill(); p.wait()
-        procs.clear()
-        for d in (A, B):
-            for f in os.listdir(d):
-                os.remove(os.path.join(d, f))
-        procs.append(start("auto", A))
-        procs.append(start("auto", B))
-        check(wait_for(lambda: "role idle" in log_of(B, "mirror_lobby.txt"), 10), "(setup) both bridges idle")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
-        put_blob(A, "hello", "host", "host hello")
-        check(wait_for(lambda: "role host" in log_of(A, "mirror_lobby.txt"), 10), "(setup) A hosts")
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
-        check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 15), "(setup) B asks to join")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "accept 1002")
-        check(wait_for(lambda: get_blob(B, "hello", "host"), 15) == "host hello", "(setup) B is connected")
-        time.sleep(1.0)
-        put_blob(A, "bye", "host", "stop 1793390000")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "stop")
-        check(wait_for(lambda: get_blob(B, "bye", "host"), 10) == "stop 1793390000", "the goodbye arrived before the link closed")
-        check(wait_for(lambda: "role idle" in log_of(A, "mirror_lobby.txt"), 10), "and the host's bridge stopped")
-
-        print("11. the host's reliable lane goes dead: the bridge notices and reconnects")
-        # (player report 2026-10-30 13:28, DBG-20261030-005: over Steam the guest got the host's heartbeats and poses
-        # but none of its reliable blobs - no hello, no world files - and stayed home after 120 s)
-        for p in procs:
-            p.kill(); p.wait()
-        procs.clear()
-        for d in (A, B):
-            for f in os.listdir(d):
-                os.remove(os.path.join(d, f))
-        fast = dict(os.environ, SURROUNSYNC_TEST_STALL_MS="4000")
-        procs.append(start("auto", A, env=dict(fast, SURROUNSYNC_TEST_DEAD_RELIABLE="1")))
-        procs.append(start("auto", B, env=fast))
-        check(wait_for(lambda: "role idle" in log_of(B, "mirror_lobby.txt"), 10), "(setup) both bridges idle")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
-        put_blob(A, "hello", "host", "host hello 11")
-        check(wait_for(lambda: "role host" in log_of(A, "mirror_lobby.txt"), 10), "(setup) A hosts")
-        lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
-        check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 15), "(setup) B asks to join")
-        lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "accept 1002")
-        check(wait_for(lambda: get_blob(B, "hello", "host"), 30) == "host hello 11", "the host's hello arrives after the dead lane")
-        check("stopped arriving" in bridge_logs(A), "the host logged the dead lane and reconnected")
-        check(re.search(r"stopped arriving \(probe \d+ unanswered.*last answered \d+.*test session queued \d+ B, rtt", bridge_logs(A)) is not None,
-              "...with the session's state, the last answered probe and the round trip")
-        put_blob(A, "life", "host", "after the reconnect")
-        check(wait_for(lambda: get_blob(B, "life", "host"), 15) == "after the reconnect", "a blob written later arrives too")
-
-        print("11b. a healthy link with a big blob in flight is never restarted")
-        for p in procs:
-            p.kill(); p.wait()
-        procs.clear()
-        for d in (A, B):
-            for f in os.listdir(d):
-                os.remove(os.path.join(d, f))
-        procs.append(start("host", A, env=fast))
-        procs.append(start("guest", B, ["--peer", "1001"], env=fast))
-        put_blob(A, "hello", "host", "host hello 11b")
-        check(wait_for(lambda: get_blob(B, "hello", "host"), 15) == "host hello 11b", "(setup) connected")
-        for i in range(3):
-            put_blob(A, "file_world_Level.sav", "host", "%d:" % i + world)
+            print("5. security: limits, kick, block, always-allow, decline")
+            big = "x" * (9 * 1024 * 1024)
+            put_blob(B, "huge", "guest", big)
+            check(wait_for(lambda: "kicked 1002" in log_of(A, "mirror_lobby.txt"), 30), "an oversized message gets the guest kicked")
+            check(get_blob(A, "huge", "guest") is None, "...and none of it was written")
+            put_blob(B, "after", "guest", "after kick")
+            time.sleep(3)
+            check(get_blob(A, "after", "guest") is None, "a kicked guest gets nothing through")
+            os.remove(os.path.join(B, "mirror_huge_guest.txt"))
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+            check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 20), "after hosting again the guest can ask again")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "allow 1002")
+            check(wait_for(lambda: get_blob(A, "after", "guest"), 15) == "after kick", "always allow: the guest's data flows")
+            check("1002" in log_of(A, "mirror_allow.txt"), "always allow: on the allow list")
+            procs[0].kill(); procs[0].wait()
+            for f in os.listdir(A):
+                if f != "mirror_allow.txt":
+                    os.remove(os.path.join(A, f))
+            procs[0] = start("auto", A)
             time.sleep(1.5)
-        time.sleep(6.0)
-        check("connected to" in bridge_logs(A) and "stopped arriving" not in bridge_logs(A) + bridge_logs(B),
-              "no restart on a healthy link")
-        check(wait_for(lambda: (get_blob(B, "file_world_Level.sav", "host") or "").startswith("2:"), 20), "the last world file arrived")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+            put_blob(B, "again", "guest", "allowed")
+            check(wait_for(lambda: get_blob(A, "again", "guest"), 20) == "allowed", "an always-allowed guest joins a restarted host without a prompt")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "clearallow")
+            time.sleep(1)
+            check(not os.path.exists(os.path.join(A, "mirror_allow.txt")), "clearallow empties the list")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+            check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 20), "(setup) the guest asks again")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "decline 1002")
+            put_blob(B, "declined", "guest", "no")
+            time.sleep(4)
+            check(get_blob(A, "declined", "guest") is None, "a declined guest gets nothing through")
+            check("request 1002" not in log_of(A, "mirror_lobby.txt"), "...and doesn't show as a request again")
+            check("joinerror declined" in log_of(B, "mirror_lobby.txt"), "...and is told it was declined (no endless waiting)")
 
-        print("11c. the reliable lane stays dead: blobs go over the unreliable lane (20% lost) with resends")
-        for p in procs:
-            p.kill(); p.wait()
-        procs.clear()
-        for d in (A, B):
-            for f in os.listdir(d):
-                os.remove(os.path.join(d, f))
-        lossy = dict(fast, SURROUNSYNC_TEST_LOSS="0.2")
-        procs.append(start("host", A, env=dict(lossy, SURROUNSYNC_TEST_DEAD_RELIABLE="2")))
-        procs.append(start("guest", B, ["--peer", "1001"], env=lossy))
-        put_blob(A, "hello", "host", "host hello 11c")
-        put_blob(A, "file_world_Level.sav", "host", "11c:" + world)
-        check(wait_for(lambda: get_blob(B, "hello", "host"), 60) == "host hello 11c", "the host's hello arrives")
-        check("still stopped arriving after" in bridge_logs(A), "the host switched to the unreliable lane")
-        check(wait_for(lambda: get_blob(B, "file_world_Level.sav", "host"), 60) == "11c:" + world, "1.5 MB world file arrived intact")
-        for i in range(5):
-            put_blob(A, "life", "host", "state %d" % i)
-            time.sleep(0.1)
-        check(wait_for(lambda: get_blob(B, "life", "host") == "state 4", 20), "the newest of quick changes wins")
+        if want("6"):
+            print("6. password: challenge-response, wrong / missing / right, 3 tries")
+            for p in procs:
+                p.kill(); p.wait()
+            procs.clear()
+            for d in (A, B):
+                for f in os.listdir(d):
+                    os.remove(os.path.join(d, f))
+            procs.append(start("auto", A))
+            procs.append(start("auto", B))
+            check(wait_for(lambda: "role idle" in log_of(A, "mirror_lobby.txt") and "role idle" in log_of(B, "mirror_lobby.txt"), 10),
+                  "(setup) both bridges idle")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "password open sesame")
+            time.sleep(0.6)
+            check("password on" in log_of(A, "mirror_lobby.txt"), "the host's lobby says a password is on")
+            check("open sesame" not in log_of(A, "mirror_bridge.log"), "the password itself is never logged")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+            time.sleep(0.6)
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
+            check(wait_for(lambda: "joinerror needpass" in log_of(B, "mirror_lobby.txt"), 20), "no password: the guest is told the host needs one")
+            check("request 1002" not in log_of(A, "mirror_lobby.txt"), "...and no join request reached the host")
+            time.sleep(1.0)
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0 open says me")
+            check(wait_for(lambda: "joinerror badpass" in log_of(B, "mirror_lobby.txt"), 20), "wrong password: told so")
+            check("request 1002" not in log_of(A, "mirror_lobby.txt"), "...no join request")
+            time.sleep(1.0)
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0 open sesame")
+            check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 20), "right password: an ordinary join request")
+            check("open sesame" not in log_of(B, "mirror_bridge.log"), "the guest doesn't log it either")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "accept 1002")
+            put_blob(B, "pw", "guest", "in")
+            check(wait_for(lambda: get_blob(A, "pw", "guest"), 15) == "in", "...accepted: data flows")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+            time.sleep(0.6)
+            # each try waits for the host's answer: a fixed 4 s sleep let a slow try overlap the next join
+            def wrongs():
+                return log_of(A, "mirror_bridge.log").count("password wrong from 1002")
+            before = wrongs()
+            for i in range(1, 4):
+                lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0 nope")
+                check(wait_for(lambda i=i: wrongs() >= before + i, 20), "(setup) wrong password try %d answered" % i)
+            check(wait_for(lambda: "joinerror blocked" in log_of(B, "mirror_lobby.txt"), 10), "three wrong passwords (three tries): blocked")
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0 open sesame")
+            time.sleep(5)
+            check("request 1002" not in log_of(A, "mirror_lobby.txt"), "...even the right one is refused until hosting again")
 
-        print("11d. a link that loses any reliable packet bigger than one packet: messages go in pieces, the lane never dies")
-        # (DBG-20261030-005, the guest's bridge log 2026-10-30: every small message arrived, nothing after the first
-        # one Steam had to split - "lootc", 8 KB compressed)
-        for p in procs:
-            p.kill(); p.wait()
-        procs.clear()
-        for d in (A, B):
-            for f in os.listdir(d):
-                os.remove(os.path.join(d, f))
-        procs.append(start("host", A, env=dict(fast, SURROUNSYNC_TEST_MTU="1200")))
-        procs.append(start("guest", B, ["--peer", "1001"], env=fast))
-        put_blob(A, "hello", "host", "host hello 11d")
-        lootc = "".join(random.choice(string.ascii_letters) for _ in range(42000))
-        put_blob(A, "lootc", "host", lootc)
-        put_blob(A, "file_world_Level.sav", "host", "11d:" + world)
-        check(wait_for(lambda: get_blob(B, "hello", "host"), 20) == "host hello 11d", "the hello arrives")
-        check(wait_for(lambda: get_blob(B, "lootc", "host"), 20) == lootc, "a 42 KB blob arrives (in pieces)")
-        check(wait_for(lambda: get_blob(B, "file_world_Level.sav", "host"), 60) == "11d:" + world, "the 1.5 MB world file arrives intact")
-        # ~4100 pieces at loopback speed: counted one by one they drained the 3000-packet burst and a lost reliable
-        # piece is never sent again (audit 2026-10-30)
-        huge = "".join(random.choice(string.ascii_letters + string.digits + "+/") for _ in range(4_200_000))
-        put_blob(A, "file_world_Big.sav", "host", huge)
-        check(wait_for(lambda: get_blob(B, "file_world_Big.sav", "host"), 90) == huge, "a 4.2 MB file in ~4100 pieces arrives intact")
-        check("(rate)" not in bridge_logs(B), "...without a rate drop on the receiving side (20 of them cut the player off)")
-        put_blob(A, "life", "host", "after the big ones")
-        check(wait_for(lambda: get_blob(B, "life", "host"), 15) == "after the big ones", "and what comes after it")
-        check("stopped arriving" not in bridge_logs(A), "the lane never died (no restart, no fallback)")
+            print("7. server browser (test net stand-in for Steam lobbies)")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "password")
+            time.sleep(0.6)
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+            time.sleep(0.6)
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "public on 33 Arkis base camp")
+            check(wait_for(lambda: "public on" in log_of(A, "mirror_lobby.txt"), 10), "the host's lobby says it's listed")
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "browse")
+            check(wait_for(lambda: "server 1001 0 " in log_of(B, "mirror_lobby.txt"), 10), "the guest's search finds the host")
+            lob = log_of(B, "mirror_lobby.txt")
+            check("33 Arkis_base_camp" in lob or "33 Arkis base camp" in lob, "...with its version and name")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "password pw1")
+            time.sleep(0.8)
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "browse")
+            check(wait_for(lambda: "server 1001 1 " in log_of(B, "mirror_lobby.txt"), 10), "a password shows in the listing")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "public off")
+            time.sleep(0.8)
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "browse")
+            check(wait_for(lambda: "server 1001" not in log_of(B, "mirror_lobby.txt"), 10), "public off: gone from the search")
+
+        if want("6b"):
+            # audit 2026-11-10: the host sent a new check code every 3 s until answered, the guest answers once: an
+            # answer slower than 3 s (a slow relay) was checked against a newer code - a right password was "wrong",
+            # and three of those blocked the guest
+            print("6b. a slow answer to the password check still counts")
+            procs.append(start("auto", A))
+            procs.append(start("auto", B, env=dict(os.environ, SURROUNSYNC_TEST_ANSWER_DELAY_MS="4500")))
+            check(wait_for(lambda: "role idle" in log_of(A, "mirror_lobby.txt") and "role idle" in log_of(B, "mirror_lobby.txt"), 10),
+                  "(setup) both bridges idle")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "password open sesame")
+            check(wait_for(lambda: "password on" in log_of(A, "mirror_lobby.txt"), 5), "(setup) password on")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+            check(wait_for(lambda: "role host" in log_of(A, "mirror_lobby.txt"), 5), "(setup) A hosts")
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0 open sesame")
+            check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 20),
+                  "the right password answered after 4.5 s: a join request (host log: %r)"
+                  % [l[9:] for l in log_of(A, "mirror_bridge.log").splitlines() if "password" in l][-3:])
+            check("password wrong" not in log_of(A, "mirror_bridge.log"), "...and no wrong try counted")
+
+        if want("8"):
+            print("8. players who aren't Steam friends: each side sends its own name")
+            for p in procs:
+                p.kill(); p.wait()
+            procs.clear()
+            for d in (A, B):
+                for f in os.listdir(d):
+                    if f.endswith(".name"):
+                        os.remove(os.path.join(d, f))
+            env = dict(os.environ, SURROUNSYNC_TEST_STRANGERS="1")
+            procs.append(start("host", A, env=env))
+            time.sleep(1.0)
+            procs.append(start("guest", B, env=env))
+            check(wait_for(lambda: log_of(B, "mirror_peer_guest.name").strip() == "Test-host", 15),
+                  "the guest shows the host's name, not [unknown] (got %r)" % log_of(B, "mirror_peer_guest.name").strip())
+            check(wait_for(lambda: log_of(A, "mirror_peer_host.name").strip() == "Test-guest", 15),
+                  "the host shows the guest's name (got %r)" % log_of(A, "mirror_peer_host.name").strip())
+
+            # The game writes its hello right after queuing the role command, and only once: a bridge that clears
+            # the files of its new role's suffix loses it, and every guest then says "it runs an OLDER SurrounSync"
+            # (player report 2026-10-28 20:38:32: the host's every blob arrived but hello).
+            print("9. a guest who becomes the host keeps the game's own hello")
+            for p in procs:
+                p.kill(); p.wait()
+            procs.clear()
+            for d in (A, B):
+                for f in os.listdir(d):
+                    os.remove(os.path.join(d, f))
+            procs.append(start("auto", B))
+            time.sleep(1.0)
+            procs.append(start("auto", A))
+            check(wait_for(lambda: "role idle" in log_of(A, "mirror_lobby.txt"), 10), "(setup) both bridges idle")
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "host")
+            put_blob(B, "look", "host", "old host look")
+            check(wait_for(lambda: "role host" in log_of(B, "mirror_lobby.txt"), 10), "(setup) B hosts")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "join 0")
+            check(wait_for(lambda: "request" in log_of(B, "mirror_lobby.txt"), 15), "(setup) A asks to join")
+            req = [l for l in log_of(B, "mirror_lobby.txt").splitlines() if l.startswith("request ")][0].split()[1]
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "accept " + req)
+            check(wait_for(lambda: get_blob(A, "look", "host"), 15) == "old host look", "(setup) the old host's look reached A")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+            put_blob(A, "hello", "host", "A hosts now")
+            check(wait_for(lambda: "role host" in log_of(A, "mirror_lobby.txt"), 10), "(setup) A switched to host")
+            time.sleep(1.0)
+            check(get_blob(A, "hello", "host") == "A hosts now", "guest -> host: the game's new hello is kept")
+            check(get_blob(A, "look", "host") is None, "guest -> host: the old host's look is cleared (not sent on as A's own)")
+            # (a bridge restart while hosting still clears "_host" at start: link.lua puts the game's blobs again)
+
+            print("10. the host's goodbye written right before 'stop' still reaches the guest")
+            # (kit 2026-10-30 12:54: a host's MAIN MENU wrote mirror_bye_* and then the stop command; the bridge
+            # dropped every link first, so guests only lost the connection instead of being taken home)
+            for p in procs:
+                p.kill(); p.wait()
+            procs.clear()
+            for d in (A, B):
+                for f in os.listdir(d):
+                    os.remove(os.path.join(d, f))
+            procs.append(start("auto", A))
+            procs.append(start("auto", B))
+            check(wait_for(lambda: "role idle" in log_of(B, "mirror_lobby.txt"), 10), "(setup) both bridges idle")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+            put_blob(A, "hello", "host", "host hello")
+            check(wait_for(lambda: "role host" in log_of(A, "mirror_lobby.txt"), 10), "(setup) A hosts")
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
+            check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 15), "(setup) B asks to join")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "accept 1002")
+            check(wait_for(lambda: get_blob(B, "hello", "host"), 15) == "host hello", "(setup) B is connected")
+            time.sleep(1.0)
+            put_blob(A, "bye", "host", "stop 1793390000")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "stop")
+            check(wait_for(lambda: get_blob(B, "bye", "host"), 10) == "stop 1793390000", "the goodbye arrived before the link closed")
+            check(wait_for(lambda: "role idle" in log_of(A, "mirror_lobby.txt"), 10), "and the host's bridge stopped")
+
+        if want("11"):
+            print("11. the host's reliable lane goes dead: the bridge notices and reconnects")
+            # (player report 2026-10-30 13:28, DBG-20261030-005: over Steam the guest got the host's heartbeats and poses
+            # but none of its reliable blobs - no hello, no world files - and stayed home after 120 s)
+            for p in procs:
+                p.kill(); p.wait()
+            procs.clear()
+            for d in (A, B):
+                for f in os.listdir(d):
+                    os.remove(os.path.join(d, f))
+            procs.append(start("auto", A, env=dict(fast, SURROUNSYNC_TEST_DEAD_RELIABLE="1")))
+            procs.append(start("auto", B, env=fast))
+            check(wait_for(lambda: "role idle" in log_of(B, "mirror_lobby.txt"), 10), "(setup) both bridges idle")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "host")
+            put_blob(A, "hello", "host", "host hello 11")
+            check(wait_for(lambda: "role host" in log_of(A, "mirror_lobby.txt"), 10), "(setup) A hosts")
+            lua_write(os.path.join(B, "mirror_bridge_cmd.txt"), "join 0")
+            check(wait_for(lambda: "request 1002" in log_of(A, "mirror_lobby.txt"), 15), "(setup) B asks to join")
+            lua_write(os.path.join(A, "mirror_bridge_cmd.txt"), "accept 1002")
+            check(wait_for(lambda: get_blob(B, "hello", "host"), 30) == "host hello 11", "the host's hello arrives after the dead lane")
+            check("stopped arriving" in bridge_logs(A), "the host logged the dead lane and reconnected")
+            check(re.search(r"stopped arriving \(probe \d+ unanswered.*last answered \d+.*test session queued \d+ B, rtt", bridge_logs(A)) is not None,
+                  "...with the session's state, the last answered probe and the round trip")
+            put_blob(A, "life", "host", "after the reconnect")
+            check(wait_for(lambda: get_blob(B, "life", "host"), 15) == "after the reconnect", "a blob written later arrives too")
+
+        if want("11b"):
+            print("11b. a healthy link with a big blob in flight is never restarted")
+            for p in procs:
+                p.kill(); p.wait()
+            procs.clear()
+            for d in (A, B):
+                for f in os.listdir(d):
+                    os.remove(os.path.join(d, f))
+            procs.append(start("host", A, env=fast))
+            procs.append(start("guest", B, ["--peer", "1001"], env=fast))
+            put_blob(A, "hello", "host", "host hello 11b")
+            check(wait_for(lambda: get_blob(B, "hello", "host"), 15) == "host hello 11b", "(setup) connected")
+            for i in range(3):
+                put_blob(A, "file_world_Level.sav", "host", "%d:" % i + world)
+                time.sleep(1.5)
+            time.sleep(6.0)
+            check("connected to" in bridge_logs(A) and "stopped arriving" not in bridge_logs(A) + bridge_logs(B),
+                  "no restart on a healthy link")
+            check(wait_for(lambda: (get_blob(B, "file_world_Level.sav", "host") or "").startswith("2:"), 20), "the last world file arrived")
+
+        if want("11c"):
+            print("11c. the reliable lane stays dead: blobs go over the unreliable lane (20% lost) with resends")
+            for p in procs:
+                p.kill(); p.wait()
+            procs.clear()
+            for d in (A, B):
+                for f in os.listdir(d):
+                    os.remove(os.path.join(d, f))
+            lossy = dict(fast, SURROUNSYNC_TEST_LOSS="0.2")
+            procs.append(start("host", A, env=dict(lossy, SURROUNSYNC_TEST_DEAD_RELIABLE="2")))
+            procs.append(start("guest", B, ["--peer", "1001"], env=lossy))
+            put_blob(A, "hello", "host", "host hello 11c")
+            put_blob(A, "file_world_Level.sav", "host", "11c:" + world)
+            check(wait_for(lambda: get_blob(B, "hello", "host"), 60) == "host hello 11c", "the host's hello arrives")
+            check("still stopped arriving after" in bridge_logs(A), "the host switched to the unreliable lane")
+            check(wait_for(lambda: get_blob(B, "file_world_Level.sav", "host"), 60) == "11c:" + world, "1.5 MB world file arrived intact")
+            for i in range(5):
+                put_blob(A, "life", "host", "state %d" % i)
+                time.sleep(0.1)
+            check(wait_for(lambda: get_blob(B, "life", "host") == "state 4", 20), "the newest of quick changes wins")
+
+            print("11d. a link that loses any reliable packet bigger than one packet: messages go in pieces, the lane never dies")
+            # (DBG-20261030-005, the guest's bridge log 2026-10-30: every small message arrived, nothing after the first
+            # one Steam had to split - "lootc", 8 KB compressed)
+            for p in procs:
+                p.kill(); p.wait()
+            procs.clear()
+            for d in (A, B):
+                for f in os.listdir(d):
+                    os.remove(os.path.join(d, f))
+            procs.append(start("host", A, env=dict(fast, SURROUNSYNC_TEST_MTU="1200")))
+            procs.append(start("guest", B, ["--peer", "1001"], env=fast))
+            put_blob(A, "hello", "host", "host hello 11d")
+            lootc = "".join(random.choice(string.ascii_letters) for _ in range(42000))
+            put_blob(A, "lootc", "host", lootc)
+            put_blob(A, "file_world_Level.sav", "host", "11d:" + world)
+            check(wait_for(lambda: get_blob(B, "hello", "host"), 20) == "host hello 11d", "the hello arrives")
+            check(wait_for(lambda: get_blob(B, "lootc", "host"), 20) == lootc, "a 42 KB blob arrives (in pieces)")
+            check(wait_for(lambda: get_blob(B, "file_world_Level.sav", "host"), 60) == "11d:" + world, "the 1.5 MB world file arrives intact")
+            # ~4100 pieces at loopback speed: counted one by one they drained the 3000-packet burst and a lost reliable
+            # piece is never sent again (audit 2026-10-30)
+            huge = "".join(random.choice(string.ascii_letters + string.digits + "+/") for _ in range(4_200_000))
+            put_blob(A, "file_world_Big.sav", "host", huge)
+            check(wait_for(lambda: get_blob(B, "file_world_Big.sav", "host"), 90) == huge, "a 4.2 MB file in ~4100 pieces arrives intact")
+            check("(rate)" not in bridge_logs(B), "...without a rate drop on the receiving side (20 of them cut the player off)")
+            put_blob(A, "life", "host", "after the big ones")
+            check(wait_for(lambda: get_blob(B, "life", "host"), 15) == "after the big ones", "and what comes after it")
+            check("stopped arriving" not in bridge_logs(A), "the lane never died (no restart, no fallback)")
+
+        if want("12"):
+            # the game starts a new bridge when it thinks the old one stopped; the new one used to empty the log before it
+            # knew another bridge held the folder, so a report lost why the connection failed
+            print("12. a second bridge next to a running one leaves its log alone; the last run's log is kept")
+            first = start("auto", C)
+            procs.append(first)
+            check(wait_for(lambda: "bridge idle up" in log_of(C, "mirror_bridge.log"), 10), "(setup) a bridge runs on the folder")
+            second = start("auto", C)
+            try:
+                second.wait(40)
+            except subprocess.TimeoutExpired:
+                second.kill(); second.wait()
+            text = log_of(C, "mirror_bridge.log")
+            check("bridge idle up" in text and "still running - exiting" in text,
+                  "the running bridge's log is still there, with the second one's 'still running' after it")
+            check(first.poll() is None, "...and the running bridge kept going")
+            first.kill(); first.wait()
+            procs.append(start("auto", C))
+            # (the old log says "bridge idle up" too until the new bridge moves it: wait for the kept copy first)
+            check(wait_for(lambda: "still running - exiting" in log_of(C, "mirror_bridge.1.log"), 10),
+                  "the last run's log is kept as mirror_bridge.1.log")
+            check(wait_for(lambda: "bridge idle up" in log_of(C, "mirror_bridge.log"), 10) and "still running" not in log_of(C, "mirror_bridge.log"),
+                  "...and the new run starts its own")
+
+            # Sentinel R1: a bridge taking over from a stuck one cleared the command file after its wait, so a command the
+            # game wrote meanwhile (the role it resends after a restart) was lost; only commands from before it started go
+        if want("12b"):
+            print("12b. a command written while a new bridge waits for a stuck one is run after the takeover")
+            import ctypes
+            for p in procs:
+                p.kill(); p.wait()
+            procs.clear()
+            for f in os.listdir(C):
+                os.remove(os.path.join(C, f))
+            stuck = start("auto", C)
+            procs.append(stuck)
+            check(wait_for(lambda: "role idle" in log_of(C, "mirror_lobby.txt"), 10), "(setup) a bridge runs on the folder")
+            h = ctypes.windll.kernel32.OpenProcess(0x0800, False, stuck.pid)   # PROCESS_SUSPEND_RESUME
+            ctypes.windll.ntdll.NtSuspendProcess(h)
+            procs.append(start("auto", C))
+            check(wait_for(lambda: "waiting up to 20 s" in log_of(C, "mirror_bridge.log"), 10), "(setup) the new bridge waits for the stuck one")
+            lua_write(os.path.join(C, "mirror_bridge_cmd.txt"), "host")
+            time.sleep(1.0)
+            stuck.kill(); stuck.wait()
+            ctypes.windll.kernel32.CloseHandle(h)
+            check(wait_for(lambda: "role host" in log_of(C, "mirror_lobby.txt"), 15),
+                  "the new bridge ran the command written during its wait (lobby: %r)" % log_of(C, "mirror_lobby.txt")[:60])
+            for p in procs:
+                p.kill(); p.wait()
+            procs.clear()
+
+            # audit 2026-11-10: the bridge's clock was Environment.TickCount, an int that is negative from 24.9 days of
+            # uptime (Fast Startup keeps it): no command read, no lobby written. The clock starts 2^31 + 5 s in here.
+            print("13. a PC up for 24.9 days: the bridge still writes its lobby and reads commands")
+            W = os.path.join(base, "uptime")
+            os.makedirs(W)
+            env = dict(os.environ, SURROUNSYNC_TEST_CLOCK_MS=str(2 ** 31 + 5000))
+            procs.append(start("auto", W, env=env))
+            check(wait_for(lambda: "END" in log_of(W, "mirror_lobby.txt"), 10),
+                  "the lobby is written (lobby: %r)" % log_of(W, "mirror_lobby.txt")[:60])
+            lua_write(os.path.join(W, "mirror_bridge_cmd.txt"), "host")
+            check(wait_for(lambda: "role host" in log_of(W, "mirror_lobby.txt"), 10), "the host command is run")
+            for p in procs:
+                p.kill(); p.wait()
+            procs.clear()
+
+            # audit 2026-11-10: a host that can't be reached left the guest "waiting for them to accept" for 2 minutes
+            print("14. a guest whose host can't be reached is told so; it clears once the host answers")
+            G, H = os.path.join(base, "reach_guest"), os.path.join(base, "reach_host")
+            os.makedirs(G); os.makedirs(H)
+            procs.append(start("auto", G))
+            check(wait_for(lambda: "role idle" in log_of(G, "mirror_lobby.txt"), 10), "(setup) the guest's bridge is up")
+            lua_write(os.path.join(G, "mirror_bridge_cmd.txt"), "join 0")
+            check(wait_for(lambda: "reach fail 1" in log_of(G, "mirror_lobby.txt"), 10),
+                  "nobody hosting: the guest's lobby says the host can't be reached (lobby: %r)" % log_of(G, "mirror_lobby.txt")[:120])
+            procs.append(start("auto", H))
+            check(wait_for(lambda: "role idle" in log_of(H, "mirror_lobby.txt"), 10), "(setup) the host's bridge is up")
+            lua_write(os.path.join(H, "mirror_bridge_cmd.txt"), "host")
+            check(wait_for(lambda: "request 1002" in log_of(H, "mirror_lobby.txt"), 20), "the host comes up: the request arrives")
+            check(wait_for(lambda: "reach fail" not in log_of(G, "mirror_lobby.txt"), 10), "...and the guest's lobby no longer says it can't be reached")
+    # (not here: a join request reaching a player who is in another's game - TellBusy, DBG-20261111-001 - because the
+    # test net only lets guests dial the host)
     finally:
         for p in procs:
             try:

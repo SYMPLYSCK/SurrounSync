@@ -50,16 +50,40 @@ function perf.run(name, fn, ...)
     crumb.at(name)
     depth = depth + 1
     if not enabled then
-        fn(...)
+        local a, b = fn(...)
         depth = depth - 1
         if outer then crumb.at(outer) end
-        return
+        return a, b
     end
     local t, m = os.clock(), collectgarbage("count")
-    fn(...)
+    local a, b = fn(...)
     depth = depth - 1
     if outer then crumb.at(outer) end
     record(name, os.clock() - t, collectgarbage("count") - m, top)
+    return a, b   -- (the first two results: util.safe's ok and the tick's own result, phase1's naps)
+end
+
+-- Naps: a system whose tick only counts a timer down between checks returns the seconds left to its next check;
+-- the frames before it skip the call, its crash step and its perf record (~10 us a run, kit 2026-10-31), and the
+-- tick gets the time it slept on waking, so it checks on the same frame as before. One set per link (phase1 copies
+-- tick their own copies of the same modules). set.run(name, dt, wrap, fn, ctx) = perf.run(name, wrap, fn, ctx, dt
+-- + the time slept); set.wake(): every system runs on the next frame.
+function perf.naps()
+    local naps = {}
+    local set = {}
+    function set.run(name, dt, wrap, fn, ctx)
+        local n = naps[name]
+        if n and n.left > dt then n.left, n.slept = n.left - dt, n.slept + dt; return end
+        local ok, left = perf.run(name, wrap, fn, ctx, dt + (n and n.slept or 0))
+        if ok and type(left) == "number" and left > 0 then
+            if not n then n = {}; naps[name] = n end
+            n.left, n.slept = left, 0.0
+        else
+            naps[name] = nil
+        end
+    end
+    function set.wake() for k in pairs(naps) do naps[k] = nil end end
+    return set
 end
 
 -- A hook body (it runs inside the game's own call, outside every tick, so no part ever counted it: the per-shot

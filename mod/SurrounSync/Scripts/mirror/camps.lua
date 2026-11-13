@@ -211,9 +211,13 @@ end
 function camps.tick(dt)
     if role == "guest" and session and session.in_world() then joined_for = joined_for + dt end
     tick_in = tick_in - dt
-    if tick_in > 0 then return end
-    tick_in = CHECK_EVERY
-    if role == "host" then host_tick() elseif role == "guest" then guest_tick() end
+    if tick_in <= 0 then
+        tick_in = CHECK_EVERY
+        if role == "host" then host_tick() elseif role == "guest" then guest_tick() end
+    end
+    -- phase1 naps until the next check; not a guest out of a world (its wake on arrival would count the sleep as
+    -- settle time)
+    if role ~= "guest" or (session and session.in_world()) then return tick_in end
 end
 
 function camps.status()

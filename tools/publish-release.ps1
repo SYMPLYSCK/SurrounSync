@@ -27,6 +27,18 @@ $Exe = Join-Path $Repo 'dist\SurrounSyncSetup.exe'
 if (-not (Test-Path $Exe)) { throw "dist\SurrounSyncSetup.exe missing - run tools\build-release.ps1" }
 $built = (& $Exe --version | Out-String).Trim()
 if ($built -ne $Version) { throw "dist\SurrounSyncSetup.exe is $built, version.lua says $Version - rebuild" }
+# the plain zip + version.json for other installers (make-modzip.py); version.json names this version and this zip
+$ModZip = Join-Path $Repo "dist\SurrounSync-$Version.zip"
+$VerJson = Join-Path $Repo 'dist\version.json'
+if (-not (Test-Path $ModZip) -or -not (Test-Path $VerJson)) { throw "dist\SurrounSync-$Version.zip or dist\version.json missing - run tools\build-release.ps1" }
+$vj = Get-Content $VerJson -Raw | ConvertFrom-Json
+if ($vj.version -ne $Version -or $vj.download.sha256 -ne (Get-FileHash $ModZip -Algorithm SHA256).Hash.ToLower()) { throw "dist\version.json doesn't match dist\SurrounSync-$Version.zip - rebuild" }
+# the Hang Glider on its own (make-glidermod.py), the same check
+$GliderZip = Join-Path $Repo "dist\SurrounSyncGlider-$Version.zip"
+$GliderJson = Join-Path $Repo 'dist\version-glider.json'
+if (-not (Test-Path $GliderZip) -or -not (Test-Path $GliderJson)) { throw "dist\SurrounSyncGlider-$Version.zip or dist\version-glider.json missing - run tools\build-release.ps1" }
+$gj = Get-Content $GliderJson -Raw | ConvertFrom-Json
+if ($gj.version -ne $Version -or $gj.download.sha256 -ne (Get-FileHash $GliderZip -Algorithm SHA256).Hash.ToLower()) { throw "dist\version-glider.json doesn't match dist\SurrounSyncGlider-$Version.zip - rebuild" }
 
 gh repo view $Slug *> $null
 if ($LASTEXITCODE -ne 0) {
@@ -43,7 +55,7 @@ git push origin HEAD:master --follow-tags 2>&1 | Out-Host
 $ErrorActionPreference = 'Stop'
 if ($LASTEXITCODE -ne 0) { throw "git push failed" }
 
-$ghArgs = @('release', 'create', $Tag, $Exe, "$Exe.sha256", '--repo', $Slug, '--title', "SurrounSync $Version", '--notes-file', $notes)
+$ghArgs = @('release', 'create', $Tag, $Exe, "$Exe.sha256", $ModZip, $VerJson, $GliderZip, $GliderJson, '--repo', $Slug, '--title', "SurrounSync $Version", '--notes-file', $notes)
 if ($Draft) { $ghArgs += '--draft' }
 gh @ghArgs
 if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }

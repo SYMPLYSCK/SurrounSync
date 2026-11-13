@@ -27,7 +27,15 @@ const LIMITS = {                      // per IP: [requests, window seconds]
     browse: [600, 3600],              // the public server list (the REALMS page asks about once a minute while open)
     join: [20, 3600],                 // joining a public Realm (a wrong password counts too)
     publish: [20, 3600],              // putting a Realm on the server list, changing its password, taking it off
+    report: [6, 24 * 3600],           // bug reports stored for the mod's makers
 };
+// Full bug reports (crash and hang dumps the Discord post can't carry): kept REPORT_DAYS, at most REPORT_MB_PER_DAY
+// stored a day from everyone together, so junk uploads can't run the bucket up
+const MAX_REPORT = 90 * 1024 * 1024;  // (a Workers request body takes 100 MB)
+const REPORT_DAYS = 30;
+const REPORT_MB_PER_DAY = 1024;
+const REPORT_LEVELS = /^(CRITICAL|ERROR|MINOR|INFO)$/;
+const REPORT_NAME = /^\d{10}-(CRITICAL|ERROR|MINOR|INFO)-[0-9A-Z]{8}\.zip$/;
 const MAX_MOTD = 500;
 // Public Realms: anyone may join one from the server list (with its password when it is locked). Those members
 // can only play with whoever hosts it: no hosting, invites or world downloads. They have their own cap, so they
@@ -212,6 +220,14 @@ const ipOf = (request) => ipKey(request.headers.get("cf-connecting-ip") || "loca
 async function limit(env, request, action) {
     const [max, window] = LIMITS[action];
     if (await bump(env, `${action}:${ipOf(request)}`, window) > max) fail(429, "slow_down", "too many requests, try again later");
+}
+
+async function bumpBy(env, bucket, window, n) {
+    const t = now(), start = t - (t % window);
+    const row = await env.DB.prepare(
+        "INSERT INTO hits (bucket, n, reset_at) VALUES (?1, ?3, ?2) ON CONFLICT(bucket) DO UPDATE SET n = n + ?3 RETURNING n")
+        .bind(`${bucket}:${start}`, start + window, n).first();
+    return row ? row.n : 0;
 }
 
 async function hitsNow(env, bucket, window) {
@@ -713,6 +729,92 @@ async function delist(env, request) {
     return json({ realm_id: rid, delisted: !undo, removed: res[1].meta.changes });
 }
 
+// ---- full bug reports: anyone stores one (a zip, limited), only the admin lists, reads and deletes them ----
+
+const reportKey = (name) => `reports/${name}`;
+
+async function storeReport(env, request) {
+    const level = (request.headers.get("x-report-level") || "").toUpperCase();
+    if (!REPORT_LEVELS.test(level)) fail(400, "bad_input", "X-Report-Level missing");
+    const len = Number(request.headers.get("content-length") || "0");
+    if (!Number.isInteger(len) || len <= 0) fail(411, "length_required", "Content-Length missing");
+    if (len < 22) fail(400, "bad_input", "not a zip");
+    if (len > MAX_REPORT) fail(413, "too_large");
+    if (!request.body) fail(400, "empty");
+    await limit(env, request, "report");
+    // the day's total is counted before the body is read: an upload that ends up refused still counts
+    const mb = Math.ceil(len / (1024 * 1024));
+    if (await bumpBy(env, "report_mb:all", 24 * 3600, mb) > (Number(env.REPORT_MB_PER_DAY) || REPORT_MB_PER_DAY))
+        fail(429, "slow_down", "no room for more reports today");
+    // streamed into R2 (a worker has 128 MB: a 90 MB report read whole didn't fit), the zip's first bytes checked on
+    // the way; FixedLengthStream refuses a body longer or shorter than its Content-Length
+    const name = `${now()}-${level}-${randomB32(8)}.zip`, key = reportKey(name);
+    const MAGIC = [0x50, 0x4b, 0x03, 0x04];
+    let seen = 0;
+    const check = new TransformStream({
+        transform(chunk, c) {
+            for (let i = 0; seen + i < MAGIC.length && i < chunk.byteLength; i++)
+                if (chunk[i] !== MAGIC[seen + i]) throw new ApiError(400, "bad_input", "not a zip");
+            seen += chunk.byteLength;
+            c.enqueue(chunk);
+        },
+    });
+    const fixed = new FixedLengthStream(len);
+    const [piped, put] = await Promise.allSettled([
+        request.body.pipeThrough(check).pipeTo(fixed.writable),
+        env.WORLDS.put(key, fixed.readable, { customMetadata: { level } }),
+    ]);
+    if (piped.status === "rejected" || put.status === "rejected") {
+        try { await env.WORLDS.delete(key); } catch (_) { /* nothing was stored */ }
+        // nothing kept: its share of the day's budget goes back (declared 90 MB of junk used it up: review R12)
+        await bumpBy(env, "report_mb:all", 24 * 3600, -mb);
+        const why = piped.status === "rejected" ? piped.reason : put.reason;
+        if (why instanceof ApiError) throw why;
+        fail(400, "bad_input", "the upload broke off");
+    }
+    return json({ name, size: len });
+}
+
+async function listReports(env, request) {
+    await admin(env, request);
+    const cursor = new URL(request.url).searchParams.get("cursor") || undefined;
+    const page = await env.WORLDS.list({ prefix: "reports/", cursor, limit: 500 });
+    return json({
+        reports: page.objects.map((o) => ({ name: o.key.slice(8), size: o.size, uploaded: Math.floor(o.uploaded.getTime() / 1000) })),
+        cursor: page.truncated ? page.cursor : null,
+    });
+}
+
+function reportName(v) {
+    if (!REPORT_NAME.test(v || "")) fail(400, "bad_input", "bad report name");
+    return v;
+}
+
+async function getReport(env, request, name) {
+    await admin(env, request);
+    const obj = await env.WORLDS.get(reportKey(reportName(name)));
+    if (!obj) fail(404, "no_report", "no such report");
+    return new Response(obj.body, { headers: { "content-type": "application/zip", "content-length": String(obj.size) } });
+}
+
+async function deleteReport(env, request, name) {
+    await admin(env, request);
+    await env.WORLDS.delete(reportKey(reportName(name)));
+    return json({ name, deleted: true });
+}
+
+// the cron's share: reports older than REPORT_DAYS go (a few pages a day is plenty for what the cap lets in)
+async function pruneReports(env, t) {
+    let cursor;
+    for (let i = 0; i < 20; i++) {
+        const page = await env.WORLDS.list({ prefix: "reports/", cursor, limit: 500 });
+        const old = page.objects.filter((o) => o.uploaded.getTime() / 1000 < t - REPORT_DAYS * 24 * 3600).map((o) => o.key);
+        if (old.length) await env.WORLDS.delete(old);
+        if (!page.truncated) break;
+        cursor = page.cursor;
+    }
+}
+
 // ---- routing ----
 
 async function route(request, env) {
@@ -730,6 +832,12 @@ async function route(request, env) {
     }
     if (p[1] === "realms" && p[2] === "public" && p.length === 3 && m === "GET") return listPublic(env, request);
     if (p[1] === "admin" && p[2] === "delist" && p.length === 3 && m === "POST") return delist(env, request);
+    if (p[1] === "reports" && p.length === 2 && m === "POST") return storeReport(env, request);
+    if (p[1] === "admin" && p[2] === "reports" && p.length === 3 && m === "GET") return listReports(env, request);
+    if (p[1] === "admin" && p[2] === "reports" && p.length === 4) {
+        if (m === "GET") return getReport(env, request, p[3]);
+        if (m === "DELETE") return deleteReport(env, request, p[3]);
+    }
     if (p[1] !== "realms" || p.length < 3) fail(404, "not_found");
 
     const rid = realmId(p[2]);
@@ -785,5 +893,6 @@ export default {
             env.DB.prepare("DELETE FROM members WHERE via = 'public' AND last_seen IS NULL AND created_at < ?")
                 .bind(t - (Number(env.PUBLIC_NEVER_SEEN_SECONDS) || PUBLIC_NEVER_SEEN_SECONDS)),
         ]);
+        await pruneReports(env, t);
     },
 };

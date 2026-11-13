@@ -1,8 +1,8 @@
 -- The minimap (user 2026-11-01): a round map in the top right corner with the player's arrow in the middle. North is
 -- always up: the map and N / E / S / W on its edge stay put and the arrow turns in its spot to the way the player
 -- faces (user 2026-11-01: the turning map spun the marker "in a circle not in its spot", "and the nwse rotate with
--- it"). M twice quickly switches it on or
--- off (remembered on this PC). It shows only while a GPS is worn (the game's IsGPSEquipped?), never over the big map
+-- it"). F4 switches it on or
+-- off (remembered on this PC; user 2026-11-12: F4 and /minimap, M is left to the game's big map). It shows only while a GPS is worn (the game's IsGPSEquipped?), never over the big map
 -- or while the mouse cursor is up (inventory, menus).
 --
 -- The picture is the big map's own texture (BP_MapData's Map Texture), placed the way the game's MapWidget puts
@@ -52,15 +52,18 @@ local ARROW, DOT = 26, 12      -- the arrow (T_Player); the dot drawn in its pla
 local LETTER_IN = 17           -- px from the disc's edge to a compass letter's centre
 local MARK, MAX_MARKS = 20, 24 -- a marker icon's size (px); the most markers drawn
 local EDGE_R = SIZE / 2 - MARK / 2 - 1   -- px from the centre: markers farther out ride the rim here
-local DOUBLE_S = 0.45          -- s between the two M presses
 local MATE_D, MAX_MATES = 12, 3 -- another player's dot (px); the most players drawn (4-player co-op)
 local BIG_DOT = 0.6            -- the big map's dot: the marker's 24 px icon at this scale
 local BIG_TRIES = 3            -- big-map markers that couldn't be made before giving up for the session
 local GPS_EVERY, DATA_EVERY, MARKS_EVERY, COMPASS_EVERY, MATES_EVERY = 0.5, 2.0, 0.5, 1.0, 0.5
 -- a FindAllOf walks every object, 6-10 ms a time: the top line of the live perf log, 2026-11-03 (0.3 ms/frame, worst
 -- 8-10 ms). No compass widget: looked for less and less often, up to COMPASS_MAX s apart. Markers: swept when the
--- compass's own widget list changes size, else every SWEEP_EVERY s; those found are read every MARKS_EVERY s.
-local SWEEP_EVERY, COMPASS_MAX = 5.0, 10.0
+-- compass's own widget list changes size, else every SWEEP_EVERY s (SWEEP_BLIND while that size can't be read);
+-- those found are read every MARKS_EVERY s (where they are; their icon and colour once per sweep).
+local SWEEP_EVERY, SWEEP_BLIND, COMPASS_MAX = 30.0, 5.0, 10.0
+-- s between reads of the compass's visibility (its opacity is read every frame: the game's fade animation puts it
+-- back, test-minimap)
+local UP_EVERY = 0.25
 local MAP_EVERY = 0.1          -- s between looks at the big map's state while the minimap isn't there to hide
 local NUDGE_PX, NUDGE_DEG = 0.25, 0.25   -- smaller moves aren't drawn: each one redraws the retainer's whole disc
 local COLLAPSED, HIDDEN, HIT_INVISIBLE = 1, 2, 3
@@ -80,14 +83,16 @@ local MATE_C = {
 }
 
 local on, loaded = false, false
-local clock, last_m = 0.0, -100.0
+local clock = 0.0
 local gps, gps_in = false, 0.0
 local data, data_in, data_said = nil, 0.0, false   -- { tex, mask, ws, mx, my } from the world's BP_MapData
 local comp_cls, comp, comp_for = nil, nil, nil
 local marks, marks_in = {}, 0.0                    -- { x, y, tex, tex_id, color } of the compass markers
 local mark_actors, sweep_at, mark_n = {}, 0.0, nil -- the markers the last sweep found; the next sweep; the list's size
 local map_open, map_in = false, 0.0                -- the big map's state as last read
-local cmp ={ w = nil, for_pc = nil, find_at = 0.0, hidden = nil }   -- the game's compass widget; the one we hid
+local cmp ={ w = nil, for_pc = nil, find_at = 0.0, hidden = nil,   -- the game's compass widget; the one we hid
+             up_w = nil, up_at = 0.0, up = false }   -- (the compass's visibility as last read, and when)
+local mark_look = {}                               -- marker addr -> { tex, color } read at the last sweep
 local view = { w = nil, built_for = nil, broken = false, shown = false }
 local mates, mates_in = {}, 0.0                    -- { a = actor, key = addr, color } of the other players here
 local big = { mw = nil, by = {}, open = false, fails = 0, said = false }   -- the big map's dots: addr -> widget
@@ -205,9 +210,11 @@ end
 
 -- the compass is up: a compass worn (the game shows the widget then)
 local function compass_up(w)
+    if cmp.up_w == w and clock < cmp.up_at then return cmp.up end
     local v
     pcall(function() v = w:GetVisibility() end)
-    return v ~= nil and v ~= COLLAPSED and v ~= HIDDEN
+    cmp.up_w, cmp.up_at, cmp.up = w, clock + UP_EVERY, v ~= nil and v ~= COLLAPSED and v ~= HIDDEN
+    return cmp.up
 end
 
 -- the compass at the top out of sight while the minimap shows (render opacity: the game's own show/hide is its
@@ -238,24 +245,30 @@ end
 local function scan_marks(w)
     local n = compass_list_size(w)
     if clock >= sweep_at or n ~= mark_n then
-        sweep_at, mark_n = clock + SWEEP_EVERY, n
+        sweep_at, mark_n = clock + (n and SWEEP_EVERY or SWEEP_BLIND), n
         local all
         pcall(function() all = FindAllOf(MARKER_CLS) end)
-        mark_actors = all or {}
+        mark_actors, mark_look = all or {}, {}
     end
     local list = {}
     for _, m in ipairs(mark_actors) do
         if #list >= MAX_MARKS then break end
-        if util.valid(m) then
-            local e = {}
+        local a = util.valid(m) and util.addr(m)
+        if a then
+            local e, look = {}, mark_look[a]
             local ok = pcall(function()
                 local l = m:K2_GetActorLocation()
                 e.x, e.y = l.X, l.Y
-                e.tex = m.Icon
-                local c = m.IconColor
-                e.color = { R = c.R, G = c.G, B = c.B, A = c.A }
+                if not look then
+                    local c = m.IconColor
+                    look = { tex = m.Icon, color = { R = c.R, G = c.G, B = c.B, A = c.A } }
+                end
             end)
-            if ok and util.valid(e.tex) then e.tex_id = util.addr(e.tex); list[#list + 1] = e end
+            if ok and look and util.valid(look.tex) then
+                mark_look[a] = look
+                e.tex, e.color, e.tex_id = look.tex, look.color, util.addr(look.tex)
+                list[#list + 1] = e
+            end
         end
     end
     marks = list
@@ -591,6 +604,31 @@ local function map_state(dt)
     return map_open
 end
 
+-- where MapWidget's Calculate Actor Position puts an actor, worked out here (its graph, step for step): the same
+-- map data and canvas size, so no out parameter has to come back from the call. A dot never placed sits in the
+-- overlay's centre, mid-map (user 2026-11-10: both players saw the other between Whitewood and the truck stop).
+local function big_pos(mw, actor)
+    local p
+    pcall(function()
+        local md = mw["Map Data"]
+        local size, l = mw.InnerCanvas:GetDesiredSize(), actor:K2_GetActorLocation()
+        -- the graph scales by the whole side (World Size / side) and clamps to half of it
+        local side = (size.X + size.Y) / 2
+        local half = side / 2
+        local ws, m = md["World Size"], md["World Middle Coordinations"]
+        if not (half > 0 and ws > 0) then return end
+        local k = side / ws
+        local x, y = (l.X - m.X) * k, (l.Y - m.Y) * k
+        p = { X = math.max(-half, math.min(half, y)), Y = math.max(-half, math.min(half, -x)) }
+    end)
+    if p then return p end
+    local out = {}
+    if not pcall(function() mw["Calculate Actor Position"](mw, actor, out) end) then return nil end
+    p = out.Location or out   -- (UE4SS may write a struct out parameter into the table itself)
+    if type(p.X) == "number" and type(p.Y) == "number" then return p end
+    return nil
+end
+
 local function update_big(dt, open)
     if not open then big.open = false; return end
     local mw
@@ -618,9 +656,7 @@ local function update_big(dt, open)
                 style_big(w, m.color)
             end
             if w then
-                local out = {}
-                local ok = pcall(function() mw["Calculate Actor Position"](mw, m.a, out) end)
-                local p = ok and out.Location
+                local p = big_pos(mw, m.a)
                 if p then
                     pcall(function() w:SetRenderTranslation({ X = p.X, Y = p.Y }) end)
                 elseif not big.said then
@@ -676,36 +712,22 @@ function minimap.set(v)
     on = v == true
     save()
     log.info("minimap: " .. (on and "on" or "off"))
-    local text = not on and "Minimap off. M twice turns it on again."
-        or worn() and "Minimap on. M twice turns it off."
+    local text = not on and "Minimap off. F4 turns it on again."
+        or worn() and "Minimap on. F4 turns it off."
         or "Minimap on: it shows while you wear a GPS."
     pcall(function() require("mirror.notify").show(text, "info", "minimap") end)
 end
 
--- M is a letter while typing: in the quick chat, or in a text box with the cursor up (the journal's chat, a rename).
--- With the big map open the cursor is up too, and that M counts (the game's M opens and closes the map).
-local function typing()
-    local busy = false
-    pcall(function() busy = require("mirror.quickchat").is_open() == true end)
-    return busy or (cursor_up() and not big_map_open())
-end
-
-local function on_m()
-    if typing() then last_m = -100.0; return end
-    if clock - last_m <= DOUBLE_S then
-        last_m = -100.0
-        minimap.set(not minimap.on())
-    else
-        last_m = clock
-    end
-end
+-- (F4 types nothing, so it counts in a chat or text box too)
+local function on_f4() minimap.set(not minimap.on()) end
 
 local function forget_world()
     drop_view()
     data, data_in, data_said, gps, gps_in = nil, 0.0, false, false, 0.0
     comp, comp_for, marks, marks_in = nil, nil, {}, 0.0
-    mark_actors, sweep_at, mark_n, map_open, map_in = {}, 0.0, nil, false, 0.0
+    mark_actors, mark_look, sweep_at, mark_n, map_open, map_in = {}, {}, 0.0, nil, false, 0.0
     mates, mates_in = {}, 0.0
+    cmp.up_w, cmp.up_at = nil, 0.0
     big.by, big.mw, big.open = {}, nil, false   -- the old world's widgets are freed: dropped without touching them
     cmp.w, cmp.for_pc, cmp.find_at, cmp.find_gap, cmp.hidden = nil, nil, 0.0, nil, nil
     view.broken = false   -- (a build that failed is tried again in the next world, not given up on until a restart)
@@ -713,18 +735,18 @@ end
 
 function minimap.init()
     load()
-    game.keybind("M", nil, on_m)
+    game.keybind("F4", nil, on_f4)
     game.on_tick(minimap.tick)
     game.on_world_reset(forget_world)
     -- a death takes every widget off the screen with the same controller (notify.lua): build it again
     game.on_widgets_cleared(drop_view)
-    log.info("minimap: " .. (on and "on" or "off") .. " (M twice switches it)")
+    log.info("minimap: " .. (on and "on" or "off") .. " (F4 switches it)")
 end
 
 -- tests: the logic without the engine
-minimap._test = { view = view, press = on_m, compass = cmp, marks = function() return marks end, big = big,
+minimap._test = { view = view, press = on_f4, compass = cmp, marks = function() return marks end, big = big,
     mates = function() return mates end, reset = function()
-    on, loaded, clock, last_m = false, false, 0.0, -100.0
+    on, loaded, clock = false, false, 0.0
     forget_world()
     view.broken = false
 end }

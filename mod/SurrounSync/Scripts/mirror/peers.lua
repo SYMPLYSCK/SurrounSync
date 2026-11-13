@@ -22,8 +22,6 @@ local SHARED = {
     -- one Realm per game: a copy's own realmplay was never started and said it hosted nothing, so every join after
     -- the first friend's was refused "isn't hosting that Realm right now" (player report 2026-10-29)
     realmplay = true,
-    -- one forest giant per world: a copy per guest each spawned, grew and mourned the same boss (audit 2026-11-02)
-    giant = true,
     -- one animation gate per game: only main.lua inits it, so a copy's own gate never ticked - its first queued
     -- destroy never ran and its hold kept the animation cvars at 0, while the main gate could put them back under
     -- it (audit 2026-11-02)
@@ -39,10 +37,7 @@ local PRESENCE = {
     downed = true,
     -- another guest's glider on their ghost (glider.lua)
     glider = true,
-    -- another guest's FPV quad (drone.lua)
-    drone = true,
 }
-SHARED.dronegrant = true   -- who may fly the bundled FPV drone: one list per game (dronegrant.lua)
 
 local list = {}          -- out tag -> instance
 local cfg, role, last_role

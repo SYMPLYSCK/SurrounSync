@@ -46,20 +46,20 @@ function chat.send(text)
     return true
 end
 
-function chat.tick()
-    channel:pump(function(p)
-        local t = os.clock()
-        for i = #incoming, 1, -1 do if t - incoming[i] > IN_WINDOW then table.remove(incoming, i) end end
-        if #incoming >= IN_BURST then log.warn("chat: dropped a line (more than " .. IN_BURST .. " in " .. IN_WINDOW .. " s)"); return end
-        incoming[#incoming + 1] = t
-        local text = clean(p)
-        if text == "" then return end
-        local who = link.peer_name()
-        add(who, text, false)
-        log.info("chat: " .. who .. ": " .. text)
-        if require("mirror.mysettings").on("chat") then notify.show(who .. ": " .. text, "info", nil, true) end
-    end)
+local function on_line(p)
+    local t = os.clock()
+    for i = #incoming, 1, -1 do if t - incoming[i] > IN_WINDOW then table.remove(incoming, i) end end
+    if #incoming >= IN_BURST then log.warn("chat: dropped a line (more than " .. IN_BURST .. " in " .. IN_WINDOW .. " s)"); return end
+    incoming[#incoming + 1] = t
+    local text = clean(p)
+    if text == "" then return end
+    local who = link.peer_name()
+    add(who, text, false)
+    log.info("chat: " .. who .. ": " .. text)
+    if require("mirror.mysettings").on("chat") then notify.show(who .. ": " .. text, "info", nil, true) end
 end
+
+function chat.tick() channel:pump(on_line) end
 
 -- (the same line to this copy's player)
 function chat.relay(text) channel:send(text) end

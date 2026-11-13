@@ -63,11 +63,7 @@ function voice.walkie()
     return mine and peer_radio
 end
 
-function voice.tick(dt)
-    -- one file for the bridge, written by the main link: "dist" = it, "dist_<tag>" = every other player's link
-    if (link.tags and link.tags()) then return end
-    write_in = write_in - dt
-    if write_in > 0 then return end
+local function write_file()
     look_for_radio(WRITE_S)
     write_in = WRITE_S
     local more = {}
@@ -87,6 +83,15 @@ function voice.tick(dt)
     f:close()
     os.remove(path)
     if os.rename(path .. ".tmp", path) then written = text end
+end
+
+function voice.tick(dt)
+    -- one file for the bridge, written by the main link: "dist" = it, "dist_<tag>" = every other player's link
+    if (link.tags and link.tags()) then return end
+    write_in = write_in - dt
+    if write_in <= 0 then write_file() end
+    -- phase1 naps until the next write (a toggle or volume change is written at most WRITE_S later)
+    return write_in
 end
 
 function voice.toggle()

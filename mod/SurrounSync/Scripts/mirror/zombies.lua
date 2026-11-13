@@ -72,18 +72,40 @@ local function fam_class(path)
     return nil
 end
 local applying_hit = false
+-- The hot paths' game reads: pcall(zr.loc, z) makes no new function per call. A pcall(function() ... end) does, on
+-- every zombie every send and every copy every frame: with 100 zombies that was 2.4 MB/s of Lua garbage on the host
+-- and 4 MB/s on the guest (test zombie_sync_sends_changes_and_makes_little_garbage; user 2026-11-10 "less LUA garbage").
+local zr = {}
+function zr.class_addr(o) return o:GetClass():GetAddress() end
+function zr.is_a(o, c) return o:IsA(c) end
+function zr.loc(z) return z:K2_GetActorLocation() end
+function zr.mesh_loc(z) return z.Mesh:K2_GetComponentLocation() end
+function zr.root(z) return z:K2_GetRootComponent() end
+function zr.hidden(z) return z.bHidden == true end
+function zr.dying(z) return z:IsActorBeingDestroyed() == true end
+function zr.yaw(z) return z:K2_GetActorRotation().Yaw end
+function zr.vel(z) return z:GetVelocity() end
+function zr.montage(z) return z:GetCurrentMontage() end
+function zr.mpos(z, m) return z.Mesh:GetAnimInstance():Montage_GetPosition(m) end
+function zr.dead(z) return z["IsDead?"] == true or z.Dead == true end
+function zr.set_vel(z, v) z.CharacterMovement.Velocity = v end
+function zr.walking(z)
+    local cm = z.CharacterMovement
+    if cm.MovementMode ~= 1 then cm:SetMovementMode(1, 0) end
+end
+function zr.place(z, l, yaw) z:K2_SetActorLocationAndRotation(l, util.rot(0, yaw, 0), false, {}, true) end
 -- (cached per class address in fam_cls: up to 7 IsA per call otherwise; forgotten with the world)
 local function family_of(o)
     if not util.valid(o) then return nil end
-    local ca
-    pcall(function() ca = o:GetClass():GetAddress() end)
+    local ok_ca, ca = pcall(zr.class_addr, o)
+    if not ok_ca then ca = nil end
     local known = ca and fam_cls[ca]
     if known ~= nil then return known or nil end
     local all = true
     for _, f in ipairs(FAMILIES) do
         local c = fam_class(f[2])
         if c then
-            local ok, r = pcall(function() return o:IsA(c) end)
+            local ok, r = pcall(zr.is_a, o, c)
             if ok and r == true then
                 if ca then fam_cls[ca] = f[1] end
                 return f[1]
@@ -129,7 +151,8 @@ local function dead_of(z, fam)
     if fam == "human" then
         pcall(function() d = smart_ai(z).Dead == true end)
     else
-        pcall(function() d = z["IsDead?"] == true or z.Dead == true end)
+        local ok, r = pcall(zr.dead, z)
+        d = ok and r == true
     end
     return d
 end
@@ -338,7 +361,7 @@ local function loot_ready()
     return missing == 0, missing
 end
 
--- For our own spawns where no ordinary AI is near (the forest giant): the game then has none of the tables loaded.
+-- For our own spawns where no ordinary AI is near: the game then has none of the tables loaded.
 -- The engine's latent LoadAsset only queues an async load and returns, and the game loads them itself the way it
 -- streams a level (kit 2026-11-02: 15 queued in 0.0 ms, none there yet, all 15 there 0.25 s later) - unlike
 -- LoadAsset or GetAsset from Lua, which wait for the load (L-014). Nothing holds them: they go again at a garbage
@@ -373,12 +396,11 @@ end
 -- Only a pin that reads back counts (DBG-20261027-016 came back 2026-10-29 on a hand-back after a teleport):
 -- for the master zombie's family a list that can't be read is a failure, never "empty", and every entry must
 -- resolve to the loaded look afterwards (Conv_SoftObjectReferenceToObject never loads).
-local MZ = "/Game/AI/Zombies/BP_MasterZombie.BP_MasterZombie_C"
 local BEGIN_EVENT = "/Game/Animations/Notifies/AnimNotify_BeginEvent.AnimNotify_BeginEvent_C:Received_NotifyBegin"
 local function pin_soft_looks(cdo, mesh, mat)
     if not cdo then return function() end end
     local K = util.cdo("/Script/Engine.Default__KismetSystemLibrary")
-    local mzc, must = find(MZ), false
+    local mzc, must = find(MASTER), false
     if mzc then pcall(function() must = cdo:IsA(mzc) == true end) end
     local saved = {}
     local function restore()
@@ -456,7 +478,7 @@ end
 -- material); copies match. Since game build 26467602 a crawler is no class of its own (BP_Zombie_Crawler is
 -- gone): SelectArchetype's Archetype_Crawler gives any zombie the crawl blend space, a 40 cm capsule, missing
 -- legs, and sometimes ToughenedCrawler inside it. Crawler is the last number: the numbers are on the wire.
--- (MZ: the master zombie class, above pin_soft_looks)
+-- (MASTER: the master zombie class, at the top)
 local ARCH = { "Sprinter", "UltraRadiated", "Acidic", "Screamer", "Grenadier", "ToughenedCrawler", "Crawler" }
 local ARCH_CHANCES = { "SprinterArchetypeChance", "UltraRadiatedArchetypeChance", "AcidicArchetypeChance",
     "ScreamerArchetypeChance", "GrenadierArchetypeChance", "CrawlerArchetypeChance" }
@@ -491,10 +513,15 @@ arch_hooks.moon.hook = function(self, start)
     if arch_hooks.moon.seen[n] == nil then arch_hooks.moon.n = arch_hooks.moon.n + 1 end
     arch_hooks.moon.seen[n] = on
 end
+-- (paths and the notify handler made once: this runs every frame, and a new closure is a new hook key to build)
+-- (in arch_hooks: the main chunk is at Lua's 200-local limit)
+arch_hooks.paths, arch_hooks.moon.path = {}, MASTER .. ":Event_BloodMoon"
+for i, a in ipairs(ARCH) do arch_hooks.paths[i] = MASTER .. ":Archetype_" .. a end
+arch_hooks.on_begin = function(self, mc) return arch_hooks.notify(self, mc) end
 local function hook_archetypes()
-    for i, a in ipairs(ARCH) do util.ensure_hook(MZ .. ":Archetype_" .. a, arch_hooks[i]) end
-    util.ensure_hook(MZ .. ":Event_BloodMoon", arch_hooks.moon.hook)
-    util.ensure_hook(BEGIN_EVENT, function(self, mc) return arch_hooks.notify(self, mc) end)
+    for i = 1, #ARCH do util.ensure_hook(arch_hooks.paths[i], arch_hooks[i]) end
+    util.ensure_hook(arch_hooks.moon.path, arch_hooks.moon.hook)
+    util.ensure_hook(BEGIN_EVENT, arch_hooks.on_begin)
 end
 -- Archetype_Crawler loads nothing (the blend space and Toughened's meshes are the class's own references):
 -- a copy runs it whether or not this game rolled a crawler lately. -> when this game is known to have it loaded
@@ -654,6 +681,33 @@ local guest_center = function() return ghost.location() end
 local p8 = { on = false, near = { d = math.huge, at = -100 }, stopped = {}, drain = {}, fighting = false }
 -- p8.stopped: guest, addr -> spawner this mod stopped (only these are handed back on a split)
 -- p8.drain: guest, addr -> { till, dead } own AI kept for a while after a merge (no pop mid-fight)
+-- Host: the last key's numbers (see host_tick). kv: id -> what the key said { x, y, z, yaw, vx, vy, vz, montage,
+-- montage position, dead, class, mesh, material }; kx / kl: its X and L lines. lines / pres / out are reused.
+zr.k = { n = 0, at = -100, KEY_S = 1.5, dict = {}, paths = {}, dict_n = 0, key_dict_n = 0,
+             kv = {}, kx = {}, kl = {}, lines = {}, pres = {}, out = {}, ZERO = { X = 0, Y = 0, Z = 0 },
+             alive = {}, sn = 0 }
+zr.k.MOVE_CM, zr.k.YAW_DEG, zr.k.VEL_CM_S, zr.k.MPOS_S = 1.0, 1.0, 2.0, 0.01
+function zr.k.idx(p)
+    if not p then return 0 end
+    local i = zr.k.dict[p]
+    if not i then zr.k.dict_n = zr.k.dict_n + 1; i = zr.k.dict_n; zr.k.dict[p] = i; zr.k.paths[i] = p end
+    return i
+end
+-- changed since the key by more than the line's own rounding? (place, velocity, montage / death)
+function zr.k.pos_moved(kv, l, yaw)
+    local M = zr.k.MOVE_CM
+    if math.abs(l.X - kv[1]) > M or math.abs(l.Y - kv[2]) > M or math.abs(l.Z - kv[3]) > M then return true end
+    return math.abs((yaw - kv[4] + 540) % 360 - 180) > zr.k.YAW_DEG
+end
+function zr.k.vel_moved(kv, v)
+    local V = zr.k.VEL_CM_S
+    return math.abs(v.X - kv[5]) > V or math.abs(v.Y - kv[6]) > V or math.abs(v.Z - kv[7]) > V
+end
+function zr.k.rest_moved(kv, mi, mp, dead)
+    return mi ~= kv[8] or math.abs(mp - kv[9]) > zr.k.MPOS_S or dead ~= kv[10]
+end
+zombies._zk = zr.k
+
 local function host_tick(dt)
     hits:pump(apply_hit)
     if watch_dead then
@@ -686,17 +740,26 @@ local function host_tick(dt)
         -- ids only get pruned below, so drop them now - a reader of by_id (corpses scan) touched freed zombies 7 s
         -- after a guest left (host crash 2026-10-27 17:07, AV in UE4SS)
         if next(by_id) then ids, by_id, statics, p8.bound = {}, {}, {}, {} end
+        zr.k.at = -100   -- (the next guest starts from a key)
         return
     end
 
-    local dict, dict_n, lines = {}, 0, {}
-    local function idx(p)
-        if not p then return 0 end
-        local i = dict[p]
-        if not i then dict_n = dict_n + 1; i = dict_n; dict[p] = i end
-        return i
+    -- Only what changed (user 2026-11-10): every KEY_S a whole snapshot goes as its own numbered blob ("zkey"); each
+    -- send between says what changed since that key (a zombie that moved, its look, a path new since) and which
+    -- zombies are there. A blob keeps only its newest text, so the changes count from the key, never from the send
+    -- before: a guest that missed sends still has the key and the newest changes.
+    local key = zr.k.n == 0 or now - zr.k.at >= zr.k.KEY_S
+    if key then
+        zr.k.n, zr.k.at = (zr.k.n == 0 and math.random(1000, 999999) or zr.k.n + 1), now
+        zr.k.dict, zr.k.paths, zr.k.dict_n = {}, {}, 0
+        zr.k.kv, zr.k.kx, zr.k.kl = {}, {}, {}
     end
-    local alive = {}
+    local idx, lines, pres = zr.k.idx, zr.k.lines, zr.k.pres
+    local n_lines, n_pres = 0, 0
+    -- alive[name] == this send's number: seen this send (one table kept, not a new one a send)
+    local alive, sn = zr.k.alive, zr.k.sn + 1
+    zr.k.sn = sn
+    if key then zr.clear(alive) end   -- (names gone without a prune, e.g. after ids were reset)
     local radius = cfg.zombies.radius * zombies.perf_share()
     local nearest = math.huge
     for _, z in ipairs(zombies_cached(now)) do
@@ -710,19 +773,20 @@ local function host_tick(dt)
         if cz and cz.z ~= z then cz, st0.corpse = nil, nil end
         if cz then l, is_dead = cz.l, true
         elseif not (skip_until and now < skip_until) then
-            pcall(function() l = z:K2_GetActorLocation() end)
+            local ok, r = pcall(zr.loc, z)
+            l = ok and r or nil
             if l and math.abs(l.X) < 1 and math.abs(l.Y) < 1 and math.abs(l.Z) < 1 then
                 is_dead = dead_of(z)
                 l = nil
-                if is_dead then pcall(function() l = z.Mesh:K2_GetComponentLocation() end) end
+                if is_dead then ok, r = pcall(zr.mesh_loc, z); l = ok and r or nil end
             end
         end
         local d = l and util.dist(gl, l)
         if d and d > radius then far_until[z] = now + math.min(2.0, (d - radius) / CLOSING_SPEED) end
         if d and d <= radius then
             local gone = not util.valid(z)
-            if not gone then pcall(function() gone = z.bHidden == true end) end
-            if not gone then pcall(function() gone = z:IsActorBeingDestroyed() == true end) end
+            if not gone then local ok, r = pcall(zr.hidden, z); gone = ok and r == true end
+            if not gone then local ok, r = pcall(zr.dying, z); gone = ok and r == true end
             if not gone then
                 if d < nearest then nearest = d end
                 local a = znames[z]
@@ -734,7 +798,7 @@ local function host_tick(dt)
                 local id = ids[a]
                 if not id then next_id = next_id + 1; id = next_id; ids[a] = id end
                 by_id[id] = z
-                alive[a] = true
+                alive[a] = sn
                 local st = statics[id]
                 if not (st and st.corpse) and (not st or now - st.at > STATICS_EVERY) then perf.run("z.statics", function()
                     local mesh, mat
@@ -749,16 +813,20 @@ local function host_tick(dt)
                     end
                     statics[id] = st
                 end) end
-                local yaw, v, mont, mpos, dead = 0, { X = 0, Y = 0, Z = 0 }, nil, 0, false
+                local yaw, v, mont, mpos, dead = 0, zr.k.ZERO, nil, 0, false
                 local cs = st.corpse
                 if cs then
                     yaw, v, mont, mpos, dead = cs.yaw, cs.v, cs.mont, cs.mpos, true
                 else
-                    pcall(function() yaw = z:K2_GetActorRotation().Yaw end)
-                    pcall(function() v = z:GetVelocity() end)
-                    pcall(function() mont = z:GetCurrentMontage() end)
+                    local ok, r = pcall(zr.yaw, z)
+                    if ok and r then yaw = r end
+                    ok, r = pcall(zr.vel, z)
+                    if ok and r then v = r end
+                    ok, r = pcall(zr.montage, z)
+                    mont = ok and r or nil
                     if util.valid(mont) then
-                        pcall(function() mpos = z.Mesh:GetAnimInstance():Montage_GetPosition(mont) end)
+                        ok, r = pcall(zr.mpos, z, mont)
+                        if ok and r then mpos = r end
                         mont = asset_path(mont)
                     else
                         mont = nil
@@ -771,13 +839,49 @@ local function host_tick(dt)
                         log.info("zombies: host zombie " .. id .. " died - its loot: " .. invdiag.summary(z.BP_JigMultiplayer.MainJigContainers))
                     end, "zombies.loot_log")
                 end
-                lines[#lines + 1] = string.format("Z %d %d %d %d %.1f %.1f %.1f %.1f %.1f %.1f %.1f %d %.2f %d",
-                    id, idx(st.cls), idx(st.mesh), idx(st.mat),
-                    l.X, l.Y, l.Z, yaw, v.X, v.Y, v.Z, idx(mont), mpos or 0, dead and 1 or 0)
-                if st.arch then lines[#lines + 1] = string.format("X %d %d %d %d", id, st.arch, st.bones, st.eyes) end
+                n_pres = n_pres + 1
+                pres[n_pres] = id
+                local ci, mei, mai, mi, mp = idx(st.cls), idx(st.mesh), idx(st.mat), idx(mont), mpos or 0
+                local kv = zr.k.kv[id]
+                if key or not kv or kv[11] ~= ci or kv[12] ~= mei or kv[13] ~= mai then
+                    -- whole: in a key, new since it, or another class/mesh/material (the guest takes those from the key)
+                    n_lines = n_lines + 1
+                    lines[n_lines] = string.format("Z %d %d %d %d %.0f %.0f %.0f %.0f %.0f %.0f %.0f %d %.2f %d",
+                        id, ci, mei, mai, l.X, l.Y, l.Z, yaw, v.X, v.Y, v.Z, mi, mp, dead and 1 or 0)
+                    if key then zr.k.kv[id] = { l.X, l.Y, l.Z, yaw, v.X, v.Y, v.Z, mi, mp, dead, ci, mei, mai } end
+                else
+                    -- "M id x y z yaw [vx vy vz [montage mpos dead]]": a group left out is the key's
+                    local rest = zr.k.rest_moved(kv, mi, mp, dead)
+                    local vel = rest or zr.k.vel_moved(kv, v)
+                    if rest then
+                        n_lines = n_lines + 1
+                        lines[n_lines] = string.format("M %d %.0f %.0f %.0f %.0f %.0f %.0f %.0f %d %.2f %d",
+                            id, l.X, l.Y, l.Z, yaw, v.X, v.Y, v.Z, mi, mp, dead and 1 or 0)
+                    elseif vel then
+                        n_lines = n_lines + 1
+                        lines[n_lines] = string.format("M %d %.0f %.0f %.0f %.0f %.0f %.0f %.0f",
+                            id, l.X, l.Y, l.Z, yaw, v.X, v.Y, v.Z)
+                    elseif zr.k.pos_moved(kv, l, yaw) then
+                        n_lines = n_lines + 1
+                        lines[n_lines] = string.format("M %d %.0f %.0f %.0f %.0f", id, l.X, l.Y, l.Z, yaw)
+                    end
+                end
+                if st.arch then
+                    local x = st.xline
+                    if not x then x = string.format("X %d %d %d %d", id, st.arch, st.bones, st.eyes); st.xline = x end
+                    if key or zr.k.kx[id] ~= x then
+                        n_lines = n_lines + 1
+                        lines[n_lines] = x
+                        if key then zr.k.kx[id] = x end
+                    end
+                end
                 if st.look then
-                    local parts = {}
-                    for _, k in ipairs(LOOK_KEYS) do parts[#parts + 1] = tostring(idx(st.look[k])) end
+                    -- (its paths' numbers hold for one key: made again for the next)
+                    if st.lpart_key ~= zr.k.n then
+                        local parts = {}
+                        for _, k in ipairs(LOOK_KEYS) do parts[#parts + 1] = tostring(idx(st.look[k])) end
+                        st.lpart, st.lpart_key = table.concat(parts, " "), zr.k.n
+                    end
                     local beh, h, gun = -1, nil, nil
                     if cs then beh, h = cs.beh, cs.h
                     else
@@ -790,7 +894,12 @@ local function host_tick(dt)
                         end
                         h = health_of(z, st.fam)
                     end
-                    lines[#lines + 1] = string.format("L %d %s %.1f %d %d", id, table.concat(parts, " "), h or -1, beh, idx(gun))
+                    local ll = string.format("L %d %s %.1f %d %d", id, st.lpart, h or -1, beh, idx(gun))
+                    if key or zr.k.kl[id] ~= ll then
+                        n_lines = n_lines + 1
+                        lines[n_lines] = ll
+                        if key then zr.k.kl[id] = ll end
+                    end
                     if dead and not cs then st.beh, st.h = beh, h end
                 end
                 if dead and not cs then
@@ -806,15 +915,26 @@ local function host_tick(dt)
     p8.near.d, p8.near.at = nearest, now
     for a, id in pairs(ids) do
         local held = p8.bound[a] and now < p8.bound[a] and util.valid(by_id[id])
-        if not alive[a] and not held then
-            ids[a] = nil; by_id[id] = nil; statics[id] = nil; p8.bound[a] = nil
+        if alive[a] ~= sn and not held then
+            ids[a] = nil; by_id[id] = nil; statics[id] = nil; p8.bound[a] = nil; alive[a] = nil
+            zr.k.kv[id], zr.k.kx[id], zr.k.kl[id] = nil, nil, nil
         end
     end
-    local out = {}
-    for p, i in pairs(dict) do out[#out + 1] = "D " .. i .. " " .. p end
-    for _, s in ipairs(lines) do out[#out + 1] = s end
-    out[#out + 1] = string.format("T %.3f", now)
-    link.put_blob("zombies", table.concat(out, "\n"))
+    -- key: "K n", every path, every zombie whole; between: "K n", the paths new since the key, the changes, "P ids"
+    local out, no = zr.k.out, 1
+    out[1] = "K " .. zr.k.n
+    for i = key and 1 or zr.k.key_dict_n + 1, zr.k.dict_n do no = no + 1; out[no] = "D " .. i .. " " .. zr.k.paths[i] end
+    for i = 1, n_lines do no = no + 1; out[no] = lines[i] end
+    local t = string.format("T %.3f", now)
+    if key then
+        zr.k.key_dict_n = zr.k.dict_n
+        no = no + 1; out[no] = t
+        link.put_blob("zkey", table.concat(out, "\n", 1, no))
+        no = 1
+    end
+    no = no + 1; out[no] = "P " .. table.concat(pres, " ", 1, n_pres)
+    no = no + 1; out[no] = t
+    link.put_blob("zombies", table.concat(out, "\n", 1, no))
 end
 
 local copies = {}
@@ -1369,6 +1489,7 @@ zombies._look = { arch_hooks = arch_hooks, moon_hook = arch_hooks.moon.hook, arc
                   sync = function(id, c, e, x) xlooks[id] = x; sync_look(id, c, e) end, pin = pin_soft_looks }
 zombies._host = { tick = function(c, dt) cfg = cfg or c; now = now + dt; host_tick(dt) end }
 zombies._test = { setup = function(c, r) cfg, role = c, r end,
+    zr = zr,   -- (the engine reads, for a kit eval that counts each one's calls and Lua memory)
     -- a whole sweep (all its frames); start/step: one frame's slice at a time
     sweep = function(dt) now = now + (dt or 0); suppress_natives(); while sweep.q do sweep.step() end end,
     start = function(dt) now = now + (dt or 0); suppress_natives() end,
@@ -1393,48 +1514,151 @@ function zg.die_now(id, c)
     end
 end
 
-local function read_snapshot()
-    local body = link.get_blob("zombies")
-    if not body then return end
-    snap_count = snap_count + 1
-    local snap_t = zclock:place(tonumber(body:match("\nT (%S+)")), now) or now
-    local dict, seen = {}, {}
-    -- at most 6 look checks per snapshot: copies spawned together would otherwise all re-check in one
-    -- frame every LOOK_EVERY (~40 ms hitch at 40 copies); the rest go on the next snapshots
-    local looks_left = 6
-    for line in body:gmatch("[^\n]+") do
-        local i, p = line:match("^D (%d+) (.+)$")
-        if i then dict[tonumber(i)] = p end
+-- Guest: the host's last key (host_tick) - its paths, every zombie's entry, looks, archetypes, health and
+-- behaviour - and each send between read on top of it: a zombie is its line in that send, else the key's.
+zr.v = { n = nil, dict = {}, ents = {}, lk = {}, xl = {}, hh = {}, hb = {}, looks_left = 0, dents = {},
+         d = { ents = {}, lk = {}, xl = {}, hh = {}, hb = {}, dict = {} } }
+
+-- one snapshot's lines into the tables given: D paths, Z whole entries, M changes on top of base (the key's
+-- entries; kdict: its paths), L looks / health / behaviour, X archetypes; order: the Z / M ids as they came
+function zr.v.parse(body, dict, ents, lk, xl, hh, hb, base, kdict, order)
+    for i, p in body:gmatch("\nD (%d+) ([^\n]+)") do dict[tonumber(i)] = p end
+    local function path(i)
+        i = tonumber(i)
+        return i and (dict[i] or (kdict and kdict[i])) or nil
     end
     for lid, rest in body:gmatch("\nL (%d+) ([^\n]+)") do
         local f = {}
         for v in rest:gmatch("%S+") do f[#f + 1] = v end
-        local lk = {}
+        local l = {}
         for k, key in ipairs(LOOK_KEYS) do
             local n = tonumber(f[k] or "0") or 0
-            lk[key] = (n > 0) and dict[n] or "-"
+            l[key] = (n > 0) and path(n) or "-"
         end
         local id = tonumber(lid)
-        looks[id] = lk
-        host_health[id] = tonumber(f[#LOOK_KEYS + 1] or "")
-        host_behaviour[id] = tonumber(f[#LOOK_KEYS + 2] or "")
+        lk[id] = l
+        hh[id] = tonumber(f[#LOOK_KEYS + 1] or "")
+        hb[id] = tonumber(f[#LOOK_KEYS + 2] or "")
         local g = tonumber(f[#LOOK_KEYS + 3] or "")
-        lk.gun = g and (g > 0 and dict[g] or "-") or nil   -- (nil: an older host that doesn't say)
+        l.gun = g and (g > 0 and path(g) or "-") or nil   -- (nil: an older host that doesn't say)
     end
     for xid, a, b, ey in body:gmatch("\nX (%d+) (%d+) (%d+) (%d+)") do
-        xlooks[tonumber(xid)] = { arch = tonumber(a), bones = tonumber(b), eyes = tonumber(ey) }
+        xl[tonumber(xid)] = { arch = tonumber(a), bones = tonumber(b), eyes = tonumber(ey) }
     end
     for i1, c1, m1, t1, x, y, z, yw, vx, vy, vz, mo, mp, dd in body:gmatch(
-            "Z (%d+) (%d+) (%d+) (%d+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%d+) (%S+) (%d)") do
+            "\nZ (%d+) (%d+) (%d+) (%d+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%d+) (%S+) (%d)") do
+        local id = tonumber(i1)
+        ents[id] = {
+            cls = path(c1), mesh = path(m1), mat = path(t1),
+            loc = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }, yaw = tonumber(yw),
+            vel = { X = tonumber(vx), Y = tonumber(vy), Z = tonumber(vz) },
+            montage = path(mo), mpos = tonumber(mp), dead = dd == "1",
+        }
+        if order then order[#order + 1] = id end
+    end
+    if not base then return end
+    -- "M id x y z yaw [vx vy vz [montage mpos dead]]" (a group left out: the key's). Its entry is the zombie's own
+    -- reused one (zr.v.dents): read at once by apply, whose track keeps a copy of the numbers.
+    local dents = zr.v.dents
+    for i1, x, y, z, yw, more in body:gmatch("\nM (%d+) (%S+) (%S+) (%S+) (%S+)([^\n]*)") do
+        local id = tonumber(i1)
+        local b = base[id]
+        if b then
+            local e = dents[id]
+            if not e then e = { loc = {}, vel = {} }; dents[id] = e end
+            e.cls, e.mesh, e.mat = b.cls, b.mesh, b.mat
+            e.loc.X, e.loc.Y, e.loc.Z, e.yaw = tonumber(x), tonumber(y), tonumber(z), tonumber(yw)
+            local vx, vy, vz, rest = more:match("^ (%S+) (%S+) (%S+)(.*)")
+            if vx then
+                e.vel.X, e.vel.Y, e.vel.Z = tonumber(vx), tonumber(vy), tonumber(vz)
+            else
+                e.vel.X, e.vel.Y, e.vel.Z = b.vel.X, b.vel.Y, b.vel.Z
+            end
+            local mo, mp, dd = (rest or ""):match("^ (%d+) (%S+) (%d)")
+            if mo then e.montage, e.mpos, e.dead = path(mo), tonumber(mp), dd == "1"
+            else e.montage, e.mpos, e.dead = b.montage, b.mpos, b.dead end
+            ents[id] = e
+        end
+    end
+end
+
+function zr.v.take_key(kb)
+    local n = tonumber(kb:match("^K (%d+)"))
+    if not n then return end
+    local dict, ents, lk, xl, hh, hb = {}, {}, {}, {}, {}, {}
+    zr.v.parse(kb, dict, ents, lk, xl, hh, hb)
+    zr.v.n, zr.v.dict, zr.v.ents, zr.v.lk, zr.v.xl, zr.v.hh, zr.v.hb = n, dict, ents, lk, xl, hh, hb
+    for id in pairs(zr.v.dents) do if not ents[id] then zr.v.dents[id] = nil end end
+end
+
+function zr.clear(t) for k in pairs(t) do t[k] = nil end return t end
+
+-- a send whose key isn't here: each M line's place, yaw and (if it says) velocity onto the copy that has one; the
+-- rest (new zombies, paths, montages) waits for the key
+zr.v.mloc, zr.v.mvel = { X = 0, Y = 0, Z = 0 }, { X = 0, Y = 0, Z = 0 }
+function zr.v.moves_only(body, snap_t)
+    local l, v = zr.v.mloc, zr.v.mvel
+    for i1, x, y, z, yw, more in body:gmatch("\nM (%d+) (%S+) (%S+) (%S+) (%S+)([^\n]*)") do
+        local c = copies[tonumber(i1)]
+        local last = c and not c.dead_at and c.track:newest()
+        if last then
+            l.X, l.Y, l.Z = tonumber(x), tonumber(y), tonumber(z)
+            local vx, vy, vz = more:match("^ (%S+) (%S+) (%S+)")
+            if vx then v.X, v.Y, v.Z = tonumber(vx), tonumber(vy), tonumber(vz)
+            else v.X, v.Y, v.Z = last.vel.X, last.vel.Y, last.vel.Z end
+            if l.X and l.Y and l.Z then
+                c.seen = now
+                c.track:push_copy(snap_t, l, tonumber(yw) or last.yaw, v)
+            end
+        end
+    end
+end
+
+local function read_snapshot()
+    local kb = link.get_blob("zkey")
+    if kb then zr.v.take_key(kb) end
+    local body = link.get_blob("zombies")
+    if not body then return end
+    local kn = tonumber(body:match("^K (%d+)"))
+    local snap_t = zclock:place(tonumber(body:match("\nT (%S+)")), now) or now
+    -- (a send of a key that isn't here yet: the key comes with it or a moment later, after a resend on a lossy
+    -- link; meanwhile its M lines' places, which don't need the key, keep the copies there moving)
+    if kn and kn ~= zr.v.n then
+        stats.key_waits = (stats.key_waits or 0) + 1
+        zr.v.moves_only(body, snap_t)
+        return
+    end
+    snap_count = snap_count + 1
+    -- at most 6 look checks per snapshot: copies spawned together would otherwise all re-check in one
+    -- frame every LOOK_EVERY (~40 ms hitch at 40 copies); the rest go on the next snapshots
+    zr.v.looks_left = 6
+    if not kn then
+        -- a whole snapshot, no key (the form before keys)
+        local ents, order = {}, {}
+        zr.v.parse("\n" .. body, {}, ents, looks, xlooks, host_health, host_behaviour, nil, nil, order)
+        for _, id in ipairs(order) do zr.v.apply(id, ents[id], snap_t) end
+        return
+    end
+    local d = zr.v.d
+    local clear = zr.clear
+    local ents, lk, xl, hh, hb = clear(d.ents), clear(d.lk), clear(d.xl), clear(d.hh), clear(d.hb)
+    zr.v.parse(body, clear(d.dict), ents, lk, xl, hh, hb, zr.v.ents, zr.v.dict)
+    for sid in (body:match("\nP ([^\n]*)") or ""):gmatch("%d+") do
+        local id = tonumber(sid)
+        local e = ents[id] or zr.v.ents[id]
+        if lk[id] then looks[id], host_health[id], host_behaviour[id] = lk[id], hh[id], hb[id]
+        elseif zr.v.lk[id] then looks[id], host_health[id], host_behaviour[id] = zr.v.lk[id], zr.v.hh[id], zr.v.hb[id] end
+        local x = xl[id] or zr.v.xl[id]
+        if x then xlooks[id] = x end
+        if e then zr.v.apply(id, e, snap_t) end
+    end
+end
+
+-- one zombie of a snapshot onto its copy (made or recycled when it has none)
+function zr.v.apply(id, e, snap_t)
+    local looks_left = zr.v.looks_left
+    do
         do
-            local id = tonumber(i1)
-            local e = {
-                cls = dict[tonumber(c1)], mesh = dict[tonumber(m1)], mat = dict[tonumber(t1)],
-                loc = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }, yaw = tonumber(yw),
-                vel = { X = tonumber(vx), Y = tonumber(vy), Z = tonumber(vz) },
-                montage = dict[tonumber(mo)], mpos = tonumber(mp), dead = dd == "1",
-            }
-            seen[id] = true
             local c = copies[id]
             -- a zombie of mine the host took over in a merge: it becomes this copy where it stands
             if not c and p8.pending[id] then c = p8.demote(id); copies[id] = c end
@@ -1449,7 +1673,7 @@ local function read_snapshot()
             end
             if c then
                 c.seen, c.seen_snap = now, snap_count
-                c.track:push(snap_t, { loc = e.loc, yaw = e.yaw, vel = e.vel, crouch = nil })
+                c.track:push_copy(snap_t, e.loc, e.yaw, e.vel)
                 if e.dead and not c.dead_at and c.fam and c.fam ~= "zombie" then
                     c.dead_at, c.die_at = now, now + DEATH_WAIT
                 elseif e.dead and not c.dead_at then
@@ -1464,7 +1688,7 @@ local function read_snapshot()
                     c.montage, c.mpos = e.montage, e.mpos
                     if c.fam == "zombie" and looks_left > 0 and now - (c.look_at or 0) > LOOK_EVERY
                             and now - (c.born or now) > LOOK_AFTER then
-                        c.look_at, looks_left = now, looks_left - 1
+                        c.look_at, zr.v.looks_left = now, looks_left - 1
                         perf.run("z.look", function() util.safe(sync_look, "zombies.look", id, c, e) end)
                     end
                 end
@@ -1473,14 +1697,13 @@ local function read_snapshot()
     end
 end
 
-local function copy_died(z) return dead_of(z) end
 
 -- A destroyed actor stays valid until garbage collection and reads its location as 0,0,0.
 local function copy_broken(z)
-    local root, l
-    pcall(function() root = z:K2_GetRootComponent() end)
-    if not util.valid(root) then return true end
-    pcall(function() l = z:K2_GetActorLocation() end)
+    local ok, root = pcall(zr.root, z)
+    if not (ok and util.valid(root)) then return true end
+    local ok2, l = pcall(zr.loc, z)
+    if not ok2 then l = nil end
     return l ~= nil and math.abs(l.X) < 1 and math.abs(l.Y) < 1 and math.abs(l.Z) < 1
 end
 
@@ -1523,7 +1746,7 @@ local function drive(dt)
             copies[id] = nil
         elseif snap_count - (c.seen_snap or snap_count) > cfg.zombies.despawn_after * cfg.zombies.send_hz then
             destroy_copy(id, "gone")
-        elseif not c.dead_at and checks_due(c) and copy_died(c.z) then
+        elseif not c.dead_at and checks_due(c) and dead_of(c.z) then
             c.dead_at = now
             hits:send(string.format("D %d %.3f 0 %s", id, zombies.FINISH_DAMAGE, "/Game/Blueprints/Other/Damage/Damage_Body.Default__Damage_Body_C"))
             log.info("zombies: copy " .. id .. " died here before the host said so - kept as a corpse, the host's one finished")
@@ -1570,9 +1793,7 @@ local function drive(dt)
             end
             local p = c.track:at(now - d_use, util, 0.25)
             if p then
-                if not util.move(c.z, p.loc, p.yaw) then
-                    pcall(function() c.z:K2_SetActorLocationAndRotation(p.loc, util.rot(0, p.yaw, 0), false, {}, true) end)
-                end
+                if not util.move(c.z, p.loc, p.yaw) then pcall(zr.place, c.z, p.loc, p.yaw) end
                 local px, py, pz = p.loc.X, p.loc.Y, p.loc.Z
                 if c.vel_snap ~= snap_count then
                     c.vel_snap = snap_count
@@ -1586,12 +1807,10 @@ local function drive(dt)
                             if dx * dx + dy * dy > 900 then v.X, v.Y, v.Z = dx, dy, 0; stats.vel_from_track = (stats.vel_from_track or 0) + 1 end
                         end
                     end
-                    pcall(function() c.z.CharacterMovement.Velocity = v end)
+                    pcall(zr.set_vel, c.z, v)
                 end
                 if c.check_now then
-                    pcall(function()
-                        if c.z.CharacterMovement.MovementMode ~= 1 then c.z.CharacterMovement:SetMovementMode(1, 0) end
-                    end)
+                    pcall(zr.walking, c.z)
                     local d = 0
                     if my_loc then local dx, dy, dz = my_loc.X - px, my_loc.Y - py, my_loc.Z - pz; d = math.sqrt(dx * dx + dy * dy + dz * dz) end
                     c.lod = d > 10000 and 4 or (d > 6000 and 2 or 1)
@@ -2519,7 +2738,6 @@ zombies._test.read = read_snapshot
 zombies._test.zhit = function(p) return apply_zhit(p) end
 zombies._test.dmg = function(p) return apply_dmg(p) end
 zombies._test.loot_ready = function() return loot_ready() end
-zombies.loot_ready = function() return loot_ready() end   -- (giant.lua: the AI loot tables are loaded)
 
 function zombies.tick(dt)
     if not (cfg and cfg.zombies.enabled) then return end
@@ -2771,6 +2989,7 @@ end
 -- The old world is gone: forget its zombies, copies and cached assets without touching them.
 local function forget_world()
     ids, by_id, statics, watch_dead = {}, {}, {}, nil
+    zr.k.at = -100   -- (host: the new world's zombies start from a key)
     zlist, zlist_set, zlist_addr, zlist_new, zlist_at, zlist_pruned = {}, {}, {}, {}, -100, -100
     zq.new_at, zq.ended, zq.remade, zq.remade_n = {}, false, {}, 0
     copies, copy_addr, destroyed, sweep.volumes, xlooks = {}, {}, {}, {}, {}
