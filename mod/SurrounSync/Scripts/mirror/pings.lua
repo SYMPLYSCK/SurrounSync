@@ -508,8 +508,10 @@ function pings.tick(dt)
         if not shared() then return end
         -- false = no map component / world yet (respawning, loading): try again; an error is logged and dropped
         if select(2, util.safe(apply, "pings.apply", p)) == false then pending[#pending + 1] = { p = p, n = 0 } end
-        -- more than two players: the host placed it under `busy`, so the other guests hear it from here
-        peers.relay("mirror.pings", pings, function(m) m.relay_send(p) end)
+        -- more than two players: the host placed it under `busy`, so the other guests hear it from here. A 1.1.2
+        -- guest's scan ("Q") goes on as "S": another 1.1.2 guest would crash on a "Q", a 1.1.3 one takes both.
+        local fwd = p:gsub("^Q ", "S ")
+        peers.relay("mirror.pings", pings, function(m) m.relay_send(fwd) end)
     end)
     retry_in = retry_in - dt
     if next(wanted_q) and retry_in <= 0 then

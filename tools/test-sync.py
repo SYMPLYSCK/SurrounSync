@@ -7727,9 +7727,10 @@ def map_pings_reach_the_other_game():
                                           world = function() return WORLD end }
         SHARE = true
         package.loaded["mirror.mysettings"] = { on = function(k) return k == "pings" and SHARE end }
-        RELAYED = 0
+        RELAYED, RELAY_SENT = 0, {}
         package.loaded["mirror.peers"] = { shared = function(n, init) return init end,
-                                           relay = function(n, self, fn) RELAYED = RELAYED + 1 end }
+                                           relay = function(n, self, fn) RELAYED = RELAYED + 1
+                                               fn({ relay_send = function(p) RELAY_SENT[#RELAY_SENT + 1] = p end }) end }
         SENT, INBOX = {}, {}
         package.loaded["mirror.events"] = evmock { new = function(name) return {
             send = function(self, m) SENT[#SENT + 1] = m end,
@@ -7850,9 +7851,11 @@ def map_pings_reach_the_other_game():
           "...and the quest marker class keeps its own defaults")
     L.execute('INBOX.pings = { "Q 100 200 300 - 1 1 1 1 0 0 Bounty01 x" }; pings.tick(0.1)')
     check(L.eval('#WORLD_SPAWNED') == 1, "...shown once (the same scan from a 1.1.2 game, as \"Q\")")
-    L.execute('INBOX.pings = { "Q 100 900 300 - 1 1 1 1 0 0 Bounty02 x" }; pings.tick(0.1)')
+    L.execute('RELAY_SENT = {}; INBOX.pings = { "Q 100 900 300 - 1 1 1 1 0 0 Bounty02 x" }; pings.tick(0.1)')
     check(L.eval('#WORLD_SPAWNED == 2 and WORLD_SPAWNED[2].tex == POINT and QM_CDO.MarkerData[TEX] == POINT'),
           "a scan whose texture isn't loaded here gets the class's own, never what the title write left behind")
+    check(list(L.eval('RELAY_SENT').values()) == ["S 100 900 300 - 1 1 1 1 0 0 Bounty02 x"],
+          "a 1.1.2 guest's scan goes on to the other guests as \"S\", which a 1.1.2 game drops (%s)" % list(L.eval('RELAY_SENT').values()))
     L.execute('SENT = {}; QMARKS[#QMARKS + 1] = WORLD_SPAWNED[1]; pings.resend_mine()')
     check(sorted(L.eval('SENT').values()) == ["S 140 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_ClassifiedContainer001 Classified container",
                                               "S 700 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_Late Classified container"],
@@ -7899,6 +7902,37 @@ def map_pings_reach_the_other_game():
     check(list(L.eval('SENT').values()) == ["O BP_GuaranteedSpawner_Classified_C 9000.0 0.0 0.0"], "searching my own scan's crate is sent (%s)" % list(L.eval('SENT').values()))
     L.execute('SENT = {}; INBOX.pings = { "O BP_GuaranteedSpawner_Classified_C 5000.0 0.0 10.0" }; pings.tick(0.1)')
     check(L.eval('CRATES[1].lid') is True and L.eval('#SENT') == 0, "the scanner searching theirs opens the copy's lid here, no echo")
+    # 1.1.2's pings.lua (git 9f87884) crashed on every "Q": the "S" a 1.1.3 game sends must change nothing there
+    import subprocess
+    old = subprocess.run(["git", "-C", ROOT, "show", "9f87884:mod/SurrounSync/Scripts/mirror/pings.lua"],
+                         capture_output=True, text=True, encoding="utf-8")
+    if old.returncode != 0:
+        print("  skip a 1.1.2 game drops a scan sent as S (no git history here)")
+        return
+    f = os.path.join(tempfile.mkdtemp(), "pings_1_1_2.lua")
+    with open(f, "w", encoding="utf-8", newline="") as o:
+        o.write(old.stdout)
+    L.execute(r"""
+        local log = package.loaded["mirror.log"]
+        local err, warn = log.error, log.warn
+        OLD_LOGGED = {}
+        log.error = function(s) OLD_LOGGED[#OLD_LOGGED + 1] = s end
+        log.warn = function(s) OLD_LOGGED[#OLD_LOGGED + 1] = s end
+        OLD = dofile(...)
+        OLD.init({}, "guest", { in_world = function() return true end })
+        local n = #WORLD_SPAWNED
+        INBOX.pings = { "S 100 300 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Bounty09 Classified container" }
+        OLD.tick(0.1); OLD.tick(3); OLD.tick(3)
+        OLD_NEW, OLD_STATUS = #WORLD_SPAWNED - n, OLD.status()
+        INBOX.pings = { "Q 100 300 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Bounty09 Classified container" }
+        OLD.tick(0.1)
+        OLD_Q_NEW = #WORLD_SPAWNED - n
+        log.error, log.warn = err, warn
+    """, f.replace("\\", "/"))
+    check(L.eval('OLD_NEW') == 0 and "waiting" not in L.eval('OLD_STATUS') and L.eval('#OLD_LOGGED') == 0,
+          "a 1.1.2 game drops a scan sent as \"S\": nothing shown, nothing waiting, nothing logged (%s new, %s, %s)"
+          % (L.eval('OLD_NEW'), L.eval('OLD_STATUS'), list(L.eval('OLD_LOGGED').values())))
+    check(L.eval('OLD_Q_NEW') == 1, "...while the same scan as \"Q\" is shown by it (%s)" % L.eval('OLD_Q_NEW'))
 
 
 def drops_pickup_reaches_every_guest():
