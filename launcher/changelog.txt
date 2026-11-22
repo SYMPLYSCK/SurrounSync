@@ -1,0 +1,5 @@
+1.1.2
+Works with SurrounDead 0.8.0b (Steam build 26730515)
+Laptop scan markers updated for the new search circle
+You can now install and update SurrounSync right here
+Everyone you play with needs 1.1.2 too

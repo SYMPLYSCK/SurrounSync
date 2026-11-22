@@ -1933,6 +1933,17 @@ local function install_firewall()
     if firewall_on then return end
     firewall_on = true
     game.on_new_player(function() util.safe(on_world_ready, "session.world_ready") end)
+    -- a save folder slotguard removed leaves the game's load list once the game reads the disk again (slotguard.relist_due)
+    -- (a local here: session.lua's main chunk is at Lua's 200-local limit)
+    local function relist_saves()
+        if not slotguard.relist_due then return end
+        local gi = FindFirstOf("SD_GameInstance_C")
+        if not util.valid(gi) then return end
+        slotguard.relist_due = false
+        local ok, err = pcall(function() gi:SetAllSaveSlots() end)
+        log.info("session: the game's save list read again after a removed save folder" .. (ok and "" or (" - failed: " .. tostring(err))))
+    end
+    game.on_tick(function() util.safe(relist_saves, "session.relist_saves") end)
     -- (the game instance class isn't loaded yet when the mod starts: hooked once it is, and again after loads)
     local hook_in = 0.0
     local on_load = function(_, LevelName)

@@ -22,6 +22,30 @@ namespace SurrounSyncShared
             get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SurrounSync"); }
         }
 
+        // Installed by the SurrounDead Mod Launcher (github.com/Fabinext/SurrounDead-ModLauncher): its record
+        // %LOCALAPPDATA%\SDModLauncher\installed\surrounsync.json names the game folder and the version it put there.
+        // The launcher updates SurrounSync itself; our setup run over its files would leave its file list wrong.
+        public static bool ByLauncher(string gameRoot, string version)
+        {
+            return ByLauncher(gameRoot, version, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "SDModLauncher", "installed", "surrounsync.json"));
+        }
+
+        public static bool ByLauncher(string gameRoot, string version, string f)
+        {
+            try
+            {
+                if (!File.Exists(f)) return false;
+                string s = File.ReadAllText(f);
+                var root = Regex.Match(s, "\"GameRoot\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+                var ver = Regex.Match(s, "\"Version\"\\s*:\\s*\"([^\"]*)\"");
+                if (!root.Success || !ver.Success || ver.Groups[1].Value != version) return false;
+                string r = Path.GetFullPath(Regex.Unescape(root.Groups[1].Value)).TrimEnd('\\');
+                return string.Equals(r, Path.GetFullPath(gameRoot).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
         public static string SourceUrl()
         {
             try

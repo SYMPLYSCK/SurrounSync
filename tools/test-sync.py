@@ -264,6 +264,69 @@ def bridge_alive_reads_the_lobby_time_not_a_name():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def lobby_update_line_says_who_installs_it():
+    """An update for a SurrounSync the SurrounDead Mod Launcher installed comes as "update <v> launcher": the CO-OP tab's
+    UPDATE then sends the player to the launcher instead of starting our setup over the launcher's files."""
+    print("lobby_update_line_says_who_installs_it")
+    import time as _t
+    for line, want in (("update 1.1.2 launcher", ("1.1.2", "launcher")), ("update 1.1.2", ("1.1.2", None))):
+        L = lua()
+        d = tempfile.mkdtemp()
+        try:
+            L.execute('local d = ...; package.loaded["mirror.localdir"] = { get = function() return d end }', d)
+            L.execute('link = require("mirror.link"); link.configure({ transport = "steam" }); link.start_lobby()')
+            with open(os.path.join(d, "mirror_lobby.txt"), "wb") as f:
+                f.write(("me 1 2 Mike\nrole idle\ntime %d\n%s\nEND\n" % (int(_t.time()), line)).encode())
+            got = (L.eval("link.lobby().update"), L.eval("link.lobby().update_by"))
+            check(got == want, "'%s' -> update %s, by %s" % (line, got[0], got[1]))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def update_popup_tells_a_launcher_install_to_use_the_launcher():
+    """Sentinel R3 2026-11-21: a SurrounSync the Mod Launcher installed got the popup 'ACCEPT opens the updater', and
+    ACCEPT then said the opposite (use the launcher). The popup now says what ACCEPT will do for that install."""
+    print("update_popup_tells_a_launcher_install_to_use_the_launcher")
+    for by, want_msg, want_card in (("launcher", "update_msg_launcher", "Mod Launcher"), (None, "update_msg", "updater is open")):
+        L = lua()
+        L.execute(r"""
+            local by = ...
+            local any = { __index = function() return function() end end }
+            local function stub(t) return setmetatable(t or {}, any) end
+            for _, n in ipairs({ "game", "menu_backups", "instance", "hostrules", "mysettings", "modlist", "itemclean",
+                                 "voice", "chat", "teleport", "compat", "version", "quickchat" }) do
+                package.loaded["mirror." .. n] = stub()
+            end
+            package.loaded["mirror.util"] = stub({ safe = function(f, _, ...) return f(...) end, error_count = function() return 0 end,
+                                                   valid = function(o) return o ~= nil end })
+            package.loaded["mirror.hostrules"] = stub({ my_value = function() return nil end })
+            CARDS, ASKED, CLOCK, CMDS = {}, {}, 0, {}
+            os.clock = function() return CLOCK end
+            package.loaded["mirror.notify"] = stub({ show = function(t, k) CARDS[#CARDS + 1] = k .. ": " .. t end })
+            package.loaded["mirror.names"] = stub({ asking = function() return false end,
+                                                    ask = function(o) ASKED[#ASKED + 1] = o; return true end })
+            LOBBY = { update = "1.1.3", update_by = by ~= "" and by or nil, lang = "en" }
+            package.loaded["mirror.link"] = stub({ kind = function() return "steam" end, lobby = function() return LOBBY end,
+                bridge_alive = function() return true end, bridge_cmd = function(c) CMDS[#CMDS + 1] = c; return true end })
+            package.loaded["mirror.session"] = stub({ state = function() return "idle" end })
+            package.loaded["mirror.phase1"] = stub({ started = function() return nil end, connected = function() return false end })
+            package.loaded["mirror.journal_tab"] = stub({ configure = function() end })
+            package.loaded["mirror.game"] = stub({ on_tick = function(f) TICK = f end, player = function() return {} end })
+            ModifierKey = { CONTROL = 1 }
+            I18N = require("mirror.i18n")
+            menu = require("mirror.menu")
+            menu.init({})
+            for _ = 1, 100 do CLOCK = CLOCK + 0.1; TICK(0.1) end
+        """, by or "")
+        check(L.eval("#ASKED") >= 1 and L.eval("ASKED[1].message") == L.eval("I18N.t(...)", want_msg),
+              "%s install: the popup says %s" % (by or "setup", want_msg))
+        L.execute("ASKED[1].done()")
+        cards = list(L.eval("CARDS").values())
+        check(any(want_card in c for c in cards) and (L.eval("#CMDS") == 0) == (by == "launcher"),
+              "...ACCEPT %s (%s, bridge commands %s)" % ("points at the launcher, no updater started" if by else "opens the updater",
+                                                         cards[-1:], list(L.eval("CMDS").values())))
+
+
 def menu_restarts_a_stopped_bridge_out_of_coop():
     """RedCloudz 2026-11-09: "THE STEAM CONNECTION ISN'T RUNNING" on the CO-OP tab with Steam up, through reinstalls.
     A bridge that stopped (Steam not answering yet at the game's start) was started again only inside a session, so
@@ -7576,8 +7639,12 @@ def map_pings_reach_the_other_game():
             HOOKS[DESTROYED](P(m)); m.gone = true; HOOKS[REMOVE](P(self), P(m))
         end
         -- laptop scans: quest marker class + defaults, the crate class, a world that spawns
-        QM_CDO = { IsValid = function() return true end, ["Marker Texture"] = POINT, Color = { R = 1, G = 1, B = 1, A = 1 },
-                   Text = { ToString = function() return "Default" end }, ["Underground?"] = false }
+        -- (game build 26730515: BP_QuestMarker's look is one S_MarkerData, with the search circle's DiscoverableRadius)
+        TITLE, UG, RAD = "MarkerTitle_47_5E7A698C4B5AC497BBB438A55515B853", "Underground?_57_38CF16D4418981C9C884F689373DF3A8",
+                         "DiscoverableRadius_60_C185CCC34DB7347746D2C281FBDCA1F1"
+        FText = function(s) return { ToString = function() return s end } end
+        function qdata(t, r, title, ug, rad) return { [TEX] = t, [COL] = { R = r, G = 0.5, B = 0, A = 1 }, [TITLE] = FText(title), [UG] = ug, [RAD] = rad } end
+        QM_CDO = { IsValid = function() return true end, MarkerData = qdata(POINT, 1, "Default", false, 0) }
         QM_CLS, CRATE_CLS = obj({}), obj({ GetFName = function() return { ToString = function() return "BP_GuaranteedSpawner_Classified_C" end } end,
             GetFullName = function() return "BlueprintGeneratedClass /Game/Inv/BP_GuaranteedSpawner_Classified.BP_GuaranteedSpawner_Classified_C" end })
         OBJS = { ["/Game/T/T_Skull.T_Skull"] = SKULL, ["/Game/Quests/Blueprints/Objects/BP_QuestMarker.BP_QuestMarker_C"] = QM_CLS,
@@ -7589,7 +7656,10 @@ def map_pings_reach_the_other_game():
             a.IsValid = function() return not a.gone end
             a.K2_GetActorLocation = function() return l end
             a.K2_DestroyActor = function() a.gone = true end
-            if c == QM_CLS then a.tex, a.color, a.text, a.ug = QM_CDO["Marker Texture"], QM_CDO.Color.R, QM_CDO.Text, QM_CDO["Underground?"] end
+            if c == QM_CLS then
+                local d = QM_CDO.MarkerData
+                a.tex, a.color, a.text, a.ug, a.rad = d[TEX], d[COL].R, d[TITLE]:ToString(), d[UG], d[RAD]
+            end
             if c == CRATE_CLS then
                 a.GetClass = function() return CRATE_CLS end
                 a.MC_CrateOpen = function() a.lid = true end
@@ -7685,26 +7755,54 @@ def map_pings_reach_the_other_game():
     # military laptop scans: the bounty quest's map icon and its crate reach the other game
     L.execute(r"""
         SENT = {}
-        function event(path, tag) return obj({ GetFullName = function() return "Quest_Event_SpawnMarker_C " .. path end,
-            Location = { X = 100, Y = 200, Z = 300 }, ["Marker Texture"] = SKULL, Color = { R = 0.25, G = 0.5, B = 0, A = 1 },
-            ["Underground?"] = true, ActorTag = { ToString = function() return tag end }, Text = "Classified container" }) end
-        BOUNTY = event("/Game/Quests/Quests/Bounties/FindClassifiedContainer/Quest_Bounty_ClassifiedContainer001.Default__Quest_Bounty_ClassifiedContainer001_C:QuestTemplate.Event_SpawnMarker_C_0", "Bounty01")
-        STORY = event("/Game/Quests/Quests/Main/Quest_Main_FindRadio.Default__Quest_Main_FindRadio_C:QuestTemplate.Event_SpawnMarker_C_0", "Radio")
-        HOOKS["Quest_Event_SpawnMarker_C:ExecuteEvent"](P(BOUNTY))
-        HOOKS["Quest_Event_SpawnMarker_C:ExecuteEvent"](P(STORY))
+        -- the quest's event (it finds the spawner by ActorTag; the spawner's Quest_SpawnMarker has run when the hook does)
+        function event(cls, path, tag) return obj({ GetFullName = function() return cls .. " " .. path end,
+            ActorTag = { ToString = function() return tag end } }) end
+        -- the spawner's icon as the game leaves it: its MarkerData, a spot inside the circle, the quest's name in Tags
+        function qicon(x, tag)
+            local tags = { { ToString = function() return tag end } }
+            tags.GetArrayNum = function(self) return #self end
+            local m = obj({ MarkerData = qdata(SKULL, 0.25, "Classified container", true, 4500), Tags = tags })
+            m.K2_GetActorLocation = function() return { X = x, Y = 260, Z = 300 } end
+            QMARKS[#QMARKS + 1] = m
+            return m
+        end
+        T1 = "Quest_Bounty_ClassifiedContainer001"
+        qicon(140, T1); qicon(900, "Quest_Main_FindRadio")
+        BOUNTY = event("Quest_Event_SpawnMarker_Object_C", "/Game/Quests/Quests/Bounties/FindClassifiedContainer/Quest_Bounty_ClassifiedContainer001.Default__Quest_Bounty_ClassifiedContainer001_C:QuestTemplate.Quest_Event_SpawnMarker_Object_C_0", T1)
+        STORY = event("Quest_Event_SpawnMarker_Object_C", "/Game/Quests/Quests/Main/Quest_Main_FindRadio.Default__Quest_Main_FindRadio_C:QuestTemplate.Quest_Event_SpawnMarker_Object_C_0", "Quest_Main_FindRadio")
+        HOOKS["Quest_Event_SpawnMarker_Object_C:ExecuteEvent"](P(BOUNTY))
+        HOOKS["Quest_Event_SpawnMarker_Object_C:ExecuteEvent"](P(STORY))
     """)
-    check(list(L.eval('SENT').values()) == ["Q 100 200 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 Bounty01 Classified container"],
-          "a laptop scan's map icon is sent, a story quest's isn't (%s)" % list(L.eval('SENT').values()))
-    L.execute('SENT = {}; INBOX.pings = { "Q 100 200 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 Bounty01 Classified container" }; pings.tick(0.1)')
+    check(L.eval('HOOKS["Quest_Event_SpawnMarker_AI_C:ExecuteEvent"] ~= nil'), "both new quest marker events are hooked (Object and AI)")
+    check(list(L.eval('SENT').values()) == ["Q 140 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_ClassifiedContainer001 Classified container"],
+          "a laptop scan's map icon is sent where the game put it, with its circle; a story quest's isn't (%s)" % list(L.eval('SENT').values()))
+    L.execute(r"""
+        SENT = {}
+        LATE = event("Quest_Event_SpawnMarker_AI_C", "/Game/Quests/Quests/Bounties/X/Quest_Bounty_Late.Default__Quest_Bounty_Late_C:QuestTemplate.E_0", "Quest_Bounty_Late")
+        NEVER = event("Quest_Event_SpawnMarker_AI_C", "/Game/Quests/Quests/Bounties/X/Quest_Bounty_None.Default__Quest_Bounty_None_C:QuestTemplate.E_0", "Quest_Bounty_None")
+        HOOKS["Quest_Event_SpawnMarker_AI_C:ExecuteEvent"](P(LATE)); HOOKS["Quest_Event_SpawnMarker_AI_C:ExecuteEvent"](P(NEVER))
+        N_EARLY = #SENT
+        qicon(700, "Quest_Bounty_Late")
+        for i = 1, 5 do pings.tick(2.5) end
+    """)
+    check(L.eval('N_EARLY') == 0 and list(L.eval('SENT').values()) == ["Q 700 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_Late Classified container"],
+          "an icon not up yet when the event ran is sent once it is; one that never comes is given up (%s)" % list(L.eval('SENT').values()))
+    L.execute('SENT = {}; INBOX.pings = { "Q 100 200 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Bounty01 Classified container" }; pings.tick(0.1)')
     check(L.eval('#WORLD_SPAWNED == 1 and WORLD_SPAWNED[1].cls == QM_CLS and WORLD_SPAWNED[1].tex == SKULL and WORLD_SPAWNED[1].color == 0.25 '
-                 'and WORLD_SPAWNED[1].text == "Classified container" and WORLD_SPAWNED[1].ug == true'),
-          "the other player's scan icon is shown here with its look")
-    check(L.eval('QM_CDO["Marker Texture"] == POINT and QM_CDO.Color.R == 1 and QM_CDO.Text == "Default" and QM_CDO["Underground?"] == false'),
+                 'and WORLD_SPAWNED[1].text == "Classified container" and WORLD_SPAWNED[1].ug == true and WORLD_SPAWNED[1].rad == 4500'),
+          "the other player's scan icon is shown here with its look and its circle")
+    check(L.eval('QM_CDO.MarkerData[TEX] == POINT and QM_CDO.MarkerData[COL].R == 1 and QM_CDO.MarkerData[TITLE]:ToString() == "Default" '
+                 'and QM_CDO.MarkerData[UG] == false and QM_CDO.MarkerData[RAD] == 0'),
           "...and the quest marker class keeps its own defaults")
-    L.execute('INBOX.pings = { "Q 100 200 300 - 1 1 1 1 0 Bounty01 x" }; pings.tick(0.1)')
+    L.execute('INBOX.pings = { "Q 100 200 300 - 1 1 1 1 0 0 Bounty01 x" }; pings.tick(0.1)')
     check(L.eval('#WORLD_SPAWNED') == 1, "...shown once")
-    L.execute('HOOKS["Quest_Event_RemoveMarker_C:ExecuteEvent"](P(BOUNTY))')
-    check(list(L.eval('SENT').values()) == ["X Bounty01"], "the scan's icon going away is sent")
+    L.execute('SENT = {}; QMARKS[#QMARKS + 1] = WORLD_SPAWNED[1]; pings.resend_mine()')
+    check(sorted(L.eval('SENT').values()) == ["Q 140 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_ClassifiedContainer001 Classified container",
+                                              "Q 700 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_Late Classified container"],
+          "an arriving player gets my running scans again, not the other player's copy (%s)" % list(L.eval('SENT').values()))
+    L.execute('SENT = {}; HOOKS["Quest_Event_RemoveMarker_C:ExecuteEvent"](P(BOUNTY))')
+    check(list(L.eval('SENT').values()) == ["X Quest_Bounty_ClassifiedContainer001"], "the scan's icon going away is sent")
     L.execute('SENT = {}; INBOX.pings = { "X Bounty01" }; pings.tick(0.1)')
     check(L.eval('WORLD_SPAWNED[1].gone'), "...and the copy goes away here")
     L.execute(r"""
@@ -14017,7 +14115,7 @@ def mods_switch_restart_and_match_the_host():
         shutil.rmtree(d, ignore_errors=True)
 
 
-for t in (fast_fire_asks_little_per_shot, player_damage_reaches_the_other_game,drops_pickup_reaches_every_guest,drops_rejoin_pairs_the_saved_pickups, drops_pile_pickups_take_only_their_own_item, loose_magazine_picked_up_by_both_at_once_is_kept_once,corpse_looted_at_the_same_moment_keeps_one_copy,corpse_partial_takes_at_the_same_moment_keep_the_total,same_moment_container_takes_keep_one_copy, same_moment_partial_takes_keep_the_total, refused_put_in_taken_back_tells_the_host_nothing,one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, player_rip_in_a_container_is_a_take, bench_output_made_on_a_guest_reaches_the_host, ui_no_room_removal_is_not_a_take, lights_come_back_on_a_respawned_ghost, perf_run_puts_the_outer_step_back, fs_write_is_whole_or_old, utf8_cut_never_splits_a_character, crumb_keeps_the_last_64_steps,unanswered_join_keeps_the_friends_list, coop_tab_in_a_realm_has_nothing_of_it, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, loot_kept_changes_outlast_the_session,car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, handheld_radio_makes_voice_a_walkie, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, plain_events_skip_late_lines_and_bound_the_window, jig_probe_names_what_a_patch_removed, jig_price_follows_the_traders_table, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, military_trader_follows_the_host, ice_cream_trader_follows_the_host, role_switch_reads_nothing_of_its_own_old_role, new_realm_character_gets_the_starting_kit, realm_takes_the_creators_difficulty, coop_guest_runs_the_hosts_world_settings, zombies_stop_at_arms_length, human_copies_hold_the_hosts_weapon, hounds_bark_when_they_come_for_you, airdrops_follow_the_host, event_sites_follow_the_host, a_guest_keeps_the_site_classes_its_failed_spawners_held, a_destroyed_sites_address_can_come_back_as_a_new_site, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, a_player_in_the_game_menu_is_not_a_frozen_game, link_restart_puts_the_games_blobs_again, link_keeps_putting_the_hello, bridge_alive_reads_the_lobby_time_not_a_name, menu_restarts_a_stopped_bridge_out_of_coop, clockmap_quiet_places_without_stats, util_game_loop_runs_on_the_game_thread_loop, util_null_objects_are_invalid,
+for t in (fast_fire_asks_little_per_shot, player_damage_reaches_the_other_game,drops_pickup_reaches_every_guest,drops_rejoin_pairs_the_saved_pickups, drops_pile_pickups_take_only_their_own_item, loose_magazine_picked_up_by_both_at_once_is_kept_once,corpse_looted_at_the_same_moment_keeps_one_copy,corpse_partial_takes_at_the_same_moment_keep_the_total,same_moment_container_takes_keep_one_copy, same_moment_partial_takes_keep_the_total, refused_put_in_taken_back_tells_the_host_nothing,one_take_fires_both_removed_hooks_and_is_sent_once, item_used_out_of_a_container_is_a_take, player_rip_in_a_container_is_a_take, bench_output_made_on_a_guest_reaches_the_host, ui_no_room_removal_is_not_a_take, lights_come_back_on_a_respawned_ghost, perf_run_puts_the_outer_step_back, fs_write_is_whole_or_old, utf8_cut_never_splits_a_character, crumb_keeps_the_last_64_steps,unanswered_join_keeps_the_friends_list, coop_tab_in_a_realm_has_nothing_of_it, bag_put_back_after_a_take_reaches_the_host, container_class_checks_are_cached, stacking_moves_reach_the_other_game, loot_take_for_a_container_the_host_lacks_is_kept, loot_kept_changes_outlast_the_session,car_trunks_go_by_the_cars_name, mods_switch_restart_and_match_the_host, loot_take_without_a_uid_pairing_finds_the_item, settings_pages_cycle_save_and_follow_the_host, handheld_radio_makes_voice_a_walkie, zombie_archetype_effects_reach_copies, group_split_host_decides_follow_and_ignores_followers, loot_open_shows_the_hosts_items_at_once, group_split_leader_and_follower_agree, vehicles_seat_four_players_by_slot, loot_asks_the_host_again_on_every_reopen, peers_give_every_player_their_own_copy, chat_and_voice_reach_every_player, reliable_events_survive_pauses_and_restarts, plain_events_skip_late_lines_and_bound_the_window, jig_probe_names_what_a_patch_removed, jig_price_follows_the_traders_table, find_by_id_reuses_the_object_it_found, tooltip_never_calls_into_null_objects, settlement_camps_follow_the_host, military_trader_follows_the_host, ice_cream_trader_follows_the_host, role_switch_reads_nothing_of_its_own_old_role, new_realm_character_gets_the_starting_kit, realm_takes_the_creators_difficulty, coop_guest_runs_the_hosts_world_settings, zombies_stop_at_arms_length, human_copies_hold_the_hosts_weapon, hounds_bark_when_they_come_for_you, airdrops_follow_the_host, event_sites_follow_the_host, a_guest_keeps_the_site_classes_its_failed_spawners_held, a_destroyed_sites_address_can_come_back_as_a_new_site, posepack_recovers_lost_packets, link_blob_comes_back_after_reset, a_player_in_the_game_menu_is_not_a_frozen_game, link_restart_puts_the_games_blobs_again, link_keeps_putting_the_hello, bridge_alive_reads_the_lobby_time_not_a_name, lobby_update_line_says_who_installs_it, update_popup_tells_a_launcher_install_to_use_the_launcher, menu_restarts_a_stopped_bridge_out_of_coop, clockmap_quiet_places_without_stats, util_game_loop_runs_on_the_game_thread_loop, util_null_objects_are_invalid,
           jig_stats_copy_the_asset_defaults, weapon_slots_get_their_stats, tactical_reads_only_lights_the_class_has, host_rules_and_mod_list_survive_a_full_disk,
           vehicles_keep_this_worlds_fuel, car_dashboard_follows_the_tank, car_horn_reaches_the_other_game, raiders_can_hit_the_guests_ghost, harvest_uses_up_nodes_once, zombie_spawn_pins_hold_or_refuse,
           zombie_copies_take_the_hosts_look,

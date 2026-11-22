@@ -618,6 +618,8 @@ def guard_drops_only_an_empty_new_save(L, tmp):
           "a thumbnail-only new save is removed (it showed in the load list and couldn't load)")
     make_slot(tmp, "S1")
     before = snapshot(tmp, "S1")
+    check(L.eval('slotguard.relist_due') is True, "...and the game's save list is to be read again")
+    L.execute('slotguard.relist_due = false')
     check(not first(L.eval('slotguard.drop_stray("S1")')) and snapshot(tmp, "S1") == before, "a real save is never touched")
     write(os.path.join(d, COOP, "Thumb.sav"), JPEG)
     check(not first(L.eval('slotguard.drop_stray(...)', COOP)) and os.path.exists(os.path.join(d, COOP, "Thumb.sav")),
@@ -627,6 +629,7 @@ def guard_drops_only_an_empty_new_save(L, tmp):
     check(not first(L.eval('slotguard.drop_stray("Odd")')) and os.path.exists(os.path.join(d, "Odd", "notes.txt")),
           "a folder with anything else in it stays")
     check(not first(L.eval('slotguard.drop_stray("../x")')), "a path is refused")
+    check(L.eval('slotguard.relist_due') is False, "nothing removed: no re-read asked for")
 
 
 @test
@@ -2886,12 +2889,20 @@ def emptied_session_saves_leave_no_folder_in_the_load_list(L, tmp):
     check(not os.path.exists(old), "a leftover co-op save of ours is emptied and its folder removed")
     check(os.path.exists(os.path.join(odd, "notes.txt")), "a folder still holding another file is kept, file and all")
     check(os.path.exists(os.path.join(foreign, "Player.sav")), "a co-op-named save SurrounSync didn't make is left alone")
+    check(L.eval('require("mirror.slotguard").relist_due') is True, "the start's removals ask the game to read its save list again")
+    L.execute('require("mirror.slotguard").relist_due = false')
     before = snapshot(tmp, "S1")
     L.execute('session.load_slot("S1"); require("mirror.save_guard").run_before_save(); PC:SaveGameToSlot()')
     scratch = os.path.join(sd, "SurrounSync_Session")
     check(os.path.exists(os.path.join(scratch, "Player.sav")), "a save during the load goes to the scratch slot")
+    # game build 26730515: the load list is SD_GameInstance's own list, read from disk at the start and on SetAllSaveSlots
+    L.execute('RELISTS = 0; GI = { IsValid = function() return true end, SetAllSaveSlots = function() RELISTS = RELISTS + 1 end }; '
+              'FindFirstOf = function(c) if c == "SD_GameInstance_C" then return GI end end')
     L.execute('for i = 1, 10 do for _, fn in ipairs(TICKS) do fn(0.5) end; TICK(1) end')   # (the firewall's tick)
     check(not os.path.exists(scratch), "after the load the scratch save is emptied and its folder removed")
+    check(L.eval('RELISTS') == 1, "...and the game reads its save list from disk again, once (%s)" % L.eval('RELISTS'))
+    L.execute('for i = 1, 5 do for _, fn in ipairs(TICKS) do fn(0.5) end; TICK(1) end')
+    check(L.eval('RELISTS') == 1, "no removal, no re-read")
     check(snapshot(tmp, "S1") == before and L.eval('CURRENT') == "S1", "the own save is untouched and current again")
     check(L.eval('(require("mirror.slotguard").remove_empty("S1"))') is None and os.path.isdir(os.path.join(sd, "S1")),
           "remove_empty refuses a save that isn't a co-op save")

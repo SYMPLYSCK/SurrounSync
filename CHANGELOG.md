@@ -2,13 +2,27 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 1.1.2 (2026-11-21)
+
+Update for the game's 0.8.0b patch. If your game updated, you need this one, and so does everyone you play with (1.1.1 and 1.1.2 can't play together).
+
+**Game update**
+- Works with SurrounDead 0.8.0b (Steam build 26730515). 1.1.1 won't install on the new game version.
+- The game changed how laptop scans mark a bounty on the map. The icon now lands somewhere inside a search circle instead of right on the crate. SurrounSync now sends your friends that same icon and circle.
+- The game's load menu now keeps its own list of saves, so a leftover SurrounSync_Session save could hang around in it until you restarted. SurrounSync now refreshes that list after it cleans up its co-op saves.
+
+**Mod Launcher**
+- You can now install SurrounSync with the SurrounDead Mod Launcher, made by Fabinext: https://github.com/Fabinext/SurrounDead-ModLauncher. Open it, pick SurrounSync and hit Install, and it keeps the mod up to date for you. Big thanks to Fabinext for building it.
+- The setup still works if you'd rather use that.
+- If you installed with the launcher, the in-game update message now tells you to update from the launcher instead of running the setup.
+- Some people have had Windows Defender flag SurrounSyncSetup.exe when downloading it. If that happens to you, use the launcher instead. It installs from the zip, not the setup.
+
 ## 1.1.1 (2026-11-12)
 
 **SurrounSync 1.1.1: the glider and its recipe for everyone, the other players in the right spot on the big map, the minimap on F4, cheaper zombies and many co-op, Realm and joining fixes.** Everyone needs 1.1.1: it doesn't play with 1.1.0.
 
 **Hang Glider**
 - The glider opens with one jump. Carrying a Hang Glider, jump off an edge with 5 m or more of drop, or jump while running down a hill, and it opens by itself once the drop is under you; no second press in the air. A jump on flat ground or down a low wall stays a normal jump, and walking off an edge without jumping doesn't open it (press Jump in the air then, as before).
-- The Hang Glider also comes as its own mod for single player without SurrounSync: SurrounSyncGlider-<version>.zip (unzip it into the game's folder) with a version-glider.json for mod installers. It holds the glider's pak, its scripts, UE4SS and the loader the pak needs. With SurrounSync installed it stays off by itself, since SurrounSync has the glider already.
 - Uninstalling SurrounSync keeps the glider's pak and the loader when the standalone glider mod is installed.
 - The Hang Glider, its workbench recipe and the Double Drum Magazine load from their paks as soon as you are in a world, without waiting for the mod loader (BPModLoaderMod). A player whose loader was off, missing or slow had no glider and no recipe, and was told the glider's files weren't loaded.
 

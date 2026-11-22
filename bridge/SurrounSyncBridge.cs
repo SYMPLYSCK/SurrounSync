@@ -1104,6 +1104,7 @@ class Bridge
     readonly Dictionary<ulong, KeyValuePair<string, long>> requests = new Dictionary<ulong, KeyValuePair<string, long>>();
     string kickedLine = null; long kickedAt = 0;
     volatile string updateVersion = null;
+    volatile bool updateByLauncher = false;   // set before updateVersion: the mod launcher put this SurrounSync here
     volatile string reportLine = null;
     const long REQUEST_TIMEOUT = 60000;
     const int MAX_POSE = 2048, MAX_HELLO = 256, MAX_PART = CHUNK + 1024, MAX_PARTS = 32, MAX_BLOB_NAMES = 256;
@@ -1920,7 +1921,7 @@ class Bridge
             }
         if (joinError != null) sb.Append("joinerror ").Append(joinError).Append('\n');
         sb.Append("voice ").Append(!voice.Available ? "unavailable" : !voice.On ? "off" : voice.Talking ? "talking" : "on").Append('\n');
-        if (updateVersion != null) sb.Append("update ").Append(updateVersion).Append('\n');
+        if (updateVersion != null) sb.Append("update ").Append(updateVersion).Append(updateByLauncher ? " launcher" : "").Append('\n');
         if (reportLine != null) sb.Append(reportLine).Append('\n');
         sb.Append("END\n");
         try { WriteAtomic(LobbyFile(), sb.ToString()); } catch { }
@@ -1930,6 +1931,7 @@ class Bridge
 
     static string ModDir() { return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..")); }
     static string Win64Dir() { return Path.GetFullPath(Path.Combine(ModDir(), "..", "..", "..")); }
+    static string GameRoot() { return Path.GetFullPath(Path.Combine(Win64Dir(), "..", "..", "..")); }
 
     void StartUpdateCheck()
     {
@@ -1959,8 +1961,10 @@ class Bridge
                 }
                 if (SurrounSyncShared.Release.Compare(latest, mine) > 0)
                 {
+                    updateByLauncher = SurrounSyncShared.Release.ByLauncher(GameRoot(), mine);
                     updateVersion = latest;
-                    Log("update check: SurrounSync " + latest + " is out (this is " + mine + ")");
+                    Log("update check: SurrounSync " + latest + " is out (this is " + mine + ")" +
+                        (updateByLauncher ? " - installed by the SurrounDead Mod Launcher, which updates it" : ""));
                 }
                 else Log("update check: up to date (" + mine + ", newest " + latest + ")");
             }
@@ -1975,7 +1979,8 @@ class Bridge
         string setup = Path.Combine(SurrounSyncShared.Release.AppDir, SurrounSyncShared.Release.SetupName);
         try
         {
-            if (File.Exists(setup))
+            if (updateByLauncher) Log("update: installed by the SurrounDead Mod Launcher - the mod tells the player to update there");
+            else if (File.Exists(setup))
             {
                 Process.Start(new ProcessStartInfo(setup, "--update --wait-game") { UseShellExecute = true });
                 Log("update: started " + setup);

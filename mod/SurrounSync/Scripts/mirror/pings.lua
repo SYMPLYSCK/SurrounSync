@@ -8,10 +8,13 @@
 -- The other game places it through the same Svr_SpawnPlayerMarker, with the sender's look swapped into the
 -- picker's DefaultPlayerMarkerData for that call. MY SETTINGS -> SHARE MAP PINGS off: yours stay yours.
 --
--- Military laptop scans (decompiled 2026-10-27): using the laptop starts a random bounty quest
--- (BP_BountyQuestManager CallRandomEvent -> Narrative BeginQuest). Its Quest_Event_SpawnMarker spawns a
--- BP_QuestMarker (map icon) at a fixed place, a "find the classified container" one also has its
--- BP_Quest_Spawner_Object (tag = the quest's name) spawn a BP_GuaranteedSpawner_Classified there (seen in-game:
+-- Military laptop scans (decompiled 2026-10-27, the icon part again 2026-11-21 for game build 26730515): using the
+-- laptop starts a random bounty quest (BP_BountyQuestManager CallRandomEvent -> Narrative BeginQuest). Its
+-- Quest_Event_SpawnMarker_Object (or _AI) finds the BP_Quest_Spawner_Object (_AI) tagged with the quest's name, whose
+-- Quest_SpawnMarker spawns a BP_QuestMarker (map icon) with the spawner's MarkerData (S_MarkerData: look, title, and
+-- the search circle drawn on the map, DiscoverableRadius) at a random spot inside that circle, then puts the quest's
+-- name in its Tags. So the icon itself is sent, as the game placed it. A "find the classified container" quest also
+-- has its BP_Quest_Spawner_Object spawn a BP_GuaranteedSpawner_Classified there (seen in-game:
 -- not the Container_LaptopEventCrate the assets suggest); Quest_Event_RemoveMarker takes the icon away when it's
 -- done. The other game gets a copy of the icon and of the crate. The quest and the crate's item stay the
 -- scanner's: searching runs Svr_CrateOpen (quest progress + one random item spawned in that world), so the copy
@@ -35,7 +38,17 @@ local F = {
     size = "TextureSize_30_0FC614D34939DCCA4077899925344EDF",
     compass = "CompassMarker?_45_173EEC314B156D67370A86A9FF973EA4",
 }
-local QUEST_SPAWN = "/Game/Quests/Events/Quest_Event_SpawnMarker.Quest_Event_SpawnMarker_C:ExecuteEvent"
+-- (Quest_Event_SpawnMarker, which spawned the icon itself, is gone since game build 26730515)
+local QUEST_SPAWNS = {
+    "/Game/Quests/Events/Quest_Event_SpawnMarker_Object.Quest_Event_SpawnMarker_Object_C:ExecuteEvent",
+    "/Game/Quests/Events/Quest_Event_SpawnMarker_AI.Quest_Event_SpawnMarker_AI_C:ExecuteEvent",
+}
+-- the S_MarkerData fields a bounty icon carries besides F.tex and F.color
+local Q = {
+    title = "MarkerTitle_47_5E7A698C4B5AC497BBB438A55515B853",
+    ug = "Underground?_57_38CF16D4418981C9C884F689373DF3A8",
+    radius = "DiscoverableRadius_60_C185CCC34DB7347746D2C281FBDCA1F1",
+}
 local QUEST_REMOVE = "/Game/Quests/Events/Quest_Event_RemoveMarker.Quest_Event_RemoveMarker_C:ExecuteEvent"
 local SPAWNER = "/Game/Quests/Blueprints/Spawner/BP_Quest_Spawner_Object.BP_Quest_Spawner_Object_C:Quest_Spawn"
 local QMARKER_ASSET = "/Game/Quests/Blueprints/Objects/BP_QuestMarker"
@@ -45,6 +58,7 @@ local CRATE_OPEN = "/Game/Quests/Blueprints/Objects/BP_GuaranteedSpawner.BP_Guar
 local BOUNTY = "^Quest_Bounty_"
 local SAME = 100        -- cm: a removed ping is the one this close to the sent place (both games trace the same ground)
 local RETRY, TRIES = 2.0, 30
+local TRIES_Q = 3       -- looks for a laptop scan's icon after the hook didn't find it (RETRY s apart)
 
 local cfg, role, session
 local channel = events.reliable("pings")
@@ -136,21 +150,66 @@ local function from_bounty(ev)
     return n ~= nil and n:find("Quest_Bounty_", 1, true) ~= nil
 end
 
+-- an icon's tag that passes want (the spawner's quest name); our copies carry none
+local function tag_where(m, want)
+    local tag
+    pcall(function()
+        for i = 1, m.Tags:GetArrayNum() do
+            local t = word(m.Tags[i]:ToString())
+            if want(t) then tag = t end
+        end
+    end)
+    return tag
+end
+local function is_bounty(t) return t:find(BOUNTY) ~= nil end
+
+-- "Q x y z texture r g b a underground radius tag title": the icon as the game placed it on my map
+local function quest_line(m, tag)
+    local l, d = loc_of(m), nil
+    pcall(function() d = m.MarkerData end)
+    if not (l and d) then return nil end
+    local tex, c, ug, rad, text
+    pcall(function() tex = path_of(d[F.tex]) end)
+    pcall(function() local v = d[F.color]; c = { v.R, v.G, v.B, v.A } end)
+    pcall(function() ug = d[Q.ug] == true end)
+    pcall(function() rad = tonumber(d[Q.radius]) end)
+    pcall(function() text = d[Q.title]:ToString() end)
+    c = c or { 1, 1, 1, 1 }
+    return string.format("Q %.0f %.0f %.0f %s %.3f %.3f %.3f %.3f %d %.0f %s %s", l.X, l.Y, l.Z, tex or "-",
+        c[1], c[2], c[3], c[4], ug and 1 or 0, rad or 0, tag, ((text or ""):gsub("[\r\n]+", " ")))
+end
+
+-- quest tag -> tries left: a scan's icon not found yet (looked for again each RETRY s)
+local wanted_q = {}
+
+-- the scan's icon with this tag on my map: sent; false = not there (yet)
+local function send_quest_icon(tag)
+    local all
+    pcall(function() all = FindAllOf("BP_QuestMarker_C") end)
+    local function same(t) return t == tag end
+    for _, m in ipairs(all or {}) do
+        if util.valid(m) and tag_where(m, same) then
+            local line = quest_line(m, tag)
+            if line then
+                mine_q[tag] = line
+                channel:send(line)
+                stats.scans = stats.scans + 1
+                local l = loc_of(m)
+                log.info(string.format("pings: laptop scan marked %s at %.0f %.0f - sent", tag, l.X, l.Y))
+                return true
+            end
+        end
+    end
+    return false
+end
+
 local function on_quest_marker(ev)
     if busy.on or not share_mine() or not from_bounty(ev) then return end
-    local l, tex, c, ug
-    pcall(function() local v = ev.Location; l = { X = v.X, Y = v.Y, Z = v.Z } end)
-    pcall(function() tex = path_of(ev["Marker Texture"]) end)
-    pcall(function() local v = ev.Color; c = { v.R, v.G, v.B, v.A } end)
-    pcall(function() ug = ev["Underground?"] == true end)
-    local tag, text = word(text_of(ev.ActorTag)), text_of(ev.Text) or ""
-    if not l or tag == "" or tag == "None" then return end
-    c = c or { 1, 1, 1, 1 }
-    mine_q[tag] = string.format("Q %.0f %.0f %.0f %s %.3f %.3f %.3f %.3f %d %s %s", l.X, l.Y, l.Z, tex or "-",
-        c[1], c[2], c[3], c[4], ug and 1 or 0, tag, (text:gsub("[\r\n]+", " ")))
-    channel:send(mine_q[tag])
-    stats.scans = stats.scans + 1
-    log.info(string.format("pings: laptop scan marked %s at %.0f %.0f - sent", tag, l.X, l.Y))
+    local tag = word(text_of(ev.ActorTag))
+    if tag == "" or tag == "None" then return end
+    -- (a BP function's hook runs after it: the spawner's icon is normally up already; a spawner with
+    -- MarkerOnSpawn? off puts none up, and it is given up after TRIES_Q looks)
+    if not send_quest_icon(tag) then wanted_q[tag] = TRIES_Q end
 end
 
 local function on_quest_unmarker(ev)
@@ -300,11 +359,11 @@ local function unmake(p)
     return true
 end
 
--- the class's defaults get the scan's look for one SpawnActor (BeginPlay builds the map icon from them)
-local QF = { tex = "Marker Texture", color = "Color", text = "Text", ug = "Underground?" }
+-- the class's defaults (its MarkerData) get the scan's look for one SpawnActor (BeginPlay builds the map icon, its
+-- circle and the compass icon from them)
 local function make_quest_marker(p)
-    local x, y, z, tex, r, g, b, a, ug, tag, text =
-        p:match("^Q (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) ([01]) (%S+) ?(.*)$")
+    local x, y, z, tex, r, g, b, a, ug, rad, tag, text =
+        p:match("^Q (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) ([01]) (%S+) (%S+) ?(.*)$")
     local l = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
     if not (tag and l.X and l.Y and l.Z) then return true end
     if util.valid(theirs_q[tag]) then return true end
@@ -313,22 +372,27 @@ local function make_quest_marker(p)
     local cls = StaticFindObject(QMARKER)
     local cdo, w = StaticFindObject(QMARKER_CDO), game.world()
     if not (util.valid(cls) and util.valid(cdo) and w) then return false end
+    local d
+    pcall(function() d = cdo.MarkerData end)
+    if not d then log.warn("pings: the quest icon class has no MarkerData - the other player's laptop scan isn't shown"); return true end
     local old = {}
-    pcall(function() old.tex = cdo[QF.tex] end)
-    pcall(function() local v = cdo[QF.color]; old.color = { R = v.R, G = v.G, B = v.B, A = v.A } end)
-    pcall(function() old.text = cdo[QF.text]:ToString() end)
-    pcall(function() old.ug = cdo[QF.ug] end)
+    pcall(function() old[F.tex] = d[F.tex] end)
+    pcall(function() local v = d[F.color]; old[F.color] = { R = v.R, G = v.G, B = v.B, A = v.A } end)
+    pcall(function() old[Q.title] = FText(d[Q.title]:ToString()) end)
+    pcall(function() old[Q.ug] = d[Q.ug] end)
+    pcall(function() old[Q.radius] = d[Q.radius] end)
     local t = tex ~= "-" and StaticFindObject(tex) or nil
     local m
     busy.on = true
     local ok, err = pcall(function()
-        if util.valid(t) then cdo[QF.tex] = t end
-        cdo[QF.color] = { R = tonumber(r), G = tonumber(g), B = tonumber(b), A = tonumber(a) }
-        cdo[QF.text] = text
-        cdo[QF.ug] = ug == "1"
+        if util.valid(t) then d[F.tex] = t end
+        d[F.color] = { R = tonumber(r), G = tonumber(g), B = tonumber(b), A = tonumber(a) }
+        d[Q.ug] = ug == "1"
+        d[Q.radius] = tonumber(rad) or 0
+        pcall(function() d[Q.title] = FText(text) end)
         m = w:SpawnActor(cls, l, { Pitch = 0, Yaw = 0, Roll = 0 })
     end)
-    for k, v in pairs(old) do pcall(function() cdo[QF[k]] = v end) end
+    for k, v in pairs(old) do pcall(function() d[k] = v end) end
     busy.on = false
     if not (ok and util.valid(m)) then log.warn("pings: couldn't show the other player's laptop scan: " .. tostring(err)); return true end
     theirs_q[tag] = m
@@ -418,7 +482,7 @@ function pings.tick(dt)
         util.ensure_hook(MARKER .. ":ActorLoaded", loaded_fn)
         util.ensure_hook(MARKER .. ":ReceiveDestroyed", destroyed_fn)
         util.ensure_hook(MINIMAP .. ":Remove Player Marker", remove_fn)
-        util.ensure_hook(QUEST_SPAWN, qmark_fn)
+        for _, f in ipairs(QUEST_SPAWNS) do util.ensure_hook(f, qmark_fn) end
         util.ensure_hook(QUEST_REMOVE, qunmark_fn)
         util.ensure_hook(SPAWNER, spawner_fn)
         util.ensure_hook(CRATE_OPEN, crate_open_fn)
@@ -432,6 +496,14 @@ function pings.tick(dt)
         peers.relay("mirror.pings", pings, function(m) m.relay_send(p) end)
     end)
     retry_in = retry_in - dt
+    if next(wanted_q) and retry_in <= 0 then
+        for tag, n in pairs(wanted_q) do
+            if not share_mine() or select(2, util.safe(send_quest_icon, "pings.quest_icon", tag)) ~= false or n <= 1 then
+                wanted_q[tag] = nil
+            else wanted_q[tag] = n - 1 end
+        end
+        if #pending == 0 then retry_in = RETRY end
+    end
     if #pending > 0 and retry_in <= 0 then
         retry_in = RETRY
         if not shared() then pending = {}; return end
@@ -457,24 +529,8 @@ function pings.resend_mine()
     local all
     pcall(function() all = FindAllOf("BP_QuestMarker_C") end)
     for _, m in ipairs(all or {}) do
-        local tag
-        pcall(function()
-            for i = 1, m.Tags:GetArrayNum() do
-                local t = m.Tags[i]:ToString()
-                if t:find(BOUNTY) then tag = word(t) end
-            end
-        end)
-        local l = loc_of(m)
-        if tag and l and not mine_q[tag] and not copies[util.addr(m) or 0] then
-            local tex, c, ug, text
-            pcall(function() tex = path_of(m[QF.tex]) end)
-            pcall(function() local v = m[QF.color]; c = { v.R, v.G, v.B, v.A } end)
-            pcall(function() ug = m[QF.ug] == true end)
-            pcall(function() text = m[QF.text]:ToString() end)
-            c = c or { 1, 1, 1, 1 }
-            mine_q[tag] = string.format("Q %.0f %.0f %.0f %s %.3f %.3f %.3f %.3f %d %s %s", l.X, l.Y, l.Z, tex or "-",
-                c[1], c[2], c[3], c[4], ug and 1 or 0, tag, ((text or ""):gsub("[\r\n]+", " ")))
-        end
+        local tag = util.valid(m) and tag_where(m, is_bounty)
+        if tag and not mine_q[tag] and not copies[util.addr(m) or 0] then mine_q[tag] = quest_line(m, tag) end
     end
     local n = 0
     for _, m in pairs(mine_q) do channel:send(m); n = n + 1 end
@@ -488,7 +544,9 @@ function pings.status()
 end
 
 -- Respawn/reload: the old world's objects are freed - drop them without touching them.
-local function forget_world() known, dying, pending, theirs_q, theirs_c, mine_q, mine_c = {}, nil, {}, {}, {}, {}, {} end
+local function forget_world()
+    known, dying, pending, theirs_q, theirs_c, mine_q, mine_c, wanted_q = {}, nil, {}, {}, {}, {}, {}, {}
+end
 function pings.init(c, r, s)
     game.on_world_reset(forget_world)
     cfg, role, session = c, r, s

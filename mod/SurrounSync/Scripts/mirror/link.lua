@@ -347,7 +347,9 @@ function link.lobby()
             -- the host can't be reached at all: Steam's P2P session error (1-4, SurrounSyncBridge.cs WriteLobby)
             l.reach_fail = tonumber(rest:match("^fail (%d+)"))
         elseif k == "update" then
-            l.update = rest
+            -- "<version> [launcher]": launcher = the SurrounDead Mod Launcher installed this one and updates it
+            local v, by = rest:match("^(%S+) ?(%S*)")
+            l.update, l.update_by = v, by ~= "" and by or nil
         elseif k == "report" then
             l.report = rest
         elseif k == "reportsent" then

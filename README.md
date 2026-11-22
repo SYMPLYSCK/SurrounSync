@@ -6,7 +6,8 @@
 
 <p align="center">
   Co-op for SurrounDead. Up to four players over Steam, no server or port forwarding needed.<br>
-  <a href="https://github.com/SYMPLYSCK/SurrounSync/releases/latest">Download</a> ·
+  <a href="https://github.com/Fabinext/SurrounDead-ModLauncher/releases/latest">Download (Mod Launcher)</a> ·
+  <a href="https://github.com/SYMPLYSCK/SurrounSync/releases/latest">Setup</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
   <a href="#troubleshooting">Help</a>
 </p>
@@ -45,16 +46,30 @@ the zombies and AI, loot, doors, cars, weather, airdrops and so on.
 
 Everyone needs the same SurrounSync version.
 
+**With the SurrounDead Mod Launcher (recommended)**
+
+1. Close SurrounDead.
+2. Download **SurrounDeadModLauncher.exe** from the [launcher's latest release](https://github.com/Fabinext/SurrounDead-ModLauncher/releases/latest) and run it.
+3. Pick **SurrounSync** and click **Install**. It finds the game through Steam, checks that your game version is the
+   one this SurrounSync is made for, and installs UE4SS if you don't have it yet, the mod, and SyncFX (switched off).
+
+The launcher keeps SurrounSync up to date: open it after a SurrounSync update comes out (the game's CO-OP tab says
+when). Removing SurrounSync in the launcher puts back the files it replaced. Your saves and backups stay.
+
+**With the setup**
+
 1. Close SurrounDead.
 2. Download **SurrounSyncSetup.exe** from the [latest release](https://github.com/SYMPLYSCK/SurrounSync/releases/latest) and run it.
 3. Click **INSTALL**. It finds the game on its own (or use *Browse*), installs UE4SS if you don't have it yet, the
    mod, and SyncFX (switched off).
 
 When it's done, the setup checks your PC and tells you if anything is off, with what to do about it. You can run
-that check again any time with the **Check** button.
+that check again any time with the **Check** button. Update it from the game: handbook (J) → CO-OP → UPDATE.
 
 To uninstall, use *Settings → Apps → SurrounSync* or the *Uninstall* button in the setup. It removes what it
 installed and nothing else. Your saves and backups stay.
+
+Use one or the other: installed with the launcher, update and remove it with the launcher.
 
 ## Play
 

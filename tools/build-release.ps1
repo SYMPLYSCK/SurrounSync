@@ -46,7 +46,8 @@ Copy-Item (Join-Path $Win64 'ue4ss\UE4SS_Signatures') $Ue -Recurse
 $ini = Join-Path $Ue 'UE4SS-settings.ini'
 (Get-Content $ini) -replace '^(ConsoleEnabled|GuiConsoleEnabled|GuiConsoleVisible)\s*=.*', '$1 = 0' | Set-Content $ini -Encoding ascii
 Copy-Item (Join-Path $Repo 'mod\SurrounSync') (Join-Path $Ue 'Mods') -Recurse
-Get-ChildItem (Join-Path $Ue 'Mods\SurrounSync') -Recurse -Include '*.bak*', '*.log', 'dlls' | Remove-Item -Recurse -Force
+# (enabled.txt: a launcher or setup install writes it into the dev folder through its junction; the zip adds its own)
+Get-ChildItem (Join-Path $Ue 'Mods\SurrounSync') -Recurse -Include '*.bak*', '*.log', 'dlls', 'enabled.txt' | Remove-Item -Recurse -Force
 # SyncFX without the developer's own settings / lamp calibration (players start from the shipped defaults) and
 # without enabled.txt (it stays off until switched on in MY SETTINGS)
 if (-not (Test-Path (Join-Path $SyncFX 'Scripts\main.lua'))) { throw "SyncFX not found in $SyncFX" }

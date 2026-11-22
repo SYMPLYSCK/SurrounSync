@@ -176,6 +176,21 @@ static class SetupTest
             Ok(kind(Doctor.VersionProblem("", "", "123", null, false, "0.0.0")) == "ok", "a program version that can't be read alone doesn't refuse");
             Ok(kind(Doctor.VersionProblem("", "", "123", null, true, "5.6")) == "ok", "no build recorded (an old setup): only the branch is checked");
 
+            // installed by the SurrounDead Mod Launcher: its record (written by JavaScriptSerializer) names this game and version
+            string launcherRec = Path.Combine(root, "surrounsync.json");
+            Func<string, string, bool> byL = (folder, ver) => SurrounSyncShared.Release.ByLauncher(folder, ver, launcherRec);
+            Ok(!byL(game, "1.1.2"), "no launcher record: not the launcher's");
+            File.WriteAllText(launcherRec, "{\"Id\":\"surrounsync\",\"Version\":\"1.1.2\",\"GameRoot\":\"" + game.Replace("\\", "\\\\") +
+                "\\\\\",\"EnabledBy\":\"SurrounDead/Binaries/Win64/ue4ss/Mods/SurrounSync/enabled.txt\",\"Files\":[]}");
+            Ok(byL(game, "1.1.2"), "the launcher's record for this game and version: the launcher's");
+            Ok(byL(game.ToUpperInvariant() + "\\", "1.1.2"), "same folder, other case and a trailing backslash: the launcher's");
+            Ok(!byL(game, "1.1.1"), "the record names another version (the setup installed this one since): not the launcher's");
+            Ok(!byL(Path.Combine(root, "other"), "1.1.2"), "the record names another game folder: not the launcher's");
+            File.WriteAllText(launcherRec, "{\"Id\":\"surrounsync\",\"Version\":\"1.1.2\"}");
+            Ok(!byL(game, "1.1.2"), "a record without a game folder: not the launcher's");
+            File.WriteAllText(launcherRec, "not json {");
+            Ok(!byL(game, "1.1.2"), "an unreadable record: not the launcher's");
+
             // the updater: a download whose connection closes early is a failure, never a cut-off setup to run
             string dl = Path.Combine(root, "dl.exe"), err;
             Ok(!SurrounSyncShared.Release.Download(Serve(1000, 10), dl, null, out err) && err.Contains("cut off") && !File.Exists(dl),

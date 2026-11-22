@@ -18,6 +18,8 @@ tools/armory/Intermediate/
 tools/armory/Saved/
 tools/armory/out/
 mod/SurrounSync/bridge/
+# the release's on-switch, written into a dev install (Mods\SurrounSync is a junction here) by the setup or the Mod Launcher
+mod/SurrounSync/enabled.txt
 
 # logs
 *.log

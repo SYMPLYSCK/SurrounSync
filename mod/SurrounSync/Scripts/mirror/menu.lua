@@ -360,7 +360,10 @@ local upd = { accepted = false, player_since = nil }
 local report_asked_at, report_seen = nil, nil
 local errors_told, errors_told_at = 0, -1000
 local function update()
-    if link.bridge_cmd("update") then
+    local l = link.lobby()
+    if l and l.update_by == "launcher" then
+        notify.show("Close the game and open the SurrounDead Mod Launcher: it installs SurrounSync " .. tostring(l.update) .. ".", "good")
+    elseif link.bridge_cmd("update") then
         notify.show("The SurrounSync updater is open - it installs the update when you close the game.", "good")
     else
         notify.show("Updates need the Steam connection. Run SurrounSync Setup from the Start menu instead.", "bad")
@@ -396,7 +399,8 @@ local function watch_release()
         local names = require("mirror.names")
         if not names.asking() then
             local i18n = require("mirror.i18n")
-            names.ask({ title = i18n.t("update_title", l.update), message = i18n.t("update_msg"),
+            names.ask({ title = i18n.t("update_title", l.update),
+                        message = i18n.t(l.update_by == "launcher" and "update_msg_launcher" or "update_msg"),
                         ok = i18n.t("update_ok"), clear = false, cancel = false, cursor = true,
                         done = function() upd.accepted = true; update() end })
         end

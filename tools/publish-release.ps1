@@ -18,7 +18,7 @@ $log = [IO.File]::ReadAllText((Join-Path $Repo 'CHANGELOG.md'), $Utf8)
 $m = [regex]::Match(($log -replace "`r`n", "`n"), "(?ms)^## \[?$([regex]::Escape($Version))\]?[^\n]*\n(.*?)(?=^## |\z)")
 if (-not $m.Success) { throw "CHANGELOG.md has no section '## $Version'" }
 $notes = Join-Path $env:TEMP "surrounsync-notes-$Version.md"
-$body = $m.Groups[1].Value.Trim() + "`n`n**Install:** download SurrounSyncSetup.exe below and run it. Already installed? Update from the game: handbook (J) -> CO-OP -> UPDATE."
+$body = $m.Groups[1].Value.Trim() + "`n`n**How to install:** the easiest way is the SurrounDead Mod Launcher (https://github.com/Fabinext/SurrounDead-ModLauncher/releases/latest). Pick SurrounSync, click Install, and it keeps it updated. You can also download SurrounSyncSetup.exe below. If you go with the setup, update from in game with J, then CO-OP, then UPDATE."
 if ($body -match '[^\x09\x0A\x0D\x20-\x7E]') { throw "The $Version notes have non-ASCII characters (emoji, arrows, dashes) - plain text only" }
 [IO.File]::WriteAllText($notes, $body, $Utf8)
 
@@ -33,12 +33,8 @@ $VerJson = Join-Path $Repo 'dist\version.json'
 if (-not (Test-Path $ModZip) -or -not (Test-Path $VerJson)) { throw "dist\SurrounSync-$Version.zip or dist\version.json missing - run tools\build-release.ps1" }
 $vj = Get-Content $VerJson -Raw | ConvertFrom-Json
 if ($vj.version -ne $Version -or $vj.download.sha256 -ne (Get-FileHash $ModZip -Algorithm SHA256).Hash.ToLower()) { throw "dist\version.json doesn't match dist\SurrounSync-$Version.zip - rebuild" }
-# the Hang Glider on its own (make-glidermod.py), the same check
-$GliderZip = Join-Path $Repo "dist\SurrounSyncGlider-$Version.zip"
-$GliderJson = Join-Path $Repo 'dist\version-glider.json'
-if (-not (Test-Path $GliderZip) -or -not (Test-Path $GliderJson)) { throw "dist\SurrounSyncGlider-$Version.zip or dist\version-glider.json missing - run tools\build-release.ps1" }
-$gj = Get-Content $GliderJson -Raw | ConvertFrom-Json
-if ($gj.version -ne $Version -or $gj.download.sha256 -ne (Get-FileHash $GliderZip -Algorithm SHA256).Hash.ToLower()) { throw "dist\version-glider.json doesn't match dist\SurrounSyncGlider-$Version.zip - rebuild" }
+# (the Hang Glider on its own, dist\SurrounSyncGlider-<version>.zip, is built but not attached: its owner releases it
+# elsewhere, user 2026-11-12)
 
 gh repo view $Slug *> $null
 if ($LASTEXITCODE -ne 0) {
@@ -55,7 +51,7 @@ git push origin HEAD:master --follow-tags 2>&1 | Out-Host
 $ErrorActionPreference = 'Stop'
 if ($LASTEXITCODE -ne 0) { throw "git push failed" }
 
-$ghArgs = @('release', 'create', $Tag, $Exe, "$Exe.sha256", $ModZip, $VerJson, $GliderZip, $GliderJson, '--repo', $Slug, '--title', "SurrounSync $Version", '--notes-file', $notes)
+$ghArgs = @('release', 'create', $Tag, $Exe, "$Exe.sha256", $ModZip, $VerJson, '--repo', $Slug, '--title', "SurrounSync $Version", '--notes-file', $notes)
 if ($Draft) { $ghArgs += '--draft' }
 gh @ghArgs
 if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }

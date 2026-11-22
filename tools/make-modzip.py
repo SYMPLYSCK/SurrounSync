@@ -8,6 +8,11 @@ itself on with an enabled.txt in its folder (no mods.txt edit); SyncFX and the g
 setup installs them. version.json lists the shared UE4SS files under "keep_if_present": other UE4SS mods use them too.
 
 version.json always sits at https://github.com/<repo>/releases/latest/download/version.json.
+
+The SurrounDead Mod Launcher (github.com/Fabinext/SurrounDead-ModLauncher, docs/MOD_MANIFEST.md) lists SurrounSync from
+that address and also shows: launcher/icon.png, launcher/banner.png (tools/make-launcher-art.py), up to 6 pictures in
+launcher/screenshots/ and the lines of launcher/changelog.txt, whose first line must be this version. The pictures are
+linked from master on raw.githubusercontent.com, so they must be committed before the release is pushed.
 """
 import hashlib
 import json
@@ -20,6 +25,9 @@ import zipfile
 REPO_SLUG = "SYMPLYSCK/SurrounSync"
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+LAUNCHER = os.path.join(REPO, "launcher")
+RAW = "https://raw.githubusercontent.com/%s/master/launcher/" % REPO_SLUG
+IMAGE_MAX = 2 * 1024 * 1024   # the launcher refuses bigger pictures
 WIN64 = "SurrounDead/Binaries/Win64/"
 CONTENT = "SurrounDead/Content/"
 # the UE4SS loader, UE4SS itself and the loaders SurrounSync needs: an installer keeps what another mod put there
@@ -46,6 +54,34 @@ def read(path, default=""):
         return default
 
 
+def picture(rel):
+    """launcher/<rel> -> its raw master address; stops the build when it's missing, not PNG/JPG or over 2 MB"""
+    path = os.path.join(LAUNCHER, rel)
+    if not rel.lower().endswith((".png", ".jpg", ".jpeg")):
+        sys.exit("launcher/%s: the mod launcher shows only PNG or JPG" % rel)
+    if not os.path.isfile(path):
+        sys.exit("launcher/%s is missing (tools/make-launcher-art.py makes the icon and banner)" % rel)
+    if os.path.getsize(path) > IMAGE_MAX:
+        sys.exit("launcher/%s is over 2 MB: the mod launcher won't show it" % rel)
+    return RAW + rel
+
+
+def launcher_fields(version):
+    """icon, banner, screenshots and changelog for the mod launcher"""
+    lines = read(os.path.join(LAUNCHER, "changelog.txt")).splitlines()
+    if not lines or lines[0].strip() != version:
+        sys.exit("launcher/changelog.txt must start with the line %s, then 3 to 6 short lines of what changed" % version)
+    changes = [l.strip() for l in lines[1:] if l.strip()]
+    if not 1 <= len(changes) <= 6 or any(re.search(r"[^\x20-\x7E]", l) for l in changes):
+        sys.exit("launcher/changelog.txt: 1 to 6 lines after the version, plain ASCII")
+    shots_dir = os.path.join(LAUNCHER, "screenshots")
+    shots = sorted(f for f in os.listdir(shots_dir)) if os.path.isdir(shots_dir) else []
+    if len(shots) > 6:
+        sys.exit("launcher/screenshots: the mod launcher shows at most 6")
+    return {"icon": picture("icon.png"), "banner": picture("banner.png"),
+            "screenshots": [picture("screenshots/" + f) for f in shots], "changelog": changes}
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit(__doc__)
@@ -53,6 +89,7 @@ def main():
     vlua = read(os.path.join(REPO, "mod", "SurrounSync", "Scripts", "mirror", "version.lua"))
     version = re.search(r'VERSION\s*=\s*"([^"]+)"', vlua).group(1)
     protocol = int(re.search(r"PROTOCOL\s*=\s*(\d+)", vlua).group(1))
+    shown = launcher_fields(version)
     name = "SurrounSync-%s.zip" % version
     zpath = os.path.join(dist, name)
     files = []
@@ -103,6 +140,7 @@ def main():
         "setup": "https://github.com/%s/releases/download/v%s/SurrounSyncSetup.exe" % (REPO_SLUG, version),
         "notes": "https://github.com/%s/releases/tag/v%s" % (REPO_SLUG, version),
     }
+    info.update(shown)
     with open(os.path.join(dist, "version.json"), "w", encoding="ascii", newline="\n") as f:
         json.dump(info, f, indent=2)
         f.write("\n")

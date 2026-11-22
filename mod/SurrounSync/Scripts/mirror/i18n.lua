@@ -27,6 +27,7 @@ local T = {
         game_build = "You and %s have different SurrounDead game versions. Both update the game in Steam, then restart it.",
         update_title = "SURROUNSYNC %s IS OUT",
         update_msg = "A new SurrounSync version is ready. ACCEPT opens the updater - it installs the update as soon as you close the game. Both players need the same version to play together.",
+        update_msg_launcher = "A new SurrounSync version is ready. You installed SurrounSync with the SurrounDead Mod Launcher: close the game and open the launcher - it installs the update. Both players need the same version to play together.",
         update_ok = "ACCEPT",
     },
     ru = {
@@ -51,6 +52,7 @@ local T = {
         game_build = "У вас и у %s разные версии игры SurrounDead. Обновите игру в Steam оба и перезапустите её.",
         update_title = "ВЫШЛА SURROUNSYNC %s",
         update_msg = "Готова новая версия SurrounSync. «ПРИНЯТЬ» откроет программу обновления - она установит обновление, как только вы закроете игру. Чтобы играть вместе, у обоих должна быть одна версия.",
+        update_msg_launcher = "Готова новая версия SurrounSync. Вы установили SurrounSync через SurrounDead Mod Launcher: закройте игру и откройте лаунчер - он установит обновление. Чтобы играть вместе, у обоих должна быть одна версия.",
         update_ok = "ПРИНЯТЬ",
     },
     de = {
@@ -75,6 +77,7 @@ local T = {
         game_build = "Du und %s habt verschiedene SurrounDead-Versionen. Aktualisiert beide das Spiel in Steam und startet es neu.",
         update_title = "SURROUNSYNC %s IST DA",
         update_msg = "Eine neue SurrounSync-Version ist bereit. AKZEPTIEREN öffnet das Update-Programm - es installiert das Update, sobald du das Spiel schließt. Zum gemeinsamen Spielen braucht ihr beide dieselbe Version.",
+        update_msg_launcher = "Eine neue SurrounSync-Version ist bereit. Du hast SurrounSync mit dem SurrounDead Mod Launcher installiert: Schließe das Spiel und öffne den Launcher - er installiert das Update. Zum gemeinsamen Spielen braucht ihr beide dieselbe Version.",
         update_ok = "AKZEPTIEREN",
     },
     es = {
@@ -99,6 +102,7 @@ local T = {
         game_build = "Tú y %s tenéis versiones distintas de SurrounDead. Actualizad los dos el juego en Steam y reiniciadlo.",
         update_title = "SURROUNSYNC %s YA ESTÁ DISPONIBLE",
         update_msg = "Hay una nueva versión de SurrounSync. ACEPTAR abre el actualizador: instala la actualización en cuanto cierres el juego. Para jugar juntos, los dos necesitáis la misma versión.",
+        update_msg_launcher = "Hay una nueva versión de SurrounSync. Instalaste SurrounSync con el SurrounDead Mod Launcher: cierra el juego y abre el launcher, que instala la actualización. Para jugar juntos, los dos necesitáis la misma versión.",
         update_ok = "ACEPTAR",
     },
     fr = {
@@ -123,6 +127,7 @@ local T = {
         game_build = "Toi et %s avez des versions différentes de SurrounDead. Mettez le jeu à jour tous les deux sur Steam et redémarrez-le.",
         update_title = "SURROUNSYNC %s EST DISPONIBLE",
         update_msg = "Une nouvelle version de SurrounSync est prête. ACCEPTER ouvre l'outil de mise à jour : il l'installe dès que tu fermes le jeu. Pour jouer ensemble, vous devez avoir la même version.",
+        update_msg_launcher = "Une nouvelle version de SurrounSync est prête. Tu as installé SurrounSync avec le SurrounDead Mod Launcher : ferme le jeu et ouvre le launcher, il installe la mise à jour. Pour jouer ensemble, vous devez avoir la même version.",
         update_ok = "ACCEPTER",
     },
     pt = {
@@ -147,6 +152,7 @@ local T = {
         game_build = "Você e %s estão com versões diferentes do SurrounDead. Atualizem os dois o jogo na Steam e reiniciem.",
         update_title = "SURROUNSYNC %s CHEGOU",
         update_msg = "Uma nova versão do SurrounSync está pronta. ACEITAR abre o atualizador: ele instala a atualização assim que você fechar o jogo. Para jogar juntos, os dois precisam da mesma versão.",
+        update_msg_launcher = "Uma nova versão do SurrounSync está pronta. Você instalou o SurrounSync com o SurrounDead Mod Launcher: feche o jogo e abra o launcher, ele instala a atualização. Para jogar juntos, os dois precisam da mesma versão.",
         update_ok = "ACEITAR",
     },
 }

@@ -339,6 +339,11 @@ function slotguard.copy_character_home(coop, own)
     return "copied"
 end
 
+-- Game build 26730515 lists saves from SD_GameInstance.AllSaveSlots, read from disk once at the game's start
+-- (SetAllSaveSlots) and added to by every save (AddSaveSlot): a folder removed here stayed in the load list until a
+-- restart. A removal sets relist_due; session.lua has the game read the disk again on the game thread.
+slotguard.relist_due = false
+
 -- A new save the game's Save menu started while joined: the game writes its thumbnail into the new slot before
 -- the save itself is sent to the co-op slot (session.lua firewall), and the load list then showed a save that
 -- can't be loaded. Only a non-co-op slot without any save data goes: its thumbnail, then the folder if that
@@ -353,6 +358,7 @@ function slotguard.drop_stray(slot)
     if not savefs.dir_exists(dir(slot)) then return false end
     os.remove(dir(slot) .. "\\Thumb.sav")
     local ok = savefs.rmdir_empty(dir(slot))
+    if ok then slotguard.relist_due = true end
     log.info("slotguard: " .. (ok and "removed" or "couldn't remove (not empty)") .. " the empty new save " .. slot)
     return ok
 end
@@ -381,7 +387,7 @@ function slotguard.remove_empty(coop)
     if not slotguard.is_coop(coop) then return refuse("remove_empty", tostring(coop) .. " is not a co-op save") end
     if has_saves(coop) or not savefs.dir_exists(dir(coop)) then return false end
     local ok = savefs.rmdir_empty(dir(coop))
-    if ok then log.info("slotguard: removed the empty co-op save folder " .. coop) end
+    if ok then slotguard.relist_due = true; log.info("slotguard: removed the empty co-op save folder " .. coop) end
     return ok
 end
 
