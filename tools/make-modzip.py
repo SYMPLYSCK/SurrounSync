@@ -137,7 +137,6 @@ def main():
             "off_by_default": [WIN64 + "ue4ss/Mods/SyncFX/", WIN64 + "ue4ss/Mods/SurrounDeadGore/",
                                CONTENT + "Paks/LogicMods/SurrounDeadGore.pak.off"],
         },
-        "setup": "https://github.com/%s/releases/download/v%s/SurrounSyncSetup.exe" % (REPO_SLUG, version),
         "notes": "https://github.com/%s/releases/tag/v%s" % (REPO_SLUG, version),
     }
     info.update(shown)

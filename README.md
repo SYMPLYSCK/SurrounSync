@@ -6,8 +6,7 @@
 
 <p align="center">
   Co-op for SurrounDead. Up to four players over Steam, no server or port forwarding needed.<br>
-  <a href="https://github.com/Fabinext/SurrounDead-ModLauncher/releases/latest">Download (Mod Launcher)</a> ·
-  <a href="https://github.com/SYMPLYSCK/SurrounSync/releases/latest">Setup</a> ·
+  <a href="https://github.com/SYMPLYSCK/SurrounSync/releases/latest/download/SurrounDeadModLauncher.exe">Download (Mod Launcher)</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
   <a href="#troubleshooting">Help</a>
 </p>
@@ -40,36 +39,23 @@ the zombies and AI, loot, doors, cars, weather, airdrops and so on.
 - The host's PC runs all the AI for everyone, so let the fastest PC host.
 - EVERYONE NEEDS THE GAME'S 0.8 (the normal Steam branch since 2026-11-05, or the experimental branch), and everyone
   in one game the same branch. The old 0.7.1 ("previous" in Steam → Properties → Game Versions & Betas) doesn't
-  work. The setup tells you if you're on it.
+  work. The Mod Launcher tells you if you're on it.
 
 ## Install
 
-Everyone needs the same SurrounSync version.
-
-**With the SurrounDead Mod Launcher (recommended)**
+Everyone needs the same SurrounSync version. SurrounSync installs with the SurrounDead Mod Launcher, made by
+[Fabinext](https://github.com/Fabinext/SurrounDead-ModLauncher).
 
 1. Close SurrounDead.
-2. Download **SurrounDeadModLauncher.exe** from the [launcher's latest release](https://github.com/Fabinext/SurrounDead-ModLauncher/releases/latest) and run it.
+2. Download **SurrounDeadModLauncher.exe** from the [latest release](https://github.com/SYMPLYSCK/SurrounSync/releases/latest) and run it.
 3. Pick **SurrounSync** and click **Install**. It finds the game through Steam, checks that your game version is the
    one this SurrounSync is made for, and installs UE4SS if you don't have it yet, the mod, and SyncFX (switched off).
 
 The launcher keeps SurrounSync up to date: open it after a SurrounSync update comes out (the game's CO-OP tab says
 when). Removing SurrounSync in the launcher puts back the files it replaced. Your saves and backups stay.
 
-**With the setup**
-
-1. Close SurrounDead.
-2. Download **SurrounSyncSetup.exe** from the [latest release](https://github.com/SYMPLYSCK/SurrounSync/releases/latest) and run it.
-3. Click **INSTALL**. It finds the game on its own (or use *Browse*), installs UE4SS if you don't have it yet, the
-   mod, and SyncFX (switched off).
-
-When it's done, the setup checks your PC and tells you if anything is off, with what to do about it. You can run
-that check again any time with the **Check** button. Update it from the game: handbook (J) → CO-OP → UPDATE.
-
-To uninstall, use *Settings → Apps → SurrounSync* or the *Uninstall* button in the setup. It removes what it
-installed and nothing else. Your saves and backups stay.
-
-Use one or the other: installed with the launcher, update and remove it with the launcher.
+**Installed it with SurrounSyncSetup.exe before?** That setup isn't offered any more. Uninstall it first with
+*Settings → Apps → SurrounSync* (your saves and backups stay), then install with the launcher.
 
 ## Play
 
@@ -106,7 +92,7 @@ Inside a Realm the CO-OP tab stays empty: chat, voice, teleports, kicks and leav
 
 ## SyncFX
 
-SyncFX is a graphics mod that comes with the setup, switched off. The game looks exactly as it always did until
+SyncFX is a graphics mod that comes with SurrounSync, switched off. The game looks exactly as it always did until
 you turn it on.
 
 - **F8** switches it on or off (it remembers your choice). **F6** opens its menu.
@@ -145,9 +131,9 @@ you turn it on.
 
 ## Updates
 
-When a new version is out, the game tells you and the CO-OP tab shows **UPDATE TO x.y.z**. Click it, close the
-game, and it installs itself. The setup can also download the newest version. If you and your friend are on
-different versions, the mod tells you when you connect.
+When a new version is out, the game tells you and the CO-OP tab shows **UPDATE TO x.y.z**. Close the game, open
+the Mod Launcher and update SurrounSync there. If you and your friend are on different versions, the mod tells you
+when you connect.
 
 ## Bug reports
 
@@ -175,12 +161,13 @@ yourself. A line about what you were doing when it broke helps a lot.
 
 ## Troubleshooting
 
-Run **SurrounSync Setup → Check** first. It catches most problems and tells you how to fix them.
+A missing or damaged file is put back by removing SurrounSync in the Mod Launcher and installing it again. Your
+saves and backups stay.
 
 | Problem | Fix |
 |---|---|
-| No CO-OP tab | Usually the wrong game version: switch SurrounDead to game 0.8 in Steam (Properties → Game Versions & Betas → None, the normal branch, then Verify integrity of game files), then run the setup's REPAIR. A different UE4SS version from another mod can also cause it. |
-| "The Steam connection isn't running" | Start Steam before the game. If it's running, your antivirus may have removed `SurrounSyncBridge.exe`. Restore it, allow it, and run REPAIR. |
+| No CO-OP tab | Usually the wrong game version: switch SurrounDead to game 0.8 in Steam (Properties → Game Versions & Betas → None, the normal branch, then Verify integrity of game files), then install SurrounSync again in the Mod Launcher. A different UE4SS version from another mod can also cause it. |
+| "The Steam connection isn't running" | Start Steam before the game. If it's running, your antivirus may have removed `SurrounSyncBridge.exe`. Restore it and allow it, or install SurrounSync again in the Mod Launcher. |
 | Friend isn't listed | They have to click **HOST A GAME** first, or you can use their friend code. |
 | "Different version of SurrounSync" | Everyone updates to the newest version. |
 | Game crashes at start after a game update | Probably an old `.pak` mod in `Content\Paks\~mods`. Move it out of the `Paks` folder. |
@@ -214,7 +201,7 @@ More detail in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ```
 mod/SurrounSync/   the mod as it goes into ue4ss/Mods (Lua scripts and the built bridge)
 bridge/            SurrounSyncBridge (Steam networking) and code shared with the setup
-installer/         SurrounSyncSetup.exe and its icon
+installer/         the old SurrounSyncSetup.exe (no longer released) and the icon
 realms-backend/    the Realms server (Cloudflare Worker, D1 database, R2 storage)
 tools/             build, release, tests, lint and a one-PC test setup
 docs/              how it works, development notes
@@ -231,5 +218,7 @@ welcome. See [LICENSE](LICENSE).
 ## Credits
 
 - [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS), the scripting runtime this is built on (MIT licence, included in
-  the setup).
+  the download).
+- The [SurrounDead Mod Launcher](https://github.com/Fabinext/SurrounDead-ModLauncher) by Fabinext, which installs
+  and updates SurrounSync.
 - SurrounSync is an unofficial fan mod. It isn't affiliated with or endorsed by the developers of SurrounDead.

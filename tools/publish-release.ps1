@@ -1,4 +1,5 @@
-# Publishes a release on GitHub with the setup attached; installed copies pick it up as an update.
+# Publishes a release on GitHub: the SurrounDead Mod Launcher (Fabinext's newest), the mod zip and version.json.
+# Players install with the launcher, which reads version.json from our latest release.
 #   .\tools\publish-release.ps1 [-NoBuild] [-Draft]
 param([switch]$NoBuild, [switch]$Draft)
 $ErrorActionPreference = 'Stop'
@@ -18,16 +19,13 @@ $log = [IO.File]::ReadAllText((Join-Path $Repo 'CHANGELOG.md'), $Utf8)
 $m = [regex]::Match(($log -replace "`r`n", "`n"), "(?ms)^## \[?$([regex]::Escape($Version))\]?[^\n]*\n(.*?)(?=^## |\z)")
 if (-not $m.Success) { throw "CHANGELOG.md has no section '## $Version'" }
 $notes = Join-Path $env:TEMP "surrounsync-notes-$Version.md"
-$body = $m.Groups[1].Value.Trim() + "`n`n**How to install:** the easiest way is the SurrounDead Mod Launcher (https://github.com/Fabinext/SurrounDead-ModLauncher/releases/latest). Pick SurrounSync, click Install, and it keeps it updated. You can also download SurrounSyncSetup.exe below. If you go with the setup, update from in game with J, then CO-OP, then UPDATE."
+$body = $m.Groups[1].Value.Trim() + "`n`n**How to install:** download SurrounDeadModLauncher.exe below and run it, pick SurrounSync and click Install. It keeps SurrounSync updated too. The launcher is made by Fabinext: https://github.com/Fabinext/SurrounDead-ModLauncher"
 if ($body -match '[^\x09\x0A\x0D\x20-\x7E]') { throw "The $Version notes have non-ASCII characters (emoji, arrows, dashes) - plain text only" }
 [IO.File]::WriteAllText($notes, $body, $Utf8)
 
 if (-not $NoBuild) { & (Join-Path $PSScriptRoot 'build-release.ps1') }
-$Exe = Join-Path $Repo 'dist\SurrounSyncSetup.exe'
-if (-not (Test-Path $Exe)) { throw "dist\SurrounSyncSetup.exe missing - run tools\build-release.ps1" }
-$built = (& $Exe --version | Out-String).Trim()
-if ($built -ne $Version) { throw "dist\SurrounSyncSetup.exe is $built, version.lua says $Version - rebuild" }
-# the plain zip + version.json for other installers (make-modzip.py); version.json names this version and this zip
+# the zip + version.json the launcher installs from (make-modzip.py); version.json names this version and this zip
+# (dist\SurrounSyncSetup.exe is still built for the test kit, but no longer released)
 $ModZip = Join-Path $Repo "dist\SurrounSync-$Version.zip"
 $VerJson = Join-Path $Repo 'dist\version.json'
 if (-not (Test-Path $ModZip) -or -not (Test-Path $VerJson)) { throw "dist\SurrounSync-$Version.zip or dist\version.json missing - run tools\build-release.ps1" }
@@ -35,6 +33,16 @@ $vj = Get-Content $VerJson -Raw | ConvertFrom-Json
 if ($vj.version -ne $Version -or $vj.download.sha256 -ne (Get-FileHash $ModZip -Algorithm SHA256).Hash.ToLower()) { throw "dist\version.json doesn't match dist\SurrounSync-$Version.zip - rebuild" }
 # (the Hang Glider on its own, dist\SurrounSyncGlider-<version>.zip, is built but not attached: its owner releases it
 # elsewhere, user 2026-11-12)
+
+# the launcher players download goes up with each release: Fabinext's newest, checked before anything is pushed
+$LauncherRepo = 'Fabinext/SurrounDead-ModLauncher'
+$LauncherDir = Join-Path $Repo 'dist\launcher'
+New-Item -ItemType Directory -Force $LauncherDir | Out-Null
+gh release download --repo $LauncherRepo --pattern 'SurrounDeadModLauncher.exe' --dir $LauncherDir --clobber
+if ($LASTEXITCODE -ne 0) { throw "Couldn't download SurrounDeadModLauncher.exe from $LauncherRepo - nothing was published." }
+$Launcher = Join-Path $LauncherDir 'SurrounDeadModLauncher.exe'
+$launcherTag = gh release view --repo $LauncherRepo --json tagName --jq .tagName
+Write-Host "Mod Launcher $launcherTag, SHA-256 $((Get-FileHash $Launcher -Algorithm SHA256).Hash.ToLower())"
 
 gh repo view $Slug *> $null
 if ($LASTEXITCODE -ne 0) {
@@ -51,7 +59,7 @@ git push origin HEAD:master --follow-tags 2>&1 | Out-Host
 $ErrorActionPreference = 'Stop'
 if ($LASTEXITCODE -ne 0) { throw "git push failed" }
 
-$ghArgs = @('release', 'create', $Tag, $Exe, "$Exe.sha256", $ModZip, $VerJson, '--repo', $Slug, '--title', "SurrounSync $Version", '--notes-file', $notes)
+$ghArgs = @('release', 'create', $Tag, $Launcher, $ModZip, $VerJson, '--repo', $Slug, '--title', "SurrounSync $Version", '--notes-file', $notes)
 if ($Draft) { $ghArgs += '--draft' }
 gh @ghArgs
 if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }

@@ -12,10 +12,10 @@ Update for the game's 0.8.0b patch. If your game updated, you need this one, and
 - The game's load menu now keeps its own list of saves, so a leftover SurrounSync_Session save could hang around in it until you restarted. SurrounSync now refreshes that list after it cleans up its co-op saves.
 
 **Mod Launcher**
-- You can now install SurrounSync with the SurrounDead Mod Launcher, made by Fabinext: https://github.com/Fabinext/SurrounDead-ModLauncher. Open it, pick SurrounSync and hit Install, and it keeps the mod up to date for you. Big thanks to Fabinext for building it.
-- The setup still works if you'd rather use that.
-- If you installed with the launcher, the in-game update message now tells you to update from the launcher instead of running the setup.
-- Some people have had Windows Defender flag SurrounSyncSetup.exe when downloading it. If that happens to you, use the launcher instead. It installs from the zip, not the setup.
+- SurrounSync now installs and updates through the SurrounDead Mod Launcher, made by Fabinext. Big thanks to Fabinext for building it.
+- SurrounSyncSetup.exe isn't offered anymore. Some people had Windows Defender flag it, and the launcher installs from the zip instead.
+- Used the setup before? Uninstall it first in Windows Settings, Apps, SurrounSync (your saves stay), then install with the launcher.
+- If you installed with the launcher, the in-game update message tells you to update from the launcher.
 
 ## 1.1.1 (2026-11-12)
 
