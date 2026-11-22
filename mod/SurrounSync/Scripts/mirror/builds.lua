@@ -315,29 +315,25 @@ local function rename(payload)
     if name == "" then return end
     local b = find(id, 100)
     if not b then stats.missing = stats.missing + 1; log.info("builds: " .. id .. " renamed - not here"); return end
-    -- The hover and the inventory panel show ContainerName as it is when looked at (decompiled), so a write that
-    -- didn't take is how a live rename stayed unseen until a rejoin brought the host's save (user 2026-11-10). Read
-    -- back; if it didn't take, the game's own Rename (decompiled: OverrideBuildName only sets ContainerName).
+    -- The hover and the inventory panel show ContainerName as it is when looked at (decompiled); read back, a name
+    -- that didn't take is how a live rename stayed unseen until a rejoin (user 2026-11-10). It goes in by the game's
+    -- own Rename (decompiled: OverrideBuildName only sets ContainerName), never written here: UE4SS's FText write also
+    -- overwrites the 8 bytes after the FText, and after ContainerName come the container's own fields (a crate's
+    -- Storage5 component).
     local function now_name()
         local s
         pcall(function() s = b.ContainerName:ToString() end)
         return s
     end
-    local ok, err = pcall(function() b.ContainerName = FText(name) end)
-    local how = "set"
+    applying = true
+    local ok, err = pcall(function() b:OverrideBuildName(FText(name)) end)
+    applying = false
     if now_name() ~= name then
-        applying = true
-        local ok2, err2 = pcall(function() b:OverrideBuildName(FText(name)) end)
-        applying = false
-        how = "the game's Rename"
-        if now_name() ~= name then
-            log.warn("builds: couldn't rename " .. id .. ": " .. tostring(ok and "the name didn't take" or err)
-                .. (ok2 and "" or (" / " .. tostring(err2))))
-            return
-        end
+        log.warn("builds: couldn't rename " .. id .. ": " .. tostring(ok and "the name didn't take" or err))
+        return
     end
     stats.applied_renames = stats.applied_renames + 1
-    log.info("builds: the other player renamed " .. id .. " (" .. how .. ")")
+    log.info("builds: the other player renamed " .. id)
 end
 local rename_fn = function(self, Name) util.safe(on_rename, "builds.rename", self, Name) end
 

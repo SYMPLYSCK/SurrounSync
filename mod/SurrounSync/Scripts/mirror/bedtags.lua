@@ -154,7 +154,8 @@ local function add_row(w, vb, label, have)
     local row
     pcall(function() row = wbl:Create(pc, cls, pc) end)
     if not util.valid(row) then return nil end
-    pcall(function() row.OptionName = FText(label) end)
+    -- (the label goes in by the row's own UpdateText, which sets OptionName (decompiled): UE4SS's FText write also
+    -- overwrites the 8 bytes after the FText, and after OptionName comes the row's OptionTag)
     local slot
     pcall(function() slot = vb:AddChildToVerticalBox(row) end)
     pcall(function() slot:SetPadding({ Left = 0, Top = 2, Right = 0, Bottom = 2 }) end)

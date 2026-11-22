@@ -163,7 +163,8 @@ local function tag_where(m, want)
 end
 local function is_bounty(t) return t:find(BOUNTY) ~= nil end
 
--- "Q x y z texture r g b a underground radius tag title": the icon as the game placed it on my map
+-- "S x y z texture r g b a underground radius tag title": the icon as the game placed it on my map. It went as "Q" up
+-- to protocol 63, and a 1.1.2 game crashes on every "Q" it gets (DBG-20261122-001); a letter it doesn't know it drops.
 local function quest_line(m, tag)
     local l, d = loc_of(m), nil
     pcall(function() d = m.MarkerData end)
@@ -175,7 +176,7 @@ local function quest_line(m, tag)
     pcall(function() rad = tonumber(d[Q.radius]) end)
     pcall(function() text = d[Q.title]:ToString() end)
     c = c or { 1, 1, 1, 1 }
-    return string.format("Q %.0f %.0f %.0f %s %.3f %.3f %.3f %.3f %d %.0f %s %s", l.X, l.Y, l.Z, tex or "-",
+    return string.format("S %.0f %.0f %.0f %s %.3f %.3f %.3f %.3f %d %.0f %s %s", l.X, l.Y, l.Z, tex or "-",
         c[1], c[2], c[3], c[4], ug and 1 or 0, rad or 0, tag, ((text or ""):gsub("[\r\n]+", " ")))
 end
 
@@ -363,7 +364,7 @@ end
 -- circle and the compass icon from them)
 local function make_quest_marker(p)
     local x, y, z, tex, r, g, b, a, ug, rad, tag, text =
-        p:match("^Q (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) ([01]) (%S+) (%S+) ?(.*)$")
+        p:match("^[QS] (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) ([01]) (%S+) (%S+) ?(.*)$")
     local l = { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }
     if not (tag and l.X and l.Y and l.Z) then return true end
     if util.valid(theirs_q[tag]) then return true end
@@ -375,24 +376,37 @@ local function make_quest_marker(p)
     local d
     pcall(function() d = cdo.MarkerData end)
     if not d then log.warn("pings: the quest icon class has no MarkerData - the other player's laptop scan isn't shown"); return true end
-    local old = {}
-    pcall(function() old[F.tex] = d[F.tex] end)
+    -- UE4SS's FText write also writes the 8 bytes after the FText, and in S_MarkerData that is MarkerTexture (title at
+    -- +0x0, 0x10 bytes; texture at +0x10). A title written after the texture left a stack address there, and the
+    -- icon's BeginPlay crashed on it in SetObjectPropertyByName(its compass marker, 'Icon') - every guest joining a
+    -- host with a bounty running (crash dumps 2026-11-22). So the texture is written after each title write, and
+    -- never read in between (reading it back runs IsA on whatever is there).
+    local old, old_tex = {}, nil
+    if not pcall(function() old_tex = d[F.tex] end) then
+        log.warn("pings: the quest icon class has no MarkerTexture - the other player's laptop scan isn't shown"); return true
+    end
     pcall(function() local v = d[F.color]; old[F.color] = { R = v.R, G = v.G, B = v.B, A = v.A } end)
-    pcall(function() old[Q.title] = FText(d[Q.title]:ToString()) end)
     pcall(function() old[Q.ug] = d[Q.ug] end)
     pcall(function() old[Q.radius] = d[Q.radius] end)
+    -- (a title that can't be read can't be put back: then none is written)
+    local old_title
+    pcall(function() old_title = FText(d[Q.title]:ToString()) end)
     local t = tex ~= "-" and StaticFindObject(tex) or nil
+    if not util.valid(t) then t = old_tex end
     local m
     busy.on = true
     local ok, err = pcall(function()
-        if util.valid(t) then d[F.tex] = t end
         d[F.color] = { R = tonumber(r), G = tonumber(g), B = tonumber(b), A = tonumber(a) }
         d[Q.ug] = ug == "1"
         d[Q.radius] = tonumber(rad) or 0
-        pcall(function() d[Q.title] = FText(text) end)
+        if old_title then pcall(function() d[Q.title] = FText(text) end) end
+        d[F.tex] = t
         m = w:SpawnActor(cls, l, { Pitch = 0, Yaw = 0, Roll = 0 })
     end)
+    -- (back in the same order: the title, then the texture over what that write left)
+    if old_title then pcall(function() d[Q.title] = old_title end) end
     for k, v in pairs(old) do pcall(function() d[k] = v end) end
+    pcall(function() d[F.tex] = old_tex end)
     busy.on = false
     if not (ok and util.valid(m)) then log.warn("pings: couldn't show the other player's laptop scan: " .. tostring(err)); return true end
     theirs_q[tag] = m
@@ -457,7 +471,9 @@ local function open_crate(p)
     return true
 end
 
-local APPLY = { A = make, R = unmake, Q = make_quest_marker, X = unmake_quest_marker, C = make_crate, O = open_crate }
+-- (Q: a scan's icon from a 1.1.2 game)
+local APPLY = { A = make, R = unmake, S = make_quest_marker, Q = make_quest_marker, X = unmake_quest_marker, C = make_crate,
+                O = open_crate }
 local function apply(p)
     local f = APPLY[p:sub(1, 1)]
     if f then return f(p) end

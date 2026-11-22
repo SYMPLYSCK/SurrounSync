@@ -435,7 +435,7 @@ local function hover()
     end
     for i, l in ipairs(labels) do
         if cur.labels[i] ~= l then
-            pcall(function() have[i].OptionName = FText(l) end)
+            -- (UpdateText sets OptionName itself; an FText written here would overwrite the OptionTag after it)
             pcall(function() have[i]:UpdateText(FText(l)) end)
             cur.labels[i] = l
         end

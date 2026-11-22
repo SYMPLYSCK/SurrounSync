@@ -5204,7 +5204,14 @@ def beds_get_a_rename_row_and_shared_names():
     L = lua()
     L.execute(FAKES + r"""
         local function text() return { t = "", SetText = function(self, v) self.t = v end } end
-        function opt(name) return obj({ sel = false, SetSelected = function(self, v) self.sel = v end, OptionName = name }) end
+        -- (as in UE4SS: an FText written into OptionName overwrites the OptionTag after it; the row's own UpdateText sets
+        -- OptionName in the game)
+        function opt(name)
+            local d
+            d = obj({ sel = false, OptionName = name, OptionTag = "Tag", SetSelected = function(self, v) d.sel = v end,
+                      UpdateText = function(self, v) d.OptionName = v end })
+            return setmetatable({}, { __index = d, __newindex = function(_, k, v) d[k] = v; if k == "OptionName" then d.OptionTag = "GARBAGE" end end })
+        end
         function arr(items) return { items = items, GetArrayNum = function(self) return #self.items end,
             ForEach = function(self, fn) for i, e in ipairs(self.items) do fn(i, { get = function() return e end }) end end } end
         OPTS = { opt("Sleep"), opt("Spawn"), opt("Move"), opt("Pick up") }
@@ -5235,6 +5242,7 @@ def beds_get_a_rename_row_and_shared_names():
     """.replace("DIR", '"' + d + '"'))
     L.execute("bt.tick(0.2)")
     check(L.eval("#VB.kids") == 5 and L.eval("VB.kids[5].OptionName") == "Rename", "a Rename row is added after the bed's own options")
+    check(L.eval("VB.kids[5].OptionTag") == "Tag", "...its label set by the row's UpdateText, its OptionTag left as it was")
     L.execute("bt.tick(0.02); bt.tick(0.02)")
     check(L.eval("#VB.kids") == 5, "the row is added once")
     L.execute("HELPER.CurrentInteractOptionIndex = 3; bt.tick(0.02)")
@@ -5434,9 +5442,19 @@ def door_code_locks_keep_other_players_out_until_they_type_it():
             package.loaded["mirror.link"].lobby = function() return { id = "SID", name = "NAME" } end
             CARDS = {}
             package.loaded["mirror.notify"] = { show = function(t) CARDS[#CARDS + 1] = t end, clear = function() end }
-            function opt(n) return obj({ sel = false, SetSelected = function(self, v) self.sel = v end, OptionName = n,
-                                        UpdateText = function(self, v) self.OptionName = v end,
-                                        RemoveFromParent = function(self) for i, k in ipairs(VB.kids) do if k == self then table.remove(VB.kids, i) end end end }) end
+            -- (as in UE4SS: an FText written into OptionName overwrites the OptionTag after it, counted in CLOBBERED; the
+            -- row's own UpdateText sets OptionName in the game)
+            CLOBBERED = 0
+            function opt(n)
+                local d
+                d = obj({ sel = false, OptionName = n, OptionTag = "Tag", SetSelected = function(self, v) d.sel = v end,
+                          UpdateText = function(self, v) d.OptionName = v end,
+                          RemoveFromParent = function(self) for i, k in ipairs(VB.kids) do if k == self then table.remove(VB.kids, i) end end end })
+                return setmetatable({}, { __index = d, __newindex = function(_, k, v)
+                    d[k] = v
+                    if k == "OptionName" then d.OptionTag = "GARBAGE"; CLOBBERED = CLOBBERED + 1 end
+                end })
+            end
             function arr(items) return { items = items, GetArrayNum = function(self) return #self.items end,
                 ForEach = function(self, fn) for i, e in ipairs(self.items) do fn(i, { get = function() return e end }) end end } end
             OPTS = { opt("Open"), opt("Pick up"), opt("Move") }
@@ -5681,6 +5699,9 @@ def door_code_locks_keep_other_players_out_until_they_type_it():
     H.execute('lock.gone({ X = 1200, Y = 2600, Z = 50 })')
     check(H.eval('lock.state_at({ X = 1200, Y = 2600, Z = 50 })') == "free", "a removed door leaves the file")
     check(G.eval('lock.loc_of_id("Buildable_WoodenDoor_C@100,200,5").X') == 1000, "a builds id reads back as its place")
+    check(H.eval('CLOBBERED') == 0 and G.eval('CLOBBERED') == 0,
+          "no FText is written over a lock row's OptionName (UE4SS would overwrite its OptionTag): UpdateText sets it (%s / %s)"
+          % (H.eval('CLOBBERED'), G.eval('CLOBBERED')))
     # an id kept from a start without Steam stays: the doors and code filed under it are still this player's
     K, kd = side("host", "7656009", "Kay")
     with open(kd + "/id.txt", "w") as f:
@@ -5831,9 +5852,19 @@ def vehicle_claims_keep_other_players_out_of_a_locked_car():
             package.loaded["mirror.link"].lobby = function() return { id = "SID", name = "NAME" } end
             CARDS = {}
             package.loaded["mirror.notify"] = { show = function(t) CARDS[#CARDS + 1] = t end, clear = function() end }
-            function opt(n) return obj({ sel = false, SetSelected = function(self, v) self.sel = v end, OptionName = n,
-                                        UpdateText = function(self, v) self.OptionName = v end,
-                                        RemoveFromParent = function(self) for i, k in ipairs(VB.kids) do if k == self then table.remove(VB.kids, i) end end end }) end
+            -- (as in UE4SS: an FText written into OptionName overwrites the OptionTag after it, counted in CLOBBERED; the
+            -- row's own UpdateText sets OptionName in the game)
+            CLOBBERED = 0
+            function opt(n)
+                local d
+                d = obj({ sel = false, OptionName = n, OptionTag = "Tag", SetSelected = function(self, v) d.sel = v end,
+                          UpdateText = function(self, v) d.OptionName = v end,
+                          RemoveFromParent = function(self) for i, k in ipairs(VB.kids) do if k == self then table.remove(VB.kids, i) end end end })
+                return setmetatable({}, { __index = d, __newindex = function(_, k, v)
+                    d[k] = v
+                    if k == "OptionName" then d.OptionTag = "GARBAGE"; CLOBBERED = CLOBBERED + 1 end
+                end })
+            end
             function arr(items) return { items = items, GetArrayNum = function(self) return #self.items end,
                 ForEach = function(self, fn) for i, e in ipairs(self.items) do fn(i, { get = function() return e end }) end end } end
             OPTS = { opt("Get In Vehicle"), opt("Open Storage"), opt("Push Vehicle") }
@@ -6043,6 +6074,9 @@ def vehicle_claims_keep_other_players_out_of_a_locked_car():
     check(G.eval('vl.unconfirmed()') > 0, "a claim the host hasn't taken counts as unconfirmed")
     G.execute('LIVE = false; tick()')
     check(G.eval('vl.unconfirmed()') == 0 and G.eval('st(CAR1)') == "free", "a guest back alone goes by its own world's claims")
+    check(H.eval('CLOBBERED') == 0 and G.eval('CLOBBERED') == 0,
+          "no FText is written over a vehicle row's OptionName (UE4SS would overwrite its OptionTag): UpdateText sets it (%s / %s)"
+          % (H.eval('CLOBBERED'), G.eval('CLOBBERED')))
 
 
 def all_players_must_sleep_before_the_night_is_skipped():
@@ -7365,7 +7399,19 @@ def throws_and_mines_reach_the_other_game():
             a.IsActorBeingDestroyed = function() return a.dead end
             a.K2_DestroyActor = function() a.dead = true end
             a.GetFullName = function() return cname .. " /Game/L.L:P." .. cname .. "_1" end
+            -- the game's Rename (sets ContainerName; a hook on it runs)
+            a.OverrideBuildName = function(self, n)
+                rawset(a, "ContainerName", n)
+                local h = HOOKS["BuildableMaster_Container_C:OverrideBuildName"]
+                if h then h(P(self), P(n)) end
+            end
             return a
+        end
+        -- (as in UE4SS: an FText written into ContainerName overwrites the field after it, a crate's Storage5)
+        function crate(cname, x)
+            local a = actor(cname, x)
+            a.Storage5 = "Storage5"
+            return setmetatable({}, { __index = a, __newindex = function(_, k, v) a[k] = v; if k == "ContainerName" then a.Storage5 = "GARBAGE" end end })
         end
         throwables = require("mirror.throwables")
         TOGETHER = true
@@ -7531,7 +7577,7 @@ def throws_and_mines_reach_the_other_game():
     check(sent is not None and sent.startswith("builds:C Buildable_StorageBox_C@200,0,0 ") and sent.count(" ") == 2,
           "a rename here is sent with the container's place, the name in one word (%s)" % sent)
     L.execute(r"""
-        COPY = actor("Buildable_StorageBox_C", 2003)
+        COPY = crate("Buildable_StorageBox_C", 2003)
         util.all_of = function() return { COPY }, 0 end
         INBOX.builds = { SENT1:sub(8) }
         SENT = {}
@@ -7540,9 +7586,10 @@ def throws_and_mines_reach_the_other_game():
     check(L.eval('COPY.ContainerName and COPY.ContainerName.text') == "Ammo, meds; 100% |  do not touch",
           "the other game's copy gets the same name, trimmed, control characters as spaces (%r)"
           % L.eval('COPY.ContainerName and COPY.ContainerName.text'))
+    check(L.eval('COPY.Storage5') == "Storage5", "...by the game's Rename: the field after ContainerName is left as it was")
     check(L.eval('#SENT') == 0, "...and nothing goes back")
-    # user 2026-11-10: the host's rename showed on the guest only after a rejoin. A copy whose ContainerName write
-    # doesn't take gets the name through the game's own Rename, and that isn't sent back
+    # user 2026-11-10: the host's rename showed on the guest only after a rejoin. A copy gets the name through the
+    # game's own Rename, and that isn't sent back
     L.execute(r"""
         STUCK = actor("Buildable_StorageBox_C", 3000)
         rawset(STUCK, "ContainerName", FText("Box"))
@@ -7558,7 +7605,7 @@ def throws_and_mines_reach_the_other_game():
         builds.tick(0.1)
     """)
     check(L.eval('STUCK.ContainerName.text') == "Meds" and L.eval('OVERRIDES') == 1,
-          "a name write that doesn't take: renamed with the game's Rename (%r)" % L.eval('STUCK.ContainerName.text'))
+          "a copy is renamed with the game's Rename, once (%r)" % L.eval('STUCK.ContainerName.text'))
     check(L.eval('#SENT') == 0, "...and that isn't sent back")
     L.execute('util.all_of = function() return { COPY }, 0 end')
     L.execute(r"""
@@ -7644,7 +7691,13 @@ def map_pings_reach_the_other_game():
                          "DiscoverableRadius_60_C185CCC34DB7347746D2C281FBDCA1F1"
         FText = function(s) return { ToString = function() return s end } end
         function qdata(t, r, title, ug, rad) return { [TEX] = t, [COL] = { R = r, G = 0.5, B = 0, A = 1 }, [TITLE] = FText(title), [UG] = ug, [RAD] = rad } end
-        QM_CDO = { IsValid = function() return true end, MarkerData = qdata(POINT, 1, "Default", false, 0) }
+        -- UE4SS's FText write also writes the 8 bytes after the FText, and in S_MarkerData that is MarkerTexture: the
+        -- stack address it left there crashed the icon's BeginPlay (SetObjectPropertyByName 'Icon', guests 2026-11-22)
+        GARBAGE = obj({})
+        function ue4ss_struct(d)
+            return setmetatable({}, { __index = d, __newindex = function(_, k, v) d[k] = v; if k == TITLE then d[TEX] = GARBAGE end end })
+        end
+        QM_CDO = { IsValid = function() return true end, MarkerData = ue4ss_struct(qdata(POINT, 1, "Default", false, 0)) }
         QM_CLS, CRATE_CLS = obj({}), obj({ GetFName = function() return { ToString = function() return "BP_GuaranteedSpawner_Classified_C" end } end,
             GetFullName = function() return "BlueprintGeneratedClass /Game/Inv/BP_GuaranteedSpawner_Classified.BP_GuaranteedSpawner_Classified_C" end })
         OBJS = { ["/Game/T/T_Skull.T_Skull"] = SKULL, ["/Game/Quests/Blueprints/Objects/BP_QuestMarker.BP_QuestMarker_C"] = QM_CLS,
@@ -7775,7 +7828,7 @@ def map_pings_reach_the_other_game():
         HOOKS["Quest_Event_SpawnMarker_Object_C:ExecuteEvent"](P(STORY))
     """)
     check(L.eval('HOOKS["Quest_Event_SpawnMarker_AI_C:ExecuteEvent"] ~= nil'), "both new quest marker events are hooked (Object and AI)")
-    check(list(L.eval('SENT').values()) == ["Q 140 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_ClassifiedContainer001 Classified container"],
+    check(list(L.eval('SENT').values()) == ["S 140 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_ClassifiedContainer001 Classified container"],
           "a laptop scan's map icon is sent where the game put it, with its circle; a story quest's isn't (%s)" % list(L.eval('SENT').values()))
     L.execute(r"""
         SENT = {}
@@ -7786,9 +7839,9 @@ def map_pings_reach_the_other_game():
         qicon(700, "Quest_Bounty_Late")
         for i = 1, 5 do pings.tick(2.5) end
     """)
-    check(L.eval('N_EARLY') == 0 and list(L.eval('SENT').values()) == ["Q 700 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_Late Classified container"],
+    check(L.eval('N_EARLY') == 0 and list(L.eval('SENT').values()) == ["S 700 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_Late Classified container"],
           "an icon not up yet when the event ran is sent once it is; one that never comes is given up (%s)" % list(L.eval('SENT').values()))
-    L.execute('SENT = {}; INBOX.pings = { "Q 100 200 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Bounty01 Classified container" }; pings.tick(0.1)')
+    L.execute('SENT = {}; INBOX.pings = { "S 100 200 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Bounty01 Classified container" }; pings.tick(0.1)')
     check(L.eval('#WORLD_SPAWNED == 1 and WORLD_SPAWNED[1].cls == QM_CLS and WORLD_SPAWNED[1].tex == SKULL and WORLD_SPAWNED[1].color == 0.25 '
                  'and WORLD_SPAWNED[1].text == "Classified container" and WORLD_SPAWNED[1].ug == true and WORLD_SPAWNED[1].rad == 4500'),
           "the other player's scan icon is shown here with its look and its circle")
@@ -7796,10 +7849,13 @@ def map_pings_reach_the_other_game():
                  'and QM_CDO.MarkerData[UG] == false and QM_CDO.MarkerData[RAD] == 0'),
           "...and the quest marker class keeps its own defaults")
     L.execute('INBOX.pings = { "Q 100 200 300 - 1 1 1 1 0 0 Bounty01 x" }; pings.tick(0.1)')
-    check(L.eval('#WORLD_SPAWNED') == 1, "...shown once")
+    check(L.eval('#WORLD_SPAWNED') == 1, "...shown once (the same scan from a 1.1.2 game, as \"Q\")")
+    L.execute('INBOX.pings = { "Q 100 900 300 - 1 1 1 1 0 0 Bounty02 x" }; pings.tick(0.1)')
+    check(L.eval('#WORLD_SPAWNED == 2 and WORLD_SPAWNED[2].tex == POINT and QM_CDO.MarkerData[TEX] == POINT'),
+          "a scan whose texture isn't loaded here gets the class's own, never what the title write left behind")
     L.execute('SENT = {}; QMARKS[#QMARKS + 1] = WORLD_SPAWNED[1]; pings.resend_mine()')
-    check(sorted(L.eval('SENT').values()) == ["Q 140 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_ClassifiedContainer001 Classified container",
-                                              "Q 700 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_Late Classified container"],
+    check(sorted(L.eval('SENT').values()) == ["S 140 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_ClassifiedContainer001 Classified container",
+                                              "S 700 260 300 /Game/T/T_Skull.T_Skull 0.250 0.500 0.000 1.000 1 4500 Quest_Bounty_Late Classified container"],
           "an arriving player gets my running scans again, not the other player's copy (%s)" % list(L.eval('SENT').values()))
     L.execute('SENT = {}; HOOKS["Quest_Event_RemoveMarker_C:ExecuteEvent"](P(BOUNTY))')
     check(list(L.eval('SENT').values()) == ["X Quest_Bounty_ClassifiedContainer001"], "the scan's icon going away is sent")

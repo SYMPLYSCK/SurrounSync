@@ -2,6 +2,19 @@
 
 Both players need the same version. The game checks this when you connect and tells you if they differ.
 
+## 1.1.3 (2026-11-22)
+
+Crash fix for 1.1.2. Everyone you play with needs 1.1.3 too.
+
+**Fixes**
+- Joining a host who had a laptop bounty running crashed the joining player's game. The bounty's map icon was copied in a way that broke it on the joining side. That copy now works the way the game expects.
+- Renaming a storage container sent the name to the other player in a way that could damage their copy of the container. It now goes through the game's own rename.
+- The extra rows SurrounSync adds to the bed, door and vehicle menus (Rename, door codes, vehicle locks) now set their text the game's own way. The old way wrote over a hidden value next to the text.
+
+**Playing with someone still on 1.1.2**
+- 1.1.2 still crashes when its player joins a game with a laptop bounty running, so ask them to update.
+- A 1.1.2 player in a 1.1.3 game doesn't get your laptop scans and sees the version message.
+
 ## 1.1.2 (2026-11-21)
 
 Update for the game's 0.8.0b patch. If your game updated, you need this one, and so does everyone you play with (1.1.1 and 1.1.2 can't play together).
